@@ -396,6 +396,13 @@ pub enum SinkEntry {
     Terminal {
         kind: u64,
         outcome: Option<u64>,
+        /// The trap info as recorded: `(code, import, context, detail)`.
+        ///
+        /// The **context** is here because it is the field a replay verdict compares — the detail is
+        /// diagnostic text and deliberately is not comparable — and because it was previously a
+        /// hard-coded literal. A sink that dropped it could not witness whether the record is
+        /// truthful, which is exactly what the assertions need to see.
+        trap: Option<(String, String, String, String)>,
     },
 }
 
@@ -633,9 +640,13 @@ impl JournalSink for MemorySink {
         &mut self,
         kind: u64,
         outcome: Option<u64>,
-        _trap: Option<(String, String, String, String)>,
+        trap: Option<(String, String, String, String)>,
     ) -> Result<(), SinkError> {
-        self.entries.push(SinkEntry::Terminal { kind, outcome });
+        self.entries.push(SinkEntry::Terminal {
+            kind,
+            outcome,
+            trap,
+        });
         Ok(())
     }
 }

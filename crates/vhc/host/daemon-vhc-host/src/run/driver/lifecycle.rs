@@ -651,7 +651,7 @@ pub fn start_run_migrating(
 /// boundary, because boundaries get added over time and a missed one fails silently and
 /// misleadingly — the failure mode being an authoritative-looking source location that belongs to a
 /// different phase and a different bug.
-fn take_trap(store: &mut Store<Host>, e: wasmtime::Error) -> Trap {
+pub(super) fn take_trap(store: &mut Store<Host>, e: wasmtime::Error) -> Trap {
     let context = store.data().slice.execution_context();
     let forwarded = {
         let shared = store.data().shared.clone();
@@ -710,7 +710,7 @@ fn classify_trap(store: &mut Store<Host>, e: wasmtime::Error) -> Trap {
 ///
 /// Rendering is selected by the negotiated ABI minor: a journal written at a legacy minor keeps the
 /// bare string it has always carried, because those bytes are evidence and evidence is not rewritten.
-fn journal_terminal_trap(
+pub(super) fn journal_terminal_trap(
     shared: &Arc<PumpShared>,
     trap: &Trap,
     context: &ExecutionContext,

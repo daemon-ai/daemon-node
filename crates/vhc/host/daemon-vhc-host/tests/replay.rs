@@ -115,10 +115,24 @@ fn to_records(entries: &[SinkEntry]) -> Vec<Record> {
                 hash: Hash(*payload_hash),
                 frame: frame.clone(),
             }),
-            SinkEntry::Terminal { kind, outcome } => Body::Terminal(TerminalRec {
+            SinkEntry::Terminal {
+                kind,
+                outcome,
+                trap,
+            } => Body::Terminal(TerminalRec {
                 kind: *kind,
                 outcome: *outcome,
-                trap: None,
+                // The trap info travels into the record, context included — that is the field a
+                // replay verdict compares, so dropping it here would make the verdict compare
+                // nothing.
+                trap: trap.as_ref().map(|(code, import, context, detail)| {
+                    daemon_vhc_observe::journal::record::TrapInfo {
+                        code: code.clone(),
+                        import: import.clone(),
+                        context: context.clone(),
+                        detail: detail.clone(),
+                    }
+                }),
             }),
             _ => continue,
         };
