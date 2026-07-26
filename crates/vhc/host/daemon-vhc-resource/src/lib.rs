@@ -29,10 +29,21 @@
 
 #![forbid(unsafe_code)]
 
+pub mod capability;
+pub mod planner;
 pub mod profile;
 pub mod revision;
 pub mod trust;
 
+pub use capability::{
+    CapabilityError, DeviceCapabilityReport, DeviceMemoryBudget, DeviceMemorySource, LinkCapacity,
+    DEVICE_CAPABILITY_REPORT_SCHEMA,
+};
+pub use planner::{
+    aggregate, compose, select, validate_against, AggregateClaim, DivergenceAuthority,
+    PhysicalClaim, PlannerError, ScopedOccupancy, ScopedTerm, Selection, SelectionPolicy,
+    PLANNER_VERSION,
+};
 pub use profile::{
     AllocationCeilings, AllocationScope, BackendExecutionProfile, CompilationBehavior,
     CompositionRule, CostExpr, CostInput, CostInputs, CostTerm, EnforcementClass, Headroom,
