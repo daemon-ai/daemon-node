@@ -2241,6 +2241,7 @@ fn vhc_dep_check() -> anyhow::Result<()> {
         anyhow::bail!("{} dependency-direction violation(s)", violations.len());
     }
     println!("\nok: no dependency-direction violations");
+    provenance_scan()?;
     Ok(())
 }
 
@@ -4566,4 +4567,133 @@ fn verify_codec() -> anyhow::Result<()> {
         fixtures.len()
     );
     Ok(())
+}
+
+/// The red-lined scan: the provenance constructors must not be reachable from non-test code.
+///
+/// The authoring migration made the module's own assessment the single source of a resource plan, and
+/// it made that structural — a seat receives derived requirements and has no constructor to invent one
+/// with. But three constructors *do* mint provenance, and for them the guarantee is about **who may
+/// call them**, which no type can express:
+///
+/// - `from_module_assessment` stamps a plan as module-derived. Called anywhere but the assessment path,
+///   it would let a hand-authored plan claim a module produced it — the exact drift the invariant
+///   exists to prevent, wearing the invariant's own badge.
+/// - `ModuleDerivedPlan::fixture` and `fixture_authored_execution` mint a plan no module produced.
+///   Honest in a fixture that pins digests resolving to no bytes; a silent bypass on the real path.
+///
+/// A naming convention is not a gate, so this is a gate. The heuristic — an occurrence is allowed if a
+/// `#[cfg(test)]` appears earlier in the file — is sound *here* because clippy's `items after a test
+/// module` already forbids the arrangement that would defeat it: non-test items cannot follow a test
+/// module, so anything after the first `#[cfg(test)]` is test code.
+fn provenance_scan() -> anyhow::Result<()> {
+    /// `(symbol, allowed non-test sites, why)`. An allowed site is a path suffix.
+    const GUARDED: &[(&str, &[&str], &str)] = &[
+        (
+            "ModuleDerivedPlan::from_module_assessment",
+            &[
+                // The definition, and the assessment path that is the single source.
+                "contracts/daemon-vhc-proto/src/execution_requirements.rs",
+                "host/daemon-vhc-host/src/run/admission.rs",
+            ],
+            "only the module's own assessment may stamp a plan as module-derived",
+        ),
+        (
+            "ModuleDerivedPlan::fixture",
+            &[
+                "contracts/daemon-vhc-proto/src/execution_requirements.rs",
+                // The testkit's labelled fixture helper. The testkit is test tooling by charter and
+                // is already exempt wholesale from the dependency-direction rules above; the gate
+                // that matters for it is that its CALLERS are test targets, which is checked below
+                // for `fixture_authored_execution`.
+                "host/daemon-vhc-testkit/src/live_genesis.rs",
+            ],
+            "a fixture's plan must not be mintable on the real authoring path",
+        ),
+        (
+            "fixture_authored_execution",
+            &[
+                "host/daemon-vhc-testkit/src/live_genesis.rs",
+                // The ceremony seat's own in-crate tests live beside it in a `#[cfg(test)]` module,
+                // which the earlier-cfg rule already covers; this entry is for the module path.
+                "host/daemon-vhc-testkit/src/ceremony.rs",
+            ],
+            "authoring a genesis from a fixture's requirements must stay in test targets",
+        ),
+    ];
+
+    let mut violations: Vec<String> = Vec::new();
+    let mut checked = 0usize;
+    for path in rust_sources(std::path::Path::new("crates"))? {
+        let display = path.display().to_string();
+        // A test target is test code wholesale: an integration test directory, or the conventional
+        // in-module `tests.rs`.
+        let is_test_target = display.contains("/tests/")
+            || display.ends_with("/tests.rs")
+            || display.contains("/benches/");
+        if is_test_target {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path)?;
+        checked += 1;
+        let first_cfg_test = text.find("#[cfg(test)]").unwrap_or(usize::MAX);
+        for (symbol, allowed, why) in GUARDED {
+            // The literal spelling. All three are associated functions or a free function reached by
+            // path, so the qualified form is the only way to call them — a bare-name search instead
+            // matched the word "fixture" in unrelated crates and reported 58 phantom violations.
+            let needle = *symbol;
+            let mut from = 0usize;
+            while let Some(at) = text[from..].find(needle) {
+                let at = from + at;
+                from = at + needle.len();
+                if at > first_cfg_test {
+                    continue; // test code, per the note above
+                }
+                if allowed.iter().any(|ok| display.ends_with(ok)) {
+                    continue;
+                }
+                let line = text[..at].lines().count();
+                violations.push(format!("{display}:{line} reaches `{symbol}` — {why}"));
+            }
+        }
+    }
+
+    if !violations.is_empty() {
+        eprintln!("\nprovenance scan violations:");
+        for v in &violations {
+            eprintln!("  x {v}");
+        }
+        anyhow::bail!(
+            "{} provenance violation(s): a fixture or an unstamped plan is reachable from non-test \
+             code",
+            violations.len()
+        );
+    }
+    println!(
+        "ok: provenance constructors unreachable from non-test code ({checked} files scanned)"
+    );
+    Ok(())
+}
+
+/// Every `.rs` file under `root`, excluding build artifacts.
+fn rust_sources(root: &std::path::Path) -> anyhow::Result<Vec<std::path::PathBuf>> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if entry.file_type()?.is_dir() {
+                if name != "target" && name != ".git" {
+                    stack.push(path);
+                }
+            } else if name.ends_with(".rs") {
+                out.push(path);
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
 }

@@ -101,6 +101,21 @@ impl PhysicalClaim {
     pub fn claim_digest(&self) -> Result<Hash, PlannerError> {
         Ok(daemon_vhc_proto::blake3_hash(&self.to_canonical_bytes()?))
     }
+
+    /// Total device residency this claim asks for, across every device-side term.
+    ///
+    /// Saturating rather than wrapping: an overflow here would silently produce a small total and
+    /// admit a claim far above any entitlement, which is the one arithmetic outcome that must not be
+    /// possible.
+    #[must_use]
+    pub fn device_total_bytes(&self) -> u64 {
+        self.persistent_device_bytes
+            .saturating_add(self.transient_peak_bytes)
+            .saturating_add(self.workspace_bytes)
+            .saturating_add(self.retained_pool_bytes)
+            .saturating_add(self.compilation_bytes)
+            .saturating_add(self.staging_bytes)
+    }
 }
 
 /// One term's contribution, kept with everything the aggregate needs to compose it at its real
@@ -534,20 +549,36 @@ pub fn aggregate(
     })
 }
 
-/// Validate a composed claim against a capability report and an owner budget.
+/// Validate a composed claim against a capability report and, where set, the owner's cap.
 ///
 /// Admission evaluates the **composed claim**, not the plan.
+///
+/// The device-memory question is **two independent comparisons**, against host-measured supply and
+/// against the owner's optional cap. They used to be one `min` of a single field that could hold either
+/// a platform measurement or an operator's number depending on a sibling enum — so the two authorities
+/// overwrote each other, and a refusal could not say which had refused. An operator whose own cap is the
+/// binding constraint should not be told their hardware is too small.
+///
+/// The owner's cap only ever *tightens* supply; it can never supply the mandatory hardware figure, which
+/// is measured on this node because this node is the thing that can measure it.
+///
+/// # Errors
+/// [`PlannerError`] when the claim exceeds measured supply, exceeds the owner's cap, exceeds the
+/// per-allocation ceiling, or when this platform has no trustworthy supply derivation at all.
 pub fn validate_against(
     claim: &PhysicalClaim,
     report: &DeviceCapabilityReport,
-    owner_budget_bytes: u64,
+    owner_cap: Option<crate::capability::OwnerDeviceCap>,
 ) -> Result<(), PlannerError> {
     report.validate()?;
-    let available = report.device_memory.stable_bytes.min(owner_budget_bytes);
-    if claim.total_peak_bytes > available {
+    // Both comparisons, and the typed refusal is preserved in the message so a reader can tell a
+    // policy refusal from a hardware one — while the shape stays the one callers already match on.
+    if let Err(refusal) =
+        crate::capability::admit_device_bytes(claim.total_peak_bytes, report, owner_cap)
+    {
         return Err(PlannerError::NoAdmissibleConfiguration {
             required: claim.total_peak_bytes,
-            available,
+            available: refusal.binding_limit_bytes(),
         });
     }
     let limit = report.max_allocation_bytes()?;
@@ -645,7 +676,7 @@ pub fn select(
     plan: &LogicalResourcePlan,
     profile: &BackendExecutionProfile,
     report: &DeviceCapabilityReport,
-    owner_budget_bytes: u64,
+    owner_cap: Option<crate::capability::OwnerDeviceCap>,
     co_resident_roles: u64,
     scope: SelectionScope,
     policy: &SelectionPolicy,
@@ -665,7 +696,7 @@ pub fn select(
     match policy {
         SelectionPolicy::Fixed(binding) => {
             let selection = finish(binding.clone())?;
-            validate_against(&selection.claim, report, owner_budget_bytes)?;
+            validate_against(&selection.claim, report, owner_cap)?;
             Ok(selection)
         }
         SelectionPolicy::LargestAdmissible => {
@@ -674,7 +705,7 @@ pub fn select(
             // the profile and the report working as designed — the machine genuinely cannot host
             // this run — and it names the numbers rather than the machine.
             let floor = finish(binding.clone())?;
-            validate_against(&floor.claim, report, owner_budget_bytes)?;
+            validate_against(&floor.claim, report, owner_cap)?;
 
             for dim in &plan.dimensions {
                 let candidates: Vec<DimensionValue> = match &dim.domain {
@@ -693,7 +724,7 @@ pub fn select(
                 for candidate in candidates {
                     binding.insert(dim.name.clone(), candidate);
                     let trial = finish(binding.clone())?;
-                    if validate_against(&trial.claim, report, owner_budget_bytes).is_ok() {
+                    if validate_against(&trial.claim, report, owner_cap).is_ok() {
                         break;
                     }
                     if let Some(previous) = &held {
@@ -928,14 +959,61 @@ mod tests {
     fn admission_evaluates_the_composed_claim_against_supply() {
         let (claim, _) = compose(&plan(), &binding(4), &profile(BackendClass::Vulkan), 1).unwrap();
         let r = report(BackendClass::Vulkan);
-        validate_against(&claim, &r, u64::MAX).expect("fits");
+        validate_against(&claim, &r, None).expect("fits within measured supply");
 
-        // A budget below the claim is a refusal that names both numbers.
-        let err = validate_against(&claim, &r, 1024).unwrap_err();
-        assert!(matches!(
-            err,
-            PlannerError::NoAdmissibleConfiguration { .. }
-        ));
+        // An owner cap below the claim refuses, and the refusal says it is a POLICY refusal rather
+        // than a hardware one — the device has the memory; its owner has chosen not to lend it.
+        let err = validate_against(
+            &claim,
+            &r,
+            Some(crate::capability::OwnerDeviceCap { max_bytes: 1024 }),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                PlannerError::NoAdmissibleConfiguration {
+                    available: 1024,
+                    ..
+                }
+            ),
+            "the cap is the binding limit: {err}"
+        );
+        // And the typed comparison underneath says WHICH refused, so an operator whose own policy is
+        // the constraint is not told their hardware is too small.
+        let typed = crate::capability::admit_device_bytes(
+            claim.total_peak_bytes,
+            &r,
+            Some(crate::capability::OwnerDeviceCap { max_bytes: 1024 }),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                typed,
+                crate::capability::DeviceAdmissionRefusal::ExceedsOwnerCap { .. }
+            ),
+            "a cap refusal is typed as a cap refusal: {typed}"
+        );
+
+        // And supply itself refuses on its own terms when the device genuinely lacks the memory.
+        let mut small = r.clone();
+        small.device_supply =
+            crate::revision::Maybe::Available(crate::capability::DeviceMemorySupply {
+                usable_bytes: 1024,
+                source: crate::capability::DeviceMemorySource::LinuxUnifiedMemoryBudget,
+            });
+        small.measured_max_allocation_bytes = crate::revision::Maybe::Available(1024);
+        let supply_typed =
+            crate::capability::admit_device_bytes(claim.total_peak_bytes, &small, None)
+                .unwrap_err();
+        assert!(
+            matches!(
+                supply_typed,
+                crate::capability::DeviceAdmissionRefusal::ExceedsSupply { .. }
+            ),
+            "a supply refusal is typed as a supply refusal, distinct from a cap refusal: \
+             {supply_typed}"
+        );
     }
 
     #[test]
@@ -943,7 +1021,7 @@ mod tests {
         let (mut claim, _) =
             compose(&plan(), &binding(1), &profile(BackendClass::Vulkan), 1).unwrap();
         claim.max_individual_allocation_bytes = 8 << 30;
-        let err = validate_against(&claim, &report(BackendClass::Vulkan), u64::MAX).unwrap_err();
+        let err = validate_against(&claim, &report(BackendClass::Vulkan), None).unwrap_err();
         assert!(matches!(
             err,
             PlannerError::AllocationCeilingExceeded { .. }
@@ -961,7 +1039,7 @@ mod tests {
             &p,
             &prof,
             &r,
-            u64::MAX,
+            None,
             1,
             SelectionScope::UniformRun,
             &SelectionPolicy::LargestAdmissible,
@@ -971,7 +1049,7 @@ mod tests {
             &p,
             &prof,
             &r,
-            u64::MAX,
+            None,
             1,
             SelectionScope::UniformRun,
             &SelectionPolicy::LargestAdmissible,
@@ -1005,7 +1083,7 @@ mod tests {
             &p,
             &prof,
             &r,
-            u64::MAX,
+            None,
             1,
             SelectionScope::UniformRun,
             &SelectionPolicy::LargestAdmissible,
@@ -1016,7 +1094,9 @@ mod tests {
             &p,
             &prof,
             &r,
-            floor.total_peak_bytes,
+            Some(crate::capability::OwnerDeviceCap {
+                max_bytes: floor.total_peak_bytes,
+            }),
             1,
             SelectionScope::UniformRun,
             &SelectionPolicy::LargestAdmissible,
@@ -1040,7 +1120,7 @@ mod tests {
             &plan(),
             &profile(BackendClass::Vulkan),
             &report(BackendClass::Vulkan),
-            1024,
+            Some(crate::capability::OwnerDeviceCap { max_bytes: 1024 }),
             1,
             SelectionScope::UniformRun,
             &SelectionPolicy::LargestAdmissible,
@@ -1060,7 +1140,7 @@ mod tests {
             &plan(),
             &profile(BackendClass::Vulkan),
             &report(BackendClass::Vulkan),
-            u64::MAX,
+            None,
             1,
             SelectionScope::UniformRun,
             &SelectionPolicy::Fixed(binding(3)),

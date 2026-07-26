@@ -220,6 +220,14 @@ impl RunConfig {
     }
 }
 
+/// The host stage a device bring-up failure is attributed to.
+///
+/// Numbered past the five admission-funnel stages deliberately: bring-up happens *after* a module has
+/// been admitted, when the instance is being stood up, and it is the first point at which a host-side
+/// failure can occur with no guest phase to name. Reusing an admission stage would place the failure
+/// in the funnel it had already cleared.
+pub const HOST_STAGE_BACKEND_BRING_UP: u32 = 6;
+
 /// Driver-level failures raised before/around guest execution (admission-shaped, not traps).
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -238,6 +246,31 @@ pub enum RunError {
     /// caller classifies it recoverable (the node reassesses; the device inventory changed).
     #[error("BackendUnavailable: {0}")]
     BackendUnavailable(String),
+    /// The device backend could not be **brought up** for this instance: a host-side failure in
+    /// which no guest code ran at all.
+    ///
+    /// It carries its own stage because it belongs to none of the guest execution contexts. That
+    /// domain describes where *guest* code was executing, and a bring-up failure happens before the
+    /// guest exists — so attributing it to initialization, which is what this used to do, was a
+    /// classification bug rather than a conservative choice: it recorded a guest-trap fact about a
+    /// phase the guest never entered, and a reader of that record would reasonably conclude the
+    /// module's own initialization had failed.
+    ///
+    /// Inventing a twelfth guest context for it would have been the same mistake with more
+    /// machinery. The honest shape is a typed host refusal outside the guest-trap surface entirely,
+    /// and **no terminal guest-trap record is written**.
+    #[error(
+        "BackendBringUp (host stage {stage}): the {backend} lane could not be brought up for this \
+         instance, before any guest code ran: {reason}"
+    )]
+    BackendBringUp {
+        /// The host stage this failed at. See [`HOST_STAGE_BACKEND_BRING_UP`].
+        stage: u32,
+        /// The backend lane that failed to come up.
+        backend: String,
+        /// The captured reason, verbatim.
+        reason: String,
+    },
     /// A journal-sink write failed (journaling is load-bearing, §8.4).
     #[error(transparent)]
     Sink(#[from] SinkError),

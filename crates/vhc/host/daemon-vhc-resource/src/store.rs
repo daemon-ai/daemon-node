@@ -31,7 +31,8 @@ use std::collections::BTreeMap;
 use crate::profile::{BackendExecutionProfile, ProfileError};
 use crate::revision::{BackendClass, BackendImplementationRevision};
 use crate::trust::{
-    authenticate, AuthenticationRefusal, ProfileAcceptancePolicy, ProfileTrustEnvelope,
+    authenticate, AuthenticationRefusal, AuthorityClass, ProfileAcceptancePolicy,
+    ProfileTrustEnvelope,
 };
 use daemon_vhc_proto::bytes::Hash;
 
@@ -141,6 +142,7 @@ pub struct AuthenticationContext<'a> {
 pub struct AuthenticatedProfile<'a> {
     profile: &'a BackendExecutionProfile,
     digest: Hash,
+    authority_class: AuthorityClass,
 }
 
 impl<'a> AuthenticatedProfile<'a> {
@@ -154,6 +156,24 @@ impl<'a> AuthenticatedProfile<'a> {
     #[must_use]
     pub fn digest(&self) -> Hash {
         self.digest
+    }
+
+    /// Which class of authority vouched for it.
+    #[must_use]
+    pub fn authority_class(&self) -> AuthorityClass {
+        self.authority_class
+    }
+
+    /// Whether this profile may certify a fleet ceremony.
+    ///
+    /// A development-vouched profile authenticates — that is the point of a development authority, so
+    /// integration work can proceed without a release key — but it does not certify. A caller building
+    /// ceremony evidence checks this rather than trusting the policy it was handed to have excluded
+    /// development keys, so the fence survives a misconfigured policy and a caller who did not know
+    /// the fence was there.
+    #[must_use]
+    pub fn may_certify_ceremony(&self) -> bool {
+        self.authority_class.may_certify_ceremony()
     }
 }
 
@@ -277,7 +297,7 @@ impl ProfileStore {
             });
         }
 
-        let mut authenticated: Vec<(Hash, &BackendExecutionProfile)> = Vec::new();
+        let mut authenticated: Vec<(Hash, &BackendExecutionProfile, AuthorityClass)> = Vec::new();
         let mut refusals: Vec<(Hash, AuthenticationRefusal)> = Vec::new();
         for (digest, held) in candidates {
             match authenticate(
@@ -289,7 +309,7 @@ impl ProfileStore {
                 context.planner_version,
                 context.now_ms,
             ) {
-                Ok(()) => authenticated.push((*digest, &held.profile)),
+                Ok(class) => authenticated.push((*digest, &held.profile, class)),
                 Err(refusal) => refusals.push((*digest, refusal)),
             }
         }
@@ -300,12 +320,16 @@ impl ProfileStore {
                 refusals,
             }),
             1 => {
-                let (digest, profile) = authenticated.remove(0);
-                Ok(AuthenticatedProfile { profile, digest })
+                let (digest, profile, authority_class) = authenticated.remove(0);
+                Ok(AuthenticatedProfile {
+                    profile,
+                    digest,
+                    authority_class,
+                })
             }
             _ => Err(SelectionRefusal::Ambiguous {
                 class: class.slug(),
-                digests: authenticated.into_iter().map(|(d, _)| d).collect(),
+                digests: authenticated.into_iter().map(|(d, _, _)| d).collect(),
             }),
         }
     }

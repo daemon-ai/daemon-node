@@ -272,19 +272,21 @@ pub fn start_run_migrating(
                         Some(runner)
                     }
                     Err(reason) => {
-                        let trap = Trap::bare(
-                            TrapCode::ComputeFault,
-                            format!(
-                                "backend unavailable at device bring-up ({}): {reason}",
-                                engine_cfg.backend.slug()
-                            ),
-                        );
-                        // The instance exists but no guest code has run: the phase it was entering
-                        // is initialization. (A host-side bring-up failure has no guest phase of its
-                        // own in the closed context domain — recorded as the phase being entered
-                        // rather than invented as a run-loop context.)
-                        journal_terminal_trap(&shared, &trap, &ExecutionContext::Init, abi_minor)?;
-                        return Ok(RunEnd::Trapped(trap));
+                        // A host-side typed refusal, and **no guest-trap record at all**: no guest
+                        // code has run, so there is no guest execution context to name and nothing
+                        // about the module to report.
+                        //
+                        // This used to journal a terminal trap attributed to initialization. That was
+                        // a classification bug, not a conservative choice — it recorded a guest-trap
+                        // fact about a phase the guest never entered, and a reader would reasonably
+                        // have concluded the module's own initialization failed when the truth was
+                        // that this host could not bring up its device. Inventing a context for it
+                        // would have been the same mistake with more machinery.
+                        return Err(RunError::BackendBringUp {
+                            stage: crate::run::driver::config::HOST_STAGE_BACKEND_BRING_UP,
+                            backend: engine_cfg.backend.slug().to_string(),
+                            reason,
+                        });
                     }
                 }
             } else {

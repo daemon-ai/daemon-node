@@ -110,14 +110,63 @@ pub struct ProfileTrustEnvelope {
     pub profile_digest: Hash,
 }
 
+/// Which class of authority vouched for a profile.
+///
+/// Returned by [`authenticate`] so a caller can refuse on the class rather than trusting that the
+/// policy it was handed had excluded development keys. The distinction is the fence: it survives a
+/// misconfigured policy, and it survives a caller who did not know the fence existed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AuthorityClass {
+    /// A release authority. Sufficient for fleet certification.
+    Release,
+    /// A development authority. May carry integration evidence; **never** certifies a ceremony, and
+    /// may be cited only as non-certifying mechanism evidence.
+    Development,
+}
+
+impl AuthorityClass {
+    /// Whether a profile vouched by this class of authority may certify a fleet ceremony.
+    ///
+    /// Only a release authority may. A development authority exists so integration work can proceed
+    /// without a release key, which is a different question from whether a run's certification means
+    /// anything to anyone else.
+    #[must_use]
+    pub fn may_certify_ceremony(self) -> bool {
+        matches!(self, Self::Release)
+    }
+
+    /// The stable slug for evidence and logs.
+    #[must_use]
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::Release => "release",
+            Self::Development => "development",
+        }
+    }
+}
+
 /// One side's acceptance policy. The effective policy is the intersection of the owner's and the
 /// run's.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ProfileAcceptancePolicy {
-    /// The authorities this side accepts. Empty means this side names no authority of its own and
-    /// defers to the other — it never means "any authority", which is why the intersection requires
-    /// at least one side to name one.
+    /// The **release** authorities this side accepts. Empty means this side names no authority of its
+    /// own and defers to the other — it never means "any authority", which is why the intersection
+    /// requires at least one side to name one.
     pub accepted_authorities: BTreeSet<PeerId>,
+    /// The **development** authorities this side accepts, which is a separate and deliberately
+    /// awkward decision from accepting a release authority.
+    ///
+    /// Separate rather than merged because the two are not interchangeable. A development authority
+    /// may vouch for a profile well enough to carry integration evidence, and it may not certify a
+    /// ceremony: a run that means to be certified needs a release-signed profile, and a policy that
+    /// could satisfy that requirement by listing a development key would make the distinction
+    /// decorative. So a development authority yields [`AuthorityClass::Development`] from
+    /// authentication and the certification surface refuses on the class, not on the policy's
+    /// good intentions.
+    ///
+    /// Empty by default: accepting one is an explicit act. The identity arrives as **data** — a public
+    /// identity the operator supplies — and nothing in this tree generates or holds a signing key.
+    pub accepted_development_authorities: BTreeSet<PeerId>,
     /// The lowest profile schema this side accepts.
     pub min_profile_schema: u32,
     /// The planner versions this side accepts. Empty defers to the other side.
@@ -322,7 +371,7 @@ pub fn authenticate(
     running: &BackendImplementationRevision,
     planner_version: u32,
     now_ms: u64,
-) -> Result<(), AuthenticationRefusal> {
+) -> Result<AuthorityClass, AuthenticationRefusal> {
     profile.validate()?;
 
     // 0. The lane, before anything else. A profile prices one backend class and is meaningless
@@ -369,20 +418,48 @@ pub fn authenticate(
 
     // 2. Authority, as an intersection. An empty set on one side defers; both empty accepts
     //    nothing, because nothing has vouched.
+    //    A development authority is a separate set, intersected the same way, and it yields a
+    //    different CLASS rather than the same verdict. Release is tried first: a key listed in both
+    //    sets is a release authority, so adding a development listing can never weaken an authority
+    //    that was already release-accepted.
     let signer = &envelope.authority.signer;
     let owner_names = !owner.accepted_authorities.is_empty();
     let run_names = !run.accepted_authorities.is_empty();
-    if !owner_names && !run_names {
+    let owner_dev = !owner.accepted_development_authorities.is_empty();
+    let run_dev = !run.accepted_development_authorities.is_empty();
+    if !owner_names && !run_names && !owner_dev && !run_dev {
         return Err(AuthenticationRefusal::NoAuthorityNamed);
     }
-    let owner_ok = !owner_names || owner.accepted_authorities.contains(signer);
-    let run_ok = !run_names || run.accepted_authorities.contains(signer);
-    if !owner_ok || !run_ok {
+    let release_ok = (owner_names || run_names)
+        && (!owner_names || owner.accepted_authorities.contains(signer))
+        && (!run_names || run.accepted_authorities.contains(signer));
+    // Development acceptance requires BOTH sides to name it — it does not inherit the release rule
+    // where an empty set defers to the other side.
+    //
+    // Deferral is safe for a release authority: a side that names none is delegating a judgement it
+    // has no opinion on. For a development authority the same silence would mean the opposite of
+    // consent. Under the deferring rule, a machine owner listing a development key would admit a
+    // dev-signed profile into a run that never opted in, and a run listing one would push it onto a
+    // machine whose owner never agreed — each side unilaterally lowering the other's bar. So silence
+    // about development authorities means no.
+    let development_ok = owner_dev
+        && run_dev
+        && owner.accepted_development_authorities.contains(signer)
+        && run.accepted_development_authorities.contains(signer);
+    let class = if release_ok {
+        AuthorityClass::Release
+    } else if development_ok {
+        AuthorityClass::Development
+    } else {
+        let owner_ok = (!owner_names || owner.accepted_authorities.contains(signer))
+            && (!owner_dev || owner.accepted_development_authorities.contains(signer));
+        let run_ok = (!run_names || run.accepted_authorities.contains(signer))
+            && (!run_dev || run.accepted_development_authorities.contains(signer));
         return Err(AuthenticationRefusal::AuthorityRejected {
             side: side_of(owner_ok, run_ok),
             authority: envelope.authority.release_authority.clone(),
         });
-    }
+    };
 
     // 3. Schema floor, per side.
     let owner_schema_ok = profile.schema >= owner.min_profile_schema;
@@ -497,7 +574,7 @@ pub fn authenticate(
     }
     check_revision_ranges(envelope, running)?;
 
-    Ok(())
+    Ok(class)
 }
 
 fn side_of(owner_ok: bool, run_ok: bool) -> PolicySide {
@@ -621,6 +698,8 @@ pub(crate) mod fixtures {
     pub(crate) fn policy_for(_store: &crate::store::ProfileStore) -> ProfileAcceptancePolicy {
         ProfileAcceptancePolicy {
             accepted_authorities: [peer(7)].into_iter().collect(),
+            // A release-only policy: accepting a development authority is a separate, explicit act.
+            accepted_development_authorities: BTreeSet::new(),
             min_profile_schema: 1,
             accepted_planner_versions: [1].into_iter().collect(),
             require_conformance_evidence: true,
@@ -684,6 +763,8 @@ mod tests {
     fn policy() -> ProfileAcceptancePolicy {
         ProfileAcceptancePolicy {
             accepted_authorities: [peer(7)].into_iter().collect(),
+            // A release-only policy: accepting a development authority is a separate, explicit act.
+            accepted_development_authorities: BTreeSet::new(),
             min_profile_schema: 1,
             accepted_planner_versions: [1].into_iter().collect(),
             require_conformance_evidence: true,
@@ -696,7 +777,7 @@ mod tests {
     fn authenticate_with(
         owner: &ProfileAcceptancePolicy,
         run: &ProfileAcceptancePolicy,
-    ) -> Result<(), AuthenticationRefusal> {
+    ) -> Result<AuthorityClass, AuthenticationRefusal> {
         let p = profile(BackendClass::Vulkan);
         let e = envelope(&p);
         authenticate(&p, &e, owner, run, &revision(), 1, NOW)
@@ -781,6 +862,92 @@ mod tests {
             ),
             "a CPU profile must not be refused on the class by a CPU lane"
         );
+    }
+
+    /// **A development authority authenticates but does not certify.**
+    ///
+    /// This is the whole fence. A development authority exists so integration work can proceed without
+    /// a release key, which is a different question from whether a run's certification means anything
+    /// to anyone else — so the profile authenticates, and the *class* comes back development, and
+    /// certification refuses on the class.
+    ///
+    /// The class rather than the policy is what carries it, deliberately: a fence that depended on
+    /// every policy being configured correctly would fail exactly when a policy was misconfigured,
+    /// which is the case it exists for.
+    #[test]
+    fn a_development_authority_authenticates_but_cannot_certify_a_ceremony() {
+        let p = profile(BackendClass::Vulkan);
+        let mut e = envelope(&p);
+        e.authority.signer = peer(42); // a development identity, supplied as data
+        e.authority.release_authority = "a development authority".into();
+
+        // A release-only policy refuses it outright: an unnamed key is not accepted for being
+        // development-shaped.
+        let refusal = authenticate(&p, &e, &policy(), &policy(), &revision(), 1, NOW)
+            .expect_err("a release-only policy must not accept a development key");
+        assert!(matches!(
+            refusal,
+            AuthenticationRefusal::AuthorityRejected { .. }
+        ));
+
+        // An explicit development policy accepts it — and says what it accepted.
+        let mut dev = policy();
+        dev.accepted_development_authorities = [peer(42)].into_iter().collect();
+        let class = authenticate(&p, &e, &dev, &dev, &revision(), 1, NOW)
+            .expect("an explicit development policy accepts a development authority");
+        assert_eq!(class, AuthorityClass::Development);
+        assert!(
+            !class.may_certify_ceremony(),
+            "a development authority must never certify a fleet ceremony"
+        );
+        assert_eq!(class.slug(), "development");
+    }
+
+    /// A release authority still certifies, and listing a key as development as well cannot weaken it.
+    ///
+    /// Release is decided first for this reason: a key that is already release-accepted must not be
+    /// downgraded by someone adding it to a development list too.
+    #[test]
+    fn a_release_authority_certifies_and_a_development_listing_cannot_weaken_it() {
+        let p = profile(BackendClass::Vulkan);
+        let e = envelope(&p);
+
+        let class = authenticate(&p, &e, &policy(), &policy(), &revision(), 1, NOW)
+            .expect("the release authority authenticates");
+        assert_eq!(class, AuthorityClass::Release);
+        assert!(class.may_certify_ceremony());
+
+        let mut both = policy();
+        both.accepted_development_authorities = [peer(7)].into_iter().collect();
+        assert_eq!(
+            authenticate(&p, &e, &both, &both, &revision(), 1, NOW).expect("still authenticates"),
+            AuthorityClass::Release,
+            "a development listing must not downgrade an already-release authority"
+        );
+    }
+
+    /// A development authority accepted by only one side is not accepted: the intersection rule is
+    /// the same for both classes, so one side cannot unilaterally admit a development key onto the
+    /// other's machine or into the other's run.
+    #[test]
+    fn a_development_authority_needs_both_sides_like_any_other() {
+        let p = profile(BackendClass::Vulkan);
+        let mut e = envelope(&p);
+        e.authority.signer = peer(42);
+
+        let mut owner_only = policy();
+        owner_only.accepted_development_authorities = [peer(42)].into_iter().collect();
+        let run_side = policy(); // names a release authority, and is SILENT about development ones
+
+        // Silence about development authorities means no, not "whatever the other side says". The
+        // release rule defers on an empty set because a side that names none is delegating a
+        // judgement; here the same silence would be read as consent nobody gave.
+        let refusal = authenticate(&p, &e, &owner_only, &run_side, &revision(), 1, NOW)
+            .expect_err("one side's development listing is not enough");
+        assert!(matches!(
+            refusal,
+            AuthenticationRefusal::AuthorityRejected { .. }
+        ));
     }
     #[test]
     fn a_bound_signed_current_profile_authenticates() {

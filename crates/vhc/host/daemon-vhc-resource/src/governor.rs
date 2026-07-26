@@ -579,27 +579,52 @@ pub struct PoolAdmission {
     pub reservation_device_memory_bytes: u64,
     /// The sizing a configured build would apply. See [`PoolSizing`] on why it is not applied.
     pub would_be: PoolSizing,
+    /// The largest reservation the **configured** allocator can take for this claim — the figure the
+    /// admission is bounded by. See [`PoolAdmission::configured_worst_case_bytes`].
+    pub configured_worst_case_bytes: u64,
 }
 
 impl PoolAdmission {
-    /// By how much an observed reservation exceeds what the run is entitled to, or `None` when it
-    /// does not.
+    /// By how much an **observed** reservation exceeded the entitlement, or `None` when it did not.
     ///
-    /// The mechanical form of the condition the framework-default ruling rides on. `bytes_reserved`
-    /// from an allocator sample is what the pool actually took from the device, and the reservation
-    /// bound is what the run may occupy; the framework default is only acceptable while the first
-    /// stays inside the second. If this returns `Some` at ceremony geometry, configuring the pool
-    /// stops being optional.
+    /// Diagnostic only, and deliberately **not** the gate. A run that happened to stay inside its
+    /// bound establishes nothing about what the configured allocator *can* reserve, and admission has
+    /// to be bounded by certified evidence covering every admitted behavior rather than by the
+    /// behaviors some run turned out to exhibit. One successful measurement at ceremony geometry does
+    /// not override a configured bound that exceeds the entitlement.
     ///
-    /// Deliberately takes the observed figure as an argument rather than reading a sampler: the
-    /// governor does not measure, and a comparison that fetched its own input could compare a
-    /// different run's reading against this claim's bound.
+    /// Takes the observed figure as an argument rather than reading a sampler: the governor does not
+    /// measure, and a comparison that fetched its own input could compare some other run's reading
+    /// against this claim's bound.
     #[must_use]
-    pub fn reservation_breach(&self, observed_bytes_reserved: u64) -> Option<u64> {
+    pub fn observed_excess(&self, observed_bytes_reserved: u64) -> Option<u64> {
         observed_bytes_reserved
             .checked_sub(self.reservation_device_memory_bytes)
             .filter(|excess| *excess > 0)
     }
+
+    /// The largest device reservation the **configured** allocator can take for this claim.
+    ///
+    /// The figure admission is bounded by. The allocator reserves in blocks, so covering a device
+    /// total takes a whole number of them — and a block larger than the entire entitlement reserves
+    /// more than the entitlement on the very first allocation, whatever the workload turns out to be.
+    /// A pool that does not return storage to the driver makes that peak the standing reservation
+    /// rather than a transient, so the worst case is what stands for the instance's life.
+    #[must_use]
+    pub fn configured_worst_case_bytes(&self) -> u64 {
+        self.configured_worst_case_bytes
+    }
+}
+
+/// The largest reservation a pool with this block behavior can take while serving `device_total`.
+///
+/// Block granularity is the whole point: with a 20.2 GiB block, a claim needing one byte still
+/// reserves 20.2 GiB. Computed from the profile's own pooling terms, so it is the *configured*
+/// behavior rather than anything measured.
+fn configured_worst_case(pooling: &crate::profile::PoolingBehavior, device_total: u64) -> u64 {
+    let block = pooling.reservation_block_bytes.max(1);
+    let blocks = device_total.max(1).div_ceil(block);
+    blocks.saturating_mul(block)
 }
 
 /// Admit or refuse a composed claim against what this device was measured to accept.
@@ -642,6 +667,27 @@ pub fn check_pool_admissible(
     let max_pool_bytes = reservation.bounds.device_memory_bytes;
     let page_bytes = requested.min(max_pool_bytes).max(alignment);
 
+    // The bound that decides admission: what the allocator this profile describes **can** reserve,
+    // not what some run was observed to reserve.
+    //
+    // Certified evidence has to bound every admitted behavior. A framework default whose block
+    // granularity exceeds the entitlement breaches it on the first allocation regardless of workload,
+    // so a run that happened to stay inside its bound is not evidence that the configuration is safe —
+    // it is one sample from a distribution whose maximum is already known to be too large. On this
+    // box the heap-derived block is 20.2 GiB against a 4 GiB entitlement, which is why this refuses
+    // rather than deferring to measurement.
+    let configured = configured_worst_case(&profile.pooling, claim.device_total_bytes());
+    if configured > max_pool_bytes {
+        return Err(GovernorError::Invalid(format!(
+            "the configured allocator can reserve up to {configured} bytes for this claim (block \
+             granularity {}, returns-to-driver {}), above the {max_pool_bytes}-byte device \
+             entitlement this reservation holds; admission is bounded by what the configuration \
+             permits, not by what a run was observed to do, so this refuses under the default \
+             configuration and needs an owner-derived pool configuration to proceed",
+            profile.pooling.reservation_block_bytes, profile.pooling.returns_to_driver
+        )));
+    }
+
     Ok(PoolAdmission {
         largest_single_allocation_bytes: requested,
         measured_device_ceiling_bytes: measured_ceiling,
@@ -650,6 +696,7 @@ pub fn check_pool_admissible(
             page_bytes,
             max_pool_bytes,
         },
+        configured_worst_case_bytes: configured,
     })
 }
 
@@ -1044,25 +1091,94 @@ mod tests {
         let bound = admission.reservation_device_memory_bytes;
         assert_eq!(bound, reservation.bounds.device_memory_bytes);
 
-        // Reserving within the entitlement is not a breach, and neither is reserving exactly it.
-        assert_eq!(admission.reservation_breach(bound / 2), None);
-        assert_eq!(admission.reservation_breach(bound), None);
+        // Reserving within the entitlement is not an excess, and neither is reserving exactly it.
+        assert_eq!(admission.observed_excess(bound / 2), None);
+        assert_eq!(admission.observed_excess(bound), None);
 
         // Above it, the excess is reported rather than merely flagged: how far over decides whether
         // this is a rounding artefact or the heap-derived page the default is known to produce.
-        assert_eq!(admission.reservation_breach(bound + 4096), Some(4096));
+        assert_eq!(admission.observed_excess(bound + 4096), Some(4096));
 
         // The observed default on this box: a page sized from the device-local heap is
         // 21,687,348,224 B against a 4 GiB budget — 5.05x what the same code reports as the budget.
         // Were the framework to reserve that, the breach would be unmistakable rather than marginal.
         let heap_derived_page = 21_687_348_224u64;
         assert_eq!(
-            admission.reservation_breach(heap_derived_page),
+            admission.observed_excess(heap_derived_page),
             Some(heap_derived_page - bound),
-            "the case that would force a configured pool is reported with its full excess"
+            "the diagnostic reports the full excess; the GATE, however, is the configured bound \
+             below — a measurement never decides this"
+        );
+        assert!(
+            admission.configured_worst_case_bytes() <= bound,
+            "this fixture admitted, so its configured worst case is within the entitlement"
         );
     }
 
+    /// **The framework default is refused when its configured block exceeds the entitlement.**
+    ///
+    /// The measured case on this box: the graphics runtime derives its pool block from the
+    /// device-local heap, giving a 20.2 GiB block against a 4 GiB device entitlement. That breaches
+    /// the entitlement on the *first* allocation, whatever the workload — so no measurement can
+    /// rehabilitate it, and a run that happened to stay inside its bound would be one sample from a
+    /// distribution whose maximum is already known to be too large.
+    ///
+    /// Admission is therefore bounded by what the configuration permits. Under the default this
+    /// refuses, and the refusal says what has to change.
+    #[test]
+    fn a_configured_block_above_the_entitlement_refuses_regardless_of_any_measurement() {
+        let p = plan();
+        let mut prof = profile(BackendClass::Vulkan);
+        let (claim, _) = compose(&p, &binding(), &prof, 1).unwrap();
+        let reservation = reserve_for("trainer", 1, 1);
+        let entitlement = reservation.bounds.device_memory_bytes;
+
+        // The heap-derived block this box's framework default actually chooses.
+        prof.pooling.reservation_block_bytes = 21_687_348_224;
+        prof.pooling.returns_to_driver = false;
+
+        let err = check_pool_admissible(&reservation, &claim, &report(BackendClass::Vulkan), &prof)
+            .expect_err("a block above the entitlement must refuse under the default");
+        let text = err.to_string();
+        assert!(
+            text.contains("21687348224"),
+            "the refusal names what the configuration can reserve: {text}"
+        );
+        assert!(
+            text.contains("owner-derived pool configuration"),
+            "and names what would let it proceed: {text}"
+        );
+        assert!(entitlement < 21_687_348_224);
+    }
+
+    /// A block that fits the entitlement admits, and the reported worst case is block-granular.
+    ///
+    /// The granularity is the whole point of computing a configured bound: with a block larger than
+    /// the claim, a claim needing one byte still reserves a whole block.
+    #[test]
+    fn the_configured_worst_case_is_block_granular_not_claim_sized() {
+        let p = plan();
+        let mut prof = profile(BackendClass::Vulkan);
+        let (claim, _) = compose(&p, &binding(), &prof, 1).unwrap();
+        let reservation = reserve_for("trainer", 1, 1);
+        let entitlement = reservation.bounds.device_memory_bytes;
+
+        // A block that divides the entitlement, so the worst case is a whole number of blocks.
+        let block = entitlement / 4;
+        prof.pooling.reservation_block_bytes = block;
+        let admission =
+            check_pool_admissible(&reservation, &claim, &report(BackendClass::Vulkan), &prof)
+                .expect("a block within the entitlement admits");
+
+        let worst = admission.configured_worst_case_bytes();
+        assert_eq!(
+            worst % block,
+            0,
+            "the worst case is a whole number of blocks"
+        );
+        assert!(worst >= claim.device_total_bytes());
+        assert!(worst <= entitlement);
+    }
     /// The check admits against a **measured** ceiling, and an unmeasured device does not pass.
     ///
     /// A reported ceiling is a vendor's claim about a family; admitting a claim against it would admit
