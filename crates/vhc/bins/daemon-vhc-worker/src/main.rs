@@ -245,6 +245,14 @@ async fn main() {
     if std::env::var_os("DAEMON_TRAIN_PROBE").is_some() {
         println!("hardware = {:#?}", backend::hardware());
         println!("device_limits = {:#?}", backend::device_limits());
+        // Why there is no device, typed — instead of leaving a reader to infer it from a zero.
+        // A GPU-capable box whose graphics loader is absent from this process's environment reports
+        // no adapter, and read as "no accelerator" it is silently reclassified as CPU-only, which a
+        // run would then admit as a CPU participant. The environment was the fault; nothing said so.
+        match daemon_vhc_host::probe::wgpu_unavailability() {
+            None => println!("device_availability = available"),
+            Some(reason) => println!("device_availability = {reason}"),
+        }
         // The revision record each probed backend makes about itself — the structure that replaces
         // a Debug-printed adapter line, readable by whatever compares it to a profile's range.
         for capability in backend::backend_inventory() {

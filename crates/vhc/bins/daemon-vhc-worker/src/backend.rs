@@ -2015,6 +2015,11 @@ pub(crate) fn revision_record(
         ProbeObservation, Unavailable,
     };
 
+    // What the framework's own adapter info supplied, where this build has that lane. Reduced to a
+    // feature-independent shape so the assembly below reads the same either way — a build without the
+    // lane simply observed nothing.
+    let probed: Option<ProbedAdapter> = probed_adapter();
+
     let (class, api) = match capability.class.as_str() {
         "vulkan" => (BackendClass::Vulkan, PlatformApi::Vulkan),
         "metal" => (BackendClass::Metal, PlatformApi::Metal),
@@ -2040,23 +2045,43 @@ pub(crate) fn revision_record(
         } else {
             AdapterDeviceType::DiscreteGpu
         },
-        // The probe does not currently compute this on the framework path, and silence is not a
-        // "no" — the assembly treats an unstated flag conservatively so a device lane refuses
-        // rather than quietly running on a rasterizer.
+        // Determined, not assumed. A CPU class is one definitionally; otherwise the framework probe's
+        // own determination stands. `None` survives only for a platform that genuinely said nothing,
+        // where the assembly is conservative so a device lane refuses rather than quietly running on
+        // a rasterizer.
         is_software_rasterizer: if class == BackendClass::Cpu {
             Some(true)
         } else {
-            None
+            probed.as_ref().map(|p| p.is_software)
         },
         identity: AdapterIdentity {
-            vendor_id: Maybe::Unavailable(Unavailable::NotExposedByFramework),
-            device_id: Maybe::Unavailable(Unavailable::NotExposedByFramework),
+            vendor_id: probed
+                .as_ref()
+                .and_then(|p| p.vendor_id)
+                .map_or(no_framework_value(), Maybe::Available),
+            device_id: probed
+                .as_ref()
+                .and_then(|p| p.device_id)
+                .map_or(no_framework_value(), Maybe::Available),
+            // The bus address and the UUID are not on the framework's adapter info at all; the
+            // platform-specific paths that carry them are a separate probe.
             pci_bus_id: Maybe::Unavailable(Unavailable::NotExposedByFramework),
             uuid: Maybe::Unavailable(Unavailable::NotExposedByFramework),
         },
         api,
         api_version: Maybe::Unavailable(Unavailable::NotExposedByFramework),
-        driver: DriverRevision::default(),
+        driver: DriverRevision {
+            // An empty string is how an absent driver name presents, and it is indistinguishable
+            // from a driver whose name IS empty — so it becomes a typed unavailability here rather
+            // than travelling as a value a range could be compared against.
+            name: probed
+                .as_ref()
+                .map_or(no_framework_value(), |p| text_or_unavailable(&p.driver)),
+            version_text: probed.as_ref().map_or(no_framework_value(), |p| {
+                text_or_unavailable(&p.driver_info)
+            }),
+            ..Default::default()
+        },
         kernel_driver: Maybe::Unavailable(Unavailable::NotExposedByPlatform),
         os: OperatingSystem {
             family,
@@ -2091,6 +2116,51 @@ pub(crate) fn revision_record(
         stack,
         sealed_binary_identity(),
     )
+}
+
+/// The adapter facts the compute framework's own info supplied, feature-independent.
+struct ProbedAdapter {
+    is_software: bool,
+    vendor_id: Option<u32>,
+    device_id: Option<u32>,
+    driver: String,
+    driver_info: String,
+}
+
+/// What the framework observed, or `None` where this build has no device lane to observe with.
+fn probed_adapter() -> Option<ProbedAdapter> {
+    #[cfg(feature = "wgpu")]
+    {
+        daemon_vhc_host::probe::probe_wgpu().map(|p| ProbedAdapter {
+            is_software: p.is_software,
+            vendor_id: p.vendor_id,
+            device_id: p.device_id,
+            driver: p.driver,
+            driver_info: p.driver_info,
+        })
+    }
+    #[cfg(not(feature = "wgpu"))]
+    {
+        None
+    }
+}
+
+/// A value the framework does not expose.
+fn no_framework_value<T>() -> daemon_vhc_resource::Maybe<T> {
+    daemon_vhc_resource::Maybe::Unavailable(daemon_vhc_resource::Unavailable::NotExposedByFramework)
+}
+
+/// A framework string, or a typed unavailability when it is empty.
+///
+/// An empty string is how an absent value presents on at least one backend, and it is
+/// indistinguishable from a value that genuinely is empty — which is precisely the ambiguity a
+/// profile's revision range cannot be evaluated against.
+fn text_or_unavailable(value: &str) -> daemon_vhc_resource::Maybe<String> {
+    if value.trim().is_empty() {
+        no_framework_value()
+    } else {
+        daemon_vhc_resource::Maybe::Available(value.to_string())
+    }
 }
 
 /// The compute-framework revision this binary links. A compile-time property of the binary, not of

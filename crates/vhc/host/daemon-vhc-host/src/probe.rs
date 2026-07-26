@@ -374,6 +374,146 @@ pub struct WgpuProbe {
     /// Whether this is a unified-memory device (`device_type` is `IntegratedGpu` or `Cpu`): the GPU
     /// shares host DRAM, so the budget math uses a joint memory pool (see [`DeviceLimits`]).
     pub unified: bool,
+    /// Whether this adapter is a **software rasterizer**.
+    ///
+    /// The framework exposes no explicit flag the way DXGI does, so this is a determination rather
+    /// than a read: a `Cpu` device type is one definitionally, and the known software
+    /// implementations are matched by name. It matters because a device-lane role admitted against a
+    /// rasterizer that reports a device backend class is the silent CPU fallback the platform rules
+    /// forbid — and the loader on at least one fleet box enumerates one beside the real adapter, so
+    /// it is reachable without any operator intending it.
+    pub is_software: bool,
+    /// The adapter's PCI vendor id (`get_info().vendor`), `None` where the platform supplies none.
+    pub vendor_id: Option<u32>,
+    /// The adapter's PCI device id (`get_info().device`).
+    pub device_id: Option<u32>,
+    /// The driver name (`get_info().driver`, e.g. `"radv"`). Empty where the platform supplies none —
+    /// which is why the caller converts an empty string to a typed unavailability rather than
+    /// recording it as a driver whose name is the empty string.
+    pub driver: String,
+    /// The driver's own version text (`get_info().driver_info`, e.g. `"Mesa 25.2.6"`). This is the
+    /// numbering a profile's permitted revision range constrains.
+    pub driver_info: String,
+}
+
+/// Names the known software rasterizers carry. Matched case-insensitively as substrings, because a
+/// platform decorates them differently (`"llvmpipe (LLVM 18.1.0, 256 bits)"`,
+/// `"Microsoft Basic Render Driver"`).
+const SOFTWARE_RASTERIZER_NAMES: &[&str] = &[
+    "llvmpipe",
+    "lavapipe",
+    "swiftshader",
+    "warp",
+    "basic render driver",
+    "software rasterizer",
+];
+
+/// Whether an adapter of this name and device type is a software rasterizer.
+///
+/// Pure, so the determination is testable without a device: the fleet's reachable case is a loader
+/// that enumerates `llvmpipe` beside real hardware and reports it under a device backend class.
+#[must_use]
+pub fn is_software_adapter(adapter_name: &str, device_type: &str) -> bool {
+    if device_type == "Cpu" {
+        return true;
+    }
+    let lowered = adapter_name.to_ascii_lowercase();
+    SOFTWARE_RASTERIZER_NAMES
+        .iter()
+        .any(|name| lowered.contains(name))
+}
+
+/// Why no device could be probed. A **typed** answer, replacing the inference a caller had to make
+/// from a zero reading.
+///
+/// A zero resource reading is an admission refusal wearing a measurement's clothes: it refuses the
+/// machine rather than reporting the defect. Worse, in the case that produced this type, it did
+/// something actively misleading — a GPU-capable box whose graphics loader was absent from the
+/// process environment reported `gpus: 0` and was silently reclassified as CPU-only, which a run
+/// would then admit as a CPU participant. The environment was the fault, and nothing said so.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DeviceProbeUnavailability {
+    /// This binary carries no device lane at all — the backend feature was compiled out. A `cfg`
+    /// fact, not an observation about the machine, and the first thing to rule out when a box that
+    /// has an accelerator reports none.
+    FeatureCompiledOut,
+    /// The lane is compiled in and the adapter could not be brought up. The captured reason is
+    /// carried **verbatim**, never parsed for policy: it distinguishes an absent loader from absent
+    /// hardware for a human reading it, and the two are not yet distinguished mechanically — that
+    /// needs a loader probe, and guessing from message text would be a policy decision resting on a
+    /// vendor's phrasing.
+    BringUpFailed(String),
+}
+
+impl DeviceProbeUnavailability {
+    /// The stable slug for evidence and logs.
+    #[must_use]
+    pub fn slug(&self) -> &'static str {
+        match self {
+            Self::FeatureCompiledOut => "DeviceLaneCompiledOut",
+            Self::BringUpFailed(_) => "DeviceBringUpFailed",
+        }
+    }
+}
+
+impl std::fmt::Display for DeviceProbeUnavailability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FeatureCompiledOut => write!(
+                f,
+                "{}: this binary was built without a device backend lane, so it reports no \
+                 accelerator regardless of what the machine has",
+                self.slug()
+            ),
+            Self::BringUpFailed(reason) => write!(
+                f,
+                "{}: the device lane is compiled in but no adapter could be brought up — check the \
+                 graphics loader is present in this process's environment before concluding the \
+                 machine has no accelerator ({reason})",
+                self.slug()
+            ),
+        }
+    }
+}
+
+/// The recorded reason the last wgpu bring-up failed, for [`wgpu_unavailability`].
+#[cfg(feature = "wgpu")]
+fn wgpu_bring_up_failure() -> Option<String> {
+    WGPU_BRING_UP_FAILURE
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+}
+
+/// Record it. Set once by the memoized probe; a later reader gets the reason the probe actually saw.
+#[cfg(feature = "wgpu")]
+fn record_wgpu_bring_up_failure(reason: &str) {
+    if let Ok(mut guard) = WGPU_BRING_UP_FAILURE.lock() {
+        *guard = Some(reason.to_string());
+    }
+}
+
+#[cfg(feature = "wgpu")]
+static WGPU_BRING_UP_FAILURE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// The typed reason no wgpu device is available, or `None` when one is.
+///
+/// Callers use this instead of inferring absence from a zero device count.
+#[must_use]
+pub fn wgpu_unavailability() -> Option<DeviceProbeUnavailability> {
+    #[cfg(feature = "wgpu")]
+    {
+        if probe_wgpu().is_some() {
+            return None;
+        }
+        Some(DeviceProbeUnavailability::BringUpFailed(
+            wgpu_bring_up_failure().unwrap_or_else(|| "no reason was recorded".to_string()),
+        ))
+    }
+    #[cfg(not(feature = "wgpu"))]
+    {
+        Some(DeviceProbeUnavailability::FeatureCompiledOut)
+    }
 }
 
 /// Probe the default wgpu device for its adapter info + limits (feature `wgpu`). Returns `None`
@@ -422,6 +562,11 @@ fn probe_wgpu_uncached() -> Option<WgpuProbe> {
         WgpuProbe {
             gpus: 1,
             max_alloc_mb,
+            is_software: is_software_adapter(&info.name, &device_type),
+            vendor_id: Some(info.vendor),
+            device_id: Some(info.device),
+            driver: info.driver.clone(),
+            driver_info: info.driver_info.clone(),
             adapter: info.name.clone(),
             backend: format!("{:?}", info.backend),
             device_type,
@@ -432,6 +577,9 @@ fn probe_wgpu_uncached() -> Option<WgpuProbe> {
     match attempt {
         Ok(probe) => Some(probe),
         Err(msg) => {
+            // The reason is recorded so `wgpu_unavailability` can report it verbatim rather than
+            // leaving a caller to infer absence from a zero.
+            record_wgpu_bring_up_failure(&msg);
             // Tier 2 — register-or-reuse: an "already registered" panic means an adapter is up
             // (a burn op registered the default client before this probe). Report availability
             // rather than caching `None`; the per-buffer limit / device_type are unknown via reuse
@@ -444,6 +592,14 @@ fn probe_wgpu_uncached() -> Option<WgpuProbe> {
                     backend: "wgpu".to_string(),
                     device_type: "Unknown".to_string(),
                     unified: false,
+                    // Nothing was observed through a reuse, so nothing is claimed. An adapter whose
+                    // class is unknown is conservatively a rasterizer here: the alternative is
+                    // asserting real hardware on the strength of a race we lost.
+                    is_software: true,
+                    vendor_id: None,
+                    device_id: None,
+                    driver: String::new(),
+                    driver_info: String::new(),
                 })
             } else {
                 None
@@ -1232,5 +1388,72 @@ mod tests {
         assert_eq!(limits.ram_mb, 8192);
         assert_eq!(limits.shared_mb, 8192);
         assert!(limits.unified);
+    }
+}
+
+#[cfg(test)]
+mod software_adapter_tests {
+    use super::{is_software_adapter, DeviceProbeUnavailability};
+
+    /// The determination is pure, so it is testable without a device — which matters because the
+    /// reachable case on a fleet box is a loader enumerating a rasterizer beside real hardware and
+    /// reporting it under a device backend class.
+    #[test]
+    fn known_software_rasterizers_are_recognized_whatever_the_platform_calls_them() {
+        for (name, device_type) in [
+            ("llvmpipe (LLVM 18.1.0, 256 bits)", "Cpu"),
+            ("lavapipe (LLVM 18.1.0, 256 bits)", "Other"),
+            ("SwiftShader Device (Subzero)", "Other"),
+            ("Microsoft Basic Render Driver", "Other"),
+            ("Microsoft Direct3D12 (WARP)", "Other"),
+        ] {
+            assert!(
+                is_software_adapter(name, device_type),
+                "`{name}` is a software rasterizer"
+            );
+        }
+
+        // A CPU device type is one definitionally, whatever it is called.
+        assert!(is_software_adapter("Some Vendor Compute Device", "Cpu"));
+    }
+
+    /// Real hardware is not swept up by the name match — a floor that refused real adapters would be
+    /// worse than the fallback it replaces.
+    #[test]
+    fn real_adapters_are_not_mistaken_for_rasterizers() {
+        for (name, device_type) in [
+            ("Radeon 8060S Graphics (RADV GFX1151)", "IntegratedGpu"),
+            ("NVIDIA GeForce RTX 5090", "DiscreteGpu"),
+            ("Apple M4 Pro", "IntegratedGpu"),
+            ("Intel(R) Arc(tm) A770 Graphics", "DiscreteGpu"),
+        ] {
+            assert!(
+                !is_software_adapter(name, device_type),
+                "`{name}` is real hardware"
+            );
+        }
+    }
+
+    /// The absence of a device is reported as a typed reason, and the two reasons are distinguishable
+    /// — the first thing to rule out when a box that has an accelerator reports none is that the
+    /// binary was built without the lane at all.
+    #[test]
+    fn device_absence_carries_a_typed_reason_that_names_the_environment() {
+        let compiled_out = DeviceProbeUnavailability::FeatureCompiledOut;
+        assert_eq!(compiled_out.slug(), "DeviceLaneCompiledOut");
+        assert!(compiled_out
+            .to_string()
+            .contains("without a device backend lane"));
+
+        let bring_up = DeviceProbeUnavailability::BringUpFailed("no adapter matched".into());
+        assert_eq!(bring_up.slug(), "DeviceBringUpFailed");
+        let rendered = bring_up.to_string();
+        assert!(
+            rendered.contains("graphics loader is present in this process's environment"),
+            "the message points at the environment before the hardware: {rendered}"
+        );
+        // The captured reason travels verbatim; it is never parsed for policy.
+        assert!(rendered.contains("no adapter matched"));
+        assert_ne!(compiled_out, bring_up);
     }
 }
