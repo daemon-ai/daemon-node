@@ -584,8 +584,20 @@ impl GuestModule for TinyLlama {
         // ef every round, both AdamW moments at a checkpoint/drain) and the per-parameter tables.
         let chunks = daemon_vhc_proto::det_state::family_chunk_count(&numels_u64, window);
         let bookkeeping = 4 * chunks * 32 + numels_u64.len() as u64 * 256;
+        // The training step's guest-resident working set: the input and target id rows the forward
+        // pass builds per micro-batch (`i64` each), plus the corpus segment bytes a live round
+        // stages for one micro-batch and their decoded `u32` tokens.
+        //
+        // This term is O(TOKENS), and keeping it there is a standing requirement, not an
+        // observation: the causal mask and the one-hot targets are O(tokens²) and O(tokens × vocab),
+        // which at the fleet geometry are 16 MiB and 256 MiB — multiples of this whole claim. Both
+        // are built and held ON DEVICE (`model.rs`). A forward pass that materializes either one in
+        // linear memory does not overrun a budget, it exhausts the sandbox's memory cap and aborts
+        // the guest.
+        let tokens = u64::from(cfg.model.seq_len) * u64::from(cfg.micro_batch);
+        let step_peak = tokens * (8 + 8 + 4 + 4);
         decl.host_state_bytes =
-            MODULE_BASELINE_BYTES + init_peak + update_peak + ingest_peak + bookkeeping;
+            MODULE_BASELINE_BYTES + init_peak + update_peak + ingest_peak + bookkeeping + step_peak;
         // The outgoing container: one section pair per window, staged host-side.
         let total_rows = numels_u64.iter().sum::<u64>() / chunk;
         decl.host_scratch_bytes =

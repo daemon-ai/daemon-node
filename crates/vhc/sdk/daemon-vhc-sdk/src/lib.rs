@@ -12,7 +12,7 @@ pub mod abi;
 pub use abi::{
     buffer_append, buffer_len, buffer_open, buffer_release, buffer_seal, cancel, compute_export,
     compute_fence, compute_import, compute_submit_op, create_from, data_fetch,
-    data_register_chunks, data_register_state_chunks, device_profile, emit_metric, hash_accel,
+    data_register_chunks, data_register_state_chunks, device_profile, emit_metric, hash_accel, log,
     next_event, payload_get, payload_put, publish, read_back_bytes, read_back_uint, read_buffer,
     read_range, rng_seed, set_timer, snapshot_state, stage_state, state_emit, state_open,
     state_seal, stream_accept, stream_open, stream_read, stream_write, verify_sig_accel, Event,
@@ -91,6 +91,14 @@ impl migrate::SectionReader for AbiSections {
 #[macro_export]
 macro_rules! main {
     ($module:ty) => {
+        // The allocator wrapper reports an exhausted linear memory before Rust aborts into an
+        // anonymous `unreachable` (see `module::rt::ReportingAlloc`). It must be declared in the
+        // final artifact, so it lands here rather than in the SDK.
+        #[cfg(target_arch = "wasm32")]
+        #[global_allocator]
+        static DAEMON_VHC_ALLOC: $crate::module::rt::ReportingAlloc =
+            $crate::module::rt::ReportingAlloc;
+
         #[cfg(target_arch = "wasm32")]
         const _: () = {
             use ::core::cell::RefCell;
@@ -172,6 +180,9 @@ macro_rules! main {
 
             #[no_mangle]
             pub extern "C" fn da_run() -> u32 {
+                // Arm panic forwarding before the module's loop can panic: a wasm trap tears the
+                // linear memory down, so the hook is the last moment the message exists.
+                $crate::module::rt::forward_panics();
                 MODULE.with(|s| {
                     let mut m = s.borrow_mut();
                     let m = m.as_mut().expect("da_init ran (host contract, §9.4)");

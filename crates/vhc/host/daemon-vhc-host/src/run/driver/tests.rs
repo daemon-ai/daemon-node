@@ -50,6 +50,7 @@ fn test_state(sink: Box<dyn JournalSink>) -> PumpState {
         gossip_arrivals: std::collections::HashMap::new(),
         metrics: Vec::new(),
         logs: Vec::new(),
+        guest_panic: None,
         published: Vec::new(),
         buffers: BufferTable::new(0, 0, 0),
         ops: OpTable::new(0, 0),

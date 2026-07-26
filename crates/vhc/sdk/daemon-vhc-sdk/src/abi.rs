@@ -100,6 +100,8 @@ extern "C" {
     fn abi_set_timer(delay_ms: u64) -> u64;
     #[link_name = "emit_metric"]
     fn abi_emit_metric(name_ptr: u32, name_len: u32, value: f64);
+    #[link_name = "log"]
+    fn abi_log(level: u32, msg_ptr: u32, msg_len: u32);
     #[link_name = "rng_seed"]
     fn abi_rng_seed(out_ptr: u32) -> u32;
     #[link_name = "device_profile"]
@@ -247,6 +249,14 @@ pub fn set_timer(delay_ms: u64) -> u64 {
 pub fn emit_metric(name: &str, value: f64) {
     // SAFETY: `name` is a live guest span for the call's duration.
     unsafe { abi_emit_metric(name.as_ptr() as u32, name.len() as u32, value) }
+}
+
+/// Emit one advisory log line (`sys@2::log`) at a [`daemon_vhc_abi`] severity. Advisory means
+/// exactly that: the host records no product and takes no decision from it (§2.7/§6.3), so a log
+/// line can never move a det digest or a replay — it costs one op against the slice budget.
+pub fn log(level: u32, msg: &str) {
+    // SAFETY: `msg` is a live guest span for the call's duration.
+    unsafe { abi_log(level, msg.as_ptr() as u32, msg.len() as u32) }
 }
 
 /// The run-scoped deterministic RNG seed (architecture §3.2 "seeded randomness"): a pure

@@ -134,6 +134,12 @@ pub(super) fn link(linker: &mut Linker<Host>) -> Result<(), wasmtime::Error> {
                 let msg = String::from_utf8_lossy(&read_guest(c, msg_ptr, msg_len)?).into_owned();
                 let shared = c.data().shared.clone();
                 let mut st = shared.state.lock().expect("pump lock");
+                // The SDK panic hook's forwarded message (ABI §3.6): hold it aside so the
+                // `unreachable` that follows a beat later traps WITH the message rather than
+                // as an anonymous `GuestPanic` (`take_trap`).
+                if let Some(detail) = msg.strip_prefix(daemon_vhc_abi::GUEST_PANIC_LOG_PREFIX) {
+                    st.guest_panic = Some(detail.to_string());
+                }
                 st.logs.push((level.min(5), msg));
                 st.note_egress();
                 Ok(())

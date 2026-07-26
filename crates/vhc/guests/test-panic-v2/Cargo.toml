@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# SPDX-FileCopyrightText: 2026 Jarrad Hope
+
+[package]
+name = "test-panic-v2"
+version = "0.0.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# The panic-forwarding conformance guest: it panics on purpose, in each of the shapes real guest
+# code panics in, so the host gate can assert the MESSAGE and its `file:line:col` arrive with the
+# `GuestPanic` trap instead of dying with the linear memory. Deliberately built on `main!` — the
+# forwarding lives in the SDK's exports, and this guest exists to prove every `main!` guest has it.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+daemon-vhc-sdk = { path = "../../sdk/daemon-vhc-sdk" }
+ciborium = "0.2"
