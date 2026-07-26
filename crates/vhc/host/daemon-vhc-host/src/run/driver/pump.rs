@@ -133,6 +133,15 @@ pub(crate) struct PumpState {
     /// module's claimed host-accountable footprint: a gate asserts the measurement against the
     /// admitted claim instead of inferring the footprint from the absence of a trap.
     pub(crate) guest_memory_high_water: u64,
+    /// Backend-allocator occupancy readings, one per phase boundary, in the order they were taken.
+    ///
+    /// The measurement every workspace, pooling, compilation and staging term in a Backend Execution
+    /// Profile is calibrated against, and which nothing in this tree took before — so no run left an
+    /// allocator record on any backend. Kept in order because the SHAPE across boundaries is the
+    /// evidence: a pool that never returns memory to the driver looks identical to one that does, at
+    /// any single point.
+    pub(crate) allocator_samples:
+        Vec<(crate::compute::SamplePoint, crate::compute::AllocatorSample)>,
     /// Open incremental buffer streams (`buffer_open`/`buffer_append`/`buffer_seal`): the host-side
     /// accumulation a guest builds a large sealed buffer through without ever holding it whole.
     pub(crate) buffer_streams: BufferStreams,
@@ -1226,4 +1235,23 @@ pub(crate) fn fire_due_timers(st: &mut PumpState, now: u64) -> Result<(), Trap> 
         });
     }
     Ok(())
+}
+
+impl PumpHandle {
+    /// The backend-allocator occupancy readings taken at this instance's phase boundaries.
+    ///
+    /// Empty when this build and backend cannot report them, which is **not** the same as an
+    /// instance that allocated nothing — a caller that conflated the two would be reporting a
+    /// measurement it does not have.
+    #[must_use]
+    pub fn allocator_samples(
+        &self,
+    ) -> Vec<(crate::compute::SamplePoint, crate::compute::AllocatorSample)> {
+        self.shared
+            .state
+            .lock()
+            .expect("pump lock")
+            .allocator_samples
+            .clone()
+    }
 }

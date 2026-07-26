@@ -79,6 +79,16 @@ daemon-vhc-sdk-consensus = { workspace = true, optional = true }
 # already enables the dlopen path via feature unification (host libcuda loaded at runtime, no
 # toolkit at build — the archived CUDA container validation finding).
 cudarc = { version = "0.19.8", optional = true, default-features = false, features = ["driver"] }
+# The compute runtime trait, for ONE call: reading the backend allocator's occupancy at a phase
+# boundary (`HostCompute::sample_allocator`). Every workspace, pooling, compilation and staging term
+# in a Backend Execution Profile has to be calibrated against that reading, and nothing in the tree
+# took it before, so no run left an allocator record on any backend.
+#
+# Lock-neutral by the standing dep rule: `cubecl-runtime 0.10.0` is ALREADY resolved in the committed
+# lock (burn's wgpu and cuda backends both pull it), so this compiles a crate the lock already pins
+# and adds no third-party dependency to the tree. Gated behind the device features, so a default
+# build never compiles it.
+cubecl-runtime = { version = "0.10.0", optional = true, default-features = false }
 
 # Windows GPU-memory probe (swarm-windows-vram-design.md §2): DXGI `GetDesc3`/`QueryVideoMemoryInfo`
 # + D3D12 `CheckFeatureSupport(ARCHITECTURE1)` + `GlobalMemoryStatusEx`. Target-gated so it never
@@ -119,7 +129,7 @@ cpu = []
 # safe alias for the CI gate).
 burn-ndarray = ["burn/ndarray"]
 # burn with the wgpu backend (cubecl + wgpu 29; targets Vulkan/RADV) — the G2 GPU lane. Opt-in only.
-wgpu = ["burn/wgpu"]
+wgpu = ["burn/wgpu", "dep:cubecl-runtime"]
 # (A2 worker-bin split): the `vhc-net` feature (the A3 live coordinator attach) moved to
 # `crates/vhc/bins/daemon-vhc-worker` with the bin — it gated only worker-binary plumbing
 # (`live.rs`); the host lib has no vhc-net code.
@@ -133,7 +143,7 @@ wgpu = ["burn/wgpu"]
 # archived CUDA container validation findings). The `BackendKind::Cuda` engine arm is wired behind
 # this feature: `dep:cudarc` adds the driver-API VRAM probe (lock-neutral — see the cudarc dep
 # note above). Opt-in only.
-cuda = ["burn/cuda", "dep:cudarc"]
+cuda = ["burn/cuda", "dep:cudarc", "dep:cubecl-runtime"]
 # The whole-run coordinator drive seat (`coordinator` module): starts the coordinator blob under
 # the real driver and signs/verifies/decodes its round decisions — harness machinery for the
 # in-process whole-run suites (testkit, session harness, worker self-driven join). Off the default

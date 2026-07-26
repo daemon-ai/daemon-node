@@ -4917,6 +4917,7 @@ dependencies = [
  "burn-router",
  "burn-std",
  "ciborium",
+ "cubecl-runtime",
  "cudarc 0.19.8",
  "daemon-vhc-abi",
  "daemon-vhc-guest-build",

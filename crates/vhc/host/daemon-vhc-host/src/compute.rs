@@ -504,6 +504,75 @@ pub struct HostCompute {
     runner: SelectedRunner,
     /// Held for the device arms; releases with the instance.
     _device_slot: Option<DeviceComputeGuard>,
+    /// The device handle the allocator sampler reads through. Kept beside the runner because the
+    /// runner consumes the device it was built with, and a sample taken against a *different*
+    /// device handle would be a measurement of something else.
+    sampler_device: SamplerDevice,
+}
+
+/// The device handle [`HostCompute::sample_allocator`] reads through.
+enum SamplerDevice {
+    /// No device allocator to sample: the CPU arm allocates through the host allocator, whose
+    /// occupancy is not what a Backend Execution Profile's pooling terms describe.
+    None,
+    #[cfg(feature = "wgpu")]
+    Wgpu(burn::backend::wgpu::WgpuDevice),
+    #[cfg(feature = "cuda")]
+    Cuda(burn::backend::cuda::CudaDevice),
+}
+
+/// One reading of the backend allocator's occupancy.
+///
+/// This is the measurement every workspace, pooling, compilation and staging term in a Backend
+/// Execution Profile has to be calibrated against. Nothing in the tree took it before, so no run
+/// left an allocator record and no such term could be measured on any backend — which is why
+/// profiles carried conservative bounds where they wanted observations.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AllocatorSample {
+    /// Active slices, not the number of times a new page was actually allocated.
+    pub number_allocs: u64,
+    /// Bytes actually in use, excluding padding and reservation.
+    pub bytes_in_use: u64,
+    /// Bytes spent on padding inside active allocations — the difference between what the module
+    /// asked for and what alignment made it cost.
+    pub bytes_padding: u64,
+    /// Total bytes reserved on the device. Above `bytes_in_use` by whatever the pool retains, which
+    /// is exactly the pooling behaviour a profile models.
+    pub bytes_reserved: u64,
+}
+
+/// Which phase boundary a sample was taken at.
+///
+/// Boundaries rather than a timer: the phases a profile prices are bounded by them, and an external
+/// sampler cannot see them at all — on one platform the device phase is milliseconds inside a
+/// process lasting tens of them, so a sampler outside the process misses the shape entirely.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SamplePoint {
+    /// Immediately after the runner is constructed and the device brought up, before any guest code.
+    /// The floor a profile's per-process and per-device terms describe.
+    AfterBringUp,
+    /// After `da_init` returned: the persistent residency the module established.
+    AfterInit,
+    /// After `da_migrate` returned.
+    AfterMigrate,
+    /// At the end of an event slice.
+    AfterSlice,
+    /// At instance teardown, so a run that died before its loop still yields a figure.
+    AtTeardown,
+}
+
+impl SamplePoint {
+    /// The stable slug for evidence and logs.
+    #[must_use]
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::AfterBringUp => "after-bring-up",
+            Self::AfterInit => "after-init",
+            Self::AfterMigrate => "after-migrate",
+            Self::AfterSlice => "after-slice",
+            Self::AtTeardown => "at-teardown",
+        }
+    }
 }
 
 impl HostCompute {
@@ -518,14 +587,18 @@ impl HostCompute {
     /// the caller maps it to the typed refusal surface.
     pub fn build(cfg: &crate::runtime::EngineConfig) -> Result<Self, String> {
         backend_available(cfg.backend)?;
-        let (runner, slot) = match cfg.backend {
-            crate::runtime::BackendKind::Cpu => {
-                (SelectedRunner::Ndarray(ComputeRunner::ndarray_cpu()), None)
-            }
+        let (runner, slot, sampler_device) = match cfg.backend {
+            crate::runtime::BackendKind::Cpu => (
+                SelectedRunner::Ndarray(ComputeRunner::ndarray_cpu()),
+                None,
+                SamplerDevice::None,
+            ),
             #[cfg(feature = "burn-ndarray")]
-            crate::runtime::BackendKind::BurnNdarray => {
-                (SelectedRunner::Ndarray(ComputeRunner::ndarray_cpu()), None)
-            }
+            crate::runtime::BackendKind::BurnNdarray => (
+                SelectedRunner::Ndarray(ComputeRunner::ndarray_cpu()),
+                None,
+                SamplerDevice::None,
+            ),
             #[cfg(feature = "wgpu")]
             crate::runtime::BackendKind::Wgpu => {
                 let slot = DeviceComputeGuard::acquire()?;
@@ -534,24 +607,29 @@ impl HostCompute {
                 // the probe found and registers it eagerly, so a placement this host cannot serve
                 // refuses here instead of surfacing as a poisoned router lock at the first op.
                 let device = crate::probe::wgpu_device_for_placement(cfg.gpu_index)?;
+                // Cloned for the sampler: the runner consumes the device it is built with, and a
+                // sample taken against a different handle measures something else.
+                let sampler = SamplerDevice::Wgpu(device.clone());
                 let runner = catch_bringup(|| ComputeRunner::<burn::backend::Wgpu>::new(device))
                     .map_err(|e| format!("wgpu device bring-up: {e}"))?;
-                (SelectedRunner::Wgpu(runner), Some(slot))
+                (SelectedRunner::Wgpu(runner), Some(slot), sampler)
             }
             #[cfg(feature = "cuda")]
             crate::runtime::BackendKind::Cuda => {
                 let slot = DeviceComputeGuard::acquire()?;
                 let device =
                     burn::backend::cuda::CudaDevice::new(cfg.gpu_index.unwrap_or(0) as usize);
+                let sampler = SamplerDevice::Cuda(device.clone());
                 let runner = catch_bringup(|| ComputeRunner::<burn::backend::Cuda>::new(device))
                     .map_err(|e| format!("CUDA device bring-up: {e}"))?;
-                (SelectedRunner::Cuda(runner), Some(slot))
+                (SelectedRunner::Cuda(runner), Some(slot), sampler)
             }
         };
         Ok(Self {
             thread: std::thread::current().id(),
             runner,
             _device_slot: slot,
+            sampler_device,
         })
     }
 
@@ -699,6 +777,50 @@ fn block_on<F: core::future::Future>(fut: F) -> F::Output {
         match fut.as_mut().poll(&mut cx) {
             Poll::Ready(v) => return v,
             Poll::Pending => core::hint::spin_loop(),
+        }
+    }
+}
+impl HostCompute {
+    /// Read the backend allocator's current occupancy, or `None` when this build and backend cannot
+    /// report it.
+    ///
+    /// `None` is not a zero. A caller that turned it into one would be manufacturing a measurement,
+    /// and a profile calibrated against that figure would be calibrated against nothing — which is
+    /// precisely why the revision record reports `statistics_available` and why authentication
+    /// refuses a statistics-derived profile on a binary that cannot produce them.
+    ///
+    /// Taken **in process**, on the pinned device thread. An external sampler cannot see a phase
+    /// boundary at all: on one fleet platform the device phase is around two milliseconds inside a
+    /// process lasting fifty, so sampling from outside misses the shape entirely.
+    #[must_use]
+    pub fn sample_allocator(&self) -> Option<AllocatorSample> {
+        self.check_thread();
+        match &self.sampler_device {
+            // The CPU arm allocates through the host allocator, whose occupancy is not what a
+            // profile's pooling terms describe. Reporting it here would answer a different question.
+            SamplerDevice::None => None,
+            #[cfg(feature = "wgpu")]
+            SamplerDevice::Wgpu(device) => {
+                use cubecl_runtime::runtime::Runtime;
+                let client = <burn::backend::wgpu::WgpuRuntime as Runtime>::client(device);
+                client.memory_usage().ok().map(|u| AllocatorSample {
+                    number_allocs: u.number_allocs,
+                    bytes_in_use: u.bytes_in_use,
+                    bytes_padding: u.bytes_padding,
+                    bytes_reserved: u.bytes_reserved,
+                })
+            }
+            #[cfg(feature = "cuda")]
+            SamplerDevice::Cuda(device) => {
+                use cubecl_runtime::runtime::Runtime;
+                let client = <burn::backend::cuda::CudaRuntime as Runtime>::client(device);
+                client.memory_usage().ok().map(|u| AllocatorSample {
+                    number_allocs: u.number_allocs,
+                    bytes_in_use: u.bytes_in_use,
+                    bytes_padding: u.bytes_padding,
+                    bytes_reserved: u.bytes_reserved,
+                })
+            }
         }
     }
 }

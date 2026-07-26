@@ -63,6 +63,7 @@ fn test_state(sink: Box<dyn JournalSink>) -> PumpState {
             crate::run::state_store::StateStoreConfig::default(),
         ),
         guest_memory_high_water: 0,
+        allocator_samples: Vec::new(),
         buffer_streams: BufferStreams::default(),
         op_requests: Vec::new(),
         stop_enqueued: false,

@@ -204,6 +204,7 @@ pub fn start_run_migrating(
                 },
             ),
             guest_memory_high_water: 0,
+            allocator_samples: Vec::new(),
             buffer_streams: BufferStreams::default(),
             op_requests: Vec::new(),
             stop_enqueued: false,
@@ -465,6 +466,7 @@ pub fn start_run_migrating(
                 }
             };
             store.data_mut().slice.in_init = false;
+            sample_allocator_at(&store, &shared, crate::compute::SamplePoint::AfterInit);
             {
                 let mut st = shared.state.lock().expect("pump lock");
                 st.sink.init(
@@ -560,6 +562,7 @@ pub fn start_run_migrating(
                         }
                     };
                 store.data_mut().slice.in_migrate = false;
+                sample_allocator_at(&store, &shared, crate::compute::SamplePoint::AfterMigrate);
                 store
                     .set_fuel(engine_cfg.fuel_per_call)
                     .map_err(|e| RunError::Sandbox(e.to_string()))?;
@@ -599,7 +602,9 @@ pub fn start_run_migrating(
                 .get_typed_func::<(), u32>(&mut store, "da_run")
                 .map_err(|_| RunError::Sandbox("missing/mis-typed da_run".into()))?;
             store.data_mut().slice.in_run = true;
+            sample_allocator_at(&store, &shared, crate::compute::SamplePoint::AfterBringUp);
             let run_result = da_run.call(&mut store, ());
+            sample_allocator_at(&store, &shared, crate::compute::SamplePoint::AtTeardown);
             {
                 let mut st = shared.state.lock().expect("pump lock");
                 // Force-reclaim the instance's buffers + outstanding ops + streams through the
@@ -727,4 +732,33 @@ pub(super) fn journal_terminal_trap(
             trap.detail.clone(),
         )),
     )
+}
+
+/// Take one backend-allocator reading at a phase boundary and record it in order.
+///
+/// Boundaries rather than a timer, and **in process**: an external sampler cannot see a phase
+/// boundary at all — on one fleet platform the device phase is around two milliseconds inside a
+/// process lasting fifty, so sampling from outside misses the shape entirely, which is the shape a
+/// pooling term is calibrated against.
+///
+/// A backend that cannot report occupancy records nothing. It deliberately does not record a zero: a
+/// zero is a measurement, absence is not, and a profile calibrated against a manufactured zero would
+/// be calibrated against nothing at all.
+fn sample_allocator_at(
+    store: &Store<Host>,
+    shared: &Arc<PumpShared>,
+    point: crate::compute::SamplePoint,
+) {
+    let Some(compute) = store.data().compute.as_ref() else {
+        return;
+    };
+    let Some(sample) = compute.sample_allocator() else {
+        return;
+    };
+    shared
+        .state
+        .lock()
+        .expect("pump lock")
+        .allocator_samples
+        .push((point, sample));
 }
