@@ -16,10 +16,15 @@
 //! against the machine it actually has and hands back the value it chose. That is the only
 //! quantity in this file whose value the module does not know at derivation time.
 //!
-//! Tensors are grouped by **class**, not listed one per layer: a 24-block decoder's blocks are
-//! identical, so `n_layers` is a leading shape dimension rather than 24 copies of one declaration.
-//! A grouped term covers every tensor in its class — the obligation is that no config-scaled
-//! device tensor is missing, not that each has its own line.
+//! Tensors are declared **one per real allocation**, not one per class. That costs a few hundred
+//! declarations for a 24-block decoder and it is not optional: the plan's largest logical object
+//! is what the host composes the per-allocation ceiling from, and every backend imposes a limit on
+//! any *one* allocation well below its total. Folding a block's 24 identical score planes into a
+//! single declaration with `n_layers` as a leading shape dimension leaves the totals right and the
+//! largest-single figure wrong by a factor of 24 — which would refuse every machine on a limit
+//! nothing ever actually asks for. Parameters, their gradients and both optimizer moments are
+//! named by their index in the canonical registration order, the same identity the checkpoint and
+//! the digest already ride.
 //!
 //! ## Why the peak is a maximum and not a sum
 //!
@@ -86,7 +91,9 @@ fn linear(name: &str, lifetime: LinearLifetime, bytes: Expr) -> LinearMemoryTerm
 /// The derived quantities every term is a function of. Fixed by the admitted configuration —
 /// only the micro-batch is left free.
 struct Geometry {
-    params: u64,
+    /// The parameter element counts in canonical registration order — the identity the checkpoint
+    /// and the digest already ride, reused here so a plan term names the same object they do.
+    param_numels: Vec<u64>,
     d_model: u64,
     qdim: u64,
     hidden: u64,
@@ -112,43 +119,106 @@ impl Geometry {
     }
 }
 
-/// The device-resident tensors, by class.
+/// The device-resident tensors, one per real allocation.
 fn tensors(g: &Geometry) -> Vec<TensorDecl> {
     let f32t = Dtype::F32;
-    let mut out = vec![
-        // -- persistent: the model and its optimizer state -------------------------------------
-        //
-        // The canonical parameters, the two AdamW moments, and the gradient buffer the backward
-        // pass fills. The moments are optimizer retention because a restore without them forks
-        // the committed trajectory even when the ingest-side digest still matches.
-        tensor(
-            "model_parameters",
-            vec![konst(g.params)],
+    let mut out = Vec::new();
+
+    // -- persistent: the model and its optimizer state, per parameter ----------------------------
+    //
+    // One declaration per parameter in canonical registration order, because these are separate
+    // allocations and the widest of them — the tied embedding — is what a backend's
+    // per-allocation ceiling is actually asked for. The two AdamW moments carry optimizer
+    // retention: a restore without them forks the committed trajectory even when the ingest-side
+    // digest still matches, so they are state the run cannot resume without.
+    for (i, &numel) in g.param_numels.iter().enumerate() {
+        out.push(tensor(
+            &format!("model_parameter_{i:03}"),
+            vec![konst(numel)],
             f32t,
             Lifetime::Persistent(Retention::Run),
-        ),
-        tensor(
-            "optimizer_first_moment",
-            vec![konst(g.params)],
+        ));
+        out.push(tensor(
+            &format!("optimizer_first_moment_{i:03}"),
+            vec![konst(numel)],
             f32t,
             Lifetime::Persistent(Retention::Optimizer),
-        ),
-        tensor(
-            "optimizer_second_moment",
-            vec![konst(g.params)],
+        ));
+        out.push(tensor(
+            &format!("optimizer_second_moment_{i:03}"),
+            vec![konst(numel)],
             f32t,
             Lifetime::Persistent(Retention::Optimizer),
-        ),
-        // -- transient: one training step --------------------------------------------------------
-        //
-        // The gradient buffer is live from the backward pass to the optimizer step; it is a step
-        // term rather than a persistent one because nothing reads it across steps.
-        tensor(
-            "step_gradients",
-            vec![konst(g.params)],
+        ));
+        // The gradient the backward pass fills for that parameter: live from the backward pass to
+        // the optimizer step, and read by nothing across steps.
+        out.push(tensor(
+            &format!("step_gradient_{i:03}"),
+            vec![konst(numel)],
             f32t,
             Lifetime::Transient(LIVE_STEP.to_string()),
-        ),
+        ));
+    }
+
+    // -- transient: one training step, per block -------------------------------------------------
+    //
+    // The autodiff tape retains each block's intermediates for the backward pass, so every block
+    // contributes its own live allocations rather than reusing one buffer.
+    for b in 0..g.layers {
+        out.push(tensor(
+            &format!("step_block_{b:03}_residual_input"),
+            vec![g.rows(), konst(g.d_model)],
+            f32t,
+            Lifetime::Transient(LIVE_STEP.to_string()),
+        ));
+        // Query, key and value share a shape; each is its own allocation.
+        for (n, part) in ["key", "query", "value"].iter().enumerate() {
+            let _ = n;
+            out.push(tensor(
+                &format!("step_block_{b:03}_attention_{part}"),
+                vec![g.rows(), konst(g.qdim)],
+                f32t,
+                Lifetime::Transient(LIVE_STEP.to_string()),
+            ));
+        }
+        // The score plane per block: quadratic in the sequence and multiplied by the head count.
+        // This is the widest transient object the algorithm has, and naming it at its real
+        // per-block size is the difference between a claim a machine can be judged against and a
+        // number 24 times too large.
+        out.push(tensor(
+            &format!("step_block_{b:03}_attention_scores"),
+            vec![
+                mul(micro_batch(), konst(g.heads)),
+                konst(g.span),
+                konst(g.span),
+            ],
+            f32t,
+            Lifetime::Transient(LIVE_STEP.to_string()),
+        ));
+        out.push(tensor(
+            &format!("step_block_{b:03}_attention_output"),
+            vec![g.rows(), konst(g.qdim)],
+            f32t,
+            Lifetime::Transient(LIVE_STEP.to_string()),
+        ));
+        // The SwiGLU gate and up projections.
+        for part in ["gate", "up"] {
+            out.push(tensor(
+                &format!("step_block_{b:03}_feedforward_{part}"),
+                vec![g.rows(), konst(g.hidden)],
+                f32t,
+                Lifetime::Transient(LIVE_STEP.to_string()),
+            ));
+        }
+    }
+    out.push(tensor(
+        "step_output_residual",
+        vec![g.rows(), konst(g.d_model)],
+        f32t,
+        Lifetime::Transient(LIVE_STEP.to_string()),
+    ));
+
+    out.extend([
         // The input and target position ids the forward pass indexes with.
         tensor(
             "step_input_ids",
@@ -162,55 +232,10 @@ fn tensors(g: &Geometry) -> Vec<TensorDecl> {
             Dtype::I64,
             Lifetime::Transient(LIVE_STEP.to_string()),
         ),
-        // The residual stream entering each block, plus the final normalized output. The autodiff
-        // tape retains one per block, which is why `n_layers` is a shape dimension and not a
-        // divisor.
-        tensor(
-            "step_residual_stream",
-            vec![konst(g.layers + 1), g.rows(), konst(g.d_model)],
-            f32t,
-            Lifetime::Transient(LIVE_STEP.to_string()),
-        ),
-        // Query, key and value projections per block (three of them), and the attention output
-        // before the output projection.
-        tensor(
-            "step_attention_projections",
-            vec![konst(g.layers), konst(3), g.rows(), konst(g.qdim)],
-            f32t,
-            Lifetime::Transient(LIVE_STEP.to_string()),
-        ),
-        tensor(
-            "step_attention_output",
-            vec![konst(g.layers), g.rows(), konst(g.qdim)],
-            f32t,
-            Lifetime::Transient(LIVE_STEP.to_string()),
-        ),
-        // Dense causal attention: the score plane per head per block, retained for the backward
-        // pass. This is the term that scales quadratically in the sequence, and naming it is the
-        // point — an unnamed quadratic term is the residency defect this contract exists to make
-        // impossible.
-        tensor(
-            "step_attention_scores",
-            vec![
-                konst(g.layers),
-                mul(micro_batch(), konst(g.heads)),
-                konst(g.span),
-                konst(g.span),
-            ],
-            f32t,
-            Lifetime::Transient(LIVE_STEP.to_string()),
-        ),
         // The additive causal mask: one plane, shared across blocks and heads, built on device.
         tensor(
             "step_causal_mask",
             vec![konst(g.span), konst(g.span)],
-            f32t,
-            Lifetime::Transient(LIVE_STEP.to_string()),
-        ),
-        // The SwiGLU gate and up projections per block.
-        tensor(
-            "step_ffn_projections",
-            vec![konst(g.layers), konst(2), g.rows(), konst(g.hidden)],
             f32t,
             Lifetime::Transient(LIVE_STEP.to_string()),
         ),
@@ -246,7 +271,7 @@ fn tensors(g: &Geometry) -> Vec<TensorDecl> {
             f32t,
             Lifetime::Transient(LIVE_STATE_WALK.to_string()),
         ),
-    ];
+    ]);
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out
 }
@@ -423,9 +448,8 @@ pub fn derive(
     bookkeeping_bytes: u64,
     baseline_bytes: u64,
 ) -> LogicalResourcePlan {
-    let params: u64 = cfg.param_numels().iter().map(|&n| n as u64).sum();
     let g = Geometry {
-        params,
+        param_numels: cfg.param_numels().iter().map(|&n| n as u64).collect(),
         d_model: u64::from(cfg.d_model),
         qdim: u64::from(cfg.n_heads) * u64::from(cfg.head_dim),
         hidden: u64::from(cfg.ffn_mult) * u64::from(cfg.d_model),

@@ -35,8 +35,8 @@ pub use migrate::{
     SectionReader, SimSections, StateManifest,
 };
 pub use module::{
-    derive_claim, manifest_bytes, ExecutionGrant, GuestModule, LogicalResourcePlan, ModuleDecl,
-    CERTIFICATION_MINOR_V2,
+    derive_claim, manifest_bytes, trivial_resource_plan, ExecutionGrant, GuestModule,
+    LogicalResourcePlan, ModuleDecl, CERTIFICATION_MINOR_V2,
 };
 
 /// Report a peer's per-round outcome — the post-ingest det digest plus the barrier's

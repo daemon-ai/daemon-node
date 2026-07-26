@@ -70,6 +70,30 @@ pub const fn pre_loop_diagnostics_armed(module_minor: u32) -> bool {
         && daemon_vhc_abi::pre_loop_log_legal(daemon_vhc_abi::DA_ABI_MINOR_V2)
 }
 
+/// The **canonical trivial plan**: what a module emits when its algorithm's device demand is
+/// genuinely nothing.
+///
+/// A compute-free role still has a wasm heap, so the plan is not empty — it carries that module's
+/// own linear-memory floor, taken from the declaration the module already derives. It carries no
+/// device tensor, no operation family and no bounded transfer, because a module with none of those
+/// has none to declare.
+///
+/// This exists so that **no plan is ever hand-authored, for any role**. A trivially-derivable plan
+/// written down beside the module rather than emitted by it is still a value maintained in two
+/// places: it drifts when the schema or the encoding changes, and it opens a path by which
+/// authoring could publish a plan the module never produced. One derivation path for every role is
+/// simpler than one path with a carve-out, and the carve-out buys nothing — emitting a trivial plan
+/// is trivial.
+///
+/// **A module with device-resident tensors must not use this.** It is the *true* plan for a
+/// compute-free module and an under-declaration for any other, so each module states it at its own
+/// site rather than inheriting it: the trait's default refuses instead, so a new module cannot
+/// acquire a trivial plan by forgetting to think about it.
+#[must_use]
+pub fn trivial_resource_plan(decl: &ModuleDecl) -> LogicalResourcePlan {
+    LogicalResourcePlan::trivial(decl.host_state_bytes.max(WASM_LINEAR_MEMORY_FLOOR_BYTES))
+}
+
 /// A major-2 module under [`crate::main!`]: the v2 analogue of the v1 SDK's `Experiment`.
 pub trait GuestModule: Sized {
     /// The static declaration the manifest + claim derive from.
@@ -167,7 +191,8 @@ const CLAIM_PAGE: u64 = 4096;
 /// double the measured minimum so a toy module has real working margin. A floor can only ever
 /// RAISE a claim, so it cannot hide an over-run, and any module whose own derived figure is larger
 /// (the trainer's is ~59 MiB at the ceremony geometry) is unaffected.
-pub const WASM_LINEAR_MEMORY_FLOOR_BYTES: u64 = 4 << 20;
+pub const WASM_LINEAR_MEMORY_FLOOR_BYTES: u64 =
+    daemon_vhc_proto::resource_plan::WASM_GUEST_LINEAR_FLOOR_BYTES;
 
 fn round_page(v: u64) -> u64 {
     v.div_ceil(CLAIM_PAGE) * CLAIM_PAGE

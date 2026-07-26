@@ -799,7 +799,47 @@ impl Expr {
 
 // -- the plan --------------------------------------------------------------------------------------
 
+/// The linear-memory floor of a wasm32 Rust `cdylib` — the bytes a module's image needs before any
+/// declared state exists (the linker's initial memory, the data segments, the first heap pages).
+///
+/// Measured, not guessed: every guest in the workspace fails to instantiate at a 1 MiB cap and
+/// comes up at 2 MiB independent of its size, so this is the toolchain's floor rather than any
+/// module's, and the declared figure doubles the measured minimum. It lives beside the plan format
+/// because the canonical trivial plan is exactly this floor and nothing else, and because a floor
+/// spelled once cannot drift from a floor spelled twice.
+pub const WASM_GUEST_LINEAR_FLOOR_BYTES: u64 = 4 << 20;
+
 impl LogicalResourcePlan {
+    /// The **canonical trivial plan** for a module whose algorithm has no device demand at all.
+    ///
+    /// It is not the empty plan: a compute-free module still has a wasm heap, so the plan carries
+    /// that one linear-memory term and nothing else — no device tensor, no operation family, no
+    /// bounded transfer, and therefore no transient group and no fragmentation allowance.
+    ///
+    /// It lives here, beside the format, so that every module that needs it emits **the same
+    /// bytes from the same construction**. Written out module by module it would be a value
+    /// maintained in as many places as there are compute-free roles, drifting the first time the
+    /// schema or the encoding moves — and a plan is the one object in this model whose whole
+    /// purpose is to be the single derivation the host prices.
+    #[must_use]
+    pub fn trivial(linear_floor_bytes: u64) -> Self {
+        Self {
+            selection_scope: SelectionScope::UniformRun,
+            equivalence_contract_hash: None,
+            dimensions: Vec::new(),
+            tensors: Vec::new(),
+            operations: Vec::new(),
+            transfers: Vec::new(),
+            linear_memory: vec![LinearMemoryTerm {
+                name: "module_linear_floor".to_string(),
+                lifetime: LinearLifetime::Persistent,
+                bytes: Expr::Const(linear_floor_bytes),
+            }],
+            transient_live_sets: Vec::new(),
+            linear_fragmentation_headroom: Expr::Const(0),
+        }
+    }
+
     /// The plan's node count: dimensions, tensors, operations, transfers, linear-memory terms and
     /// every nested expression node.
     #[must_use]
