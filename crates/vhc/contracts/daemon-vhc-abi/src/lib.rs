@@ -115,6 +115,36 @@ pub const NET_V2_SYMBOLS: &[&str] = &["publish"];
 pub const SYS_V2_PHASE_A_SYMBOLS: &[&str] =
     &["set_timer", "cancel_timer", "now", "emit_metric", "log"];
 
+/// The `sys@2::log` severity scale (ABI §2.2): `0` trace … `4` error. The import takes a `u32`
+/// and the host clamps anything higher, so the scale is open at the top without a wire change.
+pub const LOG_LEVEL_TRACE: u32 = 0;
+/// See [`LOG_LEVEL_TRACE`].
+pub const LOG_LEVEL_DEBUG: u32 = 1;
+/// See [`LOG_LEVEL_TRACE`].
+pub const LOG_LEVEL_INFO: u32 = 2;
+/// See [`LOG_LEVEL_TRACE`].
+pub const LOG_LEVEL_WARN: u32 = 3;
+/// See [`LOG_LEVEL_TRACE`].
+pub const LOG_LEVEL_ERROR: u32 = 4;
+
+/// The marker a guest's SDK panic hook stamps on the `sys@2::log` line it emits from a panicking
+/// `da_run`, and the marker the host recognizes to lift that line into the [`GuestPanic`] trap's
+/// typed detail (ABI §2.2 `log`, §3.6).
+///
+/// A wasm guest's panic reaches the host as a bare `unreachable`: the message and its
+/// `file:line:col` live in linear memory the trap tears down, so the host learns only that
+/// *something* panicked. Forwarding the message over the advisory log sink BEFORE the panic
+/// runtime aborts is the whole mechanism — no new import, no new wire surface, and no journal
+/// record (`log` is an advisory sink: no recorded product, no decision, ABI §2.7/§6.3, so a
+/// forwarded panic cannot perturb a det digest or a replay).
+///
+/// The hook is armed for `da_run` only: capability imports are illegal during `da_init` and
+/// `da_migrate` (§6.6), so a hook that logged from those entry points would convert a guest panic
+/// into a `PhaseViolation` and lose the very classification it exists to preserve.
+///
+/// [`GuestPanic`]: https://docs.rs/daemon-vhc-host
+pub const GUEST_PANIC_LOG_PREFIX: &str = "guest panic: ";
+
 /// The `sys@2` **crypto acceleration** symbols (Phase B; ABI §2.2 "later phases", architecture
 /// §3.2/§3.7): `hash` and `verify_sig`, following the det-lane pattern — semantics pinned by the
 /// dual-compiled `daemon-vhc-proto::crypto` contract, an in-guest fallback always available, the

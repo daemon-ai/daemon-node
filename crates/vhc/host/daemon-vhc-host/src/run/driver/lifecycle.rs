@@ -168,6 +168,7 @@ pub fn start_run_migrating(
             gossip_arrivals: std::collections::HashMap::new(),
             metrics: Vec::new(),
             logs: Vec::new(),
+            guest_panic: None,
             published: Vec::new(),
             // Generation-seeded by the instantiation counter (0: this driver instantiates once
             // per start_run; trap-restart re-seeding rides the tag-13 counter, ABI §7.1).
@@ -550,7 +551,29 @@ pub fn start_run_migrating(
 
 /// Map a wasmtime error into the typed taxonomy: prefer the stashed host trap, else classify the
 /// engine trap (fuel/epoch/unreachable/oob), mirroring the v1 driver's mapping (§7.6).
+///
+/// A guest that panicked forwarded its message through `sys@2::log` a beat before the panic
+/// runtime executed `unreachable` (ABI [`daemon_vhc_abi::GUEST_PANIC_LOG_PREFIX`]); that message
+/// is lifted to the FRONT of the detail here, so a `GuestPanic` names the assertion that failed
+/// and the `file:line:col` it failed at instead of only the engine's backtrace.
 fn take_trap(store: &mut Store<Host>, e: wasmtime::Error) -> Trap {
+    let forwarded = {
+        let shared = store.data().shared.clone();
+        let mut st = shared.state.lock().expect("pump lock");
+        st.guest_panic.take()
+    };
+    let mut trap = classify_trap(store, e);
+    if let Some(message) = forwarded {
+        trap.detail = if trap.detail.is_empty() {
+            message
+        } else {
+            format!("{message} — {}", trap.detail)
+        };
+    }
+    trap
+}
+
+fn classify_trap(store: &mut Store<Host>, e: wasmtime::Error) -> Trap {
     if let Some(t) = store.data_mut().trap.take() {
         return t;
     }

@@ -57,7 +57,7 @@ use crate::coordinator_config::{
 use daemon_vhc_net::PublishedArtifact;
 use daemon_vhc_proto::det_state::{
     derive_state_chunk_size, family_byte_len, family_fold, validate_checkpoint_cadence,
-    validate_profile_chunk, validate_state_chunk_size,
+    validate_profile_chunk, validate_state_chunk_size, FamilyEntry,
 };
 use daemon_vhc_proto::envelope::Access;
 use daemon_vhc_proto::genesis::{
@@ -487,6 +487,189 @@ pub fn ceremony_trainer_config_training_step(
         })
         .collect();
     Value::Map(patched)
+}
+
+/// The reduced parameter layout the live-corpus staging gate trains — the ONE deviation that lane
+/// takes from the frozen fleet trainer, and the mirror image of
+/// [`ceremony_trainer_config_training_step`]'s.
+///
+/// That lane shortens the SEQUENCE and keeps the parameters; this one keeps the SEQUENCE and
+/// shortens the parameters. Between them the frozen `(seq_len, vocab)` and the frozen parameter
+/// count are each driven through a real training step, and neither lane costs a datacenter.
+pub const STAGING_GATE_D_MODEL: u32 = 64;
+/// See [`STAGING_GATE_D_MODEL`].
+pub const STAGING_GATE_N_LAYERS: u32 = 2;
+/// See [`STAGING_GATE_D_MODEL`].
+pub const STAGING_GATE_N_HEADS: u32 = 2;
+/// See [`STAGING_GATE_D_MODEL`] (`n_heads · head_dim == d_model`, as the frozen layout requires).
+pub const STAGING_GATE_HEAD_DIM: u32 = 32;
+/// See [`STAGING_GATE_D_MODEL`].
+pub const STAGING_GATE_FFN_MULT: u32 = 2;
+
+/// The per-parameter numels of [`ceremony_trainer_config_live_staging`]'s reduced layout, in the
+/// guest's registration order (the same arithmetic as [`ceremony_param_numels`]).
+#[must_use]
+pub fn staging_gate_param_numels() -> Vec<usize> {
+    let d = STAGING_GATE_D_MODEL as usize;
+    let qdim = (STAGING_GATE_N_HEADS * STAGING_GATE_HEAD_DIM) as usize;
+    let hidden = (STAGING_GATE_FFN_MULT * STAGING_GATE_D_MODEL) as usize;
+    let vocab = CEREMONY_VOCAB as usize;
+    let mut out = vec![vocab * d];
+    for _ in 0..STAGING_GATE_N_LAYERS {
+        out.extend([
+            d,
+            d * qdim,
+            d * qdim,
+            d * qdim,
+            qdim * d,
+            d,
+            d * hidden,
+            d * hidden,
+            hidden * d,
+        ]);
+    }
+    out.push(d);
+    out
+}
+
+/// The state contract for the reduced staging layout: the derived chunk size plus the seed-form
+/// init pin, authored here so the guest's own `expected_root` cross-check runs for real.
+#[must_use]
+pub fn staging_gate_state_contract() -> StateContract {
+    let seed = [0x5eu8; 32];
+    let dist = daemon_vhc_det::SEED_INIT_DIST_V1;
+    let chunk_size = derive_state_chunk_size(u64::from(STAGING_GATE_D_MODEL));
+    let param_bytes: Vec<Vec<u8>> = staging_gate_param_numels()
+        .iter()
+        .enumerate()
+        .map(|(i, &n)| {
+            let vals =
+                daemon_vhc_det::seed_init_param(&seed, dist, i as u64, n).expect("known dist");
+            let mut b = Vec::with_capacity(n * 4);
+            for v in vals {
+                b.extend_from_slice(&v.to_le_bytes());
+            }
+            b
+        })
+        .collect();
+    let views: Vec<&[u8]> = param_bytes.iter().map(Vec::as_slice).collect();
+    let expected_root = FamilyEntry::author(&views, chunk_size)
+        .expect("the staging layout authors a matched-init fold")
+        .fold;
+    StateContract {
+        chunk_size,
+        init: StateInit::Seed {
+            seed: Seed(seed),
+            dist,
+            expected_root,
+        },
+    }
+}
+
+/// The frozen ceremony trainer config in its **live-corpus staging gate** form: the fleet's OWN
+/// `live` section over a reduced parameter layout.
+///
+/// # Why this form exists
+///
+/// Every other trainer form drops the `live` section, so the guest takes its batches from host
+/// staging and its whole module-driven data path — manifest fetch → chunk registration → planned
+/// segments → `ArtifactRange` → `stage_fetched_batches` → the round's first `train_step` — is
+/// driven by nothing. The fleet genesis is the only config that carries `live`, which made the
+/// fleet the only place that path had ever run.
+///
+/// # What is FROZEN here (all of what the gap was about)
+///
+/// The `live` section itself, `seq_len`, `vocab`, `steps_per_round`, `micro_batch`,
+/// `stall_rounds_max`, and the compression profile's shape — so the round plans the fleet's 30
+/// single-sequence inner steps over the fleet's 2048-token sequences against a real chunk-addressed
+/// manifest, and the forward pass sees the frozen `(seq_len, vocab)` activation geometry.
+///
+/// # The bound
+///
+/// `d_model`/`n_layers`/`n_heads`/`head_dim`/`ffn_mult` are reduced
+/// ([`STAGING_GATE_D_MODEL`] and friends), because a 30-step round over 786_507_264 parameters at
+/// 2048 tokens is ~290 TFLOP — not a gate on any CPU. What that does NOT touch is what this lane
+/// is for: the staging path is parameter-independent, and the forward pass's own guest-resident
+/// working set is a function of `(seq_len, vocab)` — the target rows and the one-hot over the
+/// vocabulary — both of which are the frozen values here. `ceremony_training_step` covers the
+/// complementary axis (the frozen parameter count at a shortened sequence), so between the two
+/// lanes a real training step is driven at full size along each axis.
+///
+/// The profile `chunk` follows the same rule as the frozen one — it must divide every numel, so it
+/// IS the reduced `d_model` — and the state contract is authored for this layout
+/// ([`staging_gate_state_contract`]), so the guest's `expected_root` cross-check runs for real.
+#[must_use]
+pub fn ceremony_trainer_config_live_staging(
+    run_label: &str,
+    corpus_manifest: Hash,
+    roster: &[PeerId],
+) -> Value {
+    let text = |s: &str| Value::Text(s.into());
+    let uint = |v: u64| Value::Integer(v.into());
+    let peer = roster.first().map_or_else(
+        || Value::Bytes(vec![0u8; 32]),
+        |p| Value::Bytes(p.0.to_vec()),
+    );
+    let model = Value::Map(vec![
+        (text("d_model"), uint(u64::from(STAGING_GATE_D_MODEL))),
+        (text("n_layers"), uint(u64::from(STAGING_GATE_N_LAYERS))),
+        (text("n_heads"), uint(u64::from(STAGING_GATE_N_HEADS))),
+        (text("head_dim"), uint(u64::from(STAGING_GATE_HEAD_DIM))),
+        (text("vocab"), uint(u64::from(CEREMONY_VOCAB))),
+        (text("seq_len"), uint(u64::from(CEREMONY_SEQ_LEN))),
+        (text("ffn_mult"), uint(u64::from(STAGING_GATE_FFN_MULT))),
+        (text("rope_theta"), Value::Float(CEREMONY_ROPE_THETA)),
+        (text("rmsnorm_eps"), Value::Float(CEREMONY_RMSNORM_EPS)),
+        (text("lr"), Value::Float(CEREMONY_LR)),
+        (text("beta1"), Value::Float(CEREMONY_BETA1)),
+        (text("beta2"), Value::Float(CEREMONY_BETA2)),
+        (text("adam_eps"), Value::Float(CEREMONY_ADAM_EPS)),
+        (text("wd"), Value::Float(CEREMONY_WD)),
+    ]);
+    let Value::Map(profile) = ceremony_profile_value() else {
+        unreachable!("the frozen profile is a map")
+    };
+    let profile = Value::Map(
+        profile
+            .into_iter()
+            .map(|(k, v)| match &k {
+                Value::Text(f) if f == "chunk" => (k, uint(u64::from(STAGING_GATE_D_MODEL))),
+                _ => (k, v),
+            })
+            .collect(),
+    );
+    Value::Map(vec![
+        (text("model"), model),
+        (text("peer"), peer),
+        (
+            text("roster"),
+            Value::Array(roster.iter().map(|p| Value::Bytes(p.0.to_vec())).collect()),
+        ),
+        (
+            text("steps_per_round"),
+            uint(u64::from(CEREMONY_STEPS_PER_ROUND)),
+        ),
+        (text("micro_batch"), uint(u64::from(CEREMONY_MICRO_BATCH))),
+        (
+            text("stall_rounds_max"),
+            uint(u64::from(CEREMONY_STALL_ROUNDS_MAX)),
+        ),
+        (text("profile"), profile),
+        (
+            text("state"),
+            Value::serialized(&staging_gate_state_contract()).expect("state contract value"),
+        ),
+        (
+            text("live"),
+            Value::Map(vec![
+                (text("run_label"), text(run_label)),
+                (
+                    text("manifest"),
+                    Value::serialized(&corpus_manifest).expect("manifest hash value"),
+                ),
+            ]),
+        ),
+    ])
 }
 
 /// The real fleet RUN TIMERS + stop condition the ceremony operator calibrates at preflight and

@@ -294,13 +294,32 @@ struct LiveInstance {
     attach: Attach,
     identity: RunIdentity,
     own_sender: PeerId,
-    published_cursor: usize,
-    metrics_cursor: usize,
+    egress: EgressCursors,
+}
+
+/// How far the session has relayed each of the pump's monotonically-growing egress buffers, and
+/// the accumulator that assembles what it reads out of them. Per-incarnation: a module switch
+/// mints a fresh instance, so the pump's buffers start empty and these start at zero together —
+/// which is the invariant that keeps a cursor from pointing into a previous instance's egress.
+struct EgressCursors {
+    published: usize,
+    metrics: usize,
+    logs: usize,
     /// Assembles the guest's reserved round-outcome metrics (the opacity-safe per-round digest +
-    /// barrier bookkeeping, ABI `round_metrics`) into [`Event::RoundOutcome`]s. Per-incarnation:
-    /// a module switch mints a fresh instance and hence a fresh accumulator, and the pump's metric
-    /// buffer starts empty, so partial groups never straddle the fence.
+    /// barrier bookkeeping, ABI `round_metrics`) into [`Event::RoundOutcome`]s. Partial groups
+    /// never straddle a module-switch fence, for the same reason the cursors do not.
     digest_accum: daemon_vhc_abi::round_metrics::RoundOutcomeAccumulator,
+}
+
+impl Default for EgressCursors {
+    fn default() -> Self {
+        Self {
+            published: 0,
+            metrics: 0,
+            logs: 0,
+            digest_accum: daemon_vhc_abi::round_metrics::RoundOutcomeAccumulator::new(),
+        }
+    }
 }
 
 /// The session body: bind, run, service, switch, classify. Returns the terminal outcome (the
@@ -444,9 +463,7 @@ async fn run_role(
         attach,
         identity: identity.clone(),
         own_sender,
-        published_cursor: 0,
-        metrics_cursor: 0,
-        digest_accum: daemon_vhc_abi::round_metrics::RoundOutcomeAccumulator::new(),
+        egress: EgressCursors::default(),
     };
 
     // Loop state: held frames (gap/back-pressure), throttle level, exit causes.
@@ -480,8 +497,7 @@ async fn run_role(
             }
             _ = egress.notified() => {
                 if let Err(reason) = relay_egress(
-                    &current.pump, &providers, &mut current.published_cursor,
-                    &mut current.metrics_cursor, &mut current.digest_accum, events, gen_now,
+                    &current.pump, &providers, &mut current.egress, events, gen_now,
                 ).await {
                     transport_fault = Some(reason);
                     break 'session;
@@ -583,9 +599,7 @@ async fn run_role(
     let _ = relay_egress(
         &current.pump,
         &providers,
-        &mut current.published_cursor,
-        &mut current.metrics_cursor,
-        &mut current.digest_accum,
+        &mut current.egress,
         events,
         gen_now,
     )
@@ -1037,9 +1051,7 @@ async fn perform_switch(
             attach,
             identity: new_identity,
             own_sender,
-            published_cursor: 0,
-            metrics_cursor: 0,
-            digest_accum: daemon_vhc_abi::round_metrics::RoundOutcomeAccumulator::new(),
+            egress: EgressCursors::default(),
         },
         retries: attempt,
         quotas: admission.quotas.clone(),
@@ -1300,14 +1312,27 @@ fn envelope_sender(frame: &[u8]) -> Option<[u8; 32]> {
 async fn relay_egress(
     pump: &PumpHandle,
     providers: &RoleProviders,
-    published_cursor: &mut usize,
-    metrics_cursor: &mut usize,
-    digest_accum: &mut daemon_vhc_abi::round_metrics::RoundOutcomeAccumulator,
+    cursors: &mut EgressCursors,
     events: &mpsc::UnboundedSender<Event>,
     generation: u64,
 ) -> Result<(), String> {
+    // Guest log lines onto the node's own stream. This is how a guest panic becomes readable:
+    // the SDK's hook forwards the message here a beat before the `unreachable` trap, so the line
+    // is on disk even when the run then dies (ABI §3.6).
+    let logs = pump.logs();
+    for (level, line) in logs.iter().skip(cursors.logs) {
+        match level {
+            0 => tracing::trace!(guest = %line, "guest log"),
+            1 => tracing::debug!(guest = %line, "guest log"),
+            2 => tracing::info!(guest = %line, "guest log"),
+            3 => tracing::warn!(guest = %line, "guest log"),
+            _ => tracing::error!(guest = %line, "guest log"),
+        }
+    }
+    cursors.logs = logs.len();
+
     let published = pump.published();
-    for (channel, seq, frame) in published.iter().skip(*published_cursor) {
+    for (channel, seq, frame) in published.iter().skip(cursors.published) {
         tracing::trace!(channel, seq, kind = %frame_kind(frame), "egress: publishing module frame");
         providers
             .control
@@ -1315,7 +1340,7 @@ async fn relay_egress(
             .await
             .map_err(|e| format!("control plane publish: {e}"))?;
     }
-    *published_cursor = published.len();
+    cursors.published = published.len();
 
     for (op, request) in pump.take_op_requests() {
         tracing::trace!(op, request = %op_kind(&request), "egress: servicing capability op");
@@ -1323,11 +1348,11 @@ async fn relay_egress(
     }
 
     let metrics = pump.metrics();
-    for (name, value) in metrics.iter().skip(*metrics_cursor) {
+    for (name, value) in metrics.iter().skip(cursors.metrics) {
         // Fold the reserved round-outcome group into a RoundOutcome the moment its digest
         // completes (all four LE words). The values are treated as opaque numbers under a reserved
         // NAMING contract — no frame is decoded here. Robust to partial groups / reordering.
-        if let Some(outcome) = digest_accum.observe(name, *value) {
+        if let Some(outcome) = cursors.digest_accum.observe(name, *value) {
             let _ = events.send(Event::RoundOutcome {
                 round: outcome.round,
                 committed: outcome.committed,
@@ -1346,7 +1371,7 @@ async fn relay_egress(
             });
         }
     }
-    *metrics_cursor = metrics.len();
+    cursors.metrics = metrics.len();
     Ok(())
 }
 

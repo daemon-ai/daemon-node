@@ -230,4 +230,173 @@ pub mod rt {
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, len) };
         ((ptr as u64) << 32) | len as u64
     }
+
+    /// The longest forwarded panic line; a payload past this is truncated with an ellipsis. A
+    /// panic message is a developer string, not a data channel — the cap keeps a runaway
+    /// `{:?}` payload from turning the log sink into one.
+    #[cfg(target_arch = "wasm32")]
+    const PANIC_LINE_MAX: usize = 4096;
+
+    /// The global allocator `main!` installs: [`std::alloc::System`], plus a report on the way out
+    /// when it comes back empty-handed.
+    ///
+    /// An out-of-memory abort is the guest failure mode a panic hook CANNOT see. Rust routes a
+    /// failed allocation through `handle_alloc_error`, which prints to a stderr the sandbox does
+    /// not have and calls `abort()` — on wasm that is an `unreachable`, so the host gets a
+    /// `GuestPanic` with no message and no location, indistinguishable from a failed assertion.
+    /// It is also the failure a guest is MOST likely to hit: linear memory is capped at the
+    /// module's own admitted claim (ABI §9.1), so any accidentally geometry-scaled buffer ends
+    /// here.
+    ///
+    /// So the size is reported at the one moment it is still known: when the underlying allocator
+    /// returns null, before the abort. The report allocates NOTHING — it formats into a stack
+    /// buffer — because the one thing known for certain at that point is that allocation is
+    /// failing.
+    #[cfg(target_arch = "wasm32")]
+    pub struct ReportingAlloc;
+
+    #[cfg(target_arch = "wasm32")]
+    // SAFETY: every method delegates to `System`, which is a valid `GlobalAlloc`; the wrapper adds
+    // only a null check and a log call, and never touches the returned pointer.
+    unsafe impl std::alloc::GlobalAlloc for ReportingAlloc {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let ptr = std::alloc::System.alloc(layout);
+            if ptr.is_null() {
+                report_alloc_failure(layout);
+            }
+            ptr
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            let ptr = std::alloc::System.alloc_zeroed(layout);
+            if ptr.is_null() {
+                report_alloc_failure(layout);
+            }
+            ptr
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            let out = std::alloc::System.realloc(ptr, layout, new_size);
+            if out.is_null() {
+                report_alloc_failure(
+                    Layout::from_size_align(new_size, layout.align()).unwrap_or(layout),
+                );
+            }
+            out
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            std::alloc::System.dealloc(ptr, layout);
+        }
+    }
+
+    /// Forward one exhausted allocation through `sys@2::log`, formatting into a stack buffer so
+    /// the report itself needs no heap. Reports once: a guest whose allocator is failing will fail
+    /// it again on the way to the abort, and one line is the diagnosis.
+    #[cfg(target_arch = "wasm32")]
+    fn report_alloc_failure(layout: Layout) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        static REPORTED: AtomicBool = AtomicBool::new(false);
+        if REPORTED.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let mut line = [0u8; 160];
+        let mut n = 0;
+        let mut put = |src: &[u8], n: &mut usize| {
+            let room = line.len() - *n;
+            let take = src.len().min(room);
+            line[*n..*n + take].copy_from_slice(&src[..take]);
+            *n += take;
+        };
+        put(daemon_vhc_abi::GUEST_PANIC_LOG_PREFIX.as_bytes(), &mut n);
+        put(b"memory allocation of ", &mut n);
+        put(decimal(layout.size() as u64).as_slice_of(), &mut n);
+        put(
+            b" bytes failed (linear memory is capped at the module's admitted claim)",
+            &mut n,
+        );
+        // SAFETY: every byte written above came from ASCII sources.
+        crate::abi::log(daemon_vhc_abi::LOG_LEVEL_ERROR, unsafe {
+            std::str::from_utf8_unchecked(&line[..n])
+        });
+    }
+
+    /// A `u64` rendered into a fixed 20-byte buffer — `u64::to_string` would allocate, and this
+    /// runs when allocation has just failed.
+    #[cfg(target_arch = "wasm32")]
+    struct Decimal {
+        buf: [u8; 20],
+        start: usize,
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    impl Decimal {
+        fn as_slice_of(&self) -> &[u8] {
+            &self.buf[self.start..]
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn decimal(mut v: u64) -> Decimal {
+        let mut buf = [0u8; 20];
+        let mut start = buf.len();
+        loop {
+            start -= 1;
+            buf[start] = b'0' + (v % 10) as u8;
+            v /= 10;
+            if v == 0 {
+                break;
+            }
+        }
+        Decimal { buf, start }
+    }
+
+    /// Arm panic forwarding for this instance: install a panic hook that pushes the message and
+    /// its `file:line:col` out through `sys@2::log` before the panic runtime aborts the guest
+    /// (ABI [`daemon_vhc_abi::GUEST_PANIC_LOG_PREFIX`]).
+    ///
+    /// Without this, a guest panic reaches the host as a bare wasm `unreachable` — a `GuestPanic`
+    /// trap with no message, since the payload dies with the linear memory. The hook is the only
+    /// moment the message is both formed and still reachable.
+    ///
+    /// `main!` calls this at the top of `da_run` and nowhere else, deliberately: capability
+    /// imports are illegal during `da_init`/`da_migrate` (ABI §6.6), so logging from a hook armed
+    /// there would re-class the guest's panic as a `PhaseViolation` and destroy the classification
+    /// the forwarding exists to preserve.
+    #[cfg(target_arch = "wasm32")]
+    pub fn forward_panics() {
+        use std::sync::Once;
+
+        static ARMED: Once = Once::new();
+        ARMED.call_once(|| {
+            std::panic::set_hook(Box::new(|info| {
+                let mut line = String::from(daemon_vhc_abi::GUEST_PANIC_LOG_PREFIX);
+                if let Some(loc) = info.location() {
+                    line.push_str(&format!("{}:{}:{}: ", loc.file(), loc.line(), loc.column()));
+                }
+                // The payload is `&str` for a literal panic and `String` for a formatted one;
+                // anything else is a `panic_any` payload no message can be recovered from.
+                let payload = info.payload();
+                let message = payload
+                    .downcast_ref::<&str>()
+                    .copied()
+                    .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                    .unwrap_or("<non-string panic payload>");
+                // One log line: a host log record is line-oriented, and a panic message may carry
+                // newlines (a multi-line `assert_eq!` is the common case).
+                line.extend(message.chars().map(|c| if c == '\n' { ' ' } else { c }));
+                if line.len() > PANIC_LINE_MAX {
+                    line.truncate(
+                        (0..=PANIC_LINE_MAX)
+                            .rev()
+                            .find(|&i| line.is_char_boundary(i))
+                            .unwrap_or(0),
+                    );
+                    line.push('…');
+                }
+                crate::abi::log(daemon_vhc_abi::LOG_LEVEL_ERROR, &line);
+            }));
+        });
+    }
 }

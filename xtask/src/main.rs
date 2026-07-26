@@ -1042,6 +1042,25 @@ const VHC_T2_SUITES: &[SuiteEntry<'static>] = &[
         ],
     ),
     (
+        // The MODULE-DRIVEN corpus lane (`ceremony_live_staging`): the trainer feeds ITSELF —
+        // manifest fetch, per-shard chunk registration, the round's own segment plan, thirty
+        // `data@2` ranges over one covering chunk, and the staged batches trained through at the
+        // FROZEN `(seq_len, vocab)`. Every other lane hands the guest host-staged batches, so this
+        // is the only place the `live` contract the fleet genesis pins is ever executed. Same
+        // release/`--ignored` reason as the training-step lane above.
+        "daemon-vhc-testkit live corpus staging lane (module-driven data plane, release)",
+        &[
+            "-p",
+            "daemon-vhc-testkit",
+            "--release",
+            "--test",
+            "ceremony_live_staging",
+            "--",
+            "--ignored",
+            "--nocapture",
+        ],
+    ),
+    (
         // D2's CONSENSUS REPLAY — the third replay tier (architecture §3.6; refactor §10 gate
         // row "Consensus replay from archive alone", tier-2): a third party re-verifies every
         // consensus decision and every digest from the record archive's signed, hash-chained,

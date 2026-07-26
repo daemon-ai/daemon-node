@@ -83,6 +83,10 @@ pub(crate) struct PumpState {
     /// Egress captured for the embedder (metrics/log are not journaled — outputs, not inputs).
     pub(crate) metrics: Vec<(String, f64)>,
     pub(crate) logs: Vec<(u32, String)>,
+    /// The last log line the guest stamped with [`daemon_vhc_abi::GUEST_PANIC_LOG_PREFIX`] — the
+    /// SDK panic hook's forwarded message, held aside so the trap that follows a beat later can
+    /// carry it as its typed detail instead of reaching the embedder as a bare `unreachable`.
+    pub(crate) guest_panic: Option<String>,
     /// Published frames, for embedder-side assertions: `(channel, seq, signed frame bytes)`.
     pub(crate) published: Vec<(u64, u64, Vec<u8>)>,
     /// The per-instance buffer table (kind 8, architecture §3.4) — shared between the guest

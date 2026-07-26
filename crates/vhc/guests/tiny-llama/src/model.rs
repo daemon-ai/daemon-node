@@ -382,6 +382,42 @@ impl<B: AutodiffBackend> TinyLlamaModel<B> {
         Tensor::cat(vec![out1, out2], 3)
     }
 
+    /// The additive causal mask `[1, s, s]`: `+0.0` on and below the diagonal, `-1.0e30` above it.
+    ///
+    /// Built ON DEVICE from one `arange` row. The values are the same to the bit as the `s × s`
+    /// image this used to fill in linear memory — what changes is that the guest never holds that
+    /// image. At the frozen 2048-token sequence it is 16 MiB, per block, against a whole-module
+    /// linear-memory claim in the tens of MiB: materializing it is one of the two allocations that
+    /// put the fleet trainer past its admitted cap and aborted it into a wasm `unreachable`.
+    fn causal_mask(&self, s: usize) -> Tensor<B, 3> {
+        let pos = Tensor::<B, 1, Int>::arange(0..s as i64, &self.device);
+        let cols = pos.clone().reshape([1, s]).expand([s, s]);
+        let rows = pos.reshape([s, 1]).expand([s, s]);
+        Tensor::<B, 2>::zeros([s, s], &self.device)
+            .mask_fill(cols.greater(rows), -1.0e30)
+            .reshape([1, s, s])
+    }
+
+    /// The one-hot target matrix `[rows, vocab]`: `1.0` at each row's target id, `+0.0` elsewhere.
+    ///
+    /// Built ON DEVICE by comparing the class ordinals against the targets, for the same reason as
+    /// [`TinyLlamaModel::causal_mask`] and with far more at stake: at the frozen `(seq_len, vocab)`
+    /// this image is `2047 × 32768 × 4` = 256 MiB, several times a trainer's whole admitted linear
+    /// memory. The guest keeps only the `rows`-long target ids it already built.
+    ///
+    /// The VALUES are unchanged, which is what keeps the loss bit-exact: a bool cast is exactly
+    /// `1.0`/`0.0`, and the reduction that consumes it still runs over the whole `[rows, vocab]`
+    /// product in the same order.
+    fn target_one_hot(&self, tgt: Vec<i64>, rows: usize, vocab: usize) -> Tensor<B, 2> {
+        let targets = Tensor::<B, 1, Int>::from_data(TensorData::new(tgt, [rows]), &self.device)
+            .reshape([rows, 1])
+            .expand([rows, vocab]);
+        let classes = Tensor::<B, 1, Int>::arange(0..vocab as i64, &self.device)
+            .reshape([1, vocab])
+            .expand([rows, vocab]);
+        classes.equal(targets).float()
+    }
+
     /// One forward pass → the scaled mean cross-entropy loss tensor (for `backward`).
     fn forward(&self, tokens: &[u32], b: usize, seq: usize, loss_scale: f64) -> Tensor<B, 1> {
         let cfg = &self.cfg;
@@ -430,14 +466,7 @@ impl<B: AutodiffBackend> TinyLlamaModel<B> {
             let v3 = v.reshape([bh, s, hd]);
             #[allow(clippy::cast_possible_truncation)]
             let scores = q3.matmul(k3.swap_dims(1, 2)).mul_scalar(scale as f32);
-            let mut mask = vec![0.0f32; s * s];
-            for i in 0..s {
-                for j in (i + 1)..s {
-                    mask[i * s + j] = -1.0e30;
-                }
-            }
-            let mask = Tensor::<B, 3>::from_data(TensorData::new(mask, [1, s, s]), &self.device);
-            let probs = activation::softmax(scores.add(mask), 2);
+            let probs = activation::softmax(scores.add(self.causal_mask(s)), 2);
             let attn = probs
                 .matmul(v3) // [bh, s, hd]
                 .reshape([b, nh, s, hd])
@@ -468,14 +497,7 @@ impl<B: AutodiffBackend> TinyLlamaModel<B> {
         let max = logits.clone().max_dim(1).detach(); // [rows, 1]
         let shifted = logits.sub(max);
         let logsm = shifted.clone().sub(shifted.exp().sum_dim(1).log());
-        let mut onehot = vec![0.0f32; rows * vocab];
-        for (i, &t) in tgt.iter().enumerate() {
-            #[allow(clippy::cast_sign_loss)]
-            {
-                onehot[i * vocab + t as usize] = 1.0;
-            }
-        }
-        let oh = Tensor::<B, 2>::from_data(TensorData::new(onehot, [rows, vocab]), &self.device);
+        let oh = self.target_one_hot(tgt, rows, vocab);
         #[allow(clippy::cast_precision_loss)]
         let denom = rows.max(1) as f32;
         #[allow(clippy::cast_possible_truncation)]
