@@ -118,11 +118,10 @@ fn genesis_wire(run_label: &str) -> Vec<u8> {
             // park until stopped.
             config: Value::from(2u8),
             grants: control_channel(),
-            device_min: daemon_vhc_proto::DeviceMinimums {
-                gpu: Some(1), // optional
-                ram_bytes: Some(1 << 20),
-                ..Default::default()
-            },
+            // The superseded device-minimums section stays EMPTY: physical requirements are
+            // members of the composed claim, and an authored minimum beside a composed one is a
+            // second authority over the same question, which authoring refuses.
+            device_min: daemon_vhc_proto::DeviceMinimums::default(),
         },
     );
 
