@@ -938,6 +938,19 @@ const VHC_DET_SUITES: &[SuiteEntry<'static>] = &[
             &["-p", "daemon-vhc-sdk"],
         ),
         (
+            // The worker binary's own integration drills: the framed command protocol, join refusal
+            // without a provisioned identity, the command loop across join/leave/shutdown, module
+            // switch with journal continuity, the live attach, and the seat smoke.
+            //
+            // In the mandatory lane because leaving it out is how a red suite survived: these drills
+            // sat failing for two sittings — every one of them refused at its first line by a genesis
+            // fixture the authoring migration had superseded — while the gate ran the crates whose
+            // tests were fast. A suite nobody runs is not coverage, and the drills are the only place
+            // the framed protocol and the durable journal are exercised through the real binary.
+            "daemon-vhc-worker (framed protocol, join refusal, command loop, switch, live attach)",
+            &["-p", "daemon-vhc-worker"],
+        ),
+        (
             "daemon-vhc-e2e (drills + observe-replay, no iroh/live)",
             &["-p", "daemon-vhc-e2e"],
         ),
