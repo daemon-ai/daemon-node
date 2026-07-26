@@ -2011,14 +2011,9 @@ pub(crate) fn revision_record(
 ) -> daemon_vhc_resource::BackendImplementationRevision {
     use daemon_vhc_resource::{
         AdapterDeviceType, AdapterIdentity, ApiSelectionSource, BackendClass, ComputeFramework,
-        ComputeStackIdentity, DriverRevision, Maybe, OperatingSystem, OsFamily, PlatformApi,
-        ProbeObservation, Unavailable,
+        ComputeStackIdentity, DriverRevision, Maybe, OsFamily, PlatformApi, ProbeObservation,
+        Unavailable,
     };
-
-    // What the framework's own adapter info supplied, where this build has that lane. Reduced to a
-    // feature-independent shape so the assembly below reads the same either way — a build without the
-    // lane simply observed nothing.
-    let probed: Option<ProbedAdapter> = probed_adapter();
 
     let (class, api) = match capability.class.as_str() {
         "vulkan" => (BackendClass::Vulkan, PlatformApi::Vulkan),
@@ -2027,6 +2022,19 @@ pub(crate) fn revision_record(
         "cuda" => (BackendClass::Cuda, PlatformApi::Cuda),
         _ => (BackendClass::Cpu, PlatformApi::None),
     };
+
+    // What the framework's adapter info supplied — **only where that adapter serves THIS lane**.
+    //
+    // The graphics probe brings up one adapter under one selected API, so its findings describe one
+    // lane and no other. Filling every lane's record from it put this box's Vulkan adapter identity
+    // and its RADV driver strings into the CPU-lane record, which correctly reported a CPU class and
+    // a software rasterizer beside them. A Vulkan profile naming a `Mesa 25.2.6` driver range would
+    // then have matched the CPU-lane record: a device profile authenticating against a CPU lane, the
+    // silent-device-fallback failure arriving through the authentication path rather than around it.
+    //
+    // Absent-for-this-lane is a *typed* absence, not a gap: a CPU lane has no device adapter and no
+    // vendor driver, so there is nothing to report and no policy should tolerate a substitute.
+    let probed: Option<ProbedAdapter> = probed_adapter().filter(|p| p.serves(class));
     let family = if cfg!(target_os = "linux") {
         OsFamily::Linux
     } else if cfg!(target_os = "macos") {
@@ -2058,15 +2066,16 @@ pub(crate) fn revision_record(
             vendor_id: probed
                 .as_ref()
                 .and_then(|p| p.vendor_id)
-                .map_or(no_framework_value(), Maybe::Available),
+                .map_or_else(|| unobserved_for(class), Maybe::Available),
             device_id: probed
                 .as_ref()
                 .and_then(|p| p.device_id)
-                .map_or(no_framework_value(), Maybe::Available),
+                .map_or_else(|| unobserved_for(class), Maybe::Available),
             // The bus address and the UUID are not on the framework's adapter info at all; the
-            // platform-specific paths that carry them are a separate probe.
-            pci_bus_id: Maybe::Unavailable(Unavailable::NotExposedByFramework),
-            uuid: Maybe::Unavailable(Unavailable::NotExposedByFramework),
+            // platform-specific paths that carry them are a separate probe. On a CPU lane there is
+            // no adapter to have them.
+            pci_bus_id: unobserved_for(class),
+            uuid: unobserved_for(class),
         },
         api,
         api_version: Maybe::Unavailable(Unavailable::NotExposedByFramework),
@@ -2076,19 +2085,15 @@ pub(crate) fn revision_record(
             // than travelling as a value a range could be compared against.
             name: probed
                 .as_ref()
-                .map_or(no_framework_value(), |p| text_or_unavailable(&p.driver)),
-            version_text: probed.as_ref().map_or(no_framework_value(), |p| {
-                text_or_unavailable(&p.driver_info)
-            }),
+                .map_or_else(|| unobserved_for(class), |p| text_or_unavailable(&p.driver)),
+            version_text: probed.as_ref().map_or_else(
+                || unobserved_for(class),
+                |p| text_or_unavailable(&p.driver_info),
+            ),
             ..Default::default()
         },
         kernel_driver: Maybe::Unavailable(Unavailable::NotExposedByPlatform),
-        os: OperatingSystem {
-            family,
-            version: std::env::consts::OS.to_string(),
-            build: Maybe::Unavailable(Unavailable::NotExposedByPlatform),
-            kernel: Maybe::Unavailable(Unavailable::NotExposedByPlatform),
-        },
+        os: operating_system(family),
         // Nothing in this build calls the runtime's memory-usage reporter, so a profile whose terms
         // were calibrated FROM allocator statistics must not be accepted against it. Reported
         // truthfully so that refusal actually fires.
@@ -2120,6 +2125,9 @@ pub(crate) fn revision_record(
 
 /// The adapter facts the compute framework's own info supplied, feature-independent.
 struct ProbedAdapter {
+    /// The graphics backend the probe brought the adapter up under, as the framework named it
+    /// (`"Vulkan"`, `"Metal"`, `"Dx12"`). This is what makes the findings attributable to one lane.
+    backend: String,
     is_software: bool,
     vendor_id: Option<u32>,
     device_id: Option<u32>,
@@ -2127,11 +2135,31 @@ struct ProbedAdapter {
     driver_info: String,
 }
 
+impl ProbedAdapter {
+    /// Whether this adapter is the one that serves `class`.
+    ///
+    /// The probe brings up a single adapter under a single selected graphics API, so its findings
+    /// describe exactly one lane. A CPU lane is never served by it — the CPU backend allocates
+    /// through the host and calls no vendor driver — and neither is CUDA, which is a different stack
+    /// reached through a different probe. Reporting the graphics adapter under either would attribute
+    /// one lane's hardware to another.
+    fn serves(&self, class: daemon_vhc_resource::BackendClass) -> bool {
+        use daemon_vhc_resource::BackendClass;
+        match class {
+            BackendClass::Vulkan => self.backend.eq_ignore_ascii_case("vulkan"),
+            BackendClass::Metal => self.backend.eq_ignore_ascii_case("metal"),
+            BackendClass::Dx12 => self.backend.eq_ignore_ascii_case("dx12"),
+            BackendClass::Cpu | BackendClass::Cuda => false,
+        }
+    }
+}
+
 /// What the framework observed, or `None` where this build has no device lane to observe with.
 fn probed_adapter() -> Option<ProbedAdapter> {
     #[cfg(feature = "wgpu")]
     {
         daemon_vhc_host::probe::probe_wgpu().map(|p| ProbedAdapter {
+            backend: p.backend,
             is_software: p.is_software,
             vendor_id: p.vendor_id,
             device_id: p.device_id,
@@ -2142,6 +2170,103 @@ fn probed_adapter() -> Option<ProbedAdapter> {
     #[cfg(not(feature = "wgpu"))]
     {
         None
+    }
+}
+
+/// The operating system's own revision, read rather than restated.
+///
+/// `version` used to be `std::env::consts::OS` — a compile-time constant spelling the family, which
+/// the family member already carries. It said nothing about the machine and, worse, said it in a
+/// field a profile's permitted range would be evaluated against.
+///
+/// `build` mattered more: it is the implementation-revision signal for a backend whose framework
+/// supplies no driver revision, which on Metal is *every* case. Hard-coding it unavailable meant
+/// Metal had no comparable revision signal at all and no Metal profile could authenticate — a
+/// platform blocked by an unread value rather than by a platform limitation.
+fn operating_system(family: daemon_vhc_resource::OsFamily) -> daemon_vhc_resource::OperatingSystem {
+    use daemon_vhc_resource::{Maybe, OperatingSystem, Unavailable};
+
+    let kernel = read_first_line(&["uname", "-r"]).map_or(
+        Maybe::Unavailable(Unavailable::ProbeFailed),
+        Maybe::Available,
+    );
+
+    #[cfg(target_os = "macos")]
+    let (version, build) = (
+        read_first_line(&["sw_vers", "-productVersion"]),
+        read_first_line(&["sw_vers", "-buildVersion"]),
+    );
+
+    // On Linux the distribution's `VERSION_ID` is the OS version, and the kernel release is the
+    // closest thing to a build — it is what actually moves when the graphics stack moves.
+    #[cfg(target_os = "linux")]
+    let (version, build) = (
+        os_release_field("VERSION_ID"),
+        read_first_line(&["uname", "-r"]),
+    );
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let (version, build) = (None, None);
+
+    OperatingSystem {
+        family,
+        version: version.map_or(
+            // Typed, not a restatement of the family: a range evaluated against a value that is
+            // really a family name would be comparing the wrong thing while looking like it worked.
+            Maybe::Unavailable(Unavailable::NotExposedByPlatform),
+            Maybe::Available,
+        ),
+        build: build.map_or(
+            Maybe::Unavailable(Unavailable::NotExposedByPlatform),
+            Maybe::Available,
+        ),
+        kernel,
+    }
+}
+
+/// The first line of a command's output, trimmed, or `None` when it cannot be read or is empty.
+fn read_first_line(argv: &[&str]) -> Option<String> {
+    let (program, args) = argv.split_first()?;
+    let output = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let line = text.lines().next()?.trim();
+    (!line.is_empty()).then(|| line.to_string())
+}
+
+/// One field of `/etc/os-release`, unquoted.
+#[cfg(target_os = "linux")]
+fn os_release_field(key: &str) -> Option<String> {
+    let text = std::fs::read_to_string("/etc/os-release").ok()?;
+    for line in text.lines() {
+        if let Some(value) = line.strip_prefix(key).and_then(|r| r.strip_prefix('=')) {
+            let unquoted = value.trim().trim_matches('"').trim();
+            if !unquoted.is_empty() {
+                return Some(unquoted.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Why a lane reports no adapter value.
+///
+/// A device lane whose probe supplied nothing has a framework gap — a defect or a platform
+/// limitation, either way something that could in principle be closed. A CPU lane has no device
+/// adapter and no vendor driver at all, so the absence is structural, and a policy meaning to
+/// constrain a device driver must never treat it as a tolerable gap.
+fn unobserved_for<T>(class: daemon_vhc_resource::BackendClass) -> daemon_vhc_resource::Maybe<T> {
+    if class == daemon_vhc_resource::BackendClass::Cpu {
+        daemon_vhc_resource::Maybe::Unavailable(
+            daemon_vhc_resource::Unavailable::NotApplicableToLane,
+        )
+    } else {
+        no_framework_value()
     }
 }
 

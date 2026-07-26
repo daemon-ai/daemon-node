@@ -41,6 +41,16 @@ pub enum Unavailable {
     ProbeFailed,
     /// Reading it needs a privilege this process does not hold.
     RequiresPrivilege,
+    /// **There is no such thing for this lane.** Not a gap to be closed and not a platform
+    /// limitation — a CPU lane has no device adapter and no vendor driver, so its adapter identity
+    /// and driver revision are absent by construction.
+    ///
+    /// Distinct from the other reasons on purpose. "The framework did not expose the driver version"
+    /// on a *device* lane is a defect or a platform gap, and a lenient policy might reasonably
+    /// tolerate it; "this lane has no driver" must never be tolerated by a policy that means to
+    /// constrain a device driver, because there is no device. Collapsing the two is how a lane
+    /// record ends up carrying another lane's adapter.
+    NotApplicableToLane,
 }
 
 /// A value a platform may not supply.
@@ -219,8 +229,10 @@ pub struct AllocatorImplementation {
 pub struct OperatingSystem {
     /// OS family.
     pub family: OsFamily,
-    /// OS version.
-    pub version: String,
+    /// OS version, where the platform supplies one distinct from its family. A typed absence rather
+    /// than a restatement of the family: a permitted range evaluated against a family name would be
+    /// comparing the wrong thing while appearing to work.
+    pub version: Maybe<String>,
     /// OS build. On a backend whose framework supplies no driver revision, this is the
     /// implementation-revision signal a profile range has to constrain instead.
     pub build: Maybe<String>,
@@ -293,7 +305,7 @@ impl DriverApi {
         if let Some(build) = self.os.build.value() {
             return RevisionSignal::OsBuild {
                 family: self.os.family,
-                version: self.os.version.clone(),
+                version: self.os.version.value().cloned().unwrap_or_default(),
                 build: build.clone(),
             };
         }
@@ -547,7 +559,7 @@ pub(crate) mod fixtures {
     pub(crate) fn os(family: OsFamily, build: Maybe<String>) -> OperatingSystem {
         OperatingSystem {
             family,
-            version: "1.0".into(),
+            version: Maybe::Available("1.0".into()),
             build,
             kernel: Maybe::Unavailable(Unavailable::NotExposedByPlatform),
         }

@@ -289,6 +289,18 @@ pub enum AuthenticationRefusal {
          everything"
     )]
     NoComparableRevisionSignal,
+    /// The profile prices a different backend class than the lane it is being authenticated against.
+    #[error(
+        "the profile prices the {profile} backend class but the running lane is {running} — a \
+         profile for one backend cannot be authenticated against another, and admitting one would \
+         be the silent-device-fallback failure arriving through the authentication path"
+    )]
+    BackendClassMismatch {
+        /// The class the profile prices.
+        profile: &'static str,
+        /// The class the running lane serves.
+        running: &'static str,
+    },
     /// The sealed binary the envelope describes is not the one running.
     #[error("the trust envelope describes a different sealed binary than the one running")]
     SealedBinaryMismatch,
@@ -312,6 +324,24 @@ pub fn authenticate(
     now_ms: u64,
 ) -> Result<(), AuthenticationRefusal> {
     profile.validate()?;
+
+    // 0. The lane, before anything else. A profile prices one backend class and is meaningless
+    //    against another: its cost terms describe that backend's allocator, its pooling, its
+    //    staging path.
+    //
+    //    This is deliberately a direct class comparison rather than a consequence of the identity
+    //    and driver checks below, because relying on those is one mistake away from the bug that
+    //    prompted it. This box's CPU-lane record carried the Vulkan adapter's identity and its RADV
+    //    driver strings — filled from a shared graphics probe regardless of lane — so a Vulkan
+    //    profile naming that driver range matched a CPU lane while the record plainly said `Cpu`
+    //    beside it. The record is fixed at its source; this refuses the class of mistake, not the
+    //    instance, so a future record that mis-attributes an adapter cannot cash it in here.
+    if profile.backend_class != running.backend_class {
+        return Err(AuthenticationRefusal::BackendClassMismatch {
+            profile: profile.backend_class.slug(),
+            running: running.backend_class.slug(),
+        });
+    }
 
     // 1. Identity first: the envelope must bind these bytes.
     if envelope.profile_digest != profile.profile_digest()? {
@@ -590,6 +620,86 @@ mod tests {
         authenticate(&p, &e, owner, run, &revision(), 1, NOW)
     }
 
+    /// **MEAS-F8.** A device profile cannot authenticate against a CPU lane.
+    ///
+    /// The reachable version of this was not hypothetical. This box's CPU-lane record carried the
+    /// *Vulkan* adapter's vendor and device ids and its RADV driver strings — filled from a shared
+    /// graphics probe regardless of which lane the record described — while correctly reporting a CPU
+    /// backend class and a software rasterizer beside them. A Vulkan profile naming a `Mesa 25.2.6`
+    /// driver range therefore matched the CPU-lane record's driver signal exactly. That is the
+    /// silent-device-fallback failure arriving *through* the authentication path rather than around
+    /// it: a device role admitted against a CPU lane by a check that believed it had verified the
+    /// driver.
+    ///
+    /// Two things had to change and this asserts the outcome of both. The record now carries only the
+    /// identity of the adapter that serves its own lane, so a CPU-lane record has no device driver to
+    /// compare against. And the class is compared directly, so the refusal does not *depend* on the
+    /// record being right — a future record that mis-attributes an adapter still cannot cash it in.
+    #[test]
+    fn a_device_profile_cannot_authenticate_against_a_cpu_lane() {
+        let device_profile = profile(BackendClass::Vulkan);
+        let envelope = envelope(&device_profile);
+
+        // A CPU-lane record that, in the shape of the defect, still carried a device driver string.
+        let mut cpu_lane = revision();
+        cpu_lane.backend_class = BackendClass::Cpu;
+        cpu_lane.driver_api.driver.version_text = Maybe::Available("Mesa 25.2.6".into());
+
+        let refusal = authenticate(
+            &device_profile,
+            &envelope,
+            &policy(),
+            &policy(),
+            &cpu_lane,
+            1,
+            NOW,
+        )
+        .expect_err("a Vulkan profile must not authenticate against a CPU lane");
+
+        assert!(
+            matches!(
+                refusal,
+                AuthenticationRefusal::BackendClassMismatch {
+                    profile: "vulkan",
+                    running: "cpu"
+                }
+            ),
+            "the refusal names both classes rather than failing later for an incidental reason: \
+             {refusal}"
+        );
+        // And it is refused on the class, BEFORE the driver range is ever consulted — so it does not
+        // rely on the driver string being absent, which is the property that survives a bad record.
+        assert!(
+            !format!("{refusal}").contains("Mesa"),
+            "the driver was never compared: {refusal}"
+        );
+    }
+
+    /// The same lane pairing in the other direction, so the check is not just refusing everything.
+    #[test]
+    fn a_profile_authenticates_against_its_own_lane() {
+        let cpu_profile = profile(BackendClass::Cpu);
+        let e = envelope(&cpu_profile);
+        let mut cpu_lane = revision();
+        cpu_lane.backend_class = BackendClass::Cpu;
+        // The CPU lane's real revision signal is the OS build, not a vendor driver — there is no
+        // vendor driver on this lane, which is exactly why its absence is typed as inapplicable.
+        cpu_lane.driver_api.driver.version_text =
+            Maybe::Unavailable(crate::revision::Unavailable::NotApplicableToLane);
+        cpu_lane.driver_api.driver.vendor_release =
+            Maybe::Unavailable(crate::revision::Unavailable::NotApplicableToLane);
+        cpu_lane.driver_api.os.build = Maybe::Available("6.19.7".into());
+        cpu_lane.driver_api.os.version = Maybe::Available("25.11".into());
+
+        // Whatever else this fixture's ranges say, the class must not be what refuses it.
+        assert!(
+            !matches!(
+                authenticate(&cpu_profile, &e, &policy(), &policy(), &cpu_lane, 1, NOW),
+                Err(AuthenticationRefusal::BackendClassMismatch { .. })
+            ),
+            "a CPU profile must not be refused on the class by a CPU lane"
+        );
+    }
     #[test]
     fn a_bound_signed_current_profile_authenticates() {
         authenticate_with(&policy(), &policy()).expect("authenticates");
@@ -745,7 +855,10 @@ mod tests {
             permitted: ["6.19.7".to_string()].into_iter().collect(),
             os_family: Some(OsFamily::Linux),
         }];
+        // The record is a Metal lane, matching the profile: a profile prices one backend class and
+        // authenticating it against another is refused on the class before any range is consulted.
         let mut running = revision();
+        running.backend_class = BackendClass::Metal;
         running.driver_api.driver = DriverRevision::default();
         authenticate(&p, &e, &policy(), &policy(), &running, 1, NOW)
             .expect("the OS build is the fallback signal");
@@ -765,6 +878,7 @@ mod tests {
         let p = profile(BackendClass::Metal);
         let e = envelope(&p);
         let mut running = revision();
+        running.backend_class = BackendClass::Metal;
         running.driver_api.driver = DriverRevision::default();
         running.driver_api.os.build = Maybe::Unavailable(Unavailable::NotExposedByPlatform);
         assert_eq!(
@@ -780,7 +894,9 @@ mod tests {
         let mut p = profile(BackendClass::Dx12);
         p.allocation_ceilings.measured_bytes = Maybe::default();
         let e = envelope(&p);
-        let err = authenticate(&p, &e, &policy(), &policy(), &revision(), 1, NOW).unwrap_err();
+        let mut running = revision();
+        running.backend_class = BackendClass::Dx12;
+        let err = authenticate(&p, &e, &policy(), &policy(), &running, 1, NOW).unwrap_err();
         assert!(matches!(
             err,
             AuthenticationRefusal::CeilingNotMeasured { .. }
@@ -794,7 +910,7 @@ mod tests {
         let mut relaxed = policy();
         relaxed.require_measured_allocation_ceiling = false;
         relaxed.require_full_calibration = false;
-        authenticate(&p, &e, &relaxed, &relaxed, &revision(), 1, NOW)
+        authenticate(&p, &e, &relaxed, &relaxed, &running, 1, NOW)
             .expect("a policy may accept an unmeasured ceiling explicitly");
     }
 
