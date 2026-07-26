@@ -71,6 +71,37 @@ impl Dropped {
     }
 }
 
+/// What a run header records about the resources the instance was admitted for — **minor-selected**.
+///
+/// An enum rather than a set of optional members, so a record carrying both a declared claim and a
+/// composed one is not merely refused but **unrepresentable**. The two answer the same question with
+/// different authorities: below the certification minor the module declared its tiers, at it the host
+/// composed them from a plan and a certified profile. A reader given both would have to guess which
+/// figure the run was actually admitted on, and the point of the minor split is that there is never
+/// anything to guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunHeaderResources<'a> {
+    /// ABI ≤ 2.4 — the module's own `da_claim` result, verbatim.
+    Declared(&'a [u8]),
+    /// The certification minor — the plan the module emitted, the claim the host composed from it, the
+    /// node/device aggregate the instance was admitted within, and the grant it runs under.
+    ///
+    /// All four inline rather than by digest: a replay has to be able to re-derive the composition, and
+    /// a digest names bytes a verifier may not hold. The grant especially — it is required before
+    /// initialization, so resolving it from a sidecar would create a dependency at the very point that
+    /// establishes execution identity.
+    Composed {
+        /// The canonical Logical Resource Plan bytes.
+        resource_plan: &'a [u8],
+        /// The composed role Physical Claim, canonical bytes.
+        physical_claim: &'a [u8],
+        /// The node/device aggregate claim, canonical bytes.
+        aggregate_claim: &'a [u8],
+        /// The Execution Grant, canonical bytes.
+        execution_grant: &'a [u8],
+    },
+}
+
 /// The §8.3 records the Phase-A driver produces, as a write-only seam (see module docs).
 ///
 /// All methods take `&mut self`; the driver serializes access behind its pump lock, so an adapter
@@ -87,7 +118,7 @@ pub trait JournalSink: Send {
         manifest: &[u8],
         config: &[u8],
         grants: &[u8],
-        claim: &[u8],
+        resources: RunHeaderResources<'_>,
         channels: &[u8],
         device: &[u8],
     ) -> Result<(), SinkError>;
@@ -208,12 +239,12 @@ impl<S: JournalSink> JournalSink for std::sync::Arc<std::sync::Mutex<S>> {
         manifest: &[u8],
         config: &[u8],
         grants: &[u8],
-        claim: &[u8],
+        resources: RunHeaderResources<'_>,
         channels: &[u8],
         device: &[u8],
     ) -> Result<(), SinkError> {
         self.lock().expect("sink lock").run_header(
-            abi, worlds, bridge, manifest, config, grants, claim, channels, device,
+            abi, worlds, bridge, manifest, config, grants, resources, channels, device,
         )
     }
     fn instantiation(&mut self, counter: u64, reason: u64, at: u64) -> Result<(), SinkError> {
@@ -326,6 +357,10 @@ pub enum SinkEntry {
     RunHeader {
         abi: u64,
         bridge: bool,
+        /// Which resource branch the header recorded: `false` for a declared claim, `true` for a
+        /// composed one. Mirrored here so a test can assert the minor selected the right branch
+        /// without a durable journal.
+        composed: bool,
     },
     Instantiation {
         counter: u64,
@@ -474,11 +509,15 @@ impl JournalSink for MemorySink {
         _manifest: &[u8],
         _config: &[u8],
         _grants: &[u8],
-        _claim: &[u8],
+        resources: RunHeaderResources<'_>,
         _channels: &[u8],
         _device: &[u8],
     ) -> Result<(), SinkError> {
-        self.entries.push(SinkEntry::RunHeader { abi, bridge });
+        self.entries.push(SinkEntry::RunHeader {
+            abi,
+            bridge,
+            composed: matches!(resources, RunHeaderResources::Composed { .. }),
+        });
         Ok(())
     }
 

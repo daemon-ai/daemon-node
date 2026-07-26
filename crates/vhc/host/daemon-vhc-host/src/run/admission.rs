@@ -365,6 +365,38 @@ impl Admission {
             .map_or(&[][..], |claim| &claim.under_pressure)
     }
 
+    /// Copy what admission decided into a [`crate::run::RunConfig`]: the **negotiated minor**, and the
+    /// composed run-header members where there are any.
+    ///
+    /// The minor matters beyond bookkeeping — it selects the run-header variant the journal writes and
+    /// the terminal-context rendering — and nothing was carrying it, so a run reported whatever the
+    /// config's default happened to be rather than what the module declared. Admission is where the
+    /// negotiated value exists, so this is where it is handed over.
+    ///
+    /// The composed members are a no-op below the certification minor, where the declared claim bytes
+    /// the caller already copies are the header's resource branch. Encoding failures are surfaced rather
+    /// than swallowed: a run whose header could not record its own composition is not a run anyone can
+    /// verify later, so the caller refuses the join with the reason.
+    ///
+    /// # Errors
+    /// The canonical-encoding failure, verbatim.
+    pub fn apply_composition(
+        &self,
+        cfg: &mut crate::run::RunConfig,
+    ) -> Result<(), daemon_vhc_resource::PlannerError> {
+        cfg.abi_minor = self.selection.minor;
+        let Some(composed) = self.composition.as_ref() else {
+            return Ok(());
+        };
+        cfg.resource_plan_bytes = self.resource_plan_bytes.clone();
+        cfg.physical_claim_bytes = composed.claim().to_canonical_bytes()?;
+        cfg.aggregate_claim_bytes = composed.aggregate.to_canonical_bytes()?;
+        cfg.execution_grant = composed.grant().to_canonical_bytes().map_err(|e| {
+            daemon_vhc_resource::PlannerError::Invalid(format!("grant encoding: {e}"))
+        })?;
+        Ok(())
+    }
+
     /// Copy the admitted quotas into a [`crate::run::RunConfig`] — the D0 envelope→admission→
     /// run-config derivation seam (deliverable 2). A no-op when the admission carried no envelope
     /// grants (the config's Phase-A defaults stand). `granted_artifacts` REPLACES the config's

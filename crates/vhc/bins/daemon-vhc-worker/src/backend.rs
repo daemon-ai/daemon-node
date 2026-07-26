@@ -1425,6 +1425,11 @@ pub(crate) fn role_binding(
     // engine caps separately from the claim's hard tier. Previously left uncapped on this path;
     // wiring it is the other half of "the claim is what governs, not a host constant".
     run.hard_accountable_host_bytes = admission.hard_accountable_host_bytes();
+    // The negotiated minor and, at the certification minor, the composed members the run header
+    // records. A run that cannot record what it was admitted on is refused rather than started.
+    admission
+        .apply_composition(&mut run)
+        .map_err(|e| format!("join re-admission: recording the composed claim: {e}"))?;
     admission.apply_quotas(&mut run);
     // Provision the state plane from the genesis state contract (§6.3): the run-pinned
     // `state_chunk_size` the streamed det-lane fold runs under (`None` = no host-side state).

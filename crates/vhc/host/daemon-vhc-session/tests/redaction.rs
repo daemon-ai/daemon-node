@@ -129,7 +129,7 @@ fn no_secret_crosses_the_command_wire_or_lands_in_a_journal() {
             b"m",
             b"c",
             b"g",
-            b"cl",
+            daemon_vhc_host::run::RunHeaderResources::Declared(b"cl"),
             b"ch",
             b"d",
         )

@@ -53,10 +53,15 @@ impl JournalSink for JournalAdapter {
         manifest: &[u8],
         config: &[u8],
         grants: &[u8],
-        claim: &[u8],
+        resources: daemon_vhc_host::run::RunHeaderResources<'_>,
         channels: &[u8],
         device: &[u8],
     ) -> Result<(), SinkError> {
+        // This adapter journals the legacy branch only; the composed branch is exercised through the
+        // durable sink, which is the one a certification run writes with.
+        let daemon_vhc_host::run::RunHeaderResources::Declared(claim) = resources else {
+            panic!("the event-loop adapter is a lower-minor seat and records a declared claim");
+        };
         self.journal
             .append(Body::RunHeader(Box::new(RunHeader {
                 run_id: self.id.run_id,

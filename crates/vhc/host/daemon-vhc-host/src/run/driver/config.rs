@@ -41,6 +41,16 @@ pub struct RunConfig {
     /// Run-header claim bytes (see [`RunConfig::manifest_bytes`]). Empty at the certification minor,
     /// which records the plan, the composed claims and the grant instead.
     pub claim_bytes: Vec<u8>,
+    /// The composed role Physical Claim's canonical bytes — a certification-minor run-header member.
+    ///
+    /// Empty below the certification minor, where [`RunConfig::claim_bytes`] carries the module's
+    /// declared claim instead. The run header records one branch or the other, never both.
+    pub physical_claim_bytes: Vec<u8>,
+    /// The node/device aggregate claim's canonical bytes (see [`RunConfig::physical_claim_bytes`]).
+    ///
+    /// Distinct from the per-instance claim: a role colocated with another shares device resources, and
+    /// the aggregate is what the node actually reserved.
+    pub aggregate_claim_bytes: Vec<u8>,
     /// The negotiated major-2 ABI minor for this instance.
     ///
     /// It is the selector for the minor-dependent behaviour: which assessment export ran, which
@@ -187,7 +197,15 @@ impl RunConfig {
             grants,
             manifest_bytes: Vec::new(),
             claim_bytes: Vec::new(),
-            abi_minor: daemon_vhc_abi::DA_ABI_MINOR_V2,
+            physical_claim_bytes: Vec::new(),
+            aggregate_claim_bytes: Vec::new(),
+            // A directly-constructed run has negotiated nothing, so it must not claim the newest
+            // contract. Defaulting to the host's own minor made this field track the constant: when
+            // the certification minor landed, every run built without admission silently began
+            // claiming it — which selects the certification run-header variant for a run that
+            // composed nothing. The default is now the highest legacy minor, and admission overwrites
+            // it with what the module actually declared.
+            abi_minor: daemon_vhc_abi::LEGACY_CONTEXT_MAX_MINOR,
             resource_plan_bytes: Vec::new(),
             execution_grant: Vec::new(),
             channels_bytes: Vec::new(),

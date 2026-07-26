@@ -140,6 +140,20 @@ pub fn start_run_migrating(
     // tag 0 first — the run header precedes everything (§8.3). The header's `bridge` field is
     // keep-reserved (always `false`: no bridge exists; the field stays so the record grammar is
     // unchanged and pre-existing journals stay parseable).
+    // Which resources the header records is selected by the negotiated minor, not by which fields
+    // happen to be populated. Reading it off the data would make an empty declared claim on a
+    // certification-minor run look like a legacy record, and a legacy run that never populated the
+    // composed fields look like a broken certification one.
+    let resources = if daemon_vhc_abi::run_header_is_certification_variant(abi_minor) {
+        crate::run::RunHeaderResources::Composed {
+            resource_plan: &run.resource_plan_bytes,
+            physical_claim: &run.physical_claim_bytes,
+            aggregate_claim: &run.aggregate_claim_bytes,
+            execution_grant: &run.execution_grant,
+        }
+    } else {
+        crate::run::RunHeaderResources::Declared(&run.claim_bytes)
+    };
     sink.run_header(
         abi_packed,
         &worlds,
@@ -147,7 +161,7 @@ pub fn start_run_migrating(
         &run.manifest_bytes,
         &run.config,
         &run.grants,
-        &run.claim_bytes,
+        resources,
         &run.channels_bytes,
         &run.device_bytes,
     )?;

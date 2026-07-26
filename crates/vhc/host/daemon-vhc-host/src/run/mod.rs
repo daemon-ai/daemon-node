@@ -41,6 +41,7 @@ pub use driver::{
     RunConfig, RunEnd, RunError, RunIdentity, SnapshotCapture, SpooledFrame,
 };
 pub use event::{decode_event_frame, encode_event_frame, EventCodecError, PayloadMeta, RunEvent};
+pub use journal::RunHeaderResources;
 pub use journal::{Dropped, JournalSink, MemorySink, SinkEntry, SinkError};
 pub use ops::{OpRequest, OpTable};
 pub use replay::{

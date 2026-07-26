@@ -194,7 +194,7 @@ impl JournalSink for MeasuringSink {
         _manifest: &[u8],
         _config: &[u8],
         _grants: &[u8],
-        _claim: &[u8],
+        _resources: daemon_vhc_host::run::RunHeaderResources<'_>,
         _channels: &[u8],
         _device: &[u8],
     ) -> Result<(), SinkError> {
