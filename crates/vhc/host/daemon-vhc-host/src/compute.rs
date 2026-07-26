@@ -541,6 +541,89 @@ pub struct AllocatorSample {
     pub bytes_reserved: u64,
 }
 
+/// The bounded bisection itself, over a predicate that decides whether one size is accepted.
+///
+/// Separate from the device call so the search's properties can be pinned without a device: that it
+/// never exceeds its attempt budget, that it never reports a size the predicate refused, and that
+/// "accepted the maximum it was allowed to ask for" is recorded as an absence of refusal rather than as a
+/// discovered limit. A search whose bound was never contradicted has established a floor under the
+/// ceiling, not the ceiling — and the direction matters, because admission compares a claim against this
+/// figure and under-reporting refuses a claim the device might have served while over-reporting admits
+/// one it cannot.
+fn bisect_max_allocation(
+    start_bytes: u64,
+    floor_bytes: u64,
+    accept: &mut impl FnMut(u64) -> bool,
+) -> Option<daemon_vhc_resource::MeasuredAllocationCeiling> {
+    use daemon_vhc_resource::{AllocationProbeMethod, MeasuredAllocationCeiling};
+
+    let floor = floor_bytes.max(1);
+    if start_bytes < floor {
+        return None;
+    }
+
+    // The largest size accepted so far, and the smallest refused. The gap between them is what
+    // bisection closes; the loop stops when the attempt budget runs out or the gap is under one
+    // floor-sized step, whichever comes first.
+    let mut attempts = 0u32;
+    let mut accepted: Option<u64> = None;
+    let mut refused: Option<u64> = None;
+    let mut candidate = start_bytes;
+    while attempts < ALLOCATION_PROBE_MAX_ATTEMPTS {
+        attempts += 1;
+        if accept(candidate) {
+            accepted = Some(candidate);
+        } else {
+            refused = Some(candidate);
+        }
+        candidate = match (accepted, refused) {
+            // Nothing refused yet: the permitted maximum was accepted, and the search is done — it will
+            // not go looking above a bound it was told not to exceed.
+            (Some(_), None) => break,
+            // Nothing accepted yet: halve toward the floor. On the last attempt, go straight to the
+            // floor instead of halving again: a device whose real ceiling is far below where the search
+            // started can exhaust the budget in halvings and learn nothing, and "nothing" makes the
+            // report carry an absence that refuses admission on a device that would have served a small
+            // allocation perfectly well. Establishing the floor is worth one attempt, and it is honest —
+            // the recorded refusal above it says the search stopped early rather than converged.
+            (None, Some(hi)) => {
+                let half = (hi / 2).max(floor);
+                let last_attempt = attempts + 1 == ALLOCATION_PROBE_MAX_ATTEMPTS;
+                let next = if last_attempt { floor } else { half };
+                if next >= hi {
+                    break;
+                }
+                next
+            }
+            (Some(lo), Some(hi)) => {
+                let midpoint = lo + (hi - lo) / 2;
+                if hi - lo <= floor || midpoint == lo {
+                    break;
+                }
+                midpoint
+            }
+            (None, None) => unreachable!("each attempt records an outcome"),
+        };
+    }
+
+    accepted.map(|accepted_bytes| MeasuredAllocationCeiling {
+        accepted_bytes,
+        refused_bytes: refused,
+        method: AllocationProbeMethod::BoundedBisection {
+            start_bytes,
+            floor_bytes: floor,
+            attempts,
+        },
+    })
+}
+
+/// How many allocations [`HostCompute::measure_max_allocation`] may attempt.
+///
+/// Bisection halves the interval each time, so twelve attempts resolve a ceiling to about one part in
+/// four thousand of the permitted maximum — ample for a figure a claim is compared against, and a fixed
+/// cost rather than an open search on a path admission waits behind.
+pub const ALLOCATION_PROBE_MAX_ATTEMPTS: u32 = 12;
+
 /// Which phase boundary a sample was taken at.
 ///
 /// Boundaries rather than a timer: the phases a profile prices are bounded by them, and an external
@@ -781,6 +864,100 @@ fn block_on<F: core::future::Future>(fut: F) -> F::Output {
     }
 }
 impl HostCompute {
+    /// Measure the largest single allocation this driver will actually accept, by allocating.
+    ///
+    /// The capability report's per-allocation ceiling has to be a **measurement**, and every ceiling
+    /// reachable without allocating is a *stated* one: a framework constant, a driver's advertised
+    /// buffer limit. Those describe what an API will let you ask for, not what the device will honour,
+    /// and the two differ — which is why admission refuses a report that carries no measured ceiling
+    /// rather than falling back to the stated one.
+    ///
+    /// **Bounded bisection over real allocations.** Each candidate is allocated through the same
+    /// allocator a run allocates through, then released immediately; the largest accepted size is the
+    /// ceiling. The search is bounded in three ways, all of them deliberate:
+    ///
+    /// - **In bytes**, by `start_bytes`. The probe never asks for more than its caller permits, so it
+    ///   cannot itself be the reason a co-tenant is starved. A search that never sees a refusal reports
+    ///   `refused_bytes: None`, which says the ceiling is *at least* this — a bound the probe declined to
+    ///   exceed, not a limit of the device.
+    /// - **In attempts**, by [`ALLOCATION_PROBE_MAX_ATTEMPTS`]. Bisection converges geometrically, so a
+    ///   fixed attempt budget gives a bounded runtime and a known granularity rather than an open
+    ///   search on the admission path.
+    /// - **In residency**: exactly one candidate is live at a time and it is dropped before the next, so
+    ///   the probe's own peak is one allocation and not the sum of the ladder.
+    ///
+    /// **What counts as accepted.** The allocation must not fault *and*, where the allocator reports
+    /// statistics, in-use bytes must actually have grown by the requested amount. Without the second
+    /// condition a pool that satisfied the request lazily out of an existing page would look like a
+    /// driver accepting a size it never committed — the measurement would then be of the pool's
+    /// bookkeeping rather than of the device.
+    ///
+    /// `None` when this build has no device allocator to ask (the CPU arm allocates through the host
+    /// allocator, which answers a different question) or when even the floor is refused, which is a
+    /// device that cannot serve the smallest allocation worth probing and is reported as an absence
+    /// rather than as a ceiling of zero.
+    #[must_use]
+    pub fn measure_max_allocation(
+        &self,
+        start_bytes: u64,
+        floor_bytes: u64,
+    ) -> Option<daemon_vhc_resource::MeasuredAllocationCeiling> {
+        self.check_thread();
+        if matches!(self.sampler_device, SamplerDevice::None) {
+            return None;
+        }
+        bisect_max_allocation(start_bytes, floor_bytes, &mut |bytes| {
+            self.allocation_is_accepted(bytes)
+        })
+    }
+
+    /// One bounded attempt: allocate, decide, release.
+    #[cfg_attr(
+        not(any(feature = "wgpu", feature = "cuda")),
+        allow(unused_variables, clippy::unused_self)
+    )]
+    fn allocation_is_accepted(&self, bytes: u64) -> bool {
+        let Ok(size) = usize::try_from(bytes) else {
+            return false;
+        };
+        // A device that cannot report occupancy still gets measured — the fault-or-not signal alone is
+        // weaker, and saying so is better than declining to measure.
+        let before = self.sample_allocator().map(|s| s.bytes_in_use);
+        let committed = |after: Option<AllocatorSample>| match (before, after) {
+            (Some(before), Some(after)) => after.bytes_in_use.saturating_sub(before) >= bytes,
+            _ => true,
+        };
+        match &self.sampler_device {
+            SamplerDevice::None => false,
+            #[cfg(feature = "wgpu")]
+            SamplerDevice::Wgpu(device) => {
+                use cubecl_runtime::runtime::Runtime;
+                let client = <burn::backend::wgpu::WgpuRuntime as Runtime>::client(device);
+                // Captured quietly: a refused allocation is the expected outcome of half this search,
+                // and the backends under here report refusal by panicking.
+                crate::device_panic::catch_mut(true, || {
+                    let handle = client.empty(size);
+                    let accepted = committed(self.sample_allocator());
+                    drop(handle);
+                    accepted
+                })
+                .unwrap_or(false)
+            }
+            #[cfg(feature = "cuda")]
+            SamplerDevice::Cuda(device) => {
+                use cubecl_runtime::runtime::Runtime;
+                let client = <burn::backend::cuda::CudaRuntime as Runtime>::client(device);
+                crate::device_panic::catch_mut(true, || {
+                    let handle = client.empty(size);
+                    let accepted = committed(self.sample_allocator());
+                    drop(handle);
+                    accepted
+                })
+                .unwrap_or(false)
+            }
+        }
+    }
+
     /// Read the backend allocator's current occupancy, or `None` when this build and backend cannot
     /// report it.
     ///
@@ -900,5 +1077,146 @@ mod tests {
         assert!(backend_available(crate::runtime::BackendKind::Cpu).is_ok());
         #[cfg(feature = "burn-ndarray")]
         assert!(backend_available(crate::runtime::BackendKind::BurnNdarray).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod allocation_probe_tests {
+    use super::{bisect_max_allocation, ALLOCATION_PROBE_MAX_ATTEMPTS};
+    use daemon_vhc_resource::AllocationProbeMethod;
+
+    const MIB: u64 = 1 << 20;
+
+    /// A device that accepts the permitted maximum ends the search there, and says it saw no refusal.
+    ///
+    /// The distinction is the point: the figure is a floor under the true ceiling, not the ceiling. A
+    /// report that claimed otherwise would be asserting a limit the probe was told not to look for.
+    #[test]
+    fn accepting_the_permitted_maximum_records_no_refusal() {
+        let mut attempts = 0;
+        let ceiling = bisect_max_allocation(2048 * MIB, MIB, &mut |_| {
+            attempts += 1;
+            true
+        })
+        .expect("an accepting device yields a ceiling");
+
+        assert_eq!(ceiling.accepted_bytes, 2048 * MIB);
+        assert_eq!(
+            ceiling.refused_bytes, None,
+            "nothing was refused, so nothing is claimed to have been"
+        );
+        assert_eq!(attempts, 1, "and it does not keep asking");
+    }
+
+    /// A real ceiling is found from below and bracketed: the reported size was accepted, and the
+    /// recorded refusal is above it.
+    #[test]
+    fn a_real_ceiling_is_bracketed_and_never_over_reported() {
+        for true_ceiling in [3 * MIB, 100 * MIB, 777 * MIB, 4096 * MIB] {
+            let mut probed = Vec::new();
+            let ceiling = bisect_max_allocation(8192 * MIB, MIB, &mut |bytes| {
+                probed.push(bytes);
+                bytes <= true_ceiling
+            })
+            .expect("a device with a ceiling above the floor yields one");
+
+            assert!(
+                ceiling.accepted_bytes <= true_ceiling,
+                "never reports a size the device refused: {} > {true_ceiling}",
+                ceiling.accepted_bytes
+            );
+            let refused = ceiling.refused_bytes.expect("the bound was contradicted");
+            assert!(
+                refused > true_ceiling,
+                "the refusal is above the real limit"
+            );
+            assert!(
+                probed.len() <= ALLOCATION_PROBE_MAX_ATTEMPTS as usize,
+                "the attempt budget bounds the search: {} attempts",
+                probed.len()
+            );
+        }
+    }
+
+    /// A device that refuses even the floor yields an absence, never a ceiling of zero.
+    #[test]
+    fn refusing_the_floor_is_an_absence() {
+        let mut attempts = 0;
+        assert!(bisect_max_allocation(1024 * MIB, MIB, &mut |_| {
+            attempts += 1;
+            false
+        })
+        .is_none());
+        assert!(
+            attempts <= ALLOCATION_PROBE_MAX_ATTEMPTS as usize,
+            "and it gives up inside the budget"
+        );
+    }
+
+    /// Within its budget the search converges: the reported size is within one floor step of the real
+    /// ceiling, from below.
+    ///
+    /// Separate from the invariants above because convergence is what the *budget* buys, and a range too
+    /// wide for the budget resolves to a coarser answer rather than a wrong one — the recorded refusal is
+    /// what tells a reader which of the two happened.
+    #[test]
+    fn a_resolvable_range_converges_from_below() {
+        for (start, true_ceiling) in [(64 * MIB, 20 * MIB), (512 * MIB, 300 * MIB)] {
+            let ceiling = bisect_max_allocation(start, MIB, &mut |bytes| bytes <= true_ceiling)
+                .expect("yields a ceiling");
+            assert!(ceiling.accepted_bytes <= true_ceiling);
+            assert!(
+                true_ceiling - ceiling.accepted_bytes <= MIB,
+                "converged to within one floor step: {} vs {true_ceiling}",
+                ceiling.accepted_bytes
+            );
+        }
+    }
+
+    /// A ceiling far below where the search began still establishes the floor rather than nothing.
+    ///
+    /// Halving from a permitted maximum that is thousands of times the real limit can exhaust the attempt
+    /// budget before anything is accepted. Reporting nothing would put a typed absence in the report and
+    /// refuse admission on a device that serves small allocations perfectly well, so the last attempt
+    /// goes to the floor. The recorded refusal above it says the search stopped early.
+    #[test]
+    fn a_ceiling_far_below_the_start_still_establishes_the_floor() {
+        let mut probed = Vec::new();
+        let ceiling = bisect_max_allocation(8192 * MIB, MIB, &mut |bytes| {
+            probed.push(bytes);
+            bytes <= 3 * MIB
+        })
+        .expect("the floor is established rather than nothing");
+
+        assert_eq!(ceiling.accepted_bytes, MIB, "the floor, measured");
+        assert!(ceiling.refused_bytes.is_some_and(|r| r > 3 * MIB));
+        assert!(probed.len() <= ALLOCATION_PROBE_MAX_ATTEMPTS as usize);
+    }
+
+    /// The recorded method carries the bounds the search actually ran under.
+    #[test]
+    fn the_method_records_the_bounds_it_ran_under() {
+        let ceiling = bisect_max_allocation(64 * MIB, 4 * MIB, &mut |bytes| bytes <= 20 * MIB)
+            .expect("yields a ceiling");
+        let AllocationProbeMethod::BoundedBisection {
+            start_bytes,
+            floor_bytes,
+            attempts,
+        } = ceiling.method;
+        assert_eq!(start_bytes, 64 * MIB);
+        assert_eq!(floor_bytes, 4 * MIB);
+        assert!((2..=ALLOCATION_PROBE_MAX_ATTEMPTS).contains(&attempts));
+    }
+
+    /// A start below the floor is not a search: there is nothing in range to attempt.
+    #[test]
+    fn a_start_below_the_floor_attempts_nothing() {
+        let mut attempts = 0;
+        assert!(bisect_max_allocation(MIB / 2, MIB, &mut |_| {
+            attempts += 1;
+            true
+        })
+        .is_none());
+        assert_eq!(attempts, 0, "and no allocation is attempted");
     }
 }

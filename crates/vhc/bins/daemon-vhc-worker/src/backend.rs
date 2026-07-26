@@ -2613,7 +2613,19 @@ pub(crate) fn device_capability_report() -> Option<daemon_vhc_resource::DeviceCa
         } else {
             MemoryPoolTopology::Separate
         },
-        measured_max_allocation_bytes: Maybe::Unavailable(Unavailable::NotExposedByFramework),
+        // Measured by allocating, or a typed absence. Never the stated ceiling: the framework's
+        // per-buffer limit describes what its validation permits, not what the device honours, and a
+        // stated figure in a field whose contract says measured is the substitution this artifact
+        // exists to prevent. An absence here refuses admission, which is the intended consequence.
+        measured_max_allocation: probe_measured_allocation_ceiling(
+            daemon_vhc_resource::derive_device_supply(&device.facts)
+                .value()
+                .map(|supply| supply.usable_bytes),
+        )
+        .map_or(
+            Maybe::Unavailable(Unavailable::ProbeFailed),
+            Maybe::Available,
+        ),
         host_memory_bytes: measured_or_failed(host_ram_mb()),
         disk_bytes: measured_or_failed(host_disk_free_mb()),
         // Not enumerated per device by anything in this build. Left empty rather than filled from the
@@ -2673,30 +2685,67 @@ pub(crate) fn derived_device_supply_bytes() -> Option<u64> {
 ///
 /// `None` is an absence and not a zero: a backend that cannot report occupancy records nothing, and a
 /// profile calibrated against a manufactured zero would be calibrated against nothing.
+///
+/// Measure the per-allocation ceiling on this box's device lane, by allocating.
+///
+/// The bound the search starts from is the smaller of two things, and neither is reported as the answer:
+/// the per-buffer ceiling the framework *states* — a legitimate search bound, since asking above it only
+/// measures the API's own validation — and a share of the derived supply, so a probe on a live machine
+/// never asks for most of the device. What comes back is what the driver accepted, method recorded.
+///
+/// `None` when there is no device lane, when the lane cannot be brought up, or when even the floor is
+/// refused. The report then carries a typed absence and admission refuses, rather than comparing a claim
+/// against a ceiling nobody measured.
+/// The lane a probe-path device measurement is taken on.
+///
+/// The DEVICE lane, explicitly. The default is the CPU lane, whose allocator is the host's and answers a
+/// different question than a device profile's terms ask — so measuring the default would report an
+/// absence on a box that has an accelerator, which is the misreading these readouts exist to prevent.
+fn probe_device_lane() -> daemon_vhc_host::runtime::BackendKind {
+    #[cfg(feature = "cuda")]
+    {
+        daemon_vhc_host::runtime::BackendKind::Cuda
+    }
+    #[cfg(all(feature = "wgpu", not(feature = "cuda")))]
+    {
+        daemon_vhc_host::runtime::BackendKind::Wgpu
+    }
+    // No device lane compiled in: there is nothing to measure, and the CPU lane declining is the honest
+    // answer rather than a defect.
+    #[cfg(not(any(feature = "wgpu", feature = "cuda")))]
+    {
+        daemon_vhc_host::runtime::BackendKind::Cpu
+    }
+}
+
+fn probe_measured_allocation_ceiling(
+    supply_bytes: Option<u64>,
+) -> Option<daemon_vhc_resource::MeasuredAllocationCeiling> {
+    /// The most of the derived supply this probe will ask for in one allocation.
+    const SUPPLY_SHARE_PERCENT: u64 = 25;
+    /// The smallest allocation worth probing: below this the device is not serving a training role.
+    const FLOOR_BYTES: u64 = 1 << 20;
+
+    let backend = probe_device_lane();
+    let stated_ceiling = device_limits().max_alloc_mb << 20;
+    let supply_share = supply_bytes.map(|bytes| bytes / 100 * SUPPLY_SHARE_PERCENT);
+    let start = match (stated_ceiling, supply_share) {
+        (0, share) => share?,
+        (stated, Some(share)) => stated.min(share),
+        (stated, None) => stated,
+    };
+
+    let compute = daemon_vhc_host::compute::HostCompute::build(
+        &daemon_vhc_host::EngineConfig::real_model(backend, None),
+    )
+    .ok()?;
+    compute.measure_max_allocation(start, FLOOR_BYTES)
+}
+
 #[must_use]
 pub(crate) fn probe_allocator_sample() -> Option<daemon_vhc_host::compute::AllocatorSample> {
-    // The DEVICE lane, explicitly. The default is the CPU lane, whose sampler declines by design —
-    // its allocations go through the host allocator, which answers a different question than a device
-    // profile's pooling terms ask — so probing the default would report an absence on a box that has
-    // an accelerator, which is exactly the kind of misreading this readout exists to prevent.
-    let backend = {
-        #[cfg(feature = "cuda")]
-        {
-            daemon_vhc_host::runtime::BackendKind::Cuda
-        }
-        #[cfg(all(feature = "wgpu", not(feature = "cuda")))]
-        {
-            daemon_vhc_host::runtime::BackendKind::Wgpu
-        }
-        // No device lane compiled in: there is nothing to sample, and the CPU lane declining is the
-        // honest answer rather than a defect.
-        #[cfg(not(any(feature = "wgpu", feature = "cuda")))]
-        {
-            daemon_vhc_host::runtime::BackendKind::Cpu
-        }
-    };
     let cfg = daemon_vhc_host::EngineConfig {
-        backend,
+        backend: probe_device_lane(),
         ..daemon_vhc_host::EngineConfig::default()
     };
     // Built on this thread, sampled on this thread: the runner is thread-pinned, so a sample taken

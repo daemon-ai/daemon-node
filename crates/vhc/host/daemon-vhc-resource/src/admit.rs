@@ -256,7 +256,8 @@ mod tests {
     /// a fixture exercising the earlier steps has to carry it.
     fn report_with_measured_ceiling() -> DeviceCapabilityReport {
         let mut report = crate::capability::fixtures::report(BackendClass::Vulkan);
-        report.measured_max_allocation_bytes = Maybe::Available(1 << 30);
+        report.measured_max_allocation =
+            Maybe::Available(crate::capability::fixtures::measured_ceiling(1 << 30));
         report
     }
 
@@ -338,7 +339,8 @@ mod tests {
             Maybe::Available(crate::capability::fixtures::derived_supply(1 << 20));
         // The ceiling stays under the supply, or the report itself is invalid and refuses a step
         // earlier — which would make this test pass for the wrong reason.
-        report.measured_max_allocation_bytes = Maybe::Available(4096);
+        report.measured_max_allocation =
+            Maybe::Available(crate::capability::fixtures::measured_ceiling(4096));
 
         let mut bounds = LaneClaimBounds::default();
         bounds.by_backend_class.insert("vulkan".into(), [0, 4096]);
@@ -364,7 +366,8 @@ mod tests {
         let mut tight = report.clone();
         tight.device_supply = Maybe::Available(crate::capability::fixtures::derived_supply(4096));
         // Kept under the supply so the report is valid and the supply comparison is what refuses.
-        tight.measured_max_allocation_bytes = Maybe::Available(4096);
+        tight.measured_max_allocation =
+            Maybe::Available(crate::capability::fixtures::measured_ceiling(4096));
         let refusal =
             admit_composition(&inputs(&plan, &profile, &tight, &bounds)).expect_err("refuses");
         assert_eq!(refusal.stage(), "device-authorization");
@@ -395,7 +398,7 @@ mod tests {
         let policy = trust_fixtures::policy_for(&store);
         let profile = authenticate(&store, &running, &policy);
         let mut unmeasured = report_with_measured_ceiling();
-        unmeasured.measured_max_allocation_bytes = Maybe::default();
+        unmeasured.measured_max_allocation = Maybe::default();
         let bounds = generous_bounds();
 
         let refusal =

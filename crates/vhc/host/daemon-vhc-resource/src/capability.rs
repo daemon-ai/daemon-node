@@ -306,6 +306,48 @@ pub fn revision_record_digest(
     Ok(blake3_hash(&bytes))
 }
 
+/// How a per-allocation ceiling was measured.
+///
+/// A method is **required** to accompany the number, which is why the report carries this type rather
+/// than a bare `u64`. Every ceiling a platform *states* — a framework constant, a driver's advertised
+/// buffer limit — is reachable from a probe without allocating anything, and promoting one of those into
+/// a field whose contract says "measured" is the substitution that once reported a two-gigabyte device
+/// supply on a card with thirty. Carrying the method makes the promotion unrepresentable: there is no
+/// way to put a figure here without saying how it was obtained.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AllocationProbeMethod {
+    /// Bounded bisection over **real device allocations**.
+    ///
+    /// Each candidate size is actually allocated and immediately released; the largest size the driver
+    /// accepted is the ceiling. Bounded in both directions on purpose: `start_bytes` caps how much of a
+    /// live machine the probe will ask for, and `attempts` caps how long it can take, so the measurement
+    /// is conservative and non-disruptive rather than exhaustive.
+    BoundedBisection {
+        /// The largest size the search was permitted to attempt.
+        start_bytes: u64,
+        /// The smallest size the search would consider.
+        floor_bytes: u64,
+        /// How many allocations were attempted.
+        attempts: u32,
+    },
+}
+
+/// The largest single allocation the driver was **measured** to accept, and how that was established.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeasuredAllocationCeiling {
+    /// The largest single allocation the driver accepted.
+    pub accepted_bytes: u64,
+    /// The smallest allocation it refused, when the search found one.
+    ///
+    /// `None` means the search never saw a refusal — the ceiling is at least the largest size the probe
+    /// was permitted to attempt, and the real limit may be higher. That is a bound the probe declined to
+    /// exceed, not a limit of the device, and a reader should be able to tell the two apart.
+    pub refused_bytes: Option<u64>,
+    /// How it was measured.
+    pub method: AllocationProbeMethod,
+}
+
 /// Whether this device's memory and the host's are one physical pool or two.
 ///
 /// Carried in the report because the report states two memory figures, and on a unified device those
@@ -349,7 +391,7 @@ pub struct DeviceCapabilityReport {
     /// The largest single physical allocation the driver was **measured** to accept. Typed
     /// unavailability when it has not been probed — the reported ceiling is not evidence of what
     /// the driver enforces, and the two are carried separately in the profile for the same reason.
-    pub measured_max_allocation_bytes: Maybe<u64>,
+    pub measured_max_allocation: Maybe<MeasuredAllocationCeiling>,
     /// Usable host memory, bytes.
     pub host_memory_bytes: Maybe<u64>,
     /// Usable free disk, bytes.
@@ -441,9 +483,9 @@ impl DeviceCapabilityReport {
             }
         }
         if self
-            .measured_max_allocation_bytes
+            .measured_max_allocation
             .value()
-            .is_some_and(|v| *v == 0)
+            .is_some_and(|c| c.accepted_bytes == 0)
         {
             return Err(CapabilityError::ZeroInsteadOfUnavailable {
                 quantity: "the measured per-allocation ceiling",
@@ -452,15 +494,28 @@ impl DeviceCapabilityReport {
         // A per-allocation ceiling above the whole budget is not a ceiling; it is the compile-time
         // constant one platform reports in place of one.
         if let (Some(ceiling), Some(supply)) = (
-            self.measured_max_allocation_bytes.value(),
+            self.measured_max_allocation.value(),
             self.device_supply.value(),
         ) {
-            if *ceiling > supply.usable_bytes {
+            if ceiling.accepted_bytes > supply.usable_bytes {
                 return Err(CapabilityError::Invalid(format!(
-                    "the measured per-allocation ceiling ({ceiling} bytes) exceeds the whole \
+                    "the measured per-allocation ceiling ({} bytes) exceeds the whole \
                      usable device supply ({} bytes), so it is not a ceiling this device can honour",
-                    supply.usable_bytes
+                    ceiling.accepted_bytes, supply.usable_bytes
                 )));
+            }
+        }
+        // A refusal the search never saw cannot be below the size that was accepted.
+        if let Some(ceiling) = self.measured_max_allocation.value() {
+            if ceiling
+                .refused_bytes
+                .is_some_and(|refused| refused <= ceiling.accepted_bytes)
+            {
+                return Err(CapabilityError::Invalid(
+                    "the allocation probe records a refusal at or below the size it accepted, which \
+                     cannot both be true of one search"
+                        .into(),
+                ));
             }
         }
         Ok(())
@@ -471,9 +526,9 @@ impl DeviceCapabilityReport {
     /// Measured or nothing. The reported figure is not evidence of what the driver enforces, and
     /// substituting it here would re-create the inventory fallback this artifact exists to avoid.
     pub fn max_allocation_bytes(&self) -> Result<u64, CapabilityError> {
-        self.measured_max_allocation_bytes
+        self.measured_max_allocation
             .value()
-            .copied()
+            .map(|ceiling| ceiling.accepted_bytes)
             .ok_or(CapabilityError::Unmeasured {
                 quantity: "per-allocation ceiling",
                 detail: "a composed claim's maximum individual allocation cannot be validated \
@@ -692,6 +747,19 @@ impl DeviceAdmissionRefusal {
 pub(crate) mod fixtures {
     use super::*;
 
+    /// A measured per-allocation ceiling for a fixture, as a bounded bisection would have found it.
+    pub(crate) fn measured_ceiling(accepted_bytes: u64) -> MeasuredAllocationCeiling {
+        MeasuredAllocationCeiling {
+            accepted_bytes,
+            refused_bytes: Some(accepted_bytes.saturating_mul(2)),
+            method: AllocationProbeMethod::BoundedBisection {
+                start_bytes: accepted_bytes.saturating_mul(2),
+                floor_bytes: 1 << 20,
+                attempts: 4,
+            },
+        }
+    }
+
     /// A derived supply figure for a fixture: the static derivation, with nothing clamped.
     pub(crate) fn derived_supply(usable_bytes: u64) -> DeviceMemorySupply {
         DeviceMemorySupply {
@@ -711,7 +779,7 @@ pub(crate) mod fixtures {
             adapter_name: "Radeon 8060S Graphics (RADV GFX1151)".into(),
             device_supply: Maybe::Available(derived_supply(32_952_745_984)),
             memory_pool: MemoryPoolTopology::Unified,
-            measured_max_allocation_bytes: Maybe::Available(4 << 30),
+            measured_max_allocation: Maybe::Available(measured_ceiling(4 << 30)),
             host_memory_bytes: Maybe::Available(64 << 30),
             disk_bytes: Maybe::Available(247 << 30),
             supported_operation_families: ["gemm".to_string()].into_iter().collect(),
@@ -730,7 +798,7 @@ pub(crate) mod fixtures {
 
 #[cfg(test)]
 mod tests {
-    use super::fixtures::{derived_supply, report};
+    use super::fixtures::{derived_supply, measured_ceiling, report};
     use super::*;
     use crate::revision::Unavailable;
 
@@ -1140,7 +1208,7 @@ mod tests {
             source: DeviceMemorySource::PlatformStatedBudget,
             ..derived_supply(2047 << 20)
         });
-        r.measured_max_allocation_bytes = Maybe::Available(4 << 30);
+        r.measured_max_allocation = Maybe::Available(measured_ceiling(4 << 30));
         assert!(r
             .validate()
             .unwrap_err()
@@ -1177,7 +1245,7 @@ mod tests {
     #[test]
     fn an_unmeasured_ceiling_cannot_validate_a_composed_claim() {
         let mut r = report(BackendClass::Vulkan);
-        r.measured_max_allocation_bytes = Maybe::default();
+        r.measured_max_allocation = Maybe::default();
         r.validate().expect("absence is legitimate in the report");
         assert!(matches!(
             r.max_allocation_bytes().unwrap_err(),

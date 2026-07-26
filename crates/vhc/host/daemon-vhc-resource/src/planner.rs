@@ -1133,7 +1133,8 @@ mod tests {
         let mut small = r.clone();
         small.device_supply =
             crate::revision::Maybe::Available(crate::capability::fixtures::derived_supply(1024));
-        small.measured_max_allocation_bytes = crate::revision::Maybe::Available(1024);
+        small.measured_max_allocation =
+            crate::revision::Maybe::Available(crate::capability::fixtures::measured_ceiling(1024));
         let supply_typed =
             crate::capability::admit_device_bytes(claim.total_peak_bytes, &small, None)
                 .unwrap_err();

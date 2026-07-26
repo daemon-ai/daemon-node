@@ -1191,7 +1191,7 @@ mod tests {
         let (claim, _) = compose(&p, &binding(), &prof, 1).unwrap();
         let reservation = reserve_for("trainer", 1, 1);
         let mut unmeasured = report(BackendClass::Vulkan);
-        unmeasured.measured_max_allocation_bytes = crate::revision::Maybe::default();
+        unmeasured.measured_max_allocation = crate::revision::Maybe::default();
 
         assert!(
             check_pool_admissible(&reservation, &claim, &unmeasured, &prof).is_err(),
