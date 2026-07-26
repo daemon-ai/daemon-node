@@ -61,6 +61,11 @@ cuda = ["daemon-vhc-host/cuda"]
 # The shared guest-workspace builder every wasm-backed test suite in this crate goes through
 # (reproducibility remap env + cross-process build lock live there, once). Test-only.
 daemon-vhc-guest-build = { workspace = true }
+# The trainer's OWN round planner (`interval_for` + `slice_interval`, the pair the tiny-llama
+# guest's `plan_open_fetches` calls): the authoring-parity lane plans an authored round exactly as
+# the guest does instead of re-deriving the arithmetic beside it. host/* -> sdk/*, test-only, under
+# this crate's wholesale harness exemption (xtask vhc-dep-check).
+daemon-vhc-sdk-rounds = { workspace = true }
 # The failover drill (refactor §8/D2): the A1 journal + the D2 record archive / chain recovery
 # the standby coordinator resumes from. host/* -> host/* (allowed), test-only.
 daemon-vhc-observe = { workspace = true }

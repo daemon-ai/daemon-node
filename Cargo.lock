@@ -5171,6 +5171,7 @@ dependencies = [
  "daemon-vhc-observe",
  "daemon-vhc-proto",
  "daemon-vhc-sdk-consensus",
+ "daemon-vhc-sdk-rounds",
  "daemon-vhc-session",
  "thiserror 2.0.18",
  "wasm-encoder 0.251.0",

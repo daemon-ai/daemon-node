@@ -41,6 +41,9 @@ use std::time::{Duration, Instant};
 
 use ciborium::value::Value;
 
+use crate::coordinator_config::{
+    coordinator_role_config, CoordinatorAuthoring, PhaseDeadlines, RoundSchedule,
+};
 use daemon_vhc_host::run::{
     replay, start_run, DeliverVerdict, MemorySink, OpOutcome, OpRequest, PumpHandle, ReplayEnd,
     ReplayScript, RunConfig, RunEnd, RunIdentity, SinkEntry,
@@ -51,9 +54,8 @@ use daemon_vhc_proto::genesis::{StateContract, StateInit};
 use daemon_vhc_proto::{
     blake3_hash, peer_id, to_canonical_vec, CapabilitySet, ControlTransport, GenesisEnvelope, Hash,
     Identities, IrohId, PeerId, RoleEntry, RoleGrants, RunSection, Seed, SigningKey,
-    SnapshotArtifact, StateDigest, TransportSelection, GENESIS_SCHEMA_MAJOR, VHC_PROTO_VERSION,
+    SnapshotArtifact, StateDigest, TransportSelection, GENESIS_SCHEMA_MAJOR,
 };
-use daemon_vhc_sdk_consensus::coordinator::{CoordinatorState, RunConfig as CoordinatorRunConfig};
 use daemon_vhc_sdk_consensus::messages::{
     BatchWindow, Commitment, Digest, Heartbeat, Join, RecordEntry, StorageReceipt, ThroughputClass,
 };
@@ -198,6 +200,9 @@ fn param_numels() -> Vec<usize> {
 /// The profile compression chunk the t2 parity shape uses (§3.2: divides every parameter numel;
 /// the `sparse_loco` profile below pins `chunk = 64`).
 const TRAINER_PROFILE_CHUNK: u64 = 64;
+/// Sequences per inner step — the trainer config's `micro_batch`, and the same value the
+/// coordinator's round window is authored around.
+const MICRO_BATCH: u32 = 1;
 /// The pinned seed-init seed. Shared across the roster, so every worker expands byte-identical
 /// init through the versioned distribution and agrees on the det-lane digest by construction.
 const TRAINER_INIT_SEED: [u8; 32] = [0x5e; 32];
@@ -508,43 +513,25 @@ pub fn genesis_envelope(
     steps_per_round: u32,
     global_batch: u32,
 ) -> GenesisEnvelope {
-    // The coordinator's opaque config: an authored RunConfig + genesis CoordinatorState, exactly
-    // the guest's `da_init` shape (`{state: …}`; event-driven synthetic clock defaults).
-    let run_config = CoordinatorRunConfig {
-        run_id: run_label.to_string(),
-        proto_version: VHC_PROTO_VERSION,
-        // The envelope anchor a worker Join asserts under v2 is the genesis hash; the harness
-        // passes `envelope_hash: None` on joins (the v1-era anchor is superseded — the genesis
-        // hash IS the run identity, carried in the execution identity / §12.1 scope).
-        envelope_hash: Hash([0u8; 32]),
-        required_capabilities: CapabilitySet::new(),
+    // The coordinator's opaque `da_init` config, through the shared authoring seat (the one place
+    // a genesis's round schedule and clock are decided — `crate::coordinator_config`): the barrier
+    // harness runs the event-driven clock, so its deadlines stay effectively infinite and every
+    // phase exits through its fast path.
+    let coord_config = coordinator_role_config(&CoordinatorAuthoring {
+        run_label,
         min_peers: workers,
         max_peers: workers.max(4),
-        warmup_s: 1_000_000,
-        round_train_max_s: 1_000_000,
-        round_witness_s: 1_000_000,
-        cooldown_s: 1_000_000,
         epoch_rounds: 0,
         stall_rounds_max: 2,
-        global_batch: daemon_vhc_proto::envelope::GlobalBatch {
-            start: global_batch,
-            end: global_batch,
-            ramp_rounds: 1,
-        },
-        stop: daemon_vhc_proto::envelope::StopCondition::Rounds(1_000_000),
-        steps_per_round,
-        seq_len: u64::from(SEQ_LEN),
-        witness_target: 0,
-        overlap_bps: 0,
         k_absences: 8,
-        verification_percent: 0,
-        authorized: Vec::new(),
-    };
-    let state = CoordinatorState::new(run_config, Seed([0x33; 32]), 0);
-    let coord_config = Value::Map(vec![(
-        Value::Text("state".into()),
-        Value::serialized(&state).expect("state to cbor value"),
-    )]);
+        seq_len: u64::from(SEQ_LEN),
+        schedule: RoundSchedule::explicit(global_batch, steps_per_round, MICRO_BATCH, workers),
+        deadlines: PhaseDeadlines::event_clock(),
+        tick_period_ms: 0,
+        stop: daemon_vhc_proto::envelope::StopCondition::Rounds(1_000_000),
+        verify_availability: false,
+    })
+    .expect("the barrier harness authors a round its workers can slice");
 
     let mut artifacts = BTreeMap::new();
     artifacts.insert(
@@ -908,7 +895,7 @@ pub fn genesis_whole_run(
     let mut workers: Vec<LiveWorker> = Vec::with_capacity(spec.workers);
     for (i, key) in worker_keys.iter().enumerate() {
         let peer = roster[i];
-        let config = trainer_config(&peer, &roster, spec.steps_per_round, 1, 2);
+        let config = trainer_config(&peer, &roster, spec.steps_per_round, MICRO_BATCH, 2);
         let engine = Worker::new(EngineConfig::default()).map_err(|e| format!("engine: {e}"))?;
         let sel = select_driver(&engine, worker_wasm, Some(&worker_hash))
             .map_err(|e| format!("worker {i} selection: {e}"))?;

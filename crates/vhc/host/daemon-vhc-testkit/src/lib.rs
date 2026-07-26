@@ -28,6 +28,7 @@
 
 pub mod ceremony;
 pub mod coordinator;
+pub mod coordinator_config;
 pub mod genesis_run;
 pub mod live_genesis;
 pub mod run;
@@ -35,6 +36,9 @@ pub mod run;
 pub use coordinator::{
     configure_coordinator, coordinator_state_from_capture, refuse_unconfigurable_envelope,
     CoordError, Coordinator, CoordinatorSpec,
+};
+pub use coordinator_config::{
+    coordinator_role_config, CoordinatorAuthoring, PhaseDeadlines, RoundSchedule,
 };
 pub use genesis_run::{
     genesis_envelope, genesis_whole_run, FaultAction, FaultPlan, FaultRule, FrameKind,

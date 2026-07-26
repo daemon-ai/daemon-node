@@ -22,17 +22,18 @@ use std::path::Path;
 
 use ciborium::value::Value;
 
+use crate::coordinator_config::{
+    coordinator_role_config, CoordinatorAuthoring, PhaseDeadlines, RoundSchedule,
+};
 use daemon_vhc_net::PublishedArtifact;
-use daemon_vhc_proto::envelope::{Access, GlobalBatch, StopCondition};
+use daemon_vhc_proto::envelope::{Access, StopCondition};
 use daemon_vhc_proto::genesis::{
     ChannelDecl, GenesisEnvelope, Identities, RoleEntry, RoleGrants, RunSection, SnapshotArtifact,
     TransportSelection, GENESIS_SCHEMA_MAJOR,
 };
 use daemon_vhc_proto::{
-    blake3_hash, to_canonical_vec, CapabilitySet, CorpusManifest, Hash, PeerId, Seed,
-    SignedEnvelope, SigningKey, VHC_PROTO_VERSION,
+    blake3_hash, to_canonical_vec, CorpusManifest, Hash, PeerId, SignedEnvelope, SigningKey,
 };
-use daemon_vhc_sdk_consensus::coordinator::{CoordinatorState, RunConfig as CoordinatorRunConfig};
 use daemon_vhc_sdk_consensus::{AuthorityConfig, SingleKey, Topology, DEFAULT_RECORDS_CHANNEL};
 
 /// The structural acceptance trainer geometry: 64-dim, two REAL transformer blocks, 4 heads.
@@ -42,9 +43,18 @@ const N_HEADS: u32 = 4;
 const HEAD_DIM: u32 = 16;
 const FFN_MULT: u32 = 2;
 
+/// Sequences per inner step — the trainer config's `micro_batch`, and the value the coordinator's
+/// round window is authored around (one config, so the two cannot disagree).
+const MICRO_BATCH: u32 = 1;
+/// Fetch-recovery budget before a stalled peer leaves for the epoch.
+const STALL_ROUNDS_MAX: u32 = 4;
+
 /// The replicated-assignment placeholder identity: every trainer instance shares this one-member
 /// roster, so each trains the round's whole global window (module docs above).
 const REPLICATED_PEER: [u8; 32] = [0x11; 32];
+
+/// The length of that roster: the round window is split one way.
+const REPLICATED_ROSTER_PEERS: u32 = 1;
 
 /// One authored acceptance genesis: the signed wire bytes plus the identities the suite pins.
 pub struct LiveGenesis {
@@ -280,52 +290,41 @@ pub fn live_genesis(spec: &LiveGenesisSpec<'_>) -> LiveGenesis {
         },
     );
 
-    // The coordinator's opaque config: the authored RunConfig + genesis CoordinatorState (the
-    // guest's `da_init` shape; event-driven synthetic clock).
-    let run_config = CoordinatorRunConfig {
-        run_id: spec.run_label.to_string(),
-        proto_version: VHC_PROTO_VERSION,
-        envelope_hash: Hash([0u8; 32]),
-        required_capabilities: CapabilitySet::new(),
+    // The coordinator's opaque `da_init` config, through the shared authoring seat (the one place
+    // a genesis's round schedule and clock are decided — `crate::coordinator_config`). A churn
+    // tier arms the coordinator's real timer so deadlines actually pass; the event-driven default
+    // (0) never arms one, and the seat refuses wall-clock deadlines authored beside it.
+    //
+    // `verify_availability`: the live deployment shape — commitments are availability-verified
+    // against the run's content-addressed plane (coordinator-as-storage-client, §6.4 I6). The
+    // deterministic harness rings leave this off (the guest default).
+    let coord_config = coordinator_role_config(&CoordinatorAuthoring {
+        run_label: spec.run_label,
         min_peers: spec.min_peers,
         max_peers: spec.max_peers,
-        warmup_s: spec.timing.warmup_s,
-        round_train_max_s: spec.timing.round_train_max_s,
-        round_witness_s: spec.timing.round_witness_s,
-        cooldown_s: spec.timing.cooldown_s,
         epoch_rounds: u64::from(spec.epoch_rounds),
-        stall_rounds_max: 4,
-        global_batch: GlobalBatch {
-            start: spec.global_batch,
-            end: spec.global_batch,
-            ramp_rounds: 1,
-        },
-        stop: StopCondition::Rounds(1_000_000),
-        steps_per_round: spec.steps_per_round,
-        seq_len: u64::from(manifest.seq_len),
-        witness_target: 0,
-        overlap_bps: 0,
+        stall_rounds_max: STALL_ROUNDS_MAX,
         k_absences: spec.k_absences,
-        verification_percent: 0,
-        authorized: Vec::new(),
-    };
-    let state = CoordinatorState::new(run_config, Seed([0x33; 32]), 0);
-    let coord_config = Value::Map(vec![
-        (
-            Value::Text("state".into()),
-            Value::serialized(&state).expect("state to cbor value"),
+        seq_len: u64::from(manifest.seq_len),
+        // Assignment is REPLICATED (module docs): the trainer config's roster has one member, so
+        // the whole round window is every trainer's own interval and the split is one-way.
+        schedule: RoundSchedule::explicit(
+            spec.global_batch,
+            spec.steps_per_round,
+            MICRO_BATCH,
+            REPLICATED_ROSTER_PEERS,
         ),
-        // A churn tier arms the coordinator's real timer so deadlines actually pass; the
-        // event-driven default (0) never arms one.
-        (
-            Value::Text("tick_period_ms".into()),
-            Value::Integer(spec.timing.tick_period_ms.into()),
-        ),
-        // The live deployment shape: commitments are availability-verified against the run's
-        // content-addressed plane (coordinator-as-storage-client, §6.4 I6). The deterministic
-        // harness rings leave this off (the guest default).
-        (Value::Text("verify_availability".into()), Value::Bool(true)),
-    ]);
+        deadlines: PhaseDeadlines {
+            warmup_s: spec.timing.warmup_s,
+            round_train_max_s: spec.timing.round_train_max_s,
+            round_witness_s: spec.timing.round_witness_s,
+            cooldown_s: spec.timing.cooldown_s,
+        },
+        tick_period_ms: spec.timing.tick_period_ms,
+        stop: StopCondition::Rounds(1_000_000),
+        verify_availability: true,
+    })
+    .expect("the acceptance genesis authors a round its trainers can slice");
 
     // Grants: the control channel both modules declare; the trainer additionally holds the
     // corpus artifact grants (the manifest + every shard fold) its data@2 fetches admit under.
@@ -366,7 +365,12 @@ pub fn live_genesis(spec: &LiveGenesisSpec<'_>) -> LiveGenesis {
             lane: "trainer".into(),
             module: "worker.wasm".into(),
             abi: "vhc@2".into(),
-            config: trainer_live_config(spec.run_label, &manifest, manifest_hash),
+            config: trainer_live_config(
+                spec.run_label,
+                &manifest,
+                manifest_hash,
+                spec.steps_per_round,
+            ),
             grants: control_channel(granted),
             device_min: daemon_vhc_proto::DeviceMinimums::default(),
         },
@@ -458,7 +462,12 @@ fn uint(v: u64) -> Value {
 /// the structural model geometry sized to the corpus manifest's sequence length + tokenizer
 /// vocabulary headroom, the replicated single-member roster, the SparseLoco profile, the
 /// deterministic matched init, and the `live` section naming the run + the manifest pin.
-fn trainer_live_config(run_label: &str, manifest: &CorpusManifest, manifest_hash: Hash) -> Value {
+fn trainer_live_config(
+    run_label: &str,
+    manifest: &CorpusManifest,
+    manifest_hash: Hash,
+    steps_per_round: u32,
+) -> Value {
     // The model vocabulary: a fixed power-of-two ceiling over the fixture tokenizer's ids (the
     // in-guest `token % vocab` clamp is then the identity for well-formed fixtures).
     let vocab = 64u32;
@@ -501,9 +510,11 @@ fn trainer_live_config(run_label: &str, manifest: &CorpusManifest, manifest_hash
             text("roster"),
             Value::Array(vec![Value::Bytes(REPLICATED_PEER.to_vec())]),
         ),
-        (text("steps_per_round"), uint(2)),
-        (text("micro_batch"), uint(1)),
-        (text("stall_rounds_max"), uint(4)),
+        // The inner loop the coordinator's round window was authored around: one config, so the
+        // window a round opens is always a whole number of this trainer's steps.
+        (text("steps_per_round"), uint(u64::from(steps_per_round))),
+        (text("micro_batch"), uint(u64::from(MICRO_BATCH))),
+        (text("stall_rounds_max"), uint(u64::from(STALL_ROUNDS_MAX))),
         (text("profile"), profile),
         (
             text("state"),
