@@ -2036,6 +2036,23 @@ fn vhc_dep_check() -> anyhow::Result<()> {
                     "{from} -> {to} [{kind}]: sdk/* must not link host/*"
                 ));
             }
+            // The Backend Execution Profile must stay unreachable from a guest (architecture §9.6
+            // [RC-4], §9.7 [PC-11]). The two hard rules above already imply it, but this one is
+            // named and separate on purpose: the consequence of getting it wrong is silent and
+            // expensive — a profile type reachable from a guest-linked crate makes every profile
+            // revision change every guest hash, so a driver update re-pins and re-certifies a
+            // training algorithm that did not change. That is the coupling the three-object model
+            // exists to remove, and a crate-layout slip is all it takes to reintroduce it. A
+            // failure here should say so rather than read as a generic layering complaint.
+            if to == "daemon-vhc-resource"
+                && (from_role == Some("contracts") || from_role == Some("sdk"))
+            {
+                violations.push(format!(
+                    "{from} -> {to} [{kind}]: the resource crate carries the Backend Execution \
+                     Profile and MUST NOT be reachable from a guest — a profile revision would \
+                     then change every guest hash, so a driver update would re-pin the fleet"
+                ));
+            }
             // The A2 dependency inversion (refactor §5 A2 item 3; architecture §7 SESS → HOSTC):
             // the session links the host — the host must NEVER re-grow a runtime edge onto the
             // session (run policy). A dev-only edge (fixture/parity tests) is permitted.
@@ -2176,6 +2193,10 @@ fn vhc_dep_check() -> anyhow::Result<()> {
     println!(
         "  rule: daemon-vhc-proto is algorithm-free and round-vocabulary-free (schemas live in \
          sdk-consensus)"
+    );
+    println!(
+        "  rule: daemon-vhc-resource (the Backend Execution Profile) is unreachable from a guest \
+         — a profile revision must never move a guest hash"
     );
     println!(
         "  rule: no production host crate resolves a schema crate ({}) in its default normal \

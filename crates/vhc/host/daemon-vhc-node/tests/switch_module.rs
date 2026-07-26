@@ -225,6 +225,10 @@ fn build_scenario(worker: &Worker, frames: u64) -> (Scenario, TransitionChain) {
         roles.insert(
             name.to_string(),
             RoleEntry {
+                // No execution-requirement structure yet: the real one is obtained from the module's own
+                // assessment export per the authoring flow, which is why nothing is hand-authored here.
+                // `validate` refuses a runnable envelope carrying none, so this fails closed and loudly.
+                execution: None,
                 lane: lane.into(),
                 module: module.into(),
                 abi: "vhc@2".into(),

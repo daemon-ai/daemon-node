@@ -478,6 +478,12 @@ daemon-vhc-observe = { version = "0", path = "crates/vhc/host/daemon-vhc-observe
 # production role-session/worker durable sink can link the on-disk store without observe's
 # oracle tooling (observe decodes SDK round schemas — forbidden in production host graphs).
 daemon-vhc-journal = { version = "0", path = "crates/vhc/host/daemon-vhc-journal" }
+# The host side of the three-object resource model: the Backend Execution Profile + its trust
+# envelope, the backend implementation revision record, the capability report, the composition
+# planner and the resource governor. Host-only BY CONSTRUCTION — if the profile type were reachable
+# from a guest-linked crate, every profile revision would change every guest hash and a driver
+# update would re-pin the fleet. `xtask vhc-dep-check` enforces the direction.
+daemon-vhc-resource = { version = "0", path = "crates/vhc/host/daemon-vhc-resource" }
 # The node-side vhc-training service (resident `VhcService` + worker supervisor), bound at boot
 # when `[vhc] enabled = true` (B3, spec §10.4). Promoted to the workspace table at Merge 3 (matches
 # the daemon-vhc-safetensors precedent from Merge 2) so `bins/daemon` consumes it via

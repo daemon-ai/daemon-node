@@ -85,6 +85,10 @@ fn genesis_wire(run_label: &str) -> Vec<u8> {
     roles.insert(
         "coordinator".to_string(),
         RoleEntry {
+            // No execution-requirement structure yet: the real one is obtained from the module's own
+            // assessment export per the authoring flow, which is why nothing is hand-authored here.
+            // `validate` refuses a runnable envelope carrying none, so this fails closed and loudly.
+            execution: None,
             lane: "coordinator".into(),
             module: "coordinator.wasm".into(),
             abi: "vhc@2".into(),
@@ -96,6 +100,10 @@ fn genesis_wire(run_label: &str) -> Vec<u8> {
     roles.insert(
         "publisher".to_string(),
         RoleEntry {
+            // No execution-requirement structure yet: the real one is obtained from the module's own
+            // assessment export per the authoring flow, which is why nothing is hand-authored here.
+            // `validate` refuses a runnable envelope carrying none, so this fails closed and loudly.
+            execution: None,
             lane: "trainer".into(),
             module: "publisher.wasm".into(),
             abi: "vhc@2".into(),

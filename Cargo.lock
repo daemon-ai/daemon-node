@@ -5030,6 +5030,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "daemon-vhc-resource"
+version = "0.0.1"
+dependencies = [
+ "blake3",
+ "ciborium",
+ "daemon-vhc-proto",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "daemon-vhc-safetensors"
 version = "0.0.1"
 dependencies = [
