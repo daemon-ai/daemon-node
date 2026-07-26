@@ -130,9 +130,45 @@ pub struct RunHeader {
     /// Admitted grants bytes.
     #[serde(with = "serde_bytes")]
     pub grants: Vec<u8>,
-    /// Admitted claim bytes.
-    #[serde(with = "serde_bytes")]
-    pub claim: Vec<u8>,
+    /// Admitted claim bytes — the **legacy** variant's physical figure, as the module declared it.
+    ///
+    /// Absent on a certification-minor run, where the module declares no physical figure at all and
+    /// the members below carry the composed answer instead. The grammar forbids carrying both: a
+    /// record holding a declared claim beside a composed one would leave a reader to guess which
+    /// figure the run was actually admitted on.
+    #[serde(with = "serde_bytes", skip_serializing_if = "Option::is_none", default)]
+    pub claim: Option<Vec<u8>>,
+    /// Tag-0 certification member: the module's Logical Resource Plan, verbatim.
+    ///
+    /// The plan is recorded rather than only its digest because a replay has to be able to re-derive
+    /// the composition, and a digest names bytes a verifier may not hold.
+    #[serde(with = "serde_bytes", skip_serializing_if = "Option::is_none", default)]
+    pub resource_plan: Option<Vec<u8>>,
+    /// blake3 of [`Self::resource_plan`], so a reader can check the bytes it was given.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub resource_plan_hash: Option<Hash>,
+    /// Tag-0 certification member: the composed Physical Claim for this role instance.
+    #[serde(with = "serde_bytes", skip_serializing_if = "Option::is_none", default)]
+    pub physical_claim: Option<Vec<u8>>,
+    /// blake3 of [`Self::physical_claim`].
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub physical_claim_hash: Option<Hash>,
+    /// Tag-0 certification member: the node/device aggregate the instance was admitted within.
+    ///
+    /// Distinct from the per-instance claim on purpose: a role colocated with another shares device
+    /// resources, and the aggregate is what the node actually reserved. A record carrying only the
+    /// per-instance figure cannot explain why two colocated roles fit.
+    #[serde(with = "serde_bytes", skip_serializing_if = "Option::is_none", default)]
+    pub aggregate_claim: Option<Vec<u8>>,
+    /// blake3 of [`Self::aggregate_claim`].
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub aggregate_claim_hash: Option<Hash>,
+    /// Tag-0 certification member: the Execution Grant this instance ran under.
+    #[serde(with = "serde_bytes", skip_serializing_if = "Option::is_none", default)]
+    pub execution_grant: Option<Vec<u8>>,
+    /// blake3 of [`Self::execution_grant`].
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub execution_grant_hash: Option<Hash>,
     /// Admitted channels bytes.
     #[serde(with = "serde_bytes")]
     pub channels: Vec<u8>,
@@ -349,8 +385,10 @@ pub struct SealRec {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Body {
-    /// tag 0.
-    RunHeader(RunHeader),
+    /// tag 0. Boxed: the certification variant carries the plan, the composed claim, the aggregate
+    /// and the grant, which makes this much the largest body — unboxed, every record of every other
+    /// tag would be sized for it.
+    RunHeader(Box<RunHeader>),
     /// tag 1.
     Event(EventRec),
     /// tag 2.
@@ -537,5 +575,219 @@ fn int_u64(v: &Value) -> Result<u64, JournalError> {
             u64::try_from(n).map_err(|_| JournalError::Codec("integer out of u64 range".into()))
         }
         _ => Err(JournalError::Codec("expected an integer".into())),
+    }
+}
+
+impl RunHeader {
+    /// Whether this header records a certification-minor run.
+    ///
+    /// Determined from the members present rather than from the ABI number, because the members are
+    /// what a reader has: a verifier holding these bytes must be able to tell which variant it is
+    /// looking at without first agreeing with the writer about what a minor implies.
+    #[must_use]
+    pub fn is_certification_variant(&self) -> bool {
+        self.resource_plan.is_some() || self.physical_claim.is_some()
+    }
+
+    /// Check the tag-0 variant grammar: exactly one of the two shapes, never both and never neither.
+    ///
+    /// The exclusivity is the point. A record carrying a module-declared claim beside a host-composed
+    /// one leaves a reader to guess which figure the run was admitted on, and the two disagreeing is
+    /// precisely the case where guessing matters. A record carrying neither claims an admission with
+    /// no resource basis at all.
+    ///
+    /// # Errors
+    /// A description of which rule the header breaks.
+    pub fn check_variant(&self) -> Result<(), String> {
+        if self.is_certification_variant() {
+            if self.claim.is_some() {
+                return Err(
+                    "a certification-variant run header carries a module-declared claim as well as \
+                     a composed one; a reader cannot tell which figure the run was admitted on"
+                        .into(),
+                );
+            }
+            for (name, present) in [
+                ("resource_plan", self.resource_plan.is_some()),
+                ("resource_plan_hash", self.resource_plan_hash.is_some()),
+                ("physical_claim", self.physical_claim.is_some()),
+                ("physical_claim_hash", self.physical_claim_hash.is_some()),
+            ] {
+                if !present {
+                    return Err(format!(
+                        "a certification-variant run header is missing `{name}`; a partial \
+                         composition record cannot be re-derived by a verifier"
+                    ));
+                }
+            }
+            // Each digest must name the bytes beside it, or the record is self-inconsistent and the
+            // bytes a verifier re-derives from would not be the ones the writer meant.
+            for (name, bytes, digest) in [
+                (
+                    "resource_plan",
+                    self.resource_plan.as_ref(),
+                    self.resource_plan_hash,
+                ),
+                (
+                    "physical_claim",
+                    self.physical_claim.as_ref(),
+                    self.physical_claim_hash,
+                ),
+                (
+                    "aggregate_claim",
+                    self.aggregate_claim.as_ref(),
+                    self.aggregate_claim_hash,
+                ),
+                (
+                    "execution_grant",
+                    self.execution_grant.as_ref(),
+                    self.execution_grant_hash,
+                ),
+            ] {
+                if let (Some(bytes), Some(digest)) = (bytes, digest) {
+                    if daemon_vhc_proto::hash::blake3_hash(bytes) != digest {
+                        return Err(format!(
+                            "`{name}_hash` does not name the `{name}` bytes beside it"
+                        ));
+                    }
+                } else if bytes.is_some() != digest.is_some() {
+                    return Err(format!(
+                        "`{name}` and `{name}_hash` must be present or absent together"
+                    ));
+                }
+            }
+            Ok(())
+        } else if self.claim.is_some() {
+            Ok(())
+        } else {
+            Err(
+                "a run header carries neither a declared claim nor a composed one, so it records \
+                 an admission with no resource basis"
+                    .into(),
+            )
+        }
+    }
+}
+
+#[cfg(test)]
+mod run_header_variant_tests {
+    use super::*;
+
+    fn legacy() -> RunHeader {
+        RunHeader {
+            run_id: Hash([1; 32]),
+            epoch: 0,
+            role: "trainer".into(),
+            instance: 0,
+            module: Hash([2; 32]),
+            abi: u64::from(daemon_vhc_abi::DA_ABI_MAJOR_V2) << 16,
+            worlds: std::collections::BTreeMap::new(),
+            bridge: false,
+            manifest: Vec::new(),
+            config: Vec::new(),
+            grants: Vec::new(),
+            claim: Some(vec![0xA1]),
+            channels: Vec::new(),
+            device: Vec::new(),
+            resource_plan: None,
+            resource_plan_hash: None,
+            physical_claim: None,
+            physical_claim_hash: None,
+            aggregate_claim: None,
+            aggregate_claim_hash: None,
+            execution_grant: None,
+            execution_grant_hash: None,
+            format: 1,
+        }
+    }
+
+    fn certification() -> RunHeader {
+        let plan = vec![0xB1, 0xB2];
+        let claim = vec![0xC1];
+        let mut h = legacy();
+        h.claim = None;
+        h.resource_plan_hash = Some(daemon_vhc_proto::hash::blake3_hash(&plan));
+        h.resource_plan = Some(plan);
+        h.physical_claim_hash = Some(daemon_vhc_proto::hash::blake3_hash(&claim));
+        h.physical_claim = Some(claim);
+        h
+    }
+
+    /// Both variants are well-formed on their own.
+    #[test]
+    fn each_variant_is_well_formed_by_itself() {
+        legacy().check_variant().expect("the legacy variant");
+        certification()
+            .check_variant()
+            .expect("the certification variant");
+        assert!(!legacy().is_certification_variant());
+        assert!(certification().is_certification_variant());
+    }
+
+    /// A record carrying both a declared claim and a composed one is refused.
+    ///
+    /// This is the rule worth having: the two figures disagreeing is exactly when it matters which
+    /// one the run was admitted on, and a record holding both leaves that to a reader's guess.
+    #[test]
+    fn a_header_carrying_both_a_declared_and_a_composed_claim_is_refused() {
+        let mut both = certification();
+        both.claim = Some(vec![0xA1]);
+        let err = both
+            .check_variant()
+            .expect_err("both shapes must be refused");
+        assert!(
+            err.contains("which figure the run was admitted on"),
+            "{err}"
+        );
+    }
+
+    /// A record carrying neither records an admission with no resource basis.
+    #[test]
+    fn a_header_carrying_no_claim_at_all_is_refused() {
+        let mut neither = legacy();
+        neither.claim = None;
+        assert!(neither.check_variant().is_err());
+    }
+
+    /// A partial composition record cannot be re-derived, so it is refused rather than half-read.
+    #[test]
+    fn a_partial_certification_record_is_refused() {
+        let mut partial = certification();
+        partial.physical_claim = None;
+        partial.physical_claim_hash = None;
+        let err = partial.check_variant().expect_err("a partial record");
+        assert!(err.contains("physical_claim"), "{err}");
+    }
+
+    /// A digest that does not name the bytes beside it is refused: a verifier re-deriving from those
+    /// bytes would not be working from what the writer meant.
+    #[test]
+    fn a_digest_that_does_not_name_its_bytes_is_refused() {
+        let mut wrong = certification();
+        wrong.resource_plan_hash = Some(Hash([0xEE; 32]));
+        let err = wrong.check_variant().expect_err("a mismatched digest");
+        assert!(err.contains("resource_plan_hash"), "{err}");
+    }
+
+    /// The legacy variant's encoding is unchanged by the new members: they are skipped when absent,
+    /// so journals written before this change still decode and still re-encode identically.
+    #[test]
+    fn the_legacy_variants_encoding_is_unchanged_by_the_new_members() {
+        let encoded = daemon_vhc_proto::canonical::to_canonical_vec(&legacy()).expect("encodes");
+        let text = format!("{encoded:?}");
+        for absent in [
+            "resource_plan",
+            "physical_claim",
+            "aggregate_claim",
+            "execution_grant",
+        ] {
+            assert!(
+                !String::from_utf8_lossy(&encoded).contains(absent),
+                "`{absent}` must not appear in a legacy record's bytes ({text:.0})"
+            );
+        }
+        let round: RunHeader =
+            ciborium::from_reader(encoded.as_slice()).expect("a legacy record round-trips");
+        assert_eq!(round, legacy());
     }
 }

@@ -58,7 +58,7 @@ impl JournalSink for JournalAdapter {
         device: &[u8],
     ) -> Result<(), SinkError> {
         self.journal
-            .append(Body::RunHeader(RunHeader {
+            .append(Body::RunHeader(Box::new(RunHeader {
                 run_id: self.id.run_id,
                 epoch: self.id.epoch,
                 role: self.id.role.clone(),
@@ -70,11 +70,19 @@ impl JournalSink for JournalAdapter {
                 manifest: manifest.to_vec(),
                 config: config.to_vec(),
                 grants: grants.to_vec(),
-                claim: claim.to_vec(),
+                claim: Some(claim.to_vec()),
                 channels: channels.to_vec(),
                 device: device.to_vec(),
+                resource_plan: None,
+                resource_plan_hash: None,
+                physical_claim: None,
+                physical_claim_hash: None,
+                aggregate_claim: None,
+                aggregate_claim_hash: None,
+                execution_grant: None,
+                execution_grant_hash: None,
                 format: u64::from(daemon_vhc_observe::journal::format_version()),
-            }))
+            })))
             .map(|_| ())
             .map_err(|e| SinkError(e.to_string()))
     }

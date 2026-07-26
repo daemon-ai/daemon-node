@@ -48,9 +48,10 @@ pub use composition_record::{
     COMPOSITION_RECORD_MEMBERS, GOVERNOR_VERSION,
 };
 pub use governor::{
-    compare_views, derive_reservation, evaluate_occupancy, pool_sizing_for, GovernorError,
-    OccupancyVerdict, PoolSizing, Reservation, ReservationBounds, ReservationComponents,
-    ReservationIdentity, ReservationStore, ScopeComponent, RESERVATION_ARITHMETIC_VERSION,
+    check_pool_admissible, compare_views, derive_reservation, evaluate_occupancy, GovernorError,
+    OccupancyVerdict, PoolAdmission, PoolSizing, Reservation, ReservationBounds,
+    ReservationComponents, ReservationIdentity, ReservationStore, ScopeComponent,
+    RESERVATION_ARITHMETIC_VERSION,
 };
 pub use planner::{
     aggregate, compose, select, validate_against, AggregateClaim, DivergenceAuthority,

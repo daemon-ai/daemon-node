@@ -539,34 +539,88 @@ pub fn evaluate_occupancy(reservation: &Reservation, observed_bytes: u64) -> Occ
     }
 }
 
-/// Allocator pool sizing, derived from the composed claim rather than defaulted.
+/// The pool sizing a composed claim implies — **computed, not applied**.
 ///
 /// The default is not neutral. One backend's runtime overrides the pool page size with a fraction of
 /// the **device-local heap** — on a machine whose heap is far larger than the run's budget that
 /// yields a single pool page several times the declared device budget, and the same code reports the
-/// smaller budget. Another sizes from a compile-time constant unrelated to the card. Taking the
-/// default therefore ships a pool that can exceed the reservation on the first allocation, which is
-/// exactly what a composed claim exists to prevent.
+/// smaller budget. Another sizes from a compile-time constant unrelated to the card.
+///
+/// These figures are nevertheless *not* configured into the runtime, and that is a ruling rather than
+/// an omission. The page size cannot be applied per claim: the bring-up registers one compute client
+/// per device per process, the probe **is** the bring-up, and the claim that would size the pool does
+/// not exist until after the probe has already registered under the framework's defaults. So the
+/// program certifies under the framework default for now and the record says so.
+///
+/// They are computed anyway, for two reasons. They are what a configured build *would* apply, so
+/// applying them later is a decision rather than a derivation. And [`Self::reservation_breach`] turns
+/// the empirical question the ruling rides on — does the framework default actually reserve within the
+/// reservation bound at ceremony geometry? — into a comparison rather than an eyeball.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PoolSizing {
-    /// The pool page size. Bounded by the claim's own largest single allocation and by what the
-    /// device was measured to accept — never derived from the heap.
+    /// The pool page size a configured build would set. Bounded by the claim's own largest single
+    /// allocation and by what the device was measured to accept — never derived from the heap.
     pub page_bytes: u64,
-    /// The pool's total ceiling: the reservation's device-memory bound.
+    /// The pool ceiling a configured build would set: the reservation's device-memory bound.
     pub max_pool_bytes: u64,
 }
 
-/// Derive pool sizing from a composed claim and a capability report.
+/// What the admission check found. Admission is the verdict; the sizing rides along unapplied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PoolAdmission {
+    /// The claim's largest single allocation, rounded up to the profile's alignment — the figure the
+    /// device must actually accept in one piece.
+    pub largest_single_allocation_bytes: u64,
+    /// What this device was **measured** to accept in one allocation. Measured, not reported: a
+    /// reported ceiling is a vendor's claim about a family, and admitting against it would admit a
+    /// claim this card was never shown to satisfy.
+    pub measured_device_ceiling_bytes: u64,
+    /// The reservation's device-memory bound — what the run is entitled to occupy on this device.
+    pub reservation_device_memory_bytes: u64,
+    /// The sizing a configured build would apply. See [`PoolSizing`] on why it is not applied.
+    pub would_be: PoolSizing,
+}
+
+impl PoolAdmission {
+    /// By how much an observed reservation exceeds what the run is entitled to, or `None` when it
+    /// does not.
+    ///
+    /// The mechanical form of the condition the framework-default ruling rides on. `bytes_reserved`
+    /// from an allocator sample is what the pool actually took from the device, and the reservation
+    /// bound is what the run may occupy; the framework default is only acceptable while the first
+    /// stays inside the second. If this returns `Some` at ceremony geometry, configuring the pool
+    /// stops being optional.
+    ///
+    /// Deliberately takes the observed figure as an argument rather than reading a sampler: the
+    /// governor does not measure, and a comparison that fetched its own input could compare a
+    /// different run's reading against this claim's bound.
+    #[must_use]
+    pub fn reservation_breach(&self, observed_bytes_reserved: u64) -> Option<u64> {
+        observed_bytes_reserved
+            .checked_sub(self.reservation_device_memory_bytes)
+            .filter(|excess| *excess > 0)
+    }
+}
+
+/// Admit or refuse a composed claim against what this device was measured to accept.
+///
+/// The **check** half of the pool question, which is the half that prevents a bad admission. A claim
+/// whose largest single allocation exceeds the device's measured limit cannot be satisfied by any pool
+/// configuration, so refusing it here is not a substitute for configuring the pool — it is the part
+/// configuration would never have fixed.
+///
+/// The sizing a configured build would apply is returned alongside, unapplied. See [`PoolSizing`].
 ///
 /// # Errors
 /// [`GovernorError`] if the claim's largest single allocation exceeds what the device was measured
-/// to accept, or if the report has no measured ceiling to bound the page against.
-pub fn pool_sizing_for(
+/// to accept, or if the report carries no measured ceiling to check against — an unmeasured device
+/// is not a device that passed, and admitting against an absent measurement would admit everything.
+pub fn check_pool_admissible(
     reservation: &Reservation,
     claim: &PhysicalClaim,
     report: &DeviceCapabilityReport,
     profile: &BackendExecutionProfile,
-) -> Result<PoolSizing, GovernorError> {
+) -> Result<PoolAdmission, GovernorError> {
     let measured_ceiling = report
         .max_allocation_bytes()
         .map_err(|e| GovernorError::Invalid(e.to_string()))?;
@@ -583,14 +637,19 @@ pub fn pool_sizing_for(
         )));
     }
 
-    // A pool page larger than the whole reservation is the defect: it cannot be satisfied inside the
-    // budget the reservation holds, whatever the heap happens to be.
+    // A pool page larger than the whole reservation is the defect a configured build would avoid: it
+    // cannot be satisfied inside the budget the reservation holds, whatever the heap happens to be.
     let max_pool_bytes = reservation.bounds.device_memory_bytes;
     let page_bytes = requested.min(max_pool_bytes).max(alignment);
 
-    Ok(PoolSizing {
-        page_bytes,
-        max_pool_bytes,
+    Ok(PoolAdmission {
+        largest_single_allocation_bytes: requested,
+        measured_device_ceiling_bytes: measured_ceiling,
+        reservation_device_memory_bytes: max_pool_bytes,
+        would_be: PoolSizing {
+            page_bytes,
+            max_pool_bytes,
+        },
     })
 }
 
@@ -934,8 +993,10 @@ mod tests {
         let prof = profile(BackendClass::Vulkan);
         let (claim, _) = compose(&p, &binding(), &prof, 1).unwrap();
         let reservation = reserve_for("trainer", 1, 1);
-        let sizing =
-            pool_sizing_for(&reservation, &claim, &report(BackendClass::Vulkan), &prof).unwrap();
+        let admission =
+            check_pool_admissible(&reservation, &claim, &report(BackendClass::Vulkan), &prof)
+                .unwrap();
+        let sizing = admission.would_be;
 
         assert_eq!(
             sizing.max_pool_bytes,
@@ -958,6 +1019,69 @@ mod tests {
         assert!(sizing.page_bytes <= 4 * 1024 * 1024 * 1024);
     }
 
+    /// The framework-default ruling rides on an empirical condition, and this is the comparison that
+    /// decides it.
+    ///
+    /// The program certifies under the framework's own pool configuration because a per-claim page
+    /// size is unreachable: one compute client per device per process, and the probe is the bring-up,
+    /// so the claim that would size the pool does not exist until after registration. That is only
+    /// acceptable while the default's actual reservation stays inside what the run is entitled to
+    /// occupy — which the allocator readout can now measure, since `bytes_reserved` is exactly what
+    /// the pool took from the device.
+    ///
+    /// So the check reports the bound, and a breach is a subtraction rather than a judgement call. If
+    /// this fires at ceremony geometry, configuring the pool stops being optional.
+    #[test]
+    fn an_observed_reservation_above_the_bound_is_reported_as_a_breach() {
+        let p = plan();
+        let prof = profile(BackendClass::Vulkan);
+        let (claim, _) = compose(&p, &binding(), &prof, 1).unwrap();
+        let reservation = reserve_for("trainer", 1, 1);
+        let admission =
+            check_pool_admissible(&reservation, &claim, &report(BackendClass::Vulkan), &prof)
+                .unwrap();
+
+        let bound = admission.reservation_device_memory_bytes;
+        assert_eq!(bound, reservation.bounds.device_memory_bytes);
+
+        // Reserving within the entitlement is not a breach, and neither is reserving exactly it.
+        assert_eq!(admission.reservation_breach(bound / 2), None);
+        assert_eq!(admission.reservation_breach(bound), None);
+
+        // Above it, the excess is reported rather than merely flagged: how far over decides whether
+        // this is a rounding artefact or the heap-derived page the default is known to produce.
+        assert_eq!(admission.reservation_breach(bound + 4096), Some(4096));
+
+        // The observed default on this box: a page sized from the device-local heap is
+        // 21,687,348,224 B against a 4 GiB budget — 5.05x what the same code reports as the budget.
+        // Were the framework to reserve that, the breach would be unmistakable rather than marginal.
+        let heap_derived_page = 21_687_348_224u64;
+        assert_eq!(
+            admission.reservation_breach(heap_derived_page),
+            Some(heap_derived_page - bound),
+            "the case that would force a configured pool is reported with its full excess"
+        );
+    }
+
+    /// The check admits against a **measured** ceiling, and an unmeasured device does not pass.
+    ///
+    /// A reported ceiling is a vendor's claim about a family; admitting a claim against it would admit
+    /// something this card was never shown to satisfy. An absent measurement therefore refuses, rather
+    /// than being treated as unlimited — a bound compared against nothing admits everything.
+    #[test]
+    fn a_device_with_no_measured_ceiling_cannot_admit_a_claim() {
+        let p = plan();
+        let prof = profile(BackendClass::Vulkan);
+        let (claim, _) = compose(&p, &binding(), &prof, 1).unwrap();
+        let reservation = reserve_for("trainer", 1, 1);
+        let mut unmeasured = report(BackendClass::Vulkan);
+        unmeasured.measured_max_allocation_bytes = crate::revision::Maybe::default();
+
+        assert!(
+            check_pool_admissible(&reservation, &claim, &unmeasured, &prof).is_err(),
+            "an unmeasured device is not a device that passed"
+        );
+    }
     /// A claim needing a single allocation above what the device was measured to accept is refused
     /// rather than sized around.
     #[test]
@@ -967,7 +1091,7 @@ mod tests {
         let (mut claim, _) = compose(&p, &binding(), &prof, 1).unwrap();
         claim.max_individual_allocation_bytes = 8 << 30;
         let reservation = reserve_for("trainer", 1, 1);
-        let err = pool_sizing_for(&reservation, &claim, &report(BackendClass::Vulkan), &prof)
+        let err = check_pool_admissible(&reservation, &claim, &report(BackendClass::Vulkan), &prof)
             .unwrap_err();
         assert!(err.to_string().contains("was measured to accept"));
     }

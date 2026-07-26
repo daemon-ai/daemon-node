@@ -50,7 +50,7 @@ fn all_bodies() -> Vec<Body> {
     worlds.insert("vhc".to_string(), 0u64);
     worlds.insert("net".to_string(), 0u64);
     vec![
-        Body::RunHeader(RunHeader {
+        Body::RunHeader(Box::new(RunHeader {
             run_id: h(1),
             epoch: 4,
             role: "trainer".into(),
@@ -62,11 +62,19 @@ fn all_bodies() -> Vec<Body> {
             manifest: b"manifest".to_vec(),
             config: b"config".to_vec(),
             grants: b"grants".to_vec(),
-            claim: b"claim".to_vec(),
+            claim: Some(b"claim".to_vec()),
             channels: b"channels".to_vec(),
             device: b"device".to_vec(),
+            resource_plan: None,
+            resource_plan_hash: None,
+            physical_claim: None,
+            physical_claim_hash: None,
+            aggregate_claim: None,
+            aggregate_claim_hash: None,
+            execution_grant: None,
+            execution_grant_hash: None,
             format: 1,
-        }),
+        })),
         Body::Event(EventRec {
             at: 12,
             frame: b"delivered-frame".to_vec(),
