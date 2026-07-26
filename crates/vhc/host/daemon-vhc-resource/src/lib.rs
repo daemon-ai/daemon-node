@@ -65,8 +65,9 @@ pub use profile::{
 pub use revision::{
     Adapter, AdapterDeviceType, AdapterIdentity, AllocatorImplementation, ApiSelectionSource,
     BackendClass, BackendImplementation, BackendImplementationRevision, ComputeFramework,
-    DriverApi, DriverRevision, Maybe, OperatingSystem, OsFamily, PlatformApi, ProducedBy,
-    RevisionRefusal, RevisionSignal, SealedBinaryIdentity, Unavailable,
+    ComputeStackIdentity, DriverApi, DriverRevision, Maybe, OperatingSystem, OsFamily, PlatformApi,
+    ProbeObservation, ProducedBy, RevisionRefusal, RevisionSignal, SealedBinaryIdentity,
+    Unavailable,
 };
 pub use trust::{
     authenticate, AuthenticationRefusal, PolicySide, ProfileAcceptancePolicy, ProfileAuthority,

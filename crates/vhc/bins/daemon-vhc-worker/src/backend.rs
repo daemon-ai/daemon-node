@@ -1987,6 +1987,133 @@ fn assess_module(
         },
     }
 }
+/// The **backend implementation revision record** this binary makes about itself
+/// (architecture §9.7 `[PC-10]`(1); `[RC-4]`'s revision binding).
+///
+/// It is assembled from values the probe path has already computed and, until now, discarded to a
+/// `Debug` print. That print contained real information no code path could act on: nothing parsed
+/// it, nothing carried it into the admitted tuple, and nothing could compare it to the revision
+/// range a Backend Execution Profile names — so the revision binding was unenforceable and
+/// "implementation identity is reported correctly" was untestable, because there was no report.
+///
+/// `produced_by` is [`ProducedBy::WorkerProbePath`] because this **is** the running binary's own
+/// statement about itself, which is the only provenance admissible as admission evidence.
+///
+/// Fields this build cannot yet observe arrive as typed unavailability with an accurate reason
+/// rather than as a value: the adapter UUID and the several driver numberings live on the
+/// framework's adapter info, which the probe does not currently retain. Closing those is a probe
+/// change, and until it lands `revision_signal()` falls back to the OS build — which is the
+/// documented behaviour for a backend whose framework supplies no driver revision at all, and is
+/// honest here rather than convenient.
+#[must_use]
+pub(crate) fn revision_record(
+    capability: &BackendCapability,
+) -> daemon_vhc_resource::BackendImplementationRevision {
+    use daemon_vhc_resource::{
+        AdapterDeviceType, AdapterIdentity, ApiSelectionSource, BackendClass, ComputeFramework,
+        ComputeStackIdentity, DriverRevision, Maybe, OperatingSystem, OsFamily, PlatformApi,
+        ProbeObservation, Unavailable,
+    };
+
+    let (class, api) = match capability.class.as_str() {
+        "vulkan" => (BackendClass::Vulkan, PlatformApi::Vulkan),
+        "metal" => (BackendClass::Metal, PlatformApi::Metal),
+        "dx12" => (BackendClass::Dx12, PlatformApi::D3d12),
+        "cuda" => (BackendClass::Cuda, PlatformApi::Cuda),
+        _ => (BackendClass::Cpu, PlatformApi::None),
+    };
+    let family = if cfg!(target_os = "linux") {
+        OsFamily::Linux
+    } else if cfg!(target_os = "macos") {
+        OsFamily::Macos
+    } else {
+        OsFamily::Windows
+    };
+
+    let observation = ProbeObservation {
+        backend_class: class,
+        adapter_name: capability.adapter.clone(),
+        device_type: if class == BackendClass::Cpu {
+            AdapterDeviceType::Cpu
+        } else if capability.unified {
+            AdapterDeviceType::IntegratedGpu
+        } else {
+            AdapterDeviceType::DiscreteGpu
+        },
+        // The probe does not currently compute this on the framework path, and silence is not a
+        // "no" — the assembly treats an unstated flag conservatively so a device lane refuses
+        // rather than quietly running on a rasterizer.
+        is_software_rasterizer: if class == BackendClass::Cpu {
+            Some(true)
+        } else {
+            None
+        },
+        identity: AdapterIdentity {
+            vendor_id: Maybe::Unavailable(Unavailable::NotExposedByFramework),
+            device_id: Maybe::Unavailable(Unavailable::NotExposedByFramework),
+            pci_bus_id: Maybe::Unavailable(Unavailable::NotExposedByFramework),
+            uuid: Maybe::Unavailable(Unavailable::NotExposedByFramework),
+        },
+        api,
+        api_version: Maybe::Unavailable(Unavailable::NotExposedByFramework),
+        driver: DriverRevision::default(),
+        kernel_driver: Maybe::Unavailable(Unavailable::NotExposedByPlatform),
+        os: OperatingSystem {
+            family,
+            version: std::env::consts::OS.to_string(),
+            build: Maybe::Unavailable(Unavailable::NotExposedByPlatform),
+            kernel: Maybe::Unavailable(Unavailable::NotExposedByPlatform),
+        },
+        // Nothing in this build calls the runtime's memory-usage reporter, so a profile whose terms
+        // were calibrated FROM allocator statistics must not be accepted against it. Reported
+        // truthfully so that refusal actually fires.
+        allocator_statistics_available: false,
+        graphics_api_selected: Maybe::Available(capability.class.clone()),
+        graphics_api_selection_source: ApiSelectionSource::PlatformDefault,
+    };
+
+    let stack = ComputeStackIdentity {
+        framework: ComputeFramework {
+            name: "burn".to_string(),
+            revision: BURN_REVISION.to_string(),
+            runtime_name: "cubecl-runtime".to_string(),
+            runtime_revision: CUBECL_REVISION.to_string(),
+        },
+        implementation_name: format!("cubecl-{}", capability.backend),
+        implementation_revision: CUBECL_REVISION.to_string(),
+        allocator_name: "cubecl-runtime/memory_management".to_string(),
+        allocator_revision: CUBECL_REVISION.to_string(),
+        allocation_mode: Maybe::Unavailable(Unavailable::NotExposedByFramework),
+    };
+
+    daemon_vhc_resource::BackendImplementationRevision::from_probe(
+        observation,
+        stack,
+        sealed_binary_identity(),
+    )
+}
+
+/// The compute-framework revision this binary links. A compile-time property of the binary, not of
+/// the machine, and the one a profile's compatibility check keys on.
+const BURN_REVISION: &str = "0.21.0";
+/// The runtime revision beneath it. Its allocator's pooling and retention behaviour is what a
+/// profile's pooling terms are calibrated against, and against nothing else.
+const CUBECL_REVISION: &str = "0.10.0";
+
+/// This binary's own identity, for the sealed-binary side of a profile's binding.
+///
+/// Read from the running executable. A record that could not identify its own binary would let a
+/// profile bound to one binary be composed with by another, which is the comparison `[PC-12]`(3)
+/// exists to make possible.
+fn sealed_binary_identity() -> daemon_vhc_resource::SealedBinaryIdentity {
+    let (blake3, size_bytes) = std::env::current_exe()
+        .ok()
+        .and_then(|path| std::fs::read(path).ok())
+        .map_or(([0u8; 32], 0), |bytes| {
+            (*blake3::hash(&bytes).as_bytes(), bytes.len() as u64)
+        });
+    daemon_vhc_resource::SealedBinaryIdentity { blake3, size_bytes }
+}
 
 #[cfg(test)]
 mod tests {

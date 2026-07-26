@@ -359,6 +359,65 @@ pub enum ProducedBy {
     ExternalExtraction,
 }
 
+/// What a probe was able to observe about the running backend, in primitives.
+///
+/// The resource crate deliberately does not depend on the worker protocol, so the caller passes what
+/// its probe found rather than a protocol type. Every field a platform may not supply is already a
+/// [`Maybe`] here: the assembly step never invents a value, and never turns an absence into a zero.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProbeObservation {
+    /// The backend class the probe resolved.
+    pub backend_class: BackendClass,
+    /// The adapter's reported name.
+    pub adapter_name: String,
+    /// Its reported device class.
+    pub device_type: AdapterDeviceType,
+    /// Whether the platform flags this adapter as a software rasterizer. `None` means the platform
+    /// did not say — which is **not** the same as "no", and is recorded as unavailable rather than
+    /// assumed false.
+    pub is_software_rasterizer: Option<bool>,
+    /// Stable hardware identity, as far as the probe got.
+    pub identity: AdapterIdentity,
+    /// The platform API in use.
+    pub api: PlatformApi,
+    /// Its version.
+    pub api_version: Maybe<String>,
+    /// The driver's revision numberings, as far as the probe got.
+    pub driver: DriverRevision,
+    /// The kernel driver.
+    pub kernel_driver: Maybe<String>,
+    /// The operating system. Required, because on a backend whose framework supplies no driver
+    /// revision it is the only implementation-revision signal there is.
+    pub os: OperatingSystem,
+    /// Whether this build can report allocator statistics.
+    pub allocator_statistics_available: bool,
+    /// The graphics API the implementation resolved to, and whether an operator chose it.
+    pub graphics_api_selected: Maybe<String>,
+    /// See [`ProbeObservation::graphics_api_selected`].
+    pub graphics_api_selection_source: ApiSelectionSource,
+}
+
+/// The compile-time identities of the compute stack this binary links.
+///
+/// These are properties of the binary, not of the machine, so they come from the build rather than
+/// from a probe — and they are passed in rather than read here so the resource crate links no compute
+/// framework of its own.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ComputeStackIdentity {
+    /// The guest-facing compute framework.
+    pub framework: ComputeFramework,
+    /// The host-side implementation of that framework for this device class.
+    pub implementation_name: String,
+    /// Its revision.
+    pub implementation_revision: String,
+    /// The allocator beneath it.
+    pub allocator_name: String,
+    /// Its revision.
+    pub allocator_revision: String,
+    /// The allocation mode in force, where the allocator exposes one.
+    pub allocation_mode: Maybe<String>,
+}
+
 /// The machine-readable statement a host makes about which backend implementation it is running.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackendImplementationRevision {
@@ -381,6 +440,62 @@ pub struct BackendImplementationRevision {
 }
 
 impl BackendImplementationRevision {
+    /// Assemble the record **on the worker's own probe path** — the only provenance that is
+    /// admission evidence.
+    ///
+    /// This is a structure where a `Debug` print used to be. The revision was reported in prose: an
+    /// adapter line in the log, carrying real information that no code path could act on. Nothing
+    /// parsed it, nothing carried it into the admitted tuple, and nothing could compare it to the
+    /// range a profile names — so the revision binding was unenforceable and "identity is reported
+    /// correctly" was untestable, because there was no report, only a print.
+    ///
+    /// Nothing is invented here. A field the probe could not supply arrives as a typed
+    /// [`Maybe::Unavailable`] carrying its reason, and stays that way.
+    #[must_use]
+    pub fn from_probe(
+        observation: ProbeObservation,
+        stack: ComputeStackIdentity,
+        sealed_binary: SealedBinaryIdentity,
+    ) -> Self {
+        Self {
+            backend_class: observation.backend_class,
+            adapter: Adapter {
+                name: observation.adapter_name,
+                device_type: observation.device_type,
+                // A platform that did not say is NOT a platform that said no. Treating silence as
+                // "not a software rasterizer" is how a CPU rasterizer ends up serving a device lane
+                // while reporting a device backend class, so silence is conservatively `true` here
+                // and the admission check refuses it — a refusal an operator can see and correct,
+                // rather than a fallback nobody notices.
+                is_software_rasterizer: observation.is_software_rasterizer.unwrap_or(true),
+                identity: observation.identity,
+            },
+            compute_framework: stack.framework,
+            backend_implementation: BackendImplementation {
+                name: stack.implementation_name,
+                revision: stack.implementation_revision,
+                graphics_api_selected: observation.graphics_api_selected,
+                graphics_api_selection_source: observation.graphics_api_selection_source,
+            },
+            allocator: AllocatorImplementation {
+                name: stack.allocator_name,
+                revision: stack.allocator_revision,
+                allocation_mode: stack.allocation_mode,
+                statistics_available: observation.allocator_statistics_available,
+            },
+            driver_api: DriverApi {
+                api: observation.api,
+                api_version: observation.api_version,
+                driver: observation.driver,
+                kernel_driver: observation.kernel_driver,
+                os: observation.os,
+            },
+            sealed_binary,
+            // The running binary's own statement about itself.
+            produced_by: ProducedBy::WorkerProbePath,
+        }
+    }
+
     /// Whether this record may be used as admission evidence.
     ///
     /// Two independent refusals live here, and both are refusals rather than warnings. A record the
@@ -429,7 +544,7 @@ pub enum RevisionRefusal {
 pub(crate) mod fixtures {
     use super::*;
 
-    fn os(family: OsFamily, build: Maybe<String>) -> OperatingSystem {
+    pub(crate) fn os(family: OsFamily, build: Maybe<String>) -> OperatingSystem {
         OperatingSystem {
             family,
             version: "1.0".into(),
@@ -558,6 +673,95 @@ mod tests {
         let mut cpu = revision(BackendClass::Cpu);
         cpu.adapter.is_software_rasterizer = true;
         cpu.admissible().expect("a cpu lane may use a cpu adapter");
+    }
+
+    fn observation(class: BackendClass) -> ProbeObservation {
+        ProbeObservation {
+            backend_class: class,
+            adapter_name: "Radeon 8060S Graphics (RADV GFX1151)".into(),
+            device_type: AdapterDeviceType::IntegratedGpu,
+            is_software_rasterizer: Some(false),
+            identity: AdapterIdentity {
+                vendor_id: Maybe::Available(4098),
+                device_id: Maybe::Available(5510),
+                pci_bus_id: Maybe::Available("0000:c4:00.0".into()),
+                uuid: Maybe::Unavailable(Unavailable::NotExposedByFramework),
+            },
+            api: PlatformApi::Vulkan,
+            api_version: Maybe::Available("1.3".into()),
+            driver: DriverRevision {
+                name: Maybe::Available("radv".into()),
+                version_text: Maybe::Available("Mesa 25.2.6".into()),
+                ..Default::default()
+            },
+            kernel_driver: Maybe::Available("amdgpu".into()),
+            os: super::fixtures::os(OsFamily::Linux, Maybe::Available("6.19.7".into())),
+            allocator_statistics_available: false,
+            graphics_api_selected: Maybe::Available("vulkan".into()),
+            graphics_api_selection_source: ApiSelectionSource::PlatformDefault,
+        }
+    }
+
+    fn stack() -> ComputeStackIdentity {
+        ComputeStackIdentity {
+            framework: ComputeFramework {
+                name: "burn".into(),
+                revision: "0.21.0".into(),
+                runtime_name: "cubecl-runtime".into(),
+                runtime_revision: "0.10.0".into(),
+            },
+            implementation_name: "cubecl-wgpu".into(),
+            implementation_revision: "0.10.0".into(),
+            allocator_name: "cubecl-runtime/memory_management".into(),
+            allocator_revision: "0.10.0".into(),
+            allocation_mode: Maybe::Available("Auto".into()),
+        }
+    }
+
+    /// The record is assembled from what the probe observed, marked as the running binary's own
+    /// statement, and admissible.
+    #[test]
+    fn a_probe_assembled_record_is_self_produced_and_admissible() {
+        let record = BackendImplementationRevision::from_probe(
+            observation(BackendClass::Vulkan),
+            stack(),
+            SealedBinaryIdentity {
+                blake3: [3u8; 32],
+                size_bytes: 41_295_576,
+            },
+        );
+        assert_eq!(record.produced_by, ProducedBy::WorkerProbePath);
+        record.admissible().expect("admissible");
+        assert_eq!(
+            record.driver_api.revision_signal(),
+            RevisionSignal::DriverVersion("Mesa 25.2.6".into()),
+            "the driver revision a profile range constrains is carried, not printed"
+        );
+        // A field the probe could not supply stays typed-unavailable rather than becoming a value.
+        assert!(!record.adapter.identity.uuid.is_available());
+        assert!(!record.allocator.statistics_available);
+    }
+
+    /// A platform that did not say whether the adapter is a software rasterizer has not said "no".
+    /// Silence is conservatively treated as one, so the device-lane refusal fires and an operator
+    /// sees it — rather than a CPU rasterizer quietly serving a device lane.
+    #[test]
+    fn an_unstated_software_rasterizer_flag_is_conservative_not_assumed_false() {
+        let mut silent = observation(BackendClass::Vulkan);
+        silent.is_software_rasterizer = None;
+        let record = BackendImplementationRevision::from_probe(
+            silent,
+            stack(),
+            SealedBinaryIdentity {
+                blake3: [3u8; 32],
+                size_bytes: 1,
+            },
+        );
+        assert!(record.adapter.is_software_rasterizer);
+        assert!(matches!(
+            record.admissible(),
+            Err(RevisionRefusal::SoftwareRasterizerOnDeviceLane { .. })
+        ));
     }
 
     #[test]

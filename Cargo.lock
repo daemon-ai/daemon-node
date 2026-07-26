@@ -5206,6 +5206,7 @@ dependencies = [
  "daemon-vhc-net",
  "daemon-vhc-node",
  "daemon-vhc-proto",
+ "daemon-vhc-resource",
  "daemon-vhc-sdk-consensus",
  "daemon-vhc-session",
  "daemon-vhc-supervisor",
