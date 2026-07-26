@@ -140,20 +140,7 @@ pub fn start_run_migrating(
     // tag 0 first — the run header precedes everything (§8.3). The header's `bridge` field is
     // keep-reserved (always `false`: no bridge exists; the field stays so the record grammar is
     // unchanged and pre-existing journals stay parseable).
-    // Which resources the header records is selected by the negotiated minor, not by which fields
-    // happen to be populated. Reading it off the data would make an empty declared claim on a
-    // certification-minor run look like a legacy record, and a legacy run that never populated the
-    // composed fields look like a broken certification one.
-    let resources = if daemon_vhc_abi::run_header_is_certification_variant(abi_minor) {
-        crate::run::RunHeaderResources::Composed {
-            resource_plan: &run.resource_plan_bytes,
-            physical_claim: &run.physical_claim_bytes,
-            aggregate_claim: &run.aggregate_claim_bytes,
-            execution_grant: &run.execution_grant,
-        }
-    } else {
-        crate::run::RunHeaderResources::Declared(&run.claim_bytes)
-    };
+    let resources = run_header_resources(&run)?;
     sink.run_header(
         abi_packed,
         &worlds,
@@ -693,6 +680,48 @@ pub(super) fn take_trap(store: &mut Store<Host>, e: wasmtime::Error) -> Trap {
         };
     }
     trap
+}
+
+/// Which resources the run header records — selected by the **negotiated minor**, and fail-closed.
+///
+/// The minor decides, not which fields happen to be populated. Reading it off the data would make an
+/// empty declared claim on a certification-minor run look like a legacy record, and a legacy run that
+/// never populated the composed fields look like a broken certification one.
+///
+/// Which leaves the case the minor alone cannot handle: a run that declares the certification minor and
+/// carries no composition. Writing the composed branch there would produce a header whose members claim
+/// a composition happened over empty bytes — a record asserting a fact about a run that has none. In
+/// production admission refuses such a run before it starts, so this is the second gate on the same
+/// rule, and it exists because the first one can be bypassed by any caller assembling a `RunConfig`
+/// directly.
+///
+/// # Errors
+/// [`RunError::CompositionMissing`] naming the first absent member.
+pub(crate) fn run_header_resources(
+    run: &RunConfig,
+) -> Result<crate::run::RunHeaderResources<'_>, RunError> {
+    if !daemon_vhc_abi::run_header_is_certification_variant(run.abi_minor) {
+        return Ok(crate::run::RunHeaderResources::Declared(&run.claim_bytes));
+    }
+    for (member, bytes) in [
+        ("resource_plan", &run.resource_plan_bytes),
+        ("physical_claim", &run.physical_claim_bytes),
+        ("aggregate_claim", &run.aggregate_claim_bytes),
+        ("execution_grant", &run.execution_grant),
+    ] {
+        if bytes.is_empty() {
+            return Err(RunError::CompositionMissing {
+                minor: run.abi_minor,
+                member,
+            });
+        }
+    }
+    Ok(crate::run::RunHeaderResources::Composed {
+        resource_plan: &run.resource_plan_bytes,
+        physical_claim: &run.physical_claim_bytes,
+        aggregate_claim: &run.aggregate_claim_bytes,
+        execution_grant: &run.execution_grant,
+    })
 }
 
 fn classify_trap(store: &mut Store<Host>, e: wasmtime::Error) -> Trap {

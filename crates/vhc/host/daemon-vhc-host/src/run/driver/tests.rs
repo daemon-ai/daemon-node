@@ -1094,3 +1094,94 @@ fn an_unsampled_run_reports_an_absence_and_not_a_zero() {
         "a measured zero is a value; the empty series above is not that value"
     );
 }
+
+/// The run header's resource branch follows the negotiated minor, and a certification-minor run with
+/// no composition **does not start**.
+///
+/// The empty-members case is the one the minor alone cannot decide. Writing the composed branch would
+/// record members asserting a composition that never happened; writing the legacy branch would record a
+/// declared claim the module never declared. Admission refuses such a run first, so reaching this gate
+/// means a caller assembled the configuration directly — which is precisely what the first gate cannot
+/// see, and why there is a second one.
+#[test]
+fn a_certification_minor_run_without_a_composition_refuses_instead_of_recording_empty_members() {
+    use crate::run::driver::config::RunError;
+    use crate::run::driver::lifecycle::run_header_resources;
+    use crate::run::RunHeaderResources;
+
+    let identity = crate::run::RunIdentity {
+        run_id: [7u8; 32],
+        epoch: 1,
+        role: "trainer".into(),
+        instance: 1,
+        module: [9u8; 32],
+    };
+    let base = || {
+        crate::run::RunConfig::new(
+            identity.clone(),
+            [0x33; 32],
+            b"cfg".to_vec(),
+            b"gr".to_vec(),
+        )
+    };
+
+    // A legacy run records what the module declared, whatever the composed fields hold.
+    let mut legacy = base();
+    legacy.abi_minor = daemon_vhc_abi::LEGACY_CONTEXT_MAX_MINOR;
+    legacy.claim_bytes = b"declared".to_vec();
+    assert!(matches!(
+        run_header_resources(&legacy).expect("a legacy run records its declared claim"),
+        RunHeaderResources::Declared(b"declared")
+    ));
+
+    // The certification minor with every member present records the composed branch.
+    let mut composed = base();
+    composed.abi_minor = daemon_vhc_abi::CERTIFICATION_MINOR_V2;
+    composed.resource_plan_bytes = b"plan".to_vec();
+    composed.physical_claim_bytes = b"claim".to_vec();
+    composed.aggregate_claim_bytes = b"aggregate".to_vec();
+    composed.execution_grant = b"grant".to_vec();
+    assert!(matches!(
+        run_header_resources(&composed).expect("a composed run records its composition"),
+        RunHeaderResources::Composed { .. }
+    ));
+
+    // Each member is individually load-bearing: absent, the run refuses and the refusal names it.
+    for (member, blank) in [
+        ("resource_plan", 0usize),
+        ("physical_claim", 1),
+        ("aggregate_claim", 2),
+        ("execution_grant", 3),
+    ] {
+        let mut missing = base();
+        missing.abi_minor = daemon_vhc_abi::CERTIFICATION_MINOR_V2;
+        let mut members = [
+            b"plan".to_vec(),
+            b"claim".to_vec(),
+            b"aggregate".to_vec(),
+            b"grant".to_vec(),
+        ];
+        members[blank] = Vec::new();
+        let [plan, claim, aggregate, grant] = members;
+        missing.resource_plan_bytes = plan;
+        missing.physical_claim_bytes = claim;
+        missing.aggregate_claim_bytes = aggregate;
+        missing.execution_grant = grant;
+
+        let refusal = run_header_resources(&missing).expect_err("an absent member refuses the run");
+        assert!(
+            matches!(refusal, RunError::CompositionMissing { member: m, .. } if m == member),
+            "the refusal names the absent member, got {refusal}"
+        );
+    }
+
+    // And a run that declares the certification minor while carrying only a declared claim is refused
+    // too — the legacy fallback is not available at that minor.
+    let mut declared_at_certification = base();
+    declared_at_certification.abi_minor = daemon_vhc_abi::CERTIFICATION_MINOR_V2;
+    declared_at_certification.claim_bytes = b"declared".to_vec();
+    assert!(matches!(
+        run_header_resources(&declared_at_certification).expect_err("no silent legacy fallback"),
+        RunError::CompositionMissing { .. }
+    ));
+}

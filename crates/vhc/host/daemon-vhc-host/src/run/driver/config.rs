@@ -253,6 +253,27 @@ pub enum RunError {
     /// Engine/linker/instantiation plumbing failed.
     #[error("v2 sandbox error: {0}")]
     Sandbox(String),
+    /// The run declares the certification minor but carries no composed claim to record.
+    ///
+    /// A host-side refusal before any guest code runs, and deliberately not a silent fallback to the
+    /// legacy header: writing the composed branch with empty members would produce a record asserting
+    /// that a composition happened for a run that has none, and writing the legacy branch would record
+    /// a declared claim the module never declared. Both are worse than not starting.
+    ///
+    /// Admission already refuses this run — a certification-minor module with no authenticated profile
+    /// gets `ClaimNotComposable` — so reaching here means a caller assembled a run configuration
+    /// directly. That is exactly the path the first gate cannot see.
+    #[error(
+        "CompositionMissing: this run declares major-2 minor {minor}, whose run header records the \
+         composed claim, but `{member}` is empty — so there is nothing to record and the run does \
+         not start"
+    )]
+    CompositionMissing {
+        /// The negotiated minor that selected the certification header variant.
+        minor: u32,
+        /// The first absent member.
+        member: &'static str,
+    },
     /// The module imports the retired `tabi@1` compute bridge — the typed `BridgeRetired`
     /// admission refusal, re-raised here so a caller that skipped the §1.3 front door still
     /// meets it before any guest code runs.
