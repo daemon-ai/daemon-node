@@ -736,6 +736,19 @@ const VHC_DET_SUITES: &[SuiteEntry<'static>] = &[
             &["-p", "daemon-vhc-proto"],
         ),
         (
+            // The host half of the three-object resource model: the composition planner and its
+            // canonical vectors, the Backend Execution Profile and its trust envelope, profile
+            // authentication and the candidate store, the Device Capability Report's supply
+            // derivation, the governor's reservation arithmetic, and the composition-evidence
+            // encoder/validator whose fail-closed behaviour gates certification evidence.
+            //
+            // In the mandatory lane because a resource-subsystem crate whose tests are skippable is
+            // the gate-blindness failure the audit documented: every one of these suites decides
+            // whether a claim is admitted, and none of them was run by the gate.
+            "daemon-vhc-resource (composition, profiles + trust, capability supply, governor, evidence)",
+            &["-p", "daemon-vhc-resource"],
+        ),
+        (
             // D0: assignment math moved out of the proto (refactor §8/D0). The golden vectors
             // (LCG stream, shuffle, quorum ladder, class weights) moved with it — this lane keeps
             // them tier-1 so any drift in the moved math stays a visible, deliberate break.
