@@ -56,9 +56,9 @@ pub use governor::{
     RESERVATION_ARITHMETIC_VERSION,
 };
 pub use planner::{
-    aggregate, compose, select, validate_against, AggregateClaim, DivergenceAuthority,
-    PhysicalClaim, PlannerError, ScopedOccupancy, ScopedTerm, Selection, SelectionPolicy,
-    PLANNER_VERSION,
+    aggregate, check_claim_against_lane, compose, select, validate_against, AggregateClaim,
+    DivergenceAuthority, LaneClaimBounds, PhysicalClaim, PlannerError, ScopedOccupancy, ScopedTerm,
+    Selection, SelectionPolicy, PLANNER_VERSION,
 };
 pub use profile::{
     AllocationCeilings, AllocationScope, BackendExecutionProfile, CompilationBehavior,

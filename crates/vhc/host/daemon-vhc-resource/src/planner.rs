@@ -230,6 +230,35 @@ pub enum PlannerError {
         /// The device's measured limit.
         limit: u64,
     },
+    /// The composed Physical Claim falls outside the participation lane's sanity bounds.
+    #[error(
+        "the composed physical claim's {total} device bytes fall outside lane `{lane}`'s bounds \
+         [{min}, {max}] for backend class `{backend_class}`"
+    )]
+    PhysicalClaimExceedsLane {
+        /// The lane.
+        lane: String,
+        /// The claim's device total.
+        total: u64,
+        /// The lane's lower bound for this backend class.
+        min: u64,
+        /// The lane's upper bound for this backend class.
+        max: u64,
+        /// The class whose bounds were applied.
+        backend_class: &'static str,
+    },
+    /// The lane states no sanity bounds for the backend class the claim was priced for.
+    #[error(
+        "lane `{lane}` states no claim bounds for backend class `{backend_class}`, so a claim priced \
+         for it cannot be sanity-checked; a lane that has not been given bounds for a backend does \
+         not admit against that backend"
+    )]
+    LaneStatesNoBoundsForClass {
+        /// The lane.
+        lane: String,
+        /// The class that has no bounds.
+        backend_class: &'static str,
+    },
     /// Two profiles disagree about how one shared term composes.
     #[error(
         "aggregation key `{key}` is given incompatible scope/rule pairs by the co-resident roles' \
@@ -547,6 +576,75 @@ pub fn aggregate(
         roles: roles.iter().map(|(r, _, _)| r.clone()).collect(),
         planner_version: PLANNER_VERSION,
     })
+}
+
+/// A participation lane's claim sanity bounds, keyed by the backend class a profile prices.
+///
+/// The legacy bounds were one `[min, max]` pair applied to a figure the guest declared, and at the
+/// certification minor the guest declares no physical figure at all: the claim is composed here, from a
+/// plan and a profile, and the same plan prices differently on every backend. One pair of scalars
+/// therefore cannot sanity-bound them — a bound loose enough for the most expensive backend is no bound
+/// on the cheapest, which is the failure mode a sanity check exists to catch.
+///
+/// **Keyed by class, not by profile digest.** A digest key would re-key on every profile revision, so a
+/// driver update would silently leave a lane with no bounds; the class is the coarsest key that still
+/// separates the backends whose prices differ. It is the same key the lane already uses to decide which
+/// backends it will host.
+///
+/// A class with no entry is **not** unbounded. It is a lane that has not been configured for that
+/// backend, and it refuses — see [`PlannerError::LaneStatesNoBoundsForClass`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LaneClaimBounds {
+    /// `[min, max]` device bytes per backend class slug.
+    pub by_backend_class: std::collections::BTreeMap<String, [u64; 2]>,
+}
+
+impl LaneClaimBounds {
+    /// The bounds this lane states for one backend class, if any.
+    #[must_use]
+    pub fn for_class(&self, class: crate::revision::BackendClass) -> Option<[u64; 2]> {
+        self.by_backend_class.get(class.slug()).copied()
+    }
+}
+
+/// Apply a lane's **profile-keyed** sanity bounds to a composed role Physical Claim.
+///
+/// Stage order is load-bearing and is the reason this is its own function: the lane check happens
+/// **after composition and before capability or owner authorization**. A claim that is absurd for the
+/// lane — a plan and profile combination pricing a role at ten times what this lane ever hosts — should
+/// be refused as a lane violation, not reported as a machine that is too small. The two refusals send an
+/// operator to different places, and the order decides which one they get.
+///
+/// The bound applied is the claim's device total, which is the figure the lane's own device minima and
+/// the owner's cap are expressed in.
+///
+/// # Errors
+/// [`PlannerError::PhysicalClaimExceedsLane`] when the total falls outside the class's bounds, and
+/// [`PlannerError::LaneStatesNoBoundsForClass`] when the lane states none for it.
+pub fn check_claim_against_lane(
+    claim: &PhysicalClaim,
+    profile: &BackendExecutionProfile,
+    lane: &str,
+    bounds: &LaneClaimBounds,
+) -> Result<(), PlannerError> {
+    let class = profile.backend_class;
+    let Some([min, max]) = bounds.for_class(class) else {
+        return Err(PlannerError::LaneStatesNoBoundsForClass {
+            lane: lane.to_string(),
+            backend_class: class.slug(),
+        });
+    };
+    let total = claim.total_peak_bytes;
+    if total < min || total > max {
+        return Err(PlannerError::PhysicalClaimExceedsLane {
+            lane: lane.to_string(),
+            total,
+            min,
+            max,
+            backend_class: class.slug(),
+        });
+    }
+    Ok(())
 }
 
 /// Validate a composed claim against a capability report and, where set, the owner's cap.
@@ -1079,6 +1177,72 @@ mod tests {
             first.claim.execution_grant_hash,
             first.grant.grant_hash().unwrap()
         );
+    }
+
+    /// The lane's sanity bounds are keyed by the class the profile prices, and applied to the composed
+    /// claim rather than to anything the guest declared.
+    #[test]
+    fn lane_claim_bounds_apply_per_backend_class_to_the_composed_claim() {
+        let p = plan();
+        let vulkan = profile(BackendClass::Vulkan);
+        let claim = compose(&p, &binding(1), &vulkan, 1).unwrap().0;
+        let total = claim.total_peak_bytes;
+
+        let mut bounds = LaneClaimBounds::default();
+        bounds
+            .by_backend_class
+            .insert("vulkan".to_string(), [0, total]);
+        check_claim_against_lane(&claim, &vulkan, "trainer", &bounds)
+            .expect("a claim at the bound is inside it");
+
+        // A hair over the lane's ceiling refuses as a LANE violation, naming the class whose bounds
+        // were applied — not as a machine that is too small.
+        bounds
+            .by_backend_class
+            .insert("vulkan".to_string(), [0, total - 1]);
+        let refusal = check_claim_against_lane(&claim, &vulkan, "trainer", &bounds).unwrap_err();
+        assert!(matches!(
+            refusal,
+            PlannerError::PhysicalClaimExceedsLane {
+                backend_class: "vulkan",
+                ..
+            }
+        ));
+
+        // Below the floor is equally a lane violation: a claim far under what the lane hosts is a
+        // composition that went wrong, not a cheap role.
+        bounds
+            .by_backend_class
+            .insert("vulkan".to_string(), [total + 1, total * 2]);
+        assert!(matches!(
+            check_claim_against_lane(&claim, &vulkan, "trainer", &bounds).unwrap_err(),
+            PlannerError::PhysicalClaimExceedsLane { .. }
+        ));
+    }
+
+    /// A lane with no bounds for the priced class refuses rather than admitting unbounded.
+    ///
+    /// The bounds are per class precisely because prices differ per backend, so a lane configured for one
+    /// backend has said nothing about another — and silence is not permission.
+    #[test]
+    fn a_lane_without_bounds_for_the_priced_class_refuses() {
+        let p = plan();
+        let metal = profile(BackendClass::Metal);
+        let claim = compose(&p, &binding(1), &metal, 1).unwrap().0;
+        let mut bounds = LaneClaimBounds::default();
+        bounds
+            .by_backend_class
+            .insert("vulkan".to_string(), [0, u64::MAX]);
+
+        let refusal = check_claim_against_lane(&claim, &metal, "trainer", &bounds).unwrap_err();
+        assert!(matches!(
+            refusal,
+            PlannerError::LaneStatesNoBoundsForClass {
+                backend_class: "metal",
+                ..
+            }
+        ));
+        assert!(refusal.to_string().contains("does not admit"));
     }
 
     /// A tighter machine selects a smaller configuration rather than refusing outright.
