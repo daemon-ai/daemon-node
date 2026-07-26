@@ -692,8 +692,59 @@ fn vhc_ci_det() -> anyhow::Result<()> {
         println!("\n== vhc-ci-det: daemon-vhc dependency-direction check ==");
         vhc_dep_check()?;
         build_guests()?;
-        vhc_ci_det_suites(det_schedule_from_env())
+        vhc_ci_det_suites(det_schedule_from_env())?;
+        vhc_cross_lane()
     })
+}
+
+/// Cross-compile the fleet worker for the platforms this machine is not.
+///
+/// **In the mandatory aggregate because a platform arm that is never compiled is not gated.** The
+/// Windows and macOS supply arms sat referencing a struct field that does not exist for four commits,
+/// through two coordinator dispositions implemented into them, because nothing on a Linux build ever
+/// type-checked that code and no lane ever cross-compiled it. The fixtures beside those arms now check
+/// the arithmetic on every build; this checks that the arms themselves still assemble against the real
+/// target's libraries and cfg set, which fixtures cannot do.
+///
+/// Sequential with the cargo suites, never beside them: one build at a time is the standing rule, and a
+/// nix build stacked on a cargo build is the failure mode that rule exists for.
+///
+/// # Errors
+/// The lane's own output when the cross build fails.
+fn vhc_cross_lane() -> anyhow::Result<()> {
+    println!("\n== vhc-ci-det: fleet cross-compile lane (x86_64-pc-windows-gnu) ==");
+    let started = std::time::Instant::now();
+    let status = std::process::Command::new("nix")
+        .args([
+            "build",
+            "--max-jobs",
+            "1",
+            "--cores",
+            "5",
+            ".#daemon-vhc-worker-windows",
+            "--no-link",
+        ])
+        .current_dir(workspace_root())
+        .status()
+        .map_err(|e| anyhow::anyhow!("run the windows cross lane: {e}"))?;
+    anyhow::ensure!(
+        status.success(),
+        "the fleet worker does not cross-compile for x86_64-pc-windows-gnu; no fleet Windows worker \
+         can be built from this revision"
+    );
+    println!(
+        "vhc-ci-det: windows cross lane green in {}s",
+        started.elapsed().as_secs()
+    );
+    // macOS has no cross target on this machine (the devShell carries wasm32 and linux-gnu only), so
+    // the Metal arm is covered by the always-compiled mappers and their fixtures rather than by a
+    // compiler run against Apple's libraries. Named here rather than left as a silence: it is the one
+    // arm this lane does not reach, and closing it needs a darwin std in the shell.
+    println!(
+        "vhc-ci-det: macOS arm not cross-compiled (no darwin target in this shell); its mapping is \
+         compiled and fixture-pinned on every platform instead"
+    );
+    Ok(())
 }
 
 /// The det-lane suite list + scheduler, WITHOUT the dep-check/guest preflight (so the production

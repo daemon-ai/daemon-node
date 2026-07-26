@@ -2399,6 +2399,131 @@ struct ProbedDevice {
     adapter_name: String,
 }
 
+/// Map the Windows probes' facts onto the supply derivation's inputs — **pure, and compiled everywhere**.
+///
+/// Compiled on every platform on purpose. This mapping used to live inside the `cfg(windows)` arm, where
+/// no Linux build ever type-checked it, and it referenced a field that does not exist: a defect that
+/// stood from the moment the arm was written until a cross-compile found it, during which two
+/// dispositions were implemented into an arm that could not build. A mapping the compiler never sees is
+/// not code, it is a draft — so the platform-shaped part is now just the probe call, and everything that
+/// can be wrong about the arithmetic is checked by every build and pinned by fixtures below.
+//
+// Compiled on every platform and *called* only on one, so a Linux build sees it as dead outside the
+// fixtures. That is the trade being made deliberately: dead here, type-checked here, and no longer
+// invisible until a cross-compile.
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+fn windows_probed_device(
+    dl: &daemon_vhc_host::probe::DeviceLimits,
+    raw: Option<&daemon_vhc_host::probe::DxgiAdapterMemory>,
+    adapter_name: Option<String>,
+    fallback_ram_bytes: u64,
+) -> ProbedDevice {
+    let mib = |mb: u64| mb << 20;
+    ProbedDevice {
+        facts: daemon_vhc_resource::HostDeviceFacts {
+            platform: daemon_vhc_resource::SupplyPlatform::Windows,
+            unified: dl.unified,
+            dedicated_bytes: mib(dl.vram_mb),
+            // The STATIC borrowable ceiling, not the live budget the mapper folds into this figure on a
+            // unified part. Same reason Linux states its heap rather than its heap budget: a supply
+            // figure that moves with co-tenant pressure gives two probes of one idle machine two report
+            // digests, and the report is cited by digest.
+            shared_pool_bytes: match (raw, dl.unified) {
+                (Some(raw), true) => raw.shared_system,
+                // A discrete adapter borrows nothing into its device budget by default.
+                (Some(_), false) => 0,
+                // Without the raw scalars the mapper's own figure is the only one in hand.
+                (None, _) => mib(dl.shared_mb),
+            },
+            host_ram_bytes: if dl.ram_mb > 0 {
+                mib(dl.ram_mb)
+            } else {
+                fallback_ram_bytes
+            },
+            // The live DXGI budget is dynamic by documentation, so it is a pressure reading for the
+            // governor and prints beside the report rather than entering it. The static derivation
+            // above, clamped by physical RAM, is what the report states.
+            platform_budget_bytes: None,
+            advertised_device_heap_bytes: None,
+        },
+        class: daemon_vhc_resource::BackendClass::Dx12,
+        adapter_name: adapter_name.unwrap_or_else(|| UNNAMED_DX12_ADAPTER.to_string()),
+    }
+}
+
+/// Map the macOS probes' facts onto the supply derivation's inputs — **pure, and compiled everywhere**.
+///
+/// Same reasoning as [`windows_probed_device`], and the same defect was present here verbatim.
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+fn macos_probed_device(
+    dl: &daemon_vhc_host::probe::DeviceLimits,
+    adapter_name: Option<String>,
+    fallback_ram_bytes: u64,
+) -> ProbedDevice {
+    let mib = |mb: u64| mb << 20;
+    ProbedDevice {
+        facts: daemon_vhc_resource::HostDeviceFacts {
+            platform: daemon_vhc_resource::SupplyPlatform::Macos,
+            unified: dl.unified,
+            // On a unified Apple part there is no dedicated carve-out at all: the device allocates out
+            // of the machine's DRAM. Feeding the working set in here as if it were dedicated memory
+            // would double-count it against the shared pool below.
+            dedicated_bytes: if dl.unified { 0 } else { mib(dl.vram_mb) },
+            shared_pool_bytes: mib(dl.shared_mb),
+            host_ram_bytes: if dl.ram_mb > 0 {
+                mib(dl.ram_mb)
+            } else {
+                fallback_ram_bytes
+            },
+            // NOT the platform-stated-budget slot, which is where this used to go.
+            //
+            // `recommendedMaxWorkingSetSize` is the macOS analogue of the Vulkan device heap, not of a
+            // live budget grant: on Apple Silicon it is a fixed fraction of physical RAM (measured at
+            // exactly two thirds on the M1, with two thirds also documented as the arithmetic fallback
+            // when the framework call is unavailable), so it is a property of the device and the OS build
+            // rather than of the moment. That is what qualifies it as the stable statement — and it
+            // enters as the *heap* that bounds the static derivation, so the report says which clamp
+            // bound the answer instead of claiming the platform handed us a budget.
+            //
+            // If it ever does move with co-tenant pressure, the acceptance check catches it: two
+            // back-to-back probes on an idle box would produce two report digests, and the recorded
+            // derivation names the heap clamp as the member that moved.
+            platform_budget_bytes: None,
+            advertised_device_heap_bytes: Some(mib(dl.vram_mb)).filter(|b| *b > 0),
+        },
+        class: daemon_vhc_resource::BackendClass::Metal,
+        adapter_name: adapter_name.unwrap_or_else(|| UNNAMED_METAL_DEVICE.to_string()),
+    }
+}
+
+/// What a report says when the graphics probe supplied no adapter name.
+///
+/// The DXGI and Metal memory probes read scalars and no description, so on a build whose graphics probe
+/// found no adapter there is genuinely no name to state. These say that rather than inventing one, and
+/// they are constants so the report's digest stays stable across probes.
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+const UNNAMED_DX12_ADAPTER: &str = "dx12 adapter (name not exposed by this build's probes)";
+/// The macOS counterpart of [`UNNAMED_DX12_ADAPTER`].
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+const UNNAMED_METAL_DEVICE: &str = "metal device (name not exposed by this build's probes)";
+
+/// The adapter name the graphics probe found, where it found one.
+///
+/// Called only from the Windows and macOS arms, so a Linux build compiles it and uses it nowhere — which
+/// is the point: it is compiled either way, and the arms that call it are no longer the only thing that
+/// type-checks them.
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+fn probed_adapter_name() -> Option<String> {
+    #[cfg(feature = "wgpu")]
+    {
+        daemon_vhc_host::probe::probe_wgpu().map(|p| p.adapter)
+    }
+    #[cfg(not(feature = "wgpu"))]
+    {
+        None
+    }
+}
+
 /// Gather the platform facts a device-supply derivation reads, or `None` on a box with no device lane.
 ///
 /// `None` is not a failure: a CPU-only participant has no device supply to state, and a report about a
@@ -2419,78 +2544,18 @@ fn probed_device() -> Option<ProbedDevice> {
     #[cfg(windows)]
     {
         if let Some(dl) = daemon_vhc_host::probe::probe_windows_device_limits() {
-            let raw = daemon_vhc_host::probe::probe_windows_adapter_memory();
-            return Some(ProbedDevice {
-                facts: HostDeviceFacts {
-                    platform: SupplyPlatform::Windows,
-                    unified: dl.unified,
-                    dedicated_bytes: mib(dl.vram_mb),
-                    // The STATIC borrowable ceiling, not the live budget the mapper folds into this
-                    // figure on a unified part. Same reason Linux states its heap rather than its
-                    // heap budget: a supply figure that moves with co-tenant pressure gives two probes
-                    // of one idle machine two report digests, and the report is cited by digest.
-                    shared_pool_bytes: match (&raw, dl.unified) {
-                        (Some(raw), true) => raw.shared_system,
-                        // A discrete adapter borrows nothing into its device budget by default.
-                        (Some(_), false) => 0,
-                        // Without the raw scalars the mapper's own figure is the only one in hand.
-                        (None, _) => mib(dl.shared_mb),
-                    },
-                    host_ram_bytes: if dl.ram_mb > 0 {
-                        mib(dl.ram_mb)
-                    } else {
-                        ram_bytes
-                    },
-                    // The live DXGI budget is dynamic by documentation, so it is a pressure reading for
-                    // the governor and is printed beside the report rather than entering it. The static
-                    // derivation above, clamped by physical RAM, is what the report states.
-                    platform_budget_bytes: None,
-                    advertised_device_heap_bytes: None,
-                },
-                class: BackendClass::Dx12,
-                adapter_name: probed_adapter()
-                    .map_or_else(|| "dx12 adapter".to_string(), |p| p.adapter),
-            });
+            return Some(windows_probed_device(
+                &dl,
+                daemon_vhc_host::probe::probe_windows_adapter_memory().as_ref(),
+                probed_adapter_name(),
+                ram_bytes,
+            ));
         }
     }
     #[cfg(target_os = "macos")]
     {
         if let Some(dl) = daemon_vhc_host::probe::probe_macos_device_limits() {
-            return Some(ProbedDevice {
-                facts: HostDeviceFacts {
-                    platform: SupplyPlatform::Macos,
-                    unified: dl.unified,
-                    // On a unified Apple part there is no dedicated carve-out at all: the device
-                    // allocates out of the machine's DRAM. Feeding the working set in here as if it
-                    // were dedicated memory would double-count it against the shared pool below.
-                    dedicated_bytes: if dl.unified { 0 } else { mib(dl.vram_mb) },
-                    shared_pool_bytes: mib(dl.shared_mb),
-                    host_ram_bytes: if dl.ram_mb > 0 {
-                        mib(dl.ram_mb)
-                    } else {
-                        ram_bytes
-                    },
-                    // NOT the platform-stated-budget slot, which is where this used to go.
-                    //
-                    // `recommendedMaxWorkingSetSize` is the macOS analogue of the Vulkan device heap,
-                    // not of a live budget grant: on Apple Silicon it is a fixed fraction of physical
-                    // RAM (measured at exactly two thirds on the M1, with two thirds also documented as
-                    // the arithmetic fallback when the framework call is unavailable), so it is a
-                    // property of the device and the OS build rather than of the moment. That is what
-                    // qualifies it as the stable statement — and it enters as the *heap* that bounds the
-                    // static derivation, so the report says which clamp bound the answer instead of
-                    // claiming the platform handed us a budget.
-                    //
-                    // If it ever does move with co-tenant pressure, the acceptance check catches it:
-                    // two back-to-back probes on an idle box would produce two report digests, and the
-                    // recorded derivation names the heap clamp as the member that moved.
-                    platform_budget_bytes: None,
-                    advertised_device_heap_bytes: Some(mib(dl.vram_mb)).filter(|b| *b > 0),
-                },
-                class: BackendClass::Metal,
-                adapter_name: probed_adapter()
-                    .map_or_else(|| "metal device".to_string(), |p| p.adapter),
-            });
+            return Some(macos_probed_device(&dl, probed_adapter_name(), ram_bytes));
         }
     }
     #[cfg(feature = "cuda")]
@@ -2892,5 +2957,159 @@ mod tests {
             .expect("cpu record always advertised");
         assert!(cpu.ready);
         assert_eq!(cpu.class, "cpu");
+    }
+}
+
+#[cfg(test)]
+mod platform_arm_tests {
+    use super::{macos_probed_device, windows_probed_device};
+    use daemon_vhc_host::probe::{DeviceLimits, DxgiAdapterMemory};
+    use daemon_vhc_resource::{BackendClass, SupplyPlatform};
+
+    const MIB: u64 = 1 << 20;
+
+    /// **These fixtures exist because the arms they cover were unbuildable for four commits.**
+    ///
+    /// The Windows and macOS mappings lived inside their `cfg` arms, where no build on this machine ever
+    /// type-checked them, and both referenced a struct field that does not exist. Two coordinator
+    /// dispositions were implemented into code that could not compile. Compiling the mapping everywhere
+    /// is the structural fix; these pin the arithmetic so the mapping is also *right* rather than merely
+    /// well-typed.
+    #[test]
+    fn the_windows_arm_states_the_static_ceiling_and_never_the_live_budget() {
+        // A unified part: the mapper folds the live local budget into its shared figure, so the raw
+        // static ceiling is what must reach the derivation.
+        let dl = DeviceLimits {
+            vram_mb: 1024,
+            ram_mb: 32_768,
+            max_alloc_mb: 2047,
+            shared_mb: 12_000, // what the mapper produced: min(shared_system, live budget)
+            unified: true,
+        };
+        let raw = DxgiAdapterMemory {
+            dedicated_video: 1024 * MIB,
+            dedicated_system: 0,
+            shared_system: 16_384 * MIB, // the STATIC borrowable ceiling
+            is_software: false,
+            uma: true,
+            cache_coherent_uma: true,
+            budget_local: 12_000 * MIB, // the live figure, deliberately not used
+            budget_non_local: 0,
+        };
+
+        let probed = windows_probed_device(&dl, Some(&raw), Some("Radeon 8060S".into()), 0);
+        assert_eq!(probed.class, BackendClass::Dx12);
+        assert_eq!(probed.facts.platform, SupplyPlatform::Windows);
+        assert_eq!(
+            probed.facts.shared_pool_bytes, raw.shared_system,
+            "the static ceiling reaches the derivation, not the live budget"
+        );
+        assert_ne!(probed.facts.shared_pool_bytes, raw.budget_local);
+        assert_eq!(
+            probed.facts.platform_budget_bytes, None,
+            "the live budget is pressure and never the stated budget"
+        );
+        assert_eq!(probed.adapter_name, "Radeon 8060S");
+
+        // A discrete adapter borrows nothing into its device budget.
+        let discrete = windows_probed_device(
+            &DeviceLimits {
+                unified: false,
+                ..dl
+            },
+            Some(&DxgiAdapterMemory { uma: false, ..raw }),
+            None,
+            0,
+        );
+        assert_eq!(discrete.facts.shared_pool_bytes, 0);
+        assert!(
+            discrete.adapter_name.contains("not exposed"),
+            "an unnamed adapter says so rather than inventing a name: {}",
+            discrete.adapter_name
+        );
+
+        // Without the raw scalars the mapper's own figure is all there is.
+        let no_raw = windows_probed_device(&dl, None, None, 0);
+        assert_eq!(no_raw.facts.shared_pool_bytes, 12_000 * MIB);
+    }
+
+    /// The macOS arm: the working set bounds the derivation as a heap, and a unified part has no
+    /// carve-out to double-count.
+    #[test]
+    fn the_macos_arm_carries_the_working_set_as_a_heap_bound() {
+        let unified = DeviceLimits {
+            vram_mb: 21_845, // recommendedMaxWorkingSetSize ≈ ⅔ of 32 GiB
+            ram_mb: 32_768,
+            max_alloc_mb: 20_000, // maxBufferLength — per-allocation only, never supply
+            shared_mb: 32_768,
+            unified: true,
+        };
+
+        let probed = macos_probed_device(&unified, Some("Apple M4 Pro".into()), 0);
+        assert_eq!(probed.class, BackendClass::Metal);
+        assert_eq!(probed.facts.platform, SupplyPlatform::Macos);
+        assert_eq!(
+            probed.facts.dedicated_bytes, 0,
+            "a unified Apple part has no dedicated carve-out to add to the shared pool"
+        );
+        assert_eq!(
+            probed.facts.advertised_device_heap_bytes,
+            Some(21_845 * MIB),
+            "the working set enters as the heap that bounds the derivation"
+        );
+        assert_eq!(
+            probed.facts.platform_budget_bytes, None,
+            "and never as a budget the platform stated for this process"
+        );
+
+        // The derivation over those facts: 90% of the pool, bounded by the working set.
+        let supply = daemon_vhc_resource::derive_device_supply(&probed.facts)
+            .value()
+            .copied()
+            .expect("a unified Apple part derives supply");
+        assert_eq!(supply.usable_bytes, 21_845 * MIB);
+        assert!(
+            supply.device_heap_clamp_bound,
+            "and the report records the heap as the clamp that bound it"
+        );
+
+        // A discrete Mac GPU: the working set IS its dedicated memory, and there is no shared pool.
+        let discrete = macos_probed_device(
+            &DeviceLimits {
+                unified: false,
+                shared_mb: 0,
+                ..unified
+            },
+            None,
+            0,
+        );
+        assert_eq!(discrete.facts.dedicated_bytes, 21_845 * MIB);
+        assert_eq!(discrete.facts.shared_pool_bytes, 0);
+        assert!(discrete.adapter_name.contains("not exposed"));
+    }
+
+    /// Physical RAM falls back to the caller's figure only when the probe reported none.
+    #[test]
+    fn the_probes_ram_figure_wins_and_the_fallback_is_only_a_fallback() {
+        let dl = DeviceLimits {
+            vram_mb: 1024,
+            ram_mb: 0,
+            max_alloc_mb: 2047,
+            shared_mb: 4096,
+            unified: true,
+        };
+        assert_eq!(
+            windows_probed_device(&dl, None, None, 64 * 1024 * MIB)
+                .facts
+                .host_ram_bytes,
+            64 * 1024 * MIB
+        );
+        assert_eq!(
+            macos_probed_device(&DeviceLimits { ram_mb: 8192, ..dl }, None, 64 * 1024 * MIB)
+                .facts
+                .host_ram_bytes,
+            8192 * MIB,
+            "when the probe read RAM, that is the figure"
+        );
     }
 }
