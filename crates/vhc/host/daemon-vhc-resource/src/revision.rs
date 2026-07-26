@@ -25,6 +25,8 @@
 //! resource reading is an admission refusal wearing a measurement's clothes, and it refuses the
 //! machine rather than reporting the defect.
 
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize};
 
 /// Why a platform did not supply a value. Recording the reason is what makes a later divergence
@@ -222,6 +224,22 @@ pub struct AllocatorImplementation {
     /// by a binary that cannot produce them: its conformance evidence is unreproducible on that
     /// binary, which makes the profile's own certification unverifiable there.
     pub statistics_available: bool,
+    /// **Which** phase boundaries this build actually samples at.
+    ///
+    /// A set rather than a second boolean, because reproducibility is not a yes/no property. A
+    /// profile whose pooling terms were calibrated from readings taken at slice ends cannot be
+    /// reproduced on a binary that samples only at phase boundaries, even though both binaries
+    /// truthfully report that statistics are available. Comparing sets makes that mismatch visible;
+    /// comparing a bool would recreate one layer up exactly the flattening the per-term calibration
+    /// basis exists to prevent — a single flag standing in for a question with structure.
+    pub sampled_points: BTreeSet<String>,
+    /// How the allocator's pool was configured when those readings were taken.
+    ///
+    /// The same binary reports a different `bytes_reserved` for the same workload under a different
+    /// pool configuration, because reserved-above-in-use *is* the pool's retention. So a reading is
+    /// only reproducible against a matching configuration, and the provenance travels with the
+    /// statistics rather than being assumed identical.
+    pub pool_configuration: Maybe<String>,
 }
 
 /// The operating system, required rather than optional.
@@ -403,6 +421,11 @@ pub struct ProbeObservation {
     pub os: OperatingSystem,
     /// Whether this build can report allocator statistics.
     pub allocator_statistics_available: bool,
+    /// Which phase boundaries this build samples at. See [`AllocatorImplementation::sampled_points`]
+    /// for why this is a set and not a second flag.
+    pub sampled_points: std::collections::BTreeSet<String>,
+    /// How the allocator pool was configured when the readings were taken.
+    pub pool_configuration: Maybe<String>,
     /// The graphics API the implementation resolved to, and whether an operator chose it.
     pub graphics_api_selected: Maybe<String>,
     /// See [`ProbeObservation::graphics_api_selected`].
@@ -494,6 +517,8 @@ impl BackendImplementationRevision {
                 revision: stack.allocator_revision,
                 allocation_mode: stack.allocation_mode,
                 statistics_available: observation.allocator_statistics_available,
+                sampled_points: observation.sampled_points,
+                pool_configuration: observation.pool_configuration,
             },
             driver_api: DriverApi {
                 api: observation.api,
@@ -597,6 +622,10 @@ pub(crate) mod fixtures {
                 revision: "0.10.0".into(),
                 allocation_mode: Maybe::Available("Auto".into()),
                 statistics_available: true,
+                sampled_points: ["after-init".to_string(), "at-teardown".to_string()]
+                    .into_iter()
+                    .collect(),
+                pool_configuration: Maybe::Available("framework-default".into()),
             },
             driver_api: DriverApi {
                 api: PlatformApi::Vulkan,
@@ -693,6 +722,10 @@ mod tests {
             adapter_name: "Radeon 8060S Graphics (RADV GFX1151)".into(),
             device_type: AdapterDeviceType::IntegratedGpu,
             is_software_rasterizer: Some(false),
+            sampled_points: ["after-init".to_string(), "at-teardown".to_string()]
+                .into_iter()
+                .collect(),
+            pool_configuration: Maybe::Available("framework-default".into()),
             identity: AdapterIdentity {
                 vendor_id: Maybe::Available(4098),
                 device_id: Maybe::Available(5510),

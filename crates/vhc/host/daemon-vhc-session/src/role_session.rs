@@ -1711,9 +1711,59 @@ async fn finish(
 
 /// Join the guest thread off the async runtime.
 async fn wait_run(run: daemon_vhc_host::run::Run) -> Result<RunEnd, String> {
+    // The allocator readout, taken here because this is the one seam every role run passes through
+    // on its way to termination — so the samples are read before the pump goes away with the run.
+    //
+    // Without a reader the sampler was recording into a buffer discarded at teardown: the boundaries
+    // were wired, the readings were real, and no run left any of it behind. Every workspace, pooling,
+    // compilation and staging term a profile prices is calibrated against these figures, so an
+    // unread sampler leaves those terms with nothing to rest on but conservative bounds.
+    //
+    // Off by default and env-gated, following the probe readout: this is calibration evidence for an
+    // operator running the deployed binary on a real box, not something every production run should
+    // print. It goes to stderr so it cannot be mistaken for run output on the wire.
+    if std::env::var_os("DAEMON_TRAIN_ALLOCATOR_READOUT").is_some() {
+        report_allocator_samples(&run.pump);
+    }
     tokio::task::spawn_blocking(move || run.wait().map_err(|e| e.to_string()))
         .await
         .map_err(|e| format!("guest join: {e}"))?
+}
+
+/// Print the allocator sample series, one line per reading, in the order they were taken.
+///
+/// Order is preserved because the SHAPE across boundaries is the evidence: a pool that never returns
+/// memory to the driver looks identical to one that does at any single point. `bytes_reserved` above
+/// `bytes_in_use` is the retention a pooling term models, and `bytes_padding` separates what the
+/// module asked for from what alignment made it cost, so an alignment term and a workspace term can
+/// be told apart rather than folded together.
+///
+/// An empty series is reported as such, explicitly. It is **not** the same as a run that allocated
+/// nothing — a backend that cannot report occupancy records nothing — and a reader who took absence
+/// for zero would be calibrating a profile against a figure nobody measured.
+fn report_allocator_samples(pump: &daemon_vhc_host::run::PumpHandle) {
+    let samples = pump.allocator_samples();
+    if samples.is_empty() {
+        eprintln!(
+            "allocator_readout: no samples — this backend cannot report allocator occupancy. This \
+             is an ABSENCE, not a zero: nothing here may be read as `bytes_in_use = 0`."
+        );
+        return;
+    }
+    eprintln!(
+        "allocator_readout: {} sample(s), in the order taken",
+        samples.len()
+    );
+    for (index, (point, sample)) in samples.iter().enumerate() {
+        eprintln!(
+            "allocator_readout[{index}]: point={} allocs={} in_use={} padding={} reserved={}",
+            point.slug(),
+            sample.number_allocs,
+            sample.bytes_in_use,
+            sample.bytes_padding,
+            sample.bytes_reserved
+        );
+    }
 }
 
 /// Classify a guest that ended on its own (no owner intent).

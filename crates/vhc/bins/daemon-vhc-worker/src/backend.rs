@@ -2094,10 +2094,29 @@ pub(crate) fn revision_record(
         },
         kernel_driver: Maybe::Unavailable(Unavailable::NotExposedByPlatform),
         os: operating_system(family),
-        // Nothing in this build calls the runtime's memory-usage reporter, so a profile whose terms
-        // were calibrated FROM allocator statistics must not be accepted against it. Reported
-        // truthfully so that refusal actually fires.
-        allocator_statistics_available: false,
+        // Whether this build can report allocator statistics **for this lane**, evaluated per record
+        // rather than declared per binary: a lane compiled in whose sampler returns a reading can, and
+        // a lane that is absent or silent cannot, in the same binary.
+        //
+        // Reported truthfully because a refusal depends on it — a profile whose terms were calibrated
+        // from allocator statistics must not be accepted by a binary that cannot reproduce them.
+        allocator_statistics_available: samples_this_lane(class),
+        // WHICH boundaries, not merely whether. A profile calibrated from slice-end readings is not
+        // reproducible on a binary that samples only at phase boundaries, even though both would
+        // truthfully report statistics as available — so the comparison is between sets.
+        sampled_points: if samples_this_lane(class) {
+            SAMPLED_POINTS.iter().map(|p| (*p).to_string()).collect()
+        } else {
+            std::collections::BTreeSet::new()
+        },
+        // The pool configuration those readings were taken under. `bytes_reserved` above bytes-in-use
+        // IS the pool's retention, so the same binary reports a different figure for the same workload
+        // under a different pool configuration; a reading is only reproducible against a match.
+        pool_configuration: if samples_this_lane(class) {
+            Maybe::Available(POOL_CONFIGURATION.to_string())
+        } else {
+            unobserved_for(class)
+        },
         graphics_api_selected: Maybe::Available(capability.class.clone()),
         graphics_api_selection_source: ApiSelectionSource::PlatformDefault,
     };
@@ -2170,6 +2189,47 @@ fn probed_adapter() -> Option<ProbedAdapter> {
     #[cfg(not(feature = "wgpu"))]
     {
         None
+    }
+}
+
+/// The phase boundaries this build's sampler is wired at, as the record spells them.
+///
+/// Kept beside the sampler's own `SamplePoint` slugs deliberately: these are the strings a profile's
+/// reproducibility check compares, so they must be the boundaries actually sampled and not an
+/// aspiration. `after-slice` is included because the slice seam is wired; per-dispatch sampling is
+/// **not** here, and is not a wiring omission — attributing a workspace divergence to one operation
+/// family needs a delta around each dispatch, which is a pricing-granularity decision rather than a
+/// wiring one.
+const SAMPLED_POINTS: &[&str] = &[
+    "after-bring-up",
+    "after-init",
+    "after-migrate",
+    "after-slice",
+    "at-teardown",
+];
+
+/// How the allocator's pool is configured in this build.
+///
+/// The framework's own default, because nothing in this build calls the pool-configuration surface
+/// yet. Named rather than left absent so a profile calibrated under this configuration can be told
+/// apart from one calibrated under a configured pool — the figure that moves is `bytes_reserved`,
+/// which is the one every pooling term is priced on.
+const POOL_CONFIGURATION: &str = "framework-default";
+
+/// Whether this build samples the allocator for `class`.
+///
+/// The conjunction the measurement wave recommended, evaluated per record: the lane must be compiled
+/// in, and its sampler must actually return a reading. The CPU lane deliberately does not — its
+/// allocations go through the host allocator, whose occupancy answers a different question than a
+/// device profile's pooling terms ask.
+fn samples_this_lane(class: daemon_vhc_resource::BackendClass) -> bool {
+    use daemon_vhc_resource::BackendClass;
+    match class {
+        BackendClass::Vulkan | BackendClass::Metal | BackendClass::Dx12 => {
+            cfg!(feature = "wgpu") && daemon_vhc_host::probe::wgpu_unavailability().is_none()
+        }
+        BackendClass::Cuda => cfg!(feature = "cuda"),
+        BackendClass::Cpu => false,
     }
 }
 

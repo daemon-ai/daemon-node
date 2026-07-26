@@ -72,6 +72,23 @@ pub(super) fn link(linker: &mut Linker<Host>) -> Result<(), wasmtime::Error> {
                     let mut st = shared.state.lock().expect("pump lock");
                     st.guest_memory_high_water = st.guest_memory_high_water.max(size);
                 }
+                // The device allocator's occupancy at the same seam, for the same reason: this is
+                // where a slice has finished and the next has not begun, so a reading here bounds
+                // what the slice left behind.
+                //
+                // Slice-end bounds the workspace terms **jointly** — it says what the whole slice
+                // retained, not what any one operation family cost. Attributing a divergence to a
+                // family needs a delta around each dispatch, which is a pricing-granularity decision
+                // rather than a wiring one and is not made here.
+                if let Some(sample) = c.data().compute.as_ref().and_then(|k| k.sample_allocator()) {
+                    let shared = c.data().shared.clone();
+                    shared
+                        .state
+                        .lock()
+                        .expect("pump lock")
+                        .allocator_samples
+                        .push((crate::compute::SamplePoint::AfterSlice, sample));
+                }
                 // Mandatory-retry rule: after NeedCapacity the re-call must be big enough (§4.1).
                 if let Some(required) = c.data().slice.pending_next {
                     if u64::from(buf_cap) < required {

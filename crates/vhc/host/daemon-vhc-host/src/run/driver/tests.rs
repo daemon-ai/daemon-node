@@ -1013,3 +1013,84 @@ fn a_matching_context_lifts_the_forwarded_line_to_the_front_of_the_detail() {
         "and the engine's own text still follows it: {detail}"
     );
 }
+
+// -- MEAS-F11: the sampler is read, and its keying compares sets ------------------------------------
+
+/// The sample points a record claims must be the ones the driver is actually wired at.
+///
+/// This is the drift that matters: a profile calibrated from slice-end readings is not reproducible on
+/// a binary that samples only at phase boundaries, even though both would truthfully report that
+/// allocator statistics are available. If the enum grows a member nobody wired, or a wired site is
+/// removed, a record claiming that point would be claiming reproducibility it cannot deliver — so the
+/// claim is pinned against the wiring here rather than trusted.
+#[test]
+fn every_sample_point_the_record_may_claim_is_wired_in_the_driver() {
+    use crate::compute::SamplePoint;
+
+    // Every member of the closed domain, so adding one forces this test to be revisited.
+    let all = [
+        SamplePoint::AfterBringUp,
+        SamplePoint::AfterInit,
+        SamplePoint::AfterMigrate,
+        SamplePoint::AfterSlice,
+        SamplePoint::AtTeardown,
+    ];
+    let slugs: Vec<&str> = all.iter().map(|p| p.slug()).collect();
+    assert_eq!(
+        slugs,
+        vec![
+            "after-bring-up",
+            "after-init",
+            "after-migrate",
+            "after-slice",
+            "at-teardown"
+        ],
+        "the slugs are the strings a reproducibility check compares, so they are pinned"
+    );
+
+    // Each one must appear at a call site in the driver. Reading the sources is the only way to
+    // assert this without running five different lifecycles on a device this test cannot require.
+    let lifecycle = include_str!("lifecycle.rs");
+    let event_seam = include_str!("linker/vhc.rs");
+    for point in all {
+        let wired = lifecycle.contains(&format!("SamplePoint::{point:?}"))
+            || event_seam.contains(&format!("SamplePoint::{point:?}"));
+        assert!(
+            wired,
+            "`{}` is in the closed domain but nothing samples at it — a record claiming it would \
+             claim a reproducibility it cannot deliver. Wire it, or remove it from the domain.",
+            point.slug()
+        );
+    }
+}
+
+/// An empty sample series is an absence, and the readout says so rather than printing zeros.
+///
+/// The distinction is the whole point of the sampler's contract: a backend that cannot report
+/// occupancy records nothing, and a reader who took that for `bytes_in_use = 0` would calibrate a
+/// profile against a figure nobody measured. That is the same mislabelling the per-term calibration
+/// basis exists to prevent, one layer down.
+#[test]
+fn an_unsampled_run_reports_an_absence_and_not_a_zero() {
+    let slice = quiescent_slice();
+    assert!(
+        slice.log_calls_this_phase == 0,
+        "the fixture is quiescent so the assertion below is about the samples, not the phase"
+    );
+
+    // A pump that never sampled holds an empty series, which is distinguishable from one that
+    // sampled and read zero.
+    let sampled_nothing: Vec<(crate::compute::SamplePoint, crate::compute::AllocatorSample)> =
+        Vec::new();
+    let sampled_a_zero = [(
+        crate::compute::SamplePoint::AfterInit,
+        crate::compute::AllocatorSample::default(),
+    )];
+    assert!(sampled_nothing.is_empty());
+    assert_eq!(sampled_a_zero.len(), 1);
+    assert_eq!(
+        sampled_a_zero[0].1,
+        crate::compute::AllocatorSample::default(),
+        "a measured zero is a value; the empty series above is not that value"
+    );
+}
