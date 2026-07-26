@@ -1203,26 +1203,36 @@ pub fn probe_windows_device_limits() -> Option<DeviceLimits> {
     }
 }
 
-/// The DXGI **local budget** for the selected adapter — the Windows platform budget query.
+/// The raw DXGI adapter memory scalars for the selected adapter.
 ///
-/// Carried separately from [`probe_windows_device_limits`] because the mapper folds it into the shared
-/// pool, where a supply derivation can no longer tell it apart from the static `SharedSystemMemory`
-/// ceiling. The two are different kinds of number: one is the platform saying what this process may
-/// use, the other is a limit on what could ever be borrowed. A supply derivation must prefer the first.
-///
-/// Zero is not a budget, so it comes back as an absence.
+/// Carried separately from [`probe_windows_device_limits`] because the mapper *combines* two numbers of
+/// different kinds: on a unified part it folds the **live** local budget together with the **static**
+/// `SharedSystemMemory` ceiling, after which a supply derivation can no longer tell them apart. One is
+/// the platform saying what this process may use at this instant; the other is a limit on what could
+/// ever be borrowed. A stable statement of supply needs the second, and the first is a pressure reading.
 #[must_use]
-pub fn probe_windows_local_budget_bytes() -> Option<u64> {
+pub fn probe_windows_adapter_memory() -> Option<DxgiAdapterMemory> {
     #[cfg(windows)]
     {
-        win_ffi::probe()
-            .map(|(_, raw)| raw.budget_local)
-            .filter(|budget| *budget > 0)
+        win_ffi::probe().map(|(_, raw)| raw)
     }
     #[cfg(not(windows))]
     {
         None
     }
+}
+
+/// The DXGI **live local budget** for the selected adapter — a pressure reading, not supply.
+///
+/// Dynamic by documentation: it moves with co-tenant pressure and OS policy, and a budget *shrink* is
+/// the Windows analogue of a preemption signal. That makes it the governor's input and disqualifies it
+/// from the capability report, which is cited by digest and must not be a different report each time it
+/// is taken. Zero is not a budget, so it comes back as an absence.
+#[must_use]
+pub fn probe_windows_local_budget_bytes() -> Option<u64> {
+    probe_windows_adapter_memory()
+        .map(|raw| raw.budget_local)
+        .filter(|budget| *budget > 0)
 }
 
 // -------------------------------------------------------------------------------------

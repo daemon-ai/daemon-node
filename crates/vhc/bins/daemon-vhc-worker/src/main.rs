@@ -288,6 +288,14 @@ async fn main() {
                 "device_heap = unavailable (no Vulkan heap could be queried on this build or box)"
             ),
         }
+        // The Windows analogue of the same split: the live DXGI local budget is a pressure reading, so
+        // it prints here and the report states the static derivation instead. Absent off Windows.
+        if let Some(budget) = daemon_vhc_host::probe::probe_windows_local_budget_bytes() {
+            println!(
+                "device_local_budget = {budget} bytes (volatile — a pressure reading for the \
+                 governor, not the supply figure)"
+            );
+        }
         // The Device Capability Report this node states about its device: the supply figure admission
         // compares a composed claim against, with the derivation that produced it named.
         //

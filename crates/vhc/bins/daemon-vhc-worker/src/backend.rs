@@ -2404,21 +2404,32 @@ fn probed_device() -> Option<ProbedDevice> {
     #[cfg(windows)]
     {
         if let Some(dl) = daemon_vhc_host::probe::probe_windows_device_limits() {
+            let raw = daemon_vhc_host::probe::probe_windows_adapter_memory();
             return Some(ProbedDevice {
                 facts: HostDeviceFacts {
                     platform: SupplyPlatform::Windows,
                     unified: dl.unified,
                     dedicated_bytes: mib(dl.vram_mb),
-                    shared_pool_bytes: mib(dl.shared_mb),
+                    // The STATIC borrowable ceiling, not the live budget the mapper folds into this
+                    // figure on a unified part. Same reason Linux states its heap rather than its
+                    // heap budget: a supply figure that moves with co-tenant pressure gives two probes
+                    // of one idle machine two report digests, and the report is cited by digest.
+                    shared_pool_bytes: match (&raw, dl.unified) {
+                        (Some(raw), true) => raw.shared_system,
+                        // A discrete adapter borrows nothing into its device budget by default.
+                        (Some(_), false) => 0,
+                        // Without the raw scalars the mapper's own figure is the only one in hand.
+                        (None, _) => mib(dl.shared_mb),
+                    },
                     host_ram_bytes: if dl.ram_mb > 0 {
                         mib(dl.ram_mb)
                     } else {
                         ram_bytes
                     },
-                    // The platform's own statement, read as itself rather than through the shared pool
-                    // the mapper folds it into.
-                    platform_budget_bytes: daemon_vhc_host::probe::probe_windows_local_budget_bytes(
-                    ),
+                    // The live DXGI budget is dynamic by documentation, so it is a pressure reading for
+                    // the governor and is printed beside the report rather than entering it. The static
+                    // derivation above, clamped by physical RAM, is what the report states.
+                    platform_budget_bytes: None,
                     advertised_device_heap_bytes: None,
                 },
                 class: BackendClass::Dx12,
