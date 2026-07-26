@@ -44,8 +44,12 @@ fn rec(tag: u64, ord: u64, body: Value) -> Value {
 }
 
 fn validate(root: &str, bytes: &[u8]) {
-    cddl_cat::validate_cbor_bytes(root, JOURNAL_CDDL, bytes)
-        .unwrap_or_else(|e| panic!("`{root}` failed to validate: {e:?}"));
+    try_validate(root, bytes).unwrap_or_else(|e| panic!("`{root}` failed to validate: {e}"));
+}
+
+/// The fallible form, for the negative assertions: a shape the grammar must *refuse*.
+fn try_validate(root: &str, bytes: &[u8]) -> Result<(), String> {
+    cddl_cat::validate_cbor_bytes(root, JOURNAL_CDDL, bytes).map_err(|e| format!("{e:?}"))
 }
 
 /// One representative record per §8.3 tag, in tag order.
@@ -73,6 +77,43 @@ fn sample_records() -> Vec<(u8, Value)> {
                     ("config", b(b"c")),
                     ("grants", b(b"g")),
                     ("claim", b(b"cl")),
+                    ("channels", b(b"ch")),
+                    ("device", b(b"d")),
+                    ("format", u(1)),
+                ]),
+            ),
+        ),
+        // tag 0, certification variant: `claim` is ABSENT and the four replacement values plus
+        // their digests are mandatory. The legacy sample above proves the other alternative, so
+        // both minor-selected shapes are exercised.
+        (
+            0,
+            rec(
+                0,
+                19,
+                map(vec![
+                    ("run_id", b(&H32)),
+                    ("epoch", u(1)),
+                    ("role", t("trainer")),
+                    ("instance", u(42)),
+                    ("module", b(&H32)),
+                    ("abi", u((2 << 16) | 5)),
+                    (
+                        "worlds",
+                        Value::Map(vec![(t("vhc"), u(0)), (t("net"), u(0))]),
+                    ),
+                    ("bridge", Value::Bool(false)),
+                    ("manifest", b(b"m")),
+                    ("config", b(b"c")),
+                    ("grants", b(b"g")),
+                    ("resource_plan", b(b"plan")),
+                    ("resource_plan_hash", b(&H32)),
+                    ("physical_claim", b(b"claim")),
+                    ("physical_claim_hash", b(&H32)),
+                    ("aggregate_claim", b(b"aggregate")),
+                    ("aggregate_claim_hash", b(&H32)),
+                    ("execution_grant", b(b"grant")),
+                    ("execution_grant_hash", b(&H32)),
                     ("channels", b(b"ch")),
                     ("device", b(b"d")),
                     ("format", u(1)),
@@ -205,6 +246,15 @@ fn sample_records() -> Vec<(u8, Value)> {
                 map(vec![("segment_blake3", b(&H32)), ("records", u(18))]),
             ),
         ),
+        // tag 18: the certification minor's grant-application result.
+        (
+            18,
+            rec(
+                18,
+                20,
+                map(vec![("execution_grant_hash", b(&H32)), ("status", u(0))]),
+            ),
+        ),
         // read-back: sidecar branch of the group choice (exercise the other alternative).
         (
             2,
@@ -241,9 +291,82 @@ fn grammar_is_machine_valid_and_every_tag_validates() {
     }
     assert_eq!(
         JOURNAL_RECORD_TAGS.len(),
-        18,
-        "the complete §8.3 record set is 18 tags (0..=17); 18..=63 reserved"
+        19,
+        "the complete §8.3 record set is 19 tags (0..=18); 19..=63 reserved"
     );
+}
+
+/// A certification-variant run header MUST NOT carry the legacy `claim` member, and MUST carry
+/// every replacement value with its digest. An optional field would not express this: a reader has
+/// to be able to tell which statement the header is making, and "absent" is not a statement.
+#[test]
+fn the_certification_run_header_forbids_the_legacy_claim_and_requires_its_replacements() {
+    let base: Vec<(&str, Value)> = vec![
+        ("run_id", b(&H32)),
+        ("epoch", u(1)),
+        ("role", t("trainer")),
+        ("instance", u(42)),
+        ("module", b(&H32)),
+        ("abi", u((2 << 16) | 5)),
+        ("worlds", Value::Map(vec![(t("vhc"), u(0))])),
+        ("bridge", Value::Bool(false)),
+        ("manifest", b(b"m")),
+        ("config", b(b"c")),
+        ("grants", b(b"g")),
+        ("resource_plan", b(b"plan")),
+        ("resource_plan_hash", b(&H32)),
+        ("physical_claim", b(b"claim")),
+        ("physical_claim_hash", b(&H32)),
+        ("aggregate_claim", b(b"aggregate")),
+        ("aggregate_claim_hash", b(&H32)),
+        ("execution_grant", b(b"grant")),
+        ("execution_grant_hash", b(&H32)),
+        ("channels", b(b"ch")),
+        ("device", b(b"d")),
+        ("format", u(1)),
+    ];
+    validate(
+        "certification-run-header-rec",
+        &enc(&rec(0, 0, map(base.clone()))),
+    );
+
+    // Adding the legacy member back is not a certification header.
+    let mut with_legacy = base.clone();
+    with_legacy.push(("claim", b(b"cl")));
+    assert!(
+        try_validate(
+            "certification-run-header-rec",
+            &enc(&rec(0, 0, map(with_legacy)))
+        )
+        .is_err(),
+        "the certification variant forbids the legacy `claim` member"
+    );
+
+    // Dropping any replacement value or digest is not a certification header either.
+    for omitted in [
+        "resource_plan",
+        "resource_plan_hash",
+        "physical_claim",
+        "physical_claim_hash",
+        "aggregate_claim",
+        "aggregate_claim_hash",
+        "execution_grant",
+        "execution_grant_hash",
+    ] {
+        let reduced: Vec<(&str, Value)> = base
+            .iter()
+            .filter(|(k, _)| *k != omitted)
+            .cloned()
+            .collect();
+        assert!(
+            try_validate(
+                "certification-run-header-rec",
+                &enc(&rec(0, 0, map(reduced)))
+            )
+            .is_err(),
+            "`{omitted}` is mandatory in the certification run header"
+        );
+    }
 }
 
 #[test]

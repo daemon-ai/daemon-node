@@ -24,18 +24,41 @@ journal-record = run-header-rec / event-rec / read-back-rec / clock-rec / publis
                / timer-arm-rec / timer-cancel-rec / drop-rec / throttle-rec / terminal-rec
                / snapshot-rec / init-rec / signed-frame-rec / instantiation-rec
                / completion-rec / device-profile-rec / condition-rec / seal-rec
+               / execution-grant-rec
 
 hash32 = bstr .size 32
 ord    = uint                        ; per-journal monotone record ordinal
 
-run-header-rec = [0, ord, {
+; Tag 0 is MINOR-SELECTED, and the legacy `claim` member is replaced rather than repurposed. A
+; header written under ABI <= 2.4 carries the verbatim `da_claim` result; a header written under
+; the certification minor (2.5) FORBIDS that member and carries the plan, the selected role
+; Physical Claim, the node/device aggregate claim and the Execution Grant, each as its exact
+; canonical bytes plus its blake3. An optional tag-0 field would not express this: a reader must be
+; able to tell which statement the header is making, and "absent" is not a statement.
+run-header-rec = legacy-run-header-rec / certification-run-header-rec
+
+legacy-run-header-rec = [0, ord, {
   "run_id": hash32, "epoch": uint, "role": tstr, "instance": uint, "module": hash32,
-  "abi": uint,                       ; negotiated (major << 16) | minor
+  "abi": uint,                       ; negotiated (major << 16) | minor, minor <= 4
   "worlds": { * tstr => uint },      ; negotiated per-world minors
   "bridge": bool,
   "manifest": bstr, "config": bstr, "grants": bstr, "claim": bstr,
   "channels": bstr, "device": bstr,  ; each: verbatim canonical-CBOR bytes of the admitted value
   "format": uint,                    ; journal format version (1)
+}]
+
+certification-run-header-rec = [0, ord, {
+  "run_id": hash32, "epoch": uint, "role": tstr, "instance": uint, "module": hash32,
+  "abi": uint,                       ; negotiated (major << 16) | minor, minor >= 5
+  "worlds": { * tstr => uint },
+  "bridge": bool,
+  "manifest": bstr, "config": bstr, "grants": bstr,
+  "resource_plan": bstr,   "resource_plan_hash": hash32,    ; the canonical Logical Resource Plan
+  "physical_claim": bstr,  "physical_claim_hash": hash32,   ; the SELECTED role claim
+  "aggregate_claim": bstr, "aggregate_claim_hash": hash32,  ; the node/device claim reserved here
+  "execution_grant": bstr, "execution_grant_hash": hash32,  ; inline: bounded, non-secret, pre-init
+  "channels": bstr, "device": bstr,
+  "format": uint,
 }]
 
 event-rec = [1, ord, {
@@ -105,6 +128,16 @@ condition-rec      = [16, ord, { "code": tstr, "detail": tstr }] ; §6.7 run con
 seal-rec = [17, ord, {
   "segment_blake3": hash32,          ; hash of this segment EXCLUDING this seal record (§8.2)
   "records": uint,
+}]
+
+; The certification minor's grant-application result. Written exactly once after
+; `da_apply_execution_grant` RETURNS (status zero or nonzero) and before tag 11 (`da_init`). On a
+; trap it is absent and exactly one terminal trap with context `da_apply_execution_grant` occupies
+; that branch instead, and initialization never occurs. Replay reproduces the branch. Absent
+; entirely for lower minors.
+execution-grant-rec = [18, ord, {
+  "execution_grant_hash": hash32,    ; MUST equal blake3 of the tag-0 execution_grant bytes
+  "status": uint,                    ; the da_apply_execution_grant return (0 = accepted)
 }]
 
 sidecar-ref = { "hash": hash32, "size": uint, "seg": uint }      ; §8.5

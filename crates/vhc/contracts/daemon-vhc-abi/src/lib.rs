@@ -18,7 +18,13 @@
 
 #![forbid(unsafe_code)]
 
+pub mod execution_context;
 pub mod round_metrics;
+
+pub use execution_context::{
+    render_legacy_terminal, terminal_contexts_agree, ExecutionContext, LEGACY_CONTEXT_MAX_MINOR,
+    LEGACY_TERMINAL_CONTEXT, SLICE_CONTEXT_PREFIX,
+};
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -65,7 +71,61 @@ pub const DA_ABI_MAJOR_V2: u32 = 2;
 /// wire, no new event, no contract: the sealed handle is exactly what `create_from` returns and
 /// `payload_put` already takes. Importing any of the three forces a declared minor ≥ 4 (§1.3
 /// step 5).
-pub const DA_ABI_MINOR_V2: u32 = 4;
+///
+/// **Minor 5 is the certification minor** ([`CERTIFICATION_MINOR_V2`]), carrying three
+/// coordinated changes as one unit — the observational-logging exemption during `da_init` and
+/// `da_migrate`, the [`DA_RESOURCE_PLAN_EXPORT`] assessment export, and the
+/// [`DA_APPLY_EXECUTION_GRANT_EXPORT`] run-instance input. They share one bump because they land
+/// in one candidate and one guest re-pin; that does not make them one semantic reason, and each
+/// is accounted for separately.
+///
+/// The minor does not version the *symbol table* — logging adds no symbol, and the two additions
+/// are exports rather than imports. It versions **what a conforming host implements**. A module
+/// built against this rung may legally log during initialization; run it on a host implementing
+/// minor 4 and that legal call becomes a `PhaseViolation` at init — an anonymous trap, which is
+/// precisely the failure this rung exists to abolish, now reachable by a version skew instead of
+/// by a missing feature. [`host_minor_for`] and the too-new refusal convert that skew into a
+/// typed admission refusal naming the minor, which is diagnosable where the trap is not.
+///
+/// This is therefore the first minor whose floor is **behavioral rather than derivable from the
+/// import shape**: [`required_v2_minor`] sees imports, so the SDK MUST raise a module's declared
+/// minor whenever it arms pre-loop panic forwarding or emits the two new exports. Conformance
+/// asserts both couplings and the lower-minor legacy path.
+pub const DA_ABI_MINOR_V2: u32 = 5;
+
+/// The **certification minor**: the major-2 rung that jointly carries the observational-logging
+/// exemption, [`DA_RESOURCE_PLAN_EXPORT`] and [`DA_APPLY_EXECUTION_GRANT_EXPORT`].
+///
+/// A module declaring this minor is dispatched down the certification path: its assessment emits
+/// a Logical Resource Plan instead of a tiered physical claim, its run instance receives an
+/// Execution Grant before `da_init`, and its journal uses the certification run-header variant.
+/// A module declaring a **lower** minor keeps `da_claim` under its existing contract, keeps the
+/// legacy lane bounds check, keeps the legacy tag-0 `claim` member and keeps the legacy terminal
+/// context rendering — and MUST continue to be admitted unchanged.
+pub const CERTIFICATION_MINOR_V2: u32 = 5;
+
+/// The assessment export a certification-minor module provides in place of `da_claim`:
+/// `da_resource_plan(cfg_ptr, cfg_len, capability_grants_ptr, capability_grants_len) -> u64`,
+/// returning `(ptr << 32) | len` canonical Logical Resource Plan bytes.
+///
+/// It runs on the **capability-free assessment instance** under the derived derivation budget,
+/// and the span it returns is guest-owned: the SDK obtains it with exactly `da_alloc(len, 1)` and
+/// the host frees it with the identical layout `da_free(ptr, len, 1)` after copying out — even
+/// when the copied bytes are subsequently refused.
+pub const DA_RESOURCE_PLAN_EXPORT: &str = "da_resource_plan";
+
+/// The run-instance input export a certification-minor module provides:
+/// `da_apply_execution_grant(grant_ptr, grant_len) -> u32`, returning `0` on acceptance.
+///
+/// Called **exactly once**, on the admitted run instance, after the host has written the
+/// canonical Execution Grant and **before** `da_init`. The span is host-written and **borrowed**,
+/// exactly like today's configuration and Capability Grants spans: the guest decodes or copies it
+/// synchronously, retains no pointer and never calls `da_free` on it; the host does not free it
+/// either; it is reclaimed with the instance. A nonzero return is a typed `ExecutionGrantRejected`
+/// join refusal recording the module's `u32` status verbatim, and is deterministic and
+/// non-retryable for that `(module, plan, grant)` tuple — a retry requires changed admitted
+/// input, not a fresh instance. A missing or mis-typed export is `BadModule`.
+pub const DA_APPLY_EXECUTION_GRANT_EXPORT: &str = "da_apply_execution_grant";
 
 /// The set of ABI **majors this host generation implements** (i.e. carries a driver for).
 ///
@@ -144,6 +204,42 @@ pub const LOG_LEVEL_ERROR: u32 = 4;
 ///
 /// [`GuestPanic`]: https://docs.rs/daemon-vhc-host
 pub const GUEST_PANIC_LOG_PREFIX: &str = "guest panic: ";
+
+// -- `sys@2::log` bounds, applied BEFORE the guest-memory read (ABI §6.5, §6.6.1 `[LX-6]`) --------
+//
+// The order of operations is normative, not an implementation detail:
+//
+//   1. admit or drop the call against the per-phase call budget, using only the arguments — a
+//      dropped call touches no guest memory at all;
+//   2. clamp the raw length to the smaller of [`LOG_MESSAGE_BYTES_MAX`] and the phase's remaining
+//      byte budget, BEFORE any host allocation or copy — the guest-supplied length is untrusted
+//      input and MUST NOT size a host allocation;
+//   3. read only the accepted prefix from guest memory;
+//   4. convert lossily and truncate at the last valid character boundary at or below the limit.
+//
+// A host that reads the guest-supplied length first and limits afterwards has already spent the
+// memory the limit exists to protect. Truncation is not a trap, an invalid encoding is not a trap,
+// and a call past either budget is dropped — counted, never delivered, never a trap.
+
+/// The maximum number of `sys@2::log` calls accepted per exempt phase (`[LX-6]`). Each of
+/// `da_init` and `da_migrate` has its own independent budget, reset when the phase is entered.
+pub const LOG_CALLS_PER_PHASE_MAX: u64 = 16;
+
+/// The maximum number of `sys@2::log` bytes accepted per exempt phase (`[LX-6]`).
+pub const LOG_BYTES_PER_PHASE_MAX: u64 = 64 * 1024;
+
+/// The maximum accepted length of one `sys@2::log` message, in bytes (`[LX-6]`). It matches the
+/// SDK's panic-line cap so the panic path never truncates twice.
+pub const LOG_MESSAGE_BYTES_MAX: u64 = 4096;
+
+/// The accepted prefix length for one `log` call: the guest-supplied length clamped to
+/// [`LOG_MESSAGE_BYTES_MAX`] and to the phase's remaining byte budget. Computed from the
+/// arguments alone, so it can be applied **before** the guest-memory read.
+#[must_use]
+pub fn log_accepted_prefix_len(raw_len: u32, remaining_phase_bytes: u64) -> u32 {
+    let clamp = LOG_MESSAGE_BYTES_MAX.min(remaining_phase_bytes);
+    u32::try_from(u64::from(raw_len).min(clamp)).unwrap_or(u32::MAX)
+}
 
 /// The `sys@2` **crypto acceleration** symbols (Phase B; ABI §2.2 "later phases", architecture
 /// §3.2/§3.7): `hash` and `verify_sig`, following the det-lane pattern — semantics pinned by the
@@ -327,6 +423,29 @@ pub const V2_REQUIRED_EXPORTS: &[&str] = &[
     "da_init",
     "da_run",
 ];
+
+/// The additional exports a module declaring [`CERTIFICATION_MINOR_V2`] MUST provide. A module
+/// declaring that minor without both is `BadModule`; a module declaring a lower minor is not
+/// asked for them and is admitted under [`V2_REQUIRED_EXPORTS`] unchanged.
+pub const V2_CERTIFICATION_MINOR_EXPORTS: &[&str] =
+    &[DA_RESOURCE_PLAN_EXPORT, DA_APPLY_EXECUTION_GRANT_EXPORT];
+
+/// The exports a conforming major-2 module MUST provide at `minor`. At or above
+/// [`CERTIFICATION_MINOR_V2`] this is [`V2_REQUIRED_EXPORTS`] plus
+/// [`V2_CERTIFICATION_MINOR_EXPORTS`]; below it, the base set alone.
+///
+/// `da_claim` stays in the base set at every minor. A certification-minor module still exports it
+/// — the host simply does not call it, because the assessment sequence dispatches on the declared
+/// minor. Dropping it from the required set would make the certification minor a *breaking*
+/// change to the export shape rather than the additive one it is.
+#[must_use]
+pub fn v2_required_exports_for_minor(minor: u32) -> Vec<&'static str> {
+    let mut exports = V2_REQUIRED_EXPORTS.to_vec();
+    if minor >= CERTIFICATION_MINOR_V2 {
+        exports.extend_from_slice(V2_CERTIFICATION_MINOR_EXPORTS);
+    }
+    exports
+}
 
 /// The symbol vocabulary the host provides for a v2 import namespace, or `None` if `ns` is
 /// not a known v2 namespace. `data@2` populated at Phase B; `compute@2` at Phase C (registered at
@@ -741,7 +860,58 @@ pub const JOURNAL_RECORD_TAGS: &[u8] = &[
     15, // device-profile (reserved, Phase B)
     16, // condition
     17, // seal
+    18, // execution-grant (the certification minor)
 ];
+
+/// The journal tag the certification minor assigns to the Execution Grant application result.
+///
+/// Written **exactly once**, after `da_apply_execution_grant` returns — whether the status is
+/// zero or nonzero — and before the tag-11 init record. On a trap the record is absent and
+/// exactly one terminal trap with context `da_apply_execution_grant` occupies that branch, and
+/// initialization never occurs. After tag 0 the grammar therefore requires exactly one of
+/// *(tag-18 result)* or *(terminal grant-application trap)*; a successful application with no
+/// tag 18 is not conforming. Replay reproduces the branch.
+pub const JOURNAL_TAG_EXECUTION_GRANT: u8 = 18;
+
+// -- the certification run-header members (ABI §8.3 tag 0, minor-selected) -------------------------
+//
+// Tag 0 is minor-selected and its legacy `claim` member is never repurposed. At ABI ≤ 2.4 the run
+// header retains `"claim": bstr` — the verbatim legacy `da_claim` result. At the certification
+// minor that member is FORBIDDEN, and the header instead carries the four canonical values below
+// with their blake3 digests. Replay verifies every digest before using any value.
+
+/// Tag-0 certification member: the canonical Logical Resource Plan bytes.
+pub const RUN_HEADER_KEY_RESOURCE_PLAN: &str = "resource_plan";
+/// Tag-0 certification member: blake3 of [`RUN_HEADER_KEY_RESOURCE_PLAN`].
+pub const RUN_HEADER_KEY_RESOURCE_PLAN_HASH: &str = "resource_plan_hash";
+/// Tag-0 certification member: the canonical bytes of the **selected role** Physical Claim.
+pub const RUN_HEADER_KEY_PHYSICAL_CLAIM: &str = "physical_claim";
+/// Tag-0 certification member: blake3 of [`RUN_HEADER_KEY_PHYSICAL_CLAIM`].
+pub const RUN_HEADER_KEY_PHYSICAL_CLAIM_HASH: &str = "physical_claim_hash";
+/// Tag-0 certification member: the canonical bytes of the node/device aggregate claim atomically
+/// reserved for this incarnation at admission.
+pub const RUN_HEADER_KEY_AGGREGATE_CLAIM: &str = "aggregate_claim";
+/// Tag-0 certification member: blake3 of [`RUN_HEADER_KEY_AGGREGATE_CLAIM`].
+pub const RUN_HEADER_KEY_AGGREGATE_CLAIM_HASH: &str = "aggregate_claim_hash";
+/// Tag-0 certification member: the canonical Execution Grant bytes, recorded **inline**.
+///
+/// Unlike arbitrary readback, the grant is bounded to 64 KiB, contains only non-secret logical
+/// policy values, and is required before initialization and before replay can execute guest code.
+/// Inline custody therefore avoids creating a sidecar-resolution dependency at the very point that
+/// establishes execution identity; the encrypted-sidecar convention for large readback values is
+/// unchanged.
+pub const RUN_HEADER_KEY_EXECUTION_GRANT: &str = "execution_grant";
+/// Tag-0 certification member: blake3 of [`RUN_HEADER_KEY_EXECUTION_GRANT`].
+pub const RUN_HEADER_KEY_EXECUTION_GRANT_HASH: &str = "execution_grant_hash";
+/// Tag-0 **legacy** member, retained at ABI ≤ 2.4 and forbidden at the certification minor: the
+/// verbatim `da_claim` result.
+pub const RUN_HEADER_KEY_LEGACY_CLAIM: &str = "claim";
+
+/// Whether a tag-0 run header written under `abi_minor` uses the certification variant.
+#[must_use]
+pub fn run_header_is_certification_variant(abi_minor: u32) -> bool {
+    abi_minor >= CERTIFICATION_MINOR_V2
+}
 
 // ================================================================================================
 // Custom-op registry (Phase C; architecture §3.2, refactor §7).                    [C2:custom-op]
@@ -1314,10 +1484,14 @@ mod tests {
         assert_eq!(host_minor_for(DA_ABI_MAJOR), None);
         // B1 bumped the major-2 minor to 1 with Completion delivery; C1 bumped it to 2 with
         // Fence delivery + the compute@2 shim; the det-state wave bumped it to 3 with the
-        // state store + the three state imports; the buffer-staging trio bumped it to 4 (all on
-        // the ratified coupled-to-the-working-driver path, ABI §1.4/§4.6). Minor 5 stays
-        // AbiMinorTooNew.
-        assert_eq!(host_minor_for(DA_ABI_MAJOR_V2), Some(BUFFER_STAGE_MINOR_V2));
+        // state store + the three state imports; the buffer-staging trio bumped it to 4; and the
+        // certification rung bumped it to 5 with the logging exemption and the two resource
+        // exports (all on the ratified coupled-to-the-working-driver path, ABI §1.4/§4.6).
+        // Minor 6 stays AbiMinorTooNew.
+        assert_eq!(
+            host_minor_for(DA_ABI_MAJOR_V2),
+            Some(CERTIFICATION_MINOR_V2)
+        );
         assert_eq!(host_minor_for(3), None);
     }
 
@@ -1525,6 +1699,65 @@ mod tests {
         .unwrap();
     }
 
+    /// The certification minor is one rung above buffer staging, is what the host implements, and
+    /// requires both resource exports **additively** — the base export set is unchanged, so a
+    /// lower-minor module's export shape still conforms.
+    #[test]
+    fn the_certification_minor_adds_two_exports_without_removing_any() {
+        assert_eq!(CERTIFICATION_MINOR_V2, BUFFER_STAGE_MINOR_V2 + 1);
+        assert_eq!(DA_ABI_MINOR_V2, CERTIFICATION_MINOR_V2);
+
+        let legacy = v2_required_exports_for_minor(BUFFER_STAGE_MINOR_V2);
+        assert_eq!(legacy, V2_REQUIRED_EXPORTS.to_vec());
+        assert!(!legacy.contains(&DA_RESOURCE_PLAN_EXPORT));
+
+        let certification = v2_required_exports_for_minor(CERTIFICATION_MINOR_V2);
+        for base in V2_REQUIRED_EXPORTS {
+            assert!(
+                certification.contains(base),
+                "the certification minor keeps `{base}`"
+            );
+        }
+        assert!(certification.contains(&DA_RESOURCE_PLAN_EXPORT));
+        assert!(certification.contains(&DA_APPLY_EXECUTION_GRANT_EXPORT));
+        // `da_claim` survives at the certification minor: the host simply stops calling it.
+        // Dropping it would make an additive rung a breaking change to the export shape.
+        assert!(certification.contains(&"da_claim"));
+    }
+
+    /// The run header and the terminal context are both selected by the negotiated minor, and the
+    /// certification minor is the boundary for each.
+    #[test]
+    fn the_run_header_and_context_rendering_are_minor_selected() {
+        assert!(!run_header_is_certification_variant(BUFFER_STAGE_MINOR_V2));
+        assert!(run_header_is_certification_variant(CERTIFICATION_MINOR_V2));
+        assert_eq!(LEGACY_CONTEXT_MAX_MINOR, CERTIFICATION_MINOR_V2 - 1);
+        assert!(JOURNAL_RECORD_TAGS.contains(&JOURNAL_TAG_EXECUTION_GRANT));
+    }
+
+    /// `[LX-6]`: the accepted prefix is computed from the arguments alone, so it can be applied
+    /// before any guest-memory read. An absurd guest-supplied length yields a bounded read, not an
+    /// allocation the length sized.
+    #[test]
+    fn the_log_prefix_length_is_clamped_from_the_arguments_alone() {
+        assert_eq!(LOG_CALLS_PER_PHASE_MAX, 16);
+        assert_eq!(LOG_BYTES_PER_PHASE_MAX, 64 * 1024);
+        assert_eq!(LOG_MESSAGE_BYTES_MAX, 4096);
+
+        assert_eq!(log_accepted_prefix_len(100, LOG_BYTES_PER_PHASE_MAX), 100);
+        assert_eq!(
+            log_accepted_prefix_len(u32::MAX, LOG_BYTES_PER_PHASE_MAX),
+            LOG_MESSAGE_BYTES_MAX as u32,
+            "an absurd length clamps to the message cap, it does not size an allocation"
+        );
+        assert_eq!(
+            log_accepted_prefix_len(4096, 10),
+            10,
+            "the remaining phase budget clamps below the message cap"
+        );
+        assert_eq!(log_accepted_prefix_len(4096, 0), 0);
+    }
+
     /// The incremental buffer-staging trio registers at its own minor, which the host implements,
     /// and importing any of it lifts the required declared minor (§1.3 step 5). It is a
     /// host-resource surface: nothing about the payload wire, the event vocabulary or the journal
@@ -1532,8 +1765,8 @@ mod tests {
     #[test]
     fn buffer_staging_ops_register_at_their_own_minor() {
         assert_eq!(BUFFER_STAGE_MINOR_V2, 4);
-        assert_eq!(DA_ABI_MINOR_V2, BUFFER_STAGE_MINOR_V2);
-        assert_eq!(host_minor_for(DA_ABI_MAJOR_V2), Some(BUFFER_STAGE_MINOR_V2));
+        assert!(DA_ABI_MINOR_V2 >= BUFFER_STAGE_MINOR_V2);
+        assert_eq!(host_minor_for(DA_ABI_MAJOR_V2), Some(DA_ABI_MINOR_V2));
         for sym in ["buffer_open", "buffer_append", "buffer_seal"] {
             assert_eq!(
                 v2_symbol_minor(NS_VHC_V2, sym),
