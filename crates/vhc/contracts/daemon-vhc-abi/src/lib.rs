@@ -104,6 +104,12 @@ pub const DA_ABI_MINOR_V2: u32 = 5;
 /// context rendering — and MUST continue to be admitted unchanged.
 pub const CERTIFICATION_MINOR_V2: u32 = 5;
 
+/// The minor ladder only ever climbs: the host's implemented minor is at least every rung it has
+/// assigned. A compile error rather than a test failure, because a rung that went backwards would
+/// make the too-new refusal admit modules the host cannot serve.
+const _: () = assert!(DA_ABI_MINOR_V2 >= BUFFER_STAGE_MINOR_V2);
+const _: () = assert!(DA_ABI_MINOR_V2 >= CERTIFICATION_MINOR_V2);
+
 /// The assessment export a certification-minor module provides in place of `da_claim`:
 /// `da_resource_plan(cfg_ptr, cfg_len, capability_grants_ptr, capability_grants_len) -> u64`,
 /// returning `(ptr << 32) | len` canonical Logical Resource Plan bytes.
@@ -1765,7 +1771,6 @@ mod tests {
     #[test]
     fn buffer_staging_ops_register_at_their_own_minor() {
         assert_eq!(BUFFER_STAGE_MINOR_V2, 4);
-        assert!(DA_ABI_MINOR_V2 >= BUFFER_STAGE_MINOR_V2);
         assert_eq!(host_minor_for(DA_ABI_MAJOR_V2), Some(DA_ABI_MINOR_V2));
         for sym in ["buffer_open", "buffer_append", "buffer_seal"] {
             assert_eq!(
