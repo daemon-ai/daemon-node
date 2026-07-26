@@ -35,6 +35,7 @@ pub mod governor;
 pub mod planner;
 pub mod profile;
 pub mod revision;
+pub mod store;
 pub mod trust;
 
 pub use capability::{
@@ -68,6 +69,10 @@ pub use revision::{
     ComputeStackIdentity, DriverApi, DriverRevision, Maybe, OperatingSystem, OsFamily, PlatformApi,
     ProbeObservation, ProducedBy, RevisionRefusal, RevisionSignal, SealedBinaryIdentity,
     Unavailable,
+};
+pub use store::{
+    AuthenticatedProfile, AuthenticationContext, ProfileStore, SelectionRefusal, StoreRefusal,
+    StoredProfile,
 };
 pub use trust::{
     authenticate, AuthenticationRefusal, PolicySide, ProfileAcceptancePolicy, ProfileAuthority,

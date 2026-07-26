@@ -550,6 +550,88 @@ fn check_revision_ranges(
 }
 
 #[cfg(test)]
+pub(crate) mod fixtures {
+    use super::*;
+
+    /// The moment every fixture's validity window contains.
+    pub(crate) const NOW: u64 = 1_000;
+
+    /// A fixture signer.
+    pub(crate) fn peer(n: u8) -> PeerId {
+        PeerId([n; 32])
+    }
+
+    /// A profile priced for the lane and revision `running` describes, so the pair is coherent —
+    /// authentication compares the class and the implementation revision, and a fixture that got them
+    /// from different places would be testing the fixture rather than the rule.
+    pub(crate) fn profile_for(running: &BackendImplementationRevision) -> BackendExecutionProfile {
+        let mut p = crate::profile::fixtures::profile(running.backend_class);
+        p.implementation_revision = running.backend_implementation.revision.clone();
+        p
+    }
+
+    /// A trust envelope binding `profile`, vouched by [`peer`]`(7)`, permitting the driver revision
+    /// `running` actually reports — so the fixture exercises the policy rather than tripping over a
+    /// range mismatch.
+    pub(crate) fn envelope_for(
+        profile: &BackendExecutionProfile,
+        running: &BackendImplementationRevision,
+    ) -> ProfileTrustEnvelope {
+        let permitted_revision_ranges = match running.driver_api.revision_signal() {
+            RevisionSignal::DriverVersion(v) => vec![RevisionRange {
+                numbering: RevisionNumbering::DriverVersion,
+                permitted: [v].into_iter().collect(),
+                os_family: None,
+            }],
+            RevisionSignal::VendorRelease(v) => vec![RevisionRange {
+                numbering: RevisionNumbering::VendorRelease,
+                permitted: [v].into_iter().collect(),
+                os_family: None,
+            }],
+            RevisionSignal::OsBuild { family, build, .. } => vec![RevisionRange {
+                numbering: RevisionNumbering::OsBuild,
+                permitted: [build].into_iter().collect(),
+                os_family: Some(family),
+            }],
+            RevisionSignal::None => Vec::new(),
+        };
+        ProfileTrustEnvelope {
+            profile_schema: profile.schema,
+            compatible_planner_versions: [1].into_iter().collect(),
+            sealed_binary: running.sealed_binary.clone(),
+            certification_evidence_digest: profile.conformance_evidence_digest,
+            authority: ProfileAuthority {
+                signer: peer(7),
+                release_authority: "the release authority".into(),
+            },
+            validity: ValidityPolicy {
+                not_before_ms: 0,
+                not_after_ms: 10_000,
+                revocation_list_digest: Hash([2u8; 32]),
+            },
+            implementation_revision: profile.implementation_revision.clone(),
+            permitted_revision_ranges,
+            profile_digest: profile.profile_digest().expect("fixture profile digests"),
+        }
+    }
+
+    /// An accepting policy naming the fixture authority. Takes the store only so a caller reads as
+    /// "the policy for this store" — no authority is derived from what is held, which is the whole
+    /// point: the authority is injected, never inferred.
+    pub(crate) fn policy_for(_store: &crate::store::ProfileStore) -> ProfileAcceptancePolicy {
+        ProfileAcceptancePolicy {
+            accepted_authorities: [peer(7)].into_iter().collect(),
+            min_profile_schema: 1,
+            accepted_planner_versions: [1].into_iter().collect(),
+            require_conformance_evidence: true,
+            require_measured_allocation_ceiling: true,
+            require_full_calibration: true,
+            revoked_profiles: BTreeSet::new(),
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::profile::fixtures::profile;
