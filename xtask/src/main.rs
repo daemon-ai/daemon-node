@@ -5000,12 +5000,26 @@ fn vhc_codename_scan() -> anyhow::Result<()> {
 
     let mut violations: Vec<String> = Vec::new();
     let mut scanned = 0usize;
+    // The tracked specifications are scanned too. They ship inside every certification candidate, so a
+    // spec citing a wave id names a document its reader does not have — the same defect as a comment
+    // doing it, in a document with a wider audience.
+    let mut targets: Vec<PathBuf> = [
+        "vhc-architecture-spec.md",
+        "vhc-module-abi-spec.md",
+        "vhc-fleet-ceremony-runbook.md",
+    ]
+    .iter()
+    .map(|name| workspace_root().join("docs/specs").join(name))
+    .filter(|p| p.is_file())
+    .collect();
     for root in ["crates", "xtask", "bins", "tests"] {
         let dir = workspace_root().join(root);
-        if !dir.is_dir() {
-            continue;
+        if dir.is_dir() {
+            targets.extend(rust_sources(&dir)?);
         }
-        for path in rust_sources(&dir)? {
+    }
+    {
+        for path in targets {
             let text = std::fs::read_to_string(&path)?;
             scanned += 1;
             for (prefix, suffix, what) in FORBIDDEN {
@@ -5032,7 +5046,7 @@ fn vhc_codename_scan() -> anyhow::Result<()> {
         violations.join("\n")
     );
     println!(
-        "ok: no program vocabulary in {scanned} rust sources ({} needles)",
+        "ok: no program vocabulary in {scanned} tracked sources and specifications ({} needles)",
         FORBIDDEN.len()
     );
     Ok(())
