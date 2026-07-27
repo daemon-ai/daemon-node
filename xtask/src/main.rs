@@ -58,6 +58,8 @@ enum Cmd {
     },
     /// Decode every CBOR fixture with the generated C codec (wire-compat gate).
     VerifyCodec,
+    /// Check the tracked ABI specification against the constants the code defines (drift gate).
+    VhcAbiSpecDrift,
     /// Build the vhc guest experiment modules (`guests/`) for `wasm32-unknown-unknown`.
     BuildGuests,
     /// Run the vhc **CI tier-1** suite: the CPU-only, consensus-critical determinism / round-
@@ -341,6 +343,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::ApiFixtures => gen_api_fixtures(),
         Cmd::GenZcbor { cddl, out } => gen_zcbor(cddl, out),
         Cmd::VerifyCodec => verify_codec(),
+        Cmd::VhcAbiSpecDrift => vhc_abi_spec_drift(),
         Cmd::BuildGuests => build_guests(),
         Cmd::VhcCiDet => vhc_ci_det(),
         Cmd::VhcCiT2 => vhc_ci_t2(),
@@ -691,6 +694,10 @@ fn vhc_ci_det() -> anyhow::Result<()> {
         // fails fast on a host/*->sdk/* regression before spending a compile.
         println!("\n== vhc-ci-det: daemon-vhc dependency-direction check ==");
         vhc_dep_check()?;
+        // The tracked specification against the code it documents — cheap, and it fails before a
+        // compile on a spec sentence a reader would act on and be wrong about.
+        println!("\n== vhc-ci-det: tracked ABI specification vs the code ==");
+        vhc_abi_spec_drift()?;
         build_guests()?;
         vhc_ci_det_suites(det_schedule_from_env())?;
         vhc_cross_lane()
@@ -4784,4 +4791,129 @@ fn rust_sources(root: &std::path::Path) -> anyhow::Result<Vec<std::path::PathBuf
     }
     out.sort();
     Ok(out)
+}
+
+/// The tracked ABI specification states values the code defines — check that they still agree.
+///
+/// A text mirror can only drift from another text. A specification drifts from the **implementation**,
+/// and that is the drift that costs something: an author reading a stated constant, writing a profile
+/// range or a permitted minor against it, and being wrong. So the check compares the spec's own
+/// sentences against `daemon-vhc-abi`'s constants rather than against a copy of itself.
+///
+/// It is deliberately narrow: the values a reader would act on. A spec sentence the code contradicts
+/// fails; prose the code has no opinion about is not this gate's business.
+///
+/// # Errors
+/// Names every statement that no longer matches, with the value the code defines.
+fn vhc_abi_spec_drift() -> anyhow::Result<()> {
+    let spec_path = workspace_root().join("docs/specs/vhc-module-abi-spec.md");
+    let spec = std::fs::read_to_string(&spec_path)
+        .map_err(|e| anyhow::anyhow!("read {}: {e}", spec_path.display()))?;
+
+    // `(what the spec must state, the value the code defines)`. Each is a value a reader acts on: a
+    // declared minor, an export name a module must provide, a journal tag a replay must decode, or a
+    // bound a guest is clamped to.
+    let expectations: Vec<(String, String)> = vec![
+        (
+            format!("`DA_ABI_MAJOR_V2` | `{}`", daemon_vhc_abi::DA_ABI_MAJOR_V2),
+            "the ABI major".into(),
+        ),
+        (
+            format!("`DA_ABI_MINOR_V2` | `{}`", daemon_vhc_abi::DA_ABI_MINOR_V2),
+            "the highest implemented minor".into(),
+        ),
+        (
+            format!(
+                "`CERTIFICATION_MINOR_V2` | `{}`",
+                daemon_vhc_abi::CERTIFICATION_MINOR_V2
+            ),
+            "the certification minor".into(),
+        ),
+        (
+            format!(
+                "`LEGACY_CONTEXT_MAX_MINOR` | `{}`",
+                daemon_vhc_abi::LEGACY_CONTEXT_MAX_MINOR
+            ),
+            "the highest legacy minor".into(),
+        ),
+        (
+            daemon_vhc_abi::DA_RESOURCE_PLAN_EXPORT.to_string(),
+            "the resource-plan export name".into(),
+        ),
+        (
+            daemon_vhc_abi::DA_APPLY_EXECUTION_GRANT_EXPORT.to_string(),
+            "the grant-application export name".into(),
+        ),
+        (
+            format!("**Tag {}**", daemon_vhc_abi::JOURNAL_TAG_EXECUTION_GRANT),
+            "the grant-application journal tag".into(),
+        ),
+        (
+            "`LOG_CALLS_PER_PHASE_MAX`".into(),
+            "the per-phase log call bound".into(),
+        ),
+        (
+            "`LOG_BYTES_PER_PHASE_MAX`".into(),
+            "the per-phase log byte bound".into(),
+        ),
+        (
+            "`LOG_MESSAGE_BYTES_MAX`".into(),
+            "the per-message log byte bound".into(),
+        ),
+    ];
+
+    let mut missing: Vec<String> = Vec::new();
+    for (needle, what) in &expectations {
+        if !spec.contains(needle) {
+            missing.push(format!("  {what}: the spec does not state `{needle}`"));
+        }
+    }
+
+    // The closed context domain: the spec's table must carry every canonical string the code renders,
+    // or a reader cannot tell which context a record's string belongs to. Enumerated here rather than
+    // iterated, so adding a twelfth variant to the code fails this gate until the table says so — which
+    // is the point, the domain being closed at eleven.
+    use daemon_vhc_abi::execution_context::ExecutionContext;
+    let domain = [
+        ExecutionContext::Init,
+        ExecutionContext::Migrate,
+        ExecutionContext::RunBeforeFirstSlice,
+        ExecutionContext::RunBetweenSlices,
+        ExecutionContext::RunAfterLastSlice,
+        ExecutionContext::RunSlice(0),
+        ExecutionContext::Assessment,
+        ExecutionContext::Claim,
+        ExecutionContext::ResourcePlan,
+        ExecutionContext::Manifest,
+        ExecutionContext::ExecutionGrant,
+    ];
+    for context in &domain {
+        let rendered = context.render();
+        // The slice context is parameterized, so the table states its shape rather than one instance.
+        let needle = if rendered.starts_with(daemon_vhc_abi::SLICE_CONTEXT_PREFIX) {
+            format!("`{}<canonical u64>`", daemon_vhc_abi::SLICE_CONTEXT_PREFIX)
+        } else {
+            format!("`{rendered}`")
+        };
+        if !spec.contains(&needle) {
+            missing.push(format!(
+                "  the execution-context table is missing {needle}, which the code renders"
+            ));
+        }
+    }
+
+    anyhow::ensure!(
+        missing.is_empty(),
+        "the tracked ABI specification has drifted from the code it documents:\n{}\n\
+         Fix the specification (or the code, if the code is what moved) — a stated constant a reader \
+         acts on must be the one the implementation defines.",
+        missing.join("\n")
+    );
+    println!(
+        "ok: the tracked ABI specification agrees with the code on {} stated values + the {}-value \
+         execution-context domain",
+        expectations.len(),
+        domain.len()
+    );
+    Ok(())
 }

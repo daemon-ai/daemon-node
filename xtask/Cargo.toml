@@ -13,6 +13,11 @@ path = "src/main.rs"
 [dependencies]
 clap = { workspace = true }
 anyhow = { workspace = true }
+# The ABI contract, for the specification drift check (`vhc-abi-spec-drift`): the tracked spec states
+# the version ladder, export names, journal tags and bounds, and the gate asserts those are the values
+# this crate defines. Checking a specification against the implementation rather than against a copy of
+# itself is the only comparison that catches the drift that costs something.
+daemon-vhc-abi = { workspace = true }
 daemon-api = { workspace = true }
 daemon-common = { workspace = true }
 daemon-protocol = { workspace = true }

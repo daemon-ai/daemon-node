@@ -18892,6 +18892,7 @@ dependencies = [
  "daemon-common",
  "daemon-egress",
  "daemon-protocol",
+ "daemon-vhc-abi",
  "daemon-vhc-guest-build",
  "daemon-vhc-net",
  "daemon-vhc-observe",

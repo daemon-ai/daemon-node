@@ -682,6 +682,48 @@ config    = { probe_every_rounds = 1 }
   cadence (v1 spec §6.1, `steps_per_round`) generalizes to the whole plan: authored inputs,
   derived schedule, peers verify the derivation ([PD-3]).
 
+### 5.4 Authoring invariants
+
+*Ratified 2026-07-26 (normative amendment A2, the derivation invariant). Cross-references: §4.4
+(plan lifecycle), §6.3 (admission).*
+
+An envelope is **derived**, never assembled by hand, and the derivation has exactly one
+implementation. Four times in this program's history a value was authored in one place, re-derived
+in another, and the two disagreed — a corpus key, an artifact URL, a role's resource requirement, a
+claim figure. Each was fixed as an incident. These rules make the class unrepresentable instead.
+
+- **[DI-1]** Every value in a genesis envelope MUST be **derived from the run's configuration** by
+  the authoring pipeline, or be an input a human supplies **exactly once** and the pipeline then
+  propagates. No value is stated twice in two places, in any form, including "for clarity".
+- **[DI-2]** Negative-path and conformance fixtures are **exempt** from [DI-1] and MUST say so at
+  their construction site: a fixture whose purpose is to be malformed cannot be derived from a
+  configuration that would make it well-formed.
+- **[DI-3]** Where a value crosses a language boundary and cannot share the implementation, the
+  contract takes one of exactly two forms, and the change MUST say which: **form 1**, one
+  implementation both sides link; **form 2**, canonical conformance vectors both sides are gated
+  against. A second hand-maintained implementation is neither form and is refused.
+- **[DI-6]** A role's **execution requirements** are carried on the genesis **schema major**, not
+  added compatibly to an older one: a reader that does not understand them MUST refuse the envelope
+  rather than silently ignore a section that changes what the run costs. The envelope's outer
+  framing carries the schema major, the required reader features, a bounded payload length and the
+  payload digest, so **refusal precedes payload decoding**.
+- **[DI-7]** Every shipping authoring path runs the same pipeline. A convenience builder that
+  drives a whole run without passing through it is a second authority and MUST NOT exist; the live
+  path is a **parameterization** of the ceremony path, not a sibling of it.
+- **[DI-9]** The admitted tuple records the identity of everything the admission decided, and a
+  renamed member is a **rename, never a repurpose**: `claim_hash` becoming
+  `logical_resource_plan_hash` means historical `claim_hash` evidence keeps its old meaning and is
+  never reinterpreted under the new one.
+- **[DI-10]** The composition planner has **one implementation and four callers** — authoring
+  validation, node admission, sealed-binary conformance, and ceremony preflight. A caller that
+  cannot link it is bound by [DI-3] form 2 instead.
+
+**What this forbids in practice.** Authoring MUST NOT contain a physical figure for a role: the
+authored artifact carries the role's **module-derived** requirements, and the physical claim is
+composed at admission from those requirements plus the node's own profile and capability report
+(§9.6). An authoring seat therefore has no constructor for stating a requirement, and no path by
+which an operator's estimate becomes one.
+
 ---
 
 ## 6. Groups, rounds, epochs, and fleet snapshots
@@ -943,6 +985,37 @@ from silence.
   keeps custody of canonical state across the fence, publishing nothing to and fetching nothing
   from the payload plane. Local switch ≠ content-plane restore.
 
+### 6.5 Node-local role composition
+
+*Ratified 2026-07-26 (normative amendment A3, node-local role composition). Extends [RL-1]/[RL-2]
+above; cross-references [CI-10]/[CI-11] (the reachability record and roster fold) and [PC-8]
+(timeout classes).*
+
+One host may run more than one role instance, and the rules below are what the implementation
+already does — written down so that a change to them is a decision rather than a drift.
+
+- **[NC-1]** Admission is **per role instance**, and the node's occupancy delta is reserved
+  **atomically**: two instances admitted concurrently on one device MUST NOT each pass a check the
+  pair would fail. One sandbox is one role instance; there is no shared-instance mode.
+- **[NC-2]** A role instance's identity includes its **incarnation**, and incarnations are never
+  reused on a host. A re-admission after a release is a new incarnation, not a resumption of the
+  old reservation's identity.
+- **[NC-3]** A colocated pair is one peer to the roster fold: the reachability record and roster
+  rules see the **node**, not each of its instances, so a two-instance host does not vote twice or
+  count twice toward a quorum.
+- **[NC-4]** A **non-accelerator** role charges **zero accelerator duty**. The consensus seat runs
+  host-side and performs no training compute, so charging it duty exhausts the ledger and refuses
+  the trainer it is colocated with — which is a resource decision nobody made.
+- **[NC-5]** A failure **before any guest code runs** is a host-side bring-up or admission refusal
+  with its own stage, recorded **outside** the guest-trap surface. Attributing it to the guest's
+  initialization phase states a fact about a phase the guest never entered.
+- **[NC-7]** Scoped terms are charged **once at their scope**: a per-process or per-device term is
+  charged once per node, not once per instance, and a per-allocation term is a maximum to validate
+  rather than occupancy to hold. Summing per-role is the double count this rule exists to name.
+- **[NC-8]** A release returns the reservation only when the instance's **teardown is observed**,
+  not when the leave is requested — otherwise a second admission can be granted against memory the
+  first is still holding.
+
 ---
 
 ## 7. The consensus and aggregation seam
@@ -1146,6 +1219,12 @@ checkpoint round, and disabling checkpointing isolated the trigger.
   assumed to have reclaimed VRAM for a later verdict without a process restart. The governor
   restarts workers between runs; keep it that way.
 
+**Relationship to §9.6 (the residency contract).** [EB-4] and [EB-6] are the device-side siblings of
+two terms in the composed claim: [EB-4]'s checkpoint-staging headroom is [RC-4]'s staging term, and
+[EB-6]'s never-shrink pool is its retained-pool term. Under §9.6 those terms are supplied by the
+backend's **certified profile** rather than authored into a guest's claim — the quantity is the same
+one, and the change is which authority states it.
+
 ### 9.3 The selection ladder and device limits
 
 - **[EB-7]** One runtime probe ladder, fixed order **cuda → wgpu/Vulkan → CPU** (`select_backend()`,
@@ -1195,6 +1274,133 @@ ladder + `DeviceLimits` produce the peer's measured budget ([EB-7], [EB-9]); adm
 per-role inequality between them (§10). Heterogeneity splits into a declarative half (the plan
 claims what a role costs) and a measured half (the peer proves what it has) — neither side trusts
 the other's arithmetic.
+
+### 9.6 The guest residency contract
+
+*Ratified 2026-07-26 (normative amendment A1, the guest residency contract). The device-side
+siblings of two of its terms are already in §9.2: [EB-4] is the checkpoint-staging headroom of
+[RC-4] term 8, and [EB-6] is the never-shrink pool behavior of [RC-4] term 4.*
+
+A module's memory footprint used to be one number the guest stated. It is now **three artifacts with
+three owners and three independent lifecycles**, because the single number required the guest to
+know things only the host can know, and a guest that guesses at device physics is a guest that
+re-pins every time a driver moves.
+
+| Artifact | Owner | States |
+|---|---|---|
+| **Logical Resource Plan** | the guest | what the algorithm needs, in logical units |
+| **Backend Execution Profile** | the host backend implementation | what it physically costs to deliver that |
+| **Device Capability Report** | the participating node | what the machine actually has |
+
+- **[RC-1]** The plan is **backend-neutral and parametric**: shapes, dtypes, logical byte sizes,
+  lifetimes, and bounded choice sets. It MUST NOT contain a physical constant, a backend name, an
+  allocator term, or a measurement. Naming one in any identifier is a refusal, not a warning.
+- **[RC-3]** Peak arithmetic is **persistent floor + the maximal concurrently-live transient set +
+  fragmentation headroom**, not a sum over everything declared. The maximal-set form is the
+  correction: summing transients over-states a peak no execution reaches.
+- **[RC-4]** `PhysicalClaim = compose(plan, authenticated certified profile)` — **one claim per
+  backend, never a maximum across backends**. Every profile term declares its **allocation scope**
+  (`PerAllocation` / `PerRoleInstance` / `PerProcess` / `PerDevice`), a stable aggregation key and an
+  associative composition rule; unknown sharing takes the conservative non-sharing rule. The Device
+  Capability Report is **measured on the participating node** and is a statement of **supply**, never
+  of demand, and never of instantaneous free memory.
+- **[RC-6]** A divergence between claimed and observed residency MUST name a **root authority and
+  the contributing authorities** among plan, profile, planner-selector, probe and governor. "The
+  memory was wrong" is not an attribution.
+- **[RC-10]** The governor **intercepts and attributes** what it can, **pre-authorizes from the
+  profile's derived worst case** what it cannot, and records the two enforcement classes
+  **distinctly** in every claim, conformance record and certification statement. A statement that
+  reported one property over both would be asserting something about a driver's internals that
+  nobody verified.
+- **[RC-11]** The host composes over the plan's choice set, selects under scope policy, and delivers
+  **logical values only** as an immutable **Execution Grant**. A `UniformRun` grant is frozen in the
+  signed role entry and every participant consumes those exact bytes; `PerParticipant` requires the
+  module's stated normalization contract and peer-visible evidence.
+- **[RC-13]** There is **one memory reservation authority**: the composed claim and its node/device
+  aggregates. Non-memory ledgers — duty, disk, bandwidth, instance ceiling — keep their existing
+  grant and policy derivations and are never claim-derived. The owner's cap **authorizes and never
+  pays**: it is not a substitute for a figure that was supposed to be derived.
+- **[RC-14]** The profiled hidden-overhead reserve is **visible and counted once**, and a
+  ledger-versus-governor comparison is about **reservation identity and bounds**, not occupancy —
+  measured usage below a reserved bound is normal and is not a divergence.
+
+**Supply is discovered, never supplied.** A certified platform adapter derives conservative usable
+device supply from the platform's own facts, and there is no parameter through which a human figure
+can enter: the node is the party that can measure the device and the operator is the party that
+cannot. Where no trustworthy derivation exists the backend **fails certification or admission** —
+that is the answer, not a prompt. The figure MUST be **stable rather than instantaneous**: a
+platform budget that moves with co-tenant pressure is the governor's input, because a report cited by
+digest cannot be a different report each time it is taken. An **optional owner cap is separate node
+policy, outside the report**, and admission makes **two independent comparisons with two
+attributions** — claim against measured supply, and claim against the cap where one is set. A single
+`min()` of the two loses which refused, and an operator whose own policy is the binding constraint
+must not be told their hardware is too small.
+
+**Ceilings are measured or absent.** The per-allocation ceiling a claim is validated against MUST be
+a **measurement, taken by allocating**, carried with the method that obtained it. Every ceiling a
+platform merely *states* — a framework constant, an advertised buffer limit — describes what an API
+permits rather than what the device honors, and promoting one into a field whose contract says
+measured is how a two-gigabyte supply was once reported for a thirty-gigabyte card. An absent
+measurement refuses admission; it does not fall back.
+
+### 9.7 Per-platform conformance
+
+*Ratified 2026-07-26 (normative amendment A4, platform conformance). [PC-9]'s checklist form also
+lands in [`vhc-fleet-ceremony-runbook.md`](vhc-fleet-ceremony-runbook.md), which is where an
+operator reads it. Cross-references §9.4 (packaging).*
+
+- **[PC-1]** The platform-sensitive registry is a **floor, not a ceiling**: process supervision,
+  path and permission handling, secret storage and dynamic loading are all platform-shaped in this
+  tree, and each entry inherits [PC-9]'s per-platform evidence obligation.
+- **[PC-3]** Every probe returns a **measured value or a typed unavailability**. A zero resource
+  reading is an admission refusal wearing a measurement's clothes: it refuses the machine rather than
+  reporting the defect, and it sends whoever investigates to the wrong place. Absence MUST
+  distinguish *not exposed by the platform*, *not exposed by the framework*, *the probe failed*,
+  *requires a privilege this process lacks*, and *not applicable to this lane*.
+- **[PC-9]** A platform is conformant when its evidence exists **per platform**, on **sealed
+  binaries**, not inferred from another platform's run.
+- **[PC-10]** Profile certification requires that the implementation identity is reported
+  truthfully, only compatible profiles are accepted, workspace formulas bound observed allocation,
+  pool retention matches, **max-allocation probing is accurate**, compilation and staging are
+  included, measured peaks sit within claim plus headroom, **stale profiles fail closed**, and the
+  digests enter admission evidence. Five separately-priced operation families cannot be certified by
+  joint sampling: either isolated per-family evidence, or per-dispatch attribution, or a profile that
+  deliberately collapses them into **one workspace group** whose claims are then group-level claims.
+- **[PC-11]** Profiles are versioned **independently of any guest**. A profile revision does not
+  re-pin a module, and a profile-attributed divergence costs a re-certified profile and re-composed
+  claims with the guest hash unchanged.
+- **[PC-12]** A profile is accepted only under the **intersection** of owner policy and run policy,
+  and a refusal names the rejecting policy. The envelope binds schema version, compatible planner
+  version, sealed backend binary identity, certification evidence digest, signer and release
+  authority, validity and revocation, and the exact implementation plus permitted driver/API ranges.
+
+  **Development authorities require explicit naming by BOTH policies** *(ratified 2026-07-26)*. A
+  development-signed profile is accepted only when owner policy **and** run policy each name that
+  development authority explicitly. Deferral-on-silence — an empty set deferring to the other side —
+  remains correct for **release** authorities only; for a development authority silence is never
+  consent, because a machine owner listing a dev key would otherwise admit a dev-signed profile into
+  a run that never opted in, and a run listing one would push it onto a machine whose owner never
+  agreed. Each side would be unilaterally lowering the other's bar. A development authority
+  **authenticates and does not certify**: it satisfies integration evidence and never ceremony
+  certification, and the class comes back from authentication so the fence survives a misconfigured
+  policy and a caller who did not know it was there.
+
+- **[PC-13]** A superseded, revoked or dangling certification record **fails a statement closed**.
+
+**Authoring caution — a permitted range MUST name whose numbering it constrains.** Two revision
+fields carry different numbering on different platforms, and a range that does not say which it means
+is unevaluable:
+
+- `os.build` carries the **kernel release** on Linux (for example `6.19.7`) and a wholly different
+  **OS build identifier** on macOS (for example `25D2140`). They are not comparable, not ordered
+  against each other, and not interchangeable.
+- The same applies to driver revisions, where a vendor release and a framework-reported driver
+  version are two numbering systems for one stack.
+
+A permitted range therefore states the platform whose numbering it constrains, and a record from
+another platform's numbering does not satisfy it. On a backend whose framework supplies no driver
+revision at all — every Metal case — `os.build` is the implementation-revision signal, which is
+precisely why its numbering must be named rather than assumed.
 
 ---
 
