@@ -37,6 +37,12 @@ pub mod planner;
 pub mod profile;
 pub mod revision;
 pub mod store;
+// Fixture assemblers for tests in OTHER crates. Behind a non-default feature that no production
+// dependency edge may enable (`xtask vhc-dep-check` fails the gate if one does): the constructors it
+// exposes can mint a profile, which is precisely the act the store's crate-private surface exists to
+// prevent a shipping binary from performing.
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 pub mod trust;
 
 pub use admit::{

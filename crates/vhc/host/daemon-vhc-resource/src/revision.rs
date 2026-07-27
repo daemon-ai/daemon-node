@@ -577,11 +577,11 @@ pub enum RevisionRefusal {
     },
 }
 
-#[cfg(test)]
-pub(crate) mod fixtures {
+#[cfg(any(test, feature = "test-support"))]
+pub mod fixtures {
     use super::*;
 
-    pub(crate) fn os(family: OsFamily, build: Maybe<String>) -> OperatingSystem {
+    pub fn os(family: OsFamily, build: Maybe<String>) -> OperatingSystem {
         OperatingSystem {
             family,
             version: Maybe::Available("1.0".into()),
@@ -591,7 +591,7 @@ pub(crate) mod fixtures {
     }
 
     /// A complete, admissible revision record for one backend class.
-    pub(crate) fn revision(class: BackendClass) -> BackendImplementationRevision {
+    pub fn revision(class: BackendClass) -> BackendImplementationRevision {
         BackendImplementationRevision {
             backend_class: class,
             adapter: Adapter {

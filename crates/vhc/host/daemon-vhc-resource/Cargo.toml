@@ -24,6 +24,21 @@ license.workspace = true
 [lib]
 path = "src/lib.rs"
 
+# `test-support` exposes the crate-private fixture constructors (a stocked profile store, an accepting
+# policy, a capability report carrying a measured ceiling, lane bounds, a plan) so that a test in
+# ANOTHER crate can assemble a resource authority. At the certification minor a module declares no
+# physical figure, so admission composes one from an *authenticated* profile — and authentication is
+# reachable only through this crate's private machinery, which would otherwise make such a test
+# impossible to write rather than merely inconvenient.
+#
+# It is deliberately absent from `default`, and it MUST appear only on `dev-dependencies` edges: a
+# production build able to switch it on would be a production build able to mint a profile, defeating
+# the trust gate. `xtask vhc-dep-check` fails if any `[dependencies]`/`[build-dependencies]` edge in
+# the workspace enables it, so the rule is mechanical rather than remembered.
+[features]
+default = []
+test-support = []
+
 [dependencies]
 # The guest-facing halves of the model: the Logical Resource Plan the profile is composed WITH, the
 # Execution Grant, canonical CBOR and blake3. The edge points host -> contracts, never back.

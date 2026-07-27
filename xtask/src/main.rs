@@ -2191,6 +2191,26 @@ fn vhc_dep_check() -> anyhow::Result<()> {
                      then change every guest hash, so a driver update would re-pin the fleet"
                 ));
             }
+            // The resource crate's `test-support` feature exposes the fixture constructors that can
+            // MINT a Backend Execution Profile — the one act the store's crate-private surface exists
+            // to keep out of a shipping binary (architecture §9.6: composition takes an authenticated
+            // profile because there is no other constructor to reach for). A test in another crate
+            // legitimately needs them, so the feature exists; it may travel on a `dev` edge only. A
+            // production edge that enables it would hand a shipping binary the ability to author its
+            // own trust, which is a hole no amount of downstream care closes.
+            if to == "daemon-vhc-resource" && kind != "dev" {
+                let enables_test_support = d["features"]
+                    .as_array()
+                    .is_some_and(|fs| fs.iter().any(|f| f.as_str() == Some("test-support")));
+                if enables_test_support {
+                    violations.push(format!(
+                        "{from} -> {to} [{kind}]: this edge enables the `test-support` feature, \
+                         whose fixture constructors can mint a Backend Execution Profile — it is \
+                         permitted on `dev-dependencies` edges only, so that no shipping binary can \
+                         author the trust it is supposed to be authenticated against"
+                    ));
+                }
+            }
             // The A2 dependency inversion (refactor §5 A2 item 3; architecture §7 SESS → HOSTC):
             // the session links the host — the host must NEVER re-grow a runtime edge onto the
             // session (run policy). A dev-only edge (fixture/parity tests) is permitted.
@@ -2227,6 +2247,35 @@ fn vhc_dep_check() -> anyhow::Result<()> {
                 ));
             }
         }
+    }
+
+    // --- The fixture feature is off by default, at the source. The edge check above catches a
+    // consumer that asks for `test-support`; this catches the far worse slip of the resource crate
+    // handing it out unasked, which would make every production edge a profile-minting edge without
+    // any consumer manifest showing it.
+    {
+        let manifest = root.join("crates/vhc/host/daemon-vhc-resource/Cargo.toml");
+        let text = std::fs::read_to_string(&manifest)
+            .map_err(|e| anyhow::anyhow!("read {}: {e}", manifest.display()))?;
+        let default_line = text
+            .lines()
+            .find(|l| l.trim_start().starts_with("default ="))
+            .unwrap_or_default();
+        if default_line.contains("test-support") {
+            violations.push(format!(
+                "daemon-vhc-resource: `test-support` is in the crate's DEFAULT feature set \
+                 ({}) — the fixture constructors that can mint a Backend Execution Profile must \
+                 never be on unless a dev edge asks for them by name",
+                default_line.trim()
+            ));
+        }
+        anyhow::ensure!(
+            text.contains("test-support = []"),
+            "daemon-vhc-resource: the `test-support` feature is not declared in {} — this gate \
+             asserts a property of a feature that must exist; if the feature was removed, remove \
+             the check with it deliberately rather than letting it pass vacuously",
+            manifest.display()
+        );
     }
 
     // --- HARNESS QUARANTINE (source-level): the engine-era surfaces stay unmistakably

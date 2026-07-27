@@ -169,6 +169,13 @@ cuda = ["burn/cuda", "dep:cudarc", "dep:cubecl-runtime"]
 harness = ["dep:daemon-vhc-sdk-consensus"]
 
 [dev-dependencies]
+# Test-only re-statement of the normal `daemon-vhc-resource` edge above, asking for the fixture
+# feature: `tests/resource_authority_assembly.rs` assembles a real `ResourceAuthority`, which means
+# selecting an authenticated profile out of a stocked store — machinery the resource crate keeps
+# private precisely so no shipping binary can mint its own trust. Under resolver 2 a dev-dependency's
+# features reach test targets only, so the production build of this crate is unaffected; `xtask
+# vhc-dep-check` fails if any non-dev edge in the workspace enables `test-support`.
+daemon-vhc-resource = { workspace = true, features = ["test-support"] }
 # The shared guest-workspace builder every wasm-backed test suite in this crate goes through
 # (reproducibility remap env + cross-process build lock live there, once). Test-only.
 daemon-vhc-guest-build = { workspace = true }

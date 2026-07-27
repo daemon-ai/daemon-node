@@ -626,22 +626,22 @@ fn check_revision_ranges(
     }
 }
 
-#[cfg(test)]
-pub(crate) mod fixtures {
+#[cfg(any(test, feature = "test-support"))]
+pub mod fixtures {
     use super::*;
 
     /// The moment every fixture's validity window contains.
-    pub(crate) const NOW: u64 = 1_000;
+    pub const NOW: u64 = 1_000;
 
     /// A fixture signer.
-    pub(crate) fn peer(n: u8) -> PeerId {
+    pub fn peer(n: u8) -> PeerId {
         PeerId([n; 32])
     }
 
     /// A profile priced for the lane and revision `running` describes, so the pair is coherent —
     /// authentication compares the class and the implementation revision, and a fixture that got them
     /// from different places would be testing the fixture rather than the rule.
-    pub(crate) fn profile_for(running: &BackendImplementationRevision) -> BackendExecutionProfile {
+    pub fn profile_for(running: &BackendImplementationRevision) -> BackendExecutionProfile {
         let mut p = crate::profile::fixtures::profile(running.backend_class);
         p.implementation_revision = running.backend_implementation.revision.clone();
         p
@@ -650,7 +650,7 @@ pub(crate) mod fixtures {
     /// A trust envelope binding `profile`, vouched by [`peer`]`(7)`, permitting the driver revision
     /// `running` actually reports — so the fixture exercises the policy rather than tripping over a
     /// range mismatch.
-    pub(crate) fn envelope_for(
+    pub fn envelope_for(
         profile: &BackendExecutionProfile,
         running: &BackendImplementationRevision,
     ) -> ProfileTrustEnvelope {
@@ -695,7 +695,7 @@ pub(crate) mod fixtures {
     /// An accepting policy naming the fixture authority. Takes the store only so a caller reads as
     /// "the policy for this store" — no authority is derived from what is held, which is the whole
     /// point: the authority is injected, never inferred.
-    pub(crate) fn policy_for(_store: &crate::store::ProfileStore) -> ProfileAcceptancePolicy {
+    pub fn policy_for(_store: &crate::store::ProfileStore) -> ProfileAcceptancePolicy {
         ProfileAcceptancePolicy {
             accepted_authorities: [peer(7)].into_iter().collect(),
             // A release-only policy: accepting a development authority is a separate, explicit act.

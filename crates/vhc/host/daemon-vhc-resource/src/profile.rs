@@ -824,11 +824,11 @@ impl BackendExecutionProfile {
     }
 }
 
-#[cfg(test)]
-pub(crate) mod fixtures {
+#[cfg(any(test, feature = "test-support"))]
+pub mod fixtures {
     use super::*;
 
-    pub(crate) fn term(
+    pub fn term(
         name: &str,
         scope: AllocationScope,
         rule: CompositionRule,
@@ -854,7 +854,7 @@ pub(crate) mod fixtures {
     }
 
     /// A small but complete and valid profile.
-    pub(crate) fn profile(class: BackendClass) -> BackendExecutionProfile {
+    pub fn profile(class: BackendClass) -> BackendExecutionProfile {
         BackendExecutionProfile {
             schema: BACKEND_EXECUTION_PROFILE_SCHEMA,
             backend_class: class,

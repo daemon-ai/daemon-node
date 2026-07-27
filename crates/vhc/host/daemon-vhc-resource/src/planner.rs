@@ -948,15 +948,15 @@ pub mod vectors {
     }
 }
 
-#[cfg(test)]
-pub(crate) mod fixtures {
+#[cfg(any(test, feature = "test-support"))]
+pub mod fixtures {
     use super::*;
     use daemon_vhc_proto::resource_plan::{
         Dimension, Dtype, Expr, Lifetime, LinearLifetime, LinearMemoryTerm, OperationDecl,
         Retention, TensorDecl, TransferDecl, TransferKind,
     };
 
-    pub(crate) fn plan() -> LogicalResourcePlan {
+    pub fn plan() -> LogicalResourcePlan {
         LogicalResourcePlan {
             selection_scope: SelectionScope::UniformRun,
             equivalence_contract_hash: None,
@@ -1004,7 +1004,7 @@ pub(crate) mod fixtures {
         }
     }
 
-    pub(crate) fn binding(micro_batch: u64) -> Binding {
+    pub fn binding(micro_batch: u64) -> Binding {
         Binding::from([("micro_batch".to_string(), DimensionValue::Uint(micro_batch))])
     }
 }

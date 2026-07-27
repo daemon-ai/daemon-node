@@ -743,12 +743,12 @@ impl DeviceAdmissionRefusal {
     }
 }
 
-#[cfg(test)]
-pub(crate) mod fixtures {
+#[cfg(any(test, feature = "test-support"))]
+pub mod fixtures {
     use super::*;
 
     /// A measured per-allocation ceiling for a fixture, as a bounded bisection would have found it.
-    pub(crate) fn measured_ceiling(accepted_bytes: u64) -> MeasuredAllocationCeiling {
+    pub fn measured_ceiling(accepted_bytes: u64) -> MeasuredAllocationCeiling {
         MeasuredAllocationCeiling {
             accepted_bytes,
             refused_bytes: Some(accepted_bytes.saturating_mul(2)),
@@ -761,7 +761,7 @@ pub(crate) mod fixtures {
     }
 
     /// A derived supply figure for a fixture: the static derivation, with nothing clamped.
-    pub(crate) fn derived_supply(usable_bytes: u64) -> DeviceMemorySupply {
+    pub fn derived_supply(usable_bytes: u64) -> DeviceMemorySupply {
         DeviceMemorySupply {
             usable_bytes,
             source: DeviceMemorySource::UnifiedStaticDerivation,
@@ -772,7 +772,7 @@ pub(crate) mod fixtures {
     }
 
     /// A complete, valid report.
-    pub(crate) fn report(class: BackendClass) -> DeviceCapabilityReport {
+    pub fn report(class: BackendClass) -> DeviceCapabilityReport {
         DeviceCapabilityReport {
             schema: DEVICE_CAPABILITY_REPORT_SCHEMA,
             backend_class: class,
