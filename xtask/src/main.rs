@@ -134,6 +134,13 @@ enum Cmd {
         /// pre-release / post-rebase pass, deliberately wired into no workflow).
         #[arg(long)]
         all: bool,
+        /// Ignore the green ledger: every selected lane RUNS, even for a byte-identical workspace.
+        ///
+        /// The certification switch. A full-scope battery whose lanes were skipped because a
+        /// fingerprint matched has verified the ledger, not the tree — so a certification run states
+        /// `--all --no-memo` and the flag is recorded with the verdict.
+        #[arg(long)]
+        no_memo: bool,
         /// Base ref for the diff scope (default: env GATE_BASE, else `vhc-integration`). The
         /// changed set is the merge-base diff vs HEAD unioned with staged/unstaged/untracked.
         #[arg(long)]
@@ -353,7 +360,12 @@ fn main() -> anyhow::Result<()> {
         Cmd::VhcCiNode => vhc_ci_node(),
         Cmd::VhcDepCheck => vhc_dep_check(),
         Cmd::VhcAcceptance => vhc_acceptance(),
-        Cmd::VhcProductionGate { all, base, dry_run } => vhc_production_gate(all, base, dry_run),
+        Cmd::VhcProductionGate {
+            all,
+            base,
+            dry_run,
+            no_memo,
+        } => vhc_production_gate(all, base, dry_run, no_memo),
         Cmd::AuthorCeremonyGenesis {
             run_label,
             author_key,
@@ -1415,7 +1427,7 @@ fn lane_ledger_path(root: &Path, lane: &str) -> PathBuf {
 /// diff-scoped gate folds its selected suite set in). `None` = memoization unavailable (disabled
 /// via env, or the workspace state cannot be proven) — the lane then just runs.
 fn lane_memo_key(root: &Path, extra: &[u8]) -> Option<String> {
-    if std::env::var("VHC_GATE_MEMO").is_ok_and(|v| v == "0") {
+    if memoization_disabled() {
         return None;
     }
     let mut hasher = workspace_fingerprint_hasher(root).ok()?;
@@ -1423,6 +1435,22 @@ fn lane_memo_key(root: &Path, extra: &[u8]) -> Option<String> {
     hasher.update(extra);
     Some(hasher.finalize().to_hex().to_string())
 }
+
+/// Whether lane memoization is switched off for this process.
+///
+/// Two switches, and the difference matters. `VHC_GATE_MEMO=0` is the developer's: ambient, convenient,
+/// and exactly the kind of thing that is set in one shell and forgotten in another. `--no-memo` is the
+/// **certification** switch: it is written in the command an operator runs and recorded in the evidence
+/// beside its verdict, so a full-scope battery cannot be satisfied by a ledger entry from an earlier
+/// tree. A certification claim that rests on "the fingerprint matched last time" rests on the ledger
+/// rather than on the run, and the whole point of the full battery is that it ran.
+fn memoization_disabled() -> bool {
+    std::env::var("VHC_GATE_MEMO").is_ok_and(|v| v == "0")
+        || NO_MEMO.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Set by `--no-memo` before any lane runs; never cleared.
+static NO_MEMO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Does the ledger record a green run of `lane` for exactly this memo key?
 fn lane_memo_green(root: &Path, lane: &str, key: &Option<String>) -> bool {
@@ -1486,7 +1514,18 @@ fn prune_acceptance_cache(cache_root: &Path, keep: usize) {
 /// `vhc-ci-node` + the dependency-direction / negative-architecture check), the tier-2 whole-run
 /// suites, and the multi-process acceptance suite. Every integration branch passes this
 /// aggregate before it merges; nothing merges on the deterministic subset alone.
-fn vhc_production_gate(all: bool, base: Option<String>, dry_run: bool) -> anyhow::Result<()> {
+fn vhc_production_gate(
+    all: bool,
+    base: Option<String>,
+    dry_run: bool,
+    no_memo: bool,
+) -> anyhow::Result<()> {
+    if no_memo {
+        // Before any lane consults the ledger. Recorded in the output as well as taken, so the verdict
+        // says which mode produced it — a full-scope claim and a memoized one are different claims.
+        NO_MEMO.store(true, std::sync::atomic::Ordering::Relaxed);
+        println!("vhc-production-gate: --no-memo — the green ledger is ignored; every lane runs");
+    }
     if all {
         if dry_run {
             println!(
