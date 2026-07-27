@@ -300,6 +300,54 @@ pub struct Admission {
     /// tighten-only). `None` on the pre-D0 path (no envelope grants) — the `RunConfig` defaults
     /// stand there.
     pub quotas: Option<daemon_vhc_proto::AdmittedQuotas>,
+    /// **Against what** the claim was composed, for the admitted tuple (`[DI-9]`).
+    ///
+    /// `None` below the certification minor, and `Some` exactly when [`Self::composition`] is. The
+    /// composition itself records what came *out*; this records the authorities that went *in*, which
+    /// is what a re-derivation at join has to agree with. Kept beside the composition rather than
+    /// inside it because the resource crate composes against borrowed inputs and must not start owning
+    /// copies of them.
+    pub composed_against: Option<ComposedAgainst>,
+}
+
+/// The authorities a composed admission was made against — the input half of the `[DI-9]` admitted
+/// tuple, in the byte-comparable form the tuple carries.
+///
+/// Every member is here because it can change between assess and join **without** any artifact hash
+/// changing, which is exactly the class of change the tuple exists to catch. A driver update leaves the
+/// module, config and grants identical and makes the priced profile inapplicable; a revoked signer
+/// leaves the profile's digest identical and makes it unusable; a device that shrank leaves everything
+/// identical and makes the reservation wrong. None of that is visible in an artifact address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComposedAgainst {
+    /// The authenticated Backend Execution Profile that priced the claim.
+    pub profile_digest: [u8; 32],
+    /// The envelope signer whose word made that profile usable here (`[PC-12]`). Recorded because
+    /// content addressing proves identity and not authority: after a revocation the question is whose
+    /// profiles are suspect, and a digest cannot answer it.
+    pub profile_authority: [u8; 32],
+    /// The backend class slug the profile prices.
+    pub backend_class: String,
+    /// The exact backend implementation revision the profile is valid for.
+    ///
+    /// Recorded explicitly even though the profile digest transitively pins it — the opposite of the
+    /// composition evidence record's choice, and deliberately so. The record describes a composition
+    /// that already happened, where a second spelling could only disagree with the first. The tuple is
+    /// **re-derived at join against the implementation running then**, so this member is what makes an
+    /// implementation revision that moved mid-run detectable at all: the profile digest would still
+    /// match, and `[RC-4]` requires execution to stop until a compatible profile is certified.
+    pub backend_implementation_revision: String,
+    /// The Device Capability Report the claim was authorized against.
+    pub capability_report_digest: [u8; 32],
+    /// The planner that composed it.
+    pub planner_version: u32,
+    /// The device the role instance is bound to for its lifetime.
+    pub device_identity: String,
+    /// The reservation's node-local monotone sequence — the one component of the reservation identity
+    /// the tuple does not already carry under another name (the role, the incarnation and the device
+    /// are members in their own right). Spelled once rather than twice, so the two views of one
+    /// reservation cannot drift apart in the record that is supposed to prove they are the same.
+    pub reservation_sequence: u64,
 }
 
 impl Admission {
@@ -779,8 +827,42 @@ pub fn admit(
                 .map_err(composition_refusal)?;
             let dt = composed.claim().device_total_bytes();
             let ht = composed.claim().linear_memory_bytes;
-            (Some(composed), dt, ht)
+            let against = ComposedAgainst {
+                profile_digest: authority.profile.digest().0,
+                profile_authority: authority.profile.authenticating_authority().0,
+                backend_class: authority.profile.profile().backend_class.slug().to_string(),
+                backend_implementation_revision: authority
+                    .profile
+                    .profile()
+                    .implementation_revision
+                    .clone(),
+                capability_report_digest: authority
+                    .report
+                    .report_digest()
+                    .map_err(|e| {
+                        FunnelRefusal::typed(
+                            4,
+                            AbiRefusal::new(
+                                AbiRefusalCode::ClaimNotComposable,
+                                format!(
+                                    "this node's capability report could not be digested, so the \
+                                     admitted tuple could not state what the claim was authorized \
+                                     against: {e}"
+                                ),
+                            ),
+                        )
+                    })?
+                    .0,
+                planner_version: daemon_vhc_resource::PLANNER_VERSION,
+                device_identity: authority.reservation_identity.device_identity.clone(),
+                reservation_sequence: authority.reservation_identity.sequence,
+            };
+            (Some((composed, against)), dt, ht)
         }
+    };
+    let (composition, composed_against) = match composition {
+        Some((composed, against)) => (Some(composed), Some(against)),
+        None => (None, None),
     };
 
     // -- stage 5: claim vs owner resource authorization — last (needs the claim), supreme ---------
@@ -816,6 +898,7 @@ pub fn admit(
         selection,
         claim: assessed.claim.clone(),
         composition,
+        composed_against,
         claim_bytes: assessed.claim_bytes,
         resource_plan_bytes: assessed.resource_plan_bytes,
         manifest_bytes: assessed.manifest_bytes,
@@ -1699,6 +1782,7 @@ mod tests {
                 under_pressure: Vec::new(),
             }),
             composition: None,
+            composed_against: None,
             claim_bytes: Vec::new(),
             manifest_bytes: Vec::new(),
             quotas: Some(quotas),

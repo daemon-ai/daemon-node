@@ -1632,7 +1632,12 @@ pub(crate) async fn assess_switch(
                 module_hash: target.new_module,
                 config_hash: *blake3::hash(&config).as_bytes(),
                 grants_hash: target.grants_hash,
-                claim_hash: *blake3::hash(&admission.claim_bytes).as_bytes(),
+                resource: daemon_vhc_session::protocol::AdmittedResource::from_admission(
+                    &admission,
+                )
+                .map_err(|e| {
+                    format!("the post-switch tuple could not state its resource identity: {e}")
+                })?,
                 genesis_hash: genesis.frozen.run_id().0,
                 role: genesis.worker_role.clone(),
                 // 0 = unassigned; the node mints the post-switch incarnation and stamps it into
@@ -1930,6 +1935,26 @@ fn assess_module(
             // of the very bytes admitted; the measured backend placement is the selection above
             // (rederiving differently at join = the device inventory changed = typed refusal);
             // the node stamps its device-profile / owner-policy revisions.
+            // The resource statement is minor-selected in ONE place (`[DI-9]`); an encoding failure
+            // means the composition cannot be stated, and a tuple that cannot state what was composed
+            // is not one join can re-verify — so the assessment reports ineligible rather than
+            // admitting with a hole in its own record.
+            let resource =
+                match daemon_vhc_session::protocol::AdmittedResource::from_admission(&admission) {
+                    Ok(resource) => resource,
+                    Err(e) => {
+                        return Eligibility {
+                            eligible: false,
+                            reasons: vec![format!(
+                                "admitted, but the admitted tuple could not state the composed \
+                             resource identity: {e}"
+                            )],
+                            headroom: Vec::new(),
+                            refusal_code: None,
+                            admitted_tuple: None,
+                        }
+                    }
+                };
             let admitted_tuple =
                 tuple_identity.map(|id| daemon_vhc_session::protocol::AdmittedTuple {
                     module_hash: module_blake3
@@ -1937,7 +1962,7 @@ fn assess_module(
                         .unwrap_or_else(|| *blake3::hash(module).as_bytes()),
                     config_hash: *blake3::hash(config).as_bytes(),
                     grants_hash: *blake3::hash(&grants).as_bytes(),
-                    claim_hash: *blake3::hash(&admission.claim_bytes).as_bytes(),
+                    resource,
                     genesis_hash: id.genesis_hash,
                     role: id.role.to_string(),
                     incarnation: id.incarnation,

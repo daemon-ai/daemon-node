@@ -177,6 +177,116 @@ pub struct Hardware {
     pub throughput_class: String,
 }
 
+/// The resource statement an assessment admitted — **minor-selected**, and the reason it is an enum
+/// rather than a widened struct (`[DI-9]`).
+///
+/// The tuple used to carry one `claim_hash` member: the digest of the guest's declared physical-tier
+/// claim bytes. At the certification minor the guest declares no physical figure at all, so the
+/// corresponding statement is the digest of a **Logical Resource Plan** — a different object, about a
+/// different thing, with different semantics. `[DI-9]` therefore requires a **rename, not a
+/// redefinition**: "an artifact that says `claim_hash` is making the old statement, and comparing it to a
+/// plan digest would silently equate two unrelated things."
+///
+/// Two variants is the strongest available form of that rule. A single `Option`-widened struct would
+/// leave both members in scope at once and leave "do not compare these" as a comment; here the legacy
+/// digest simply does not exist on the certification branch, mirroring tag 0, where the legacy `claim`
+/// member is *forbidden* at the certification minor rather than zeroed. Historical evidence keeps its
+/// meaning because nothing reads it under new semantics — there is no field to read it into.
+///
+/// Both branches are compared field-by-field at join; neither is compared across branches, because a
+/// tuple whose branch changed between assess and join is a tuple whose module changed minor, which the
+/// selection check has already refused.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AdmittedResource {
+    /// ABI ≤ 2.4: the module's `claim()` output as admitted (hash of the verbatim claim bytes).
+    ///
+    /// The default, so a pre-extension tuple decodes to the statement it was making.
+    Declared {
+        /// Hash of the declared claim bytes — the original member, unchanged in name and meaning.
+        claim_hash: [u8; 32],
+    },
+    /// The certification minor: the plan that was priced, and the composition that priced it.
+    Composed(Box<ComposedResource>),
+}
+
+/// The certification-minor resource identity (`[DI-9]`): what was priced, what it was priced against,
+/// and what came out.
+///
+/// Recorded as canonical bytes and digests rather than typed structures. That is deliberate on both
+/// counts: the tuple's contract is byte-identity re-derived at join, and a typed member would invite a
+/// semantic comparison where the contract is a byte comparison — the failure mode being a "matching"
+/// tuple whose bytes differ, which is precisely what a stale or swapped artifact looks like. It also
+/// means the wire vocabulary itself names no pricing type: the builder encodes, and everything that
+/// travels is bytes, digests and primitives a consumer can compare without linking a planner.
+///
+/// Boxed because this variant is an order of magnitude larger than the legacy one, and a run below the
+/// certification minor should not pay for a branch it does not take.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComposedResource {
+    /// **The renamed member.** blake3 of the canonical Logical Resource Plan the module emitted.
+    ///
+    /// Never compare this to a historical `claim_hash`: that member digested physical tiers the guest
+    /// declared, this digests a logical shape the guest published. Equal values would mean nothing and
+    /// unequal values would mean nothing.
+    pub logical_resource_plan_hash: [u8; 32],
+    /// The selection scope the envelope resolved (`"uniform-run"` / `"per-participant"`).
+    pub selection_scope: String,
+    /// The canonical bytes of the **selected logical configuration** (`[RC-11]`) — the binding, as
+    /// carried by the Execution Grant this instance consumes.
+    pub selected_configuration: Vec<u8>,
+    /// blake3 of [`Self::selected_configuration`] — the Execution Grant digest.
+    ///
+    /// The grant is the separately encoded, separately hashed *output* of selection, and must never be
+    /// confused with the Capability Grants document (`grants_hash`) that is an *input* to plan
+    /// derivation. Recording both under names that cannot be mistaken for one another is what keeps the
+    /// derivation acyclic in the record as well as in the code.
+    pub execution_grant_hash: [u8; 32],
+    /// The backend class the claim was priced for.
+    pub backend_class: String,
+    /// The authenticated Backend Execution Profile that priced it.
+    pub profile_digest: [u8; 32],
+    /// The envelope signer that authenticated that profile (`[PC-12]`).
+    pub profile_authority: [u8; 32],
+    /// The exact backend implementation revision the profile is valid for.
+    ///
+    /// Join re-derives this from the implementation running *then*. An unmatched revision prevents
+    /// execution until a compatible profile is certified (`[RC-4]`) — and it is the one member here that
+    /// can move while every artifact hash and the profile digest stay identical, which is why the
+    /// composition evidence record's decision to omit it as transitively pinned does not apply to a
+    /// tuple that gets re-derived.
+    pub backend_implementation_revision: String,
+    /// The planner that composed the claim.
+    pub planner_version: u32,
+    /// The Device Capability Report the claim was authorized against.
+    pub capability_report_digest: [u8; 32],
+    /// The canonical bytes of the composed **role** Physical Claim.
+    pub physical_claim: Vec<u8>,
+    /// blake3 of [`Self::physical_claim`].
+    pub physical_claim_hash: [u8; 32],
+    /// The canonical bytes of the node/device **aggregate** claim atomically reserved for this
+    /// incarnation.
+    ///
+    /// Separate from the role claim because a correctly-shared process-scoped term and a
+    /// double-counted per-role one produce the same role total and different aggregates — the
+    /// colocation defect the aggregate exists to make visible.
+    pub aggregate_claim: Vec<u8>,
+    /// blake3 of [`Self::aggregate_claim`].
+    pub aggregate_claim_hash: [u8; 32],
+    /// The governor that took the reservation.
+    pub governor_version: u32,
+    /// The reservation's node-local monotone sequence. With the tuple's own role, incarnation and
+    /// [`Self::device_identity`] this is the full reservation identity, spelled once.
+    pub reservation_sequence: u64,
+    /// blake3 of the reservation's canonical encoding.
+    ///
+    /// Identity alone only *locates* a reservation; it does not prove what was charged (`[RC-15]`). The
+    /// owner's ledger charge and the governor's occupancy reservation are one reservation seen twice,
+    /// and this is the value both views must produce.
+    pub reservation_digest: [u8; 32],
+    /// The device the role instance is bound to for its lifetime.
+    pub device_identity: String,
+}
+
 /// The immutable **admitted tuple** an assessment produces (architecture §6.3): the exact
 /// assessed identity of what will run, carried to `JoinRun` and re-verified there. Join rederives
 /// every artifact-addressed field from the artifacts it is about to run and compares field by
@@ -191,8 +301,14 @@ pub struct AdmittedTuple {
     pub config_hash: [u8; 32],
     /// Canonical-CBOR hash of the FULL grants document (ABI §2.6).
     pub grants_hash: [u8; 32],
-    /// The module's `claim()` output as admitted (hash of the claim bytes).
-    pub claim_hash: [u8; 32],
+    /// **What resource statement was admitted** — minor-selected, exactly as tag 0 is (`[DI-9]`).
+    ///
+    /// Below the certification minor this is the module's own declared claim, under the member name and
+    /// the semantics it has always had. At the certification minor there is no declared claim to hash,
+    /// and this carries the plan digest plus the composition the host derived. The two are separate
+    /// variants rather than one member with two meanings, so a plan digest and a claim hash cannot be
+    /// compared: the comparison is not merely discouraged, it does not typecheck.
+    pub resource: AdmittedResource,
     /// The run identity — the genesis-envelope hash.
     pub genesis_hash: [u8; 32],
     /// The envelope-level role label admitted.
@@ -234,8 +350,8 @@ impl AdmittedTuple {
             Some("config_hash")
         } else if self.grants_hash != rederived.grants_hash {
             Some("grants_hash")
-        } else if self.claim_hash != rederived.claim_hash {
-            Some("claim_hash")
+        } else if let Some(member) = self.resource.first_mismatch(&rederived.resource) {
+            Some(member)
         } else if self.genesis_hash != rederived.genesis_hash {
             Some("genesis_hash")
         } else if self.role != rederived.role {
@@ -246,6 +362,145 @@ impl AdmittedTuple {
             Some("backend")
         } else if self.gpu_index != rederived.gpu_index {
             Some("gpu_index")
+        } else {
+            None
+        }
+    }
+}
+
+impl Default for AdmittedResource {
+    /// The legacy branch, with a zero digest.
+    ///
+    /// A default tuple is a *placeholder*, not an admission, and the legacy branch is the honest shape
+    /// for one: defaulting to the composed branch would produce a value asserting that a composition
+    /// happened, complete with digests of nothing.
+    fn default() -> Self {
+        Self::Declared {
+            claim_hash: [0u8; 32],
+        }
+    }
+}
+
+impl AdmittedResource {
+    /// Build the resource statement for an admission, selecting the shape on the negotiated minor.
+    ///
+    /// The **only** place that decision is made. Two producers each deciding it independently is how a
+    /// certification-minor run would end up carrying a legacy digest of empty bytes — a member that
+    /// compares equal across every run on earth, and so re-verifies nothing at join while looking like
+    /// it does.
+    ///
+    /// # Errors
+    /// The canonical-encoding failure, verbatim. A composed admission that cannot state what it
+    /// composed is not admissible: the caller refuses rather than recording a tuple with holes.
+    pub fn from_admission(
+        admission: &daemon_vhc_host::run::Admission,
+    ) -> Result<Self, daemon_vhc_resource::PlannerError> {
+        let (Some(composed), Some(against)) = (
+            admission.composition.as_ref(),
+            admission.composed_against.as_ref(),
+        ) else {
+            // ABI ≤ 2.4 — the declared claim bytes, digested as they always were. Also the branch a
+            // harness seat takes when it never went through the funnel: empty claim bytes there mean
+            // "this seat declared nothing", which is a true statement about a legacy tuple.
+            return Ok(Self::Declared {
+                claim_hash: *blake3::hash(&admission.claim_bytes).as_bytes(),
+            });
+        };
+
+        let grant_bytes = composed.grant().to_canonical_bytes().map_err(|e| {
+            daemon_vhc_resource::PlannerError::Invalid(format!("grant encoding: {e}"))
+        })?;
+        let claim_bytes = composed.claim().to_canonical_bytes()?;
+        let aggregate_bytes = composed.aggregate.to_canonical_bytes()?;
+        let reservation_digest = composed.reservation.reservation_digest().map_err(|e| {
+            daemon_vhc_resource::PlannerError::Invalid(format!("reservation encoding: {e}"))
+        })?;
+
+        Ok(Self::Composed(Box::new(ComposedResource {
+            logical_resource_plan_hash: *blake3::hash(&admission.resource_plan_bytes).as_bytes(),
+            selection_scope: composed.grant().scope.spelling().to_string(),
+            execution_grant_hash: *blake3::hash(&grant_bytes).as_bytes(),
+            selected_configuration: grant_bytes,
+            backend_class: against.backend_class.clone(),
+            profile_digest: against.profile_digest,
+            profile_authority: against.profile_authority,
+            backend_implementation_revision: against.backend_implementation_revision.clone(),
+            planner_version: against.planner_version,
+            capability_report_digest: against.capability_report_digest,
+            physical_claim_hash: *blake3::hash(&claim_bytes).as_bytes(),
+            physical_claim: claim_bytes,
+            aggregate_claim_hash: *blake3::hash(&aggregate_bytes).as_bytes(),
+            aggregate_claim: aggregate_bytes,
+            governor_version: daemon_vhc_resource::GOVERNOR_VERSION,
+            reservation_sequence: against.reservation_sequence,
+            reservation_digest: reservation_digest.0,
+            device_identity: against.device_identity.clone(),
+        })))
+    }
+
+    /// The first member that differs from `rederived`, or `None` when they agree.
+    ///
+    /// A **branch** difference is itself the answer: a tuple admitted as composed and re-derived as
+    /// declared (or the reverse) means the module's negotiated minor moved between assess and join,
+    /// which no field comparison should paper over.
+    #[must_use]
+    pub fn first_mismatch(&self, rederived: &Self) -> Option<&'static str> {
+        match (self, rederived) {
+            (Self::Declared { claim_hash: a }, Self::Declared { claim_hash: b }) => {
+                (a != b).then_some("claim_hash")
+            }
+            (Self::Composed(a), Self::Composed(b)) => a.first_mismatch(b),
+            _ => Some("resource (the admitted ABI minor's resource branch)"),
+        }
+    }
+}
+
+impl ComposedResource {
+    /// The first member that differs, in the order a reader should hear about it: what was priced,
+    /// then what priced it, then what came out, then what was reserved.
+    ///
+    /// Ordered rather than arbitrary because the first difference is the one an operator acts on, and
+    /// these members are causally downstream of each other — a changed plan explains a changed claim,
+    /// so reporting the claim would send the reader to the wrong document.
+    #[must_use]
+    pub fn first_mismatch(&self, rederived: &Self) -> Option<&'static str> {
+        if self.logical_resource_plan_hash != rederived.logical_resource_plan_hash {
+            Some("logical_resource_plan_hash")
+        } else if self.selection_scope != rederived.selection_scope {
+            Some("selection_scope")
+        } else if self.selected_configuration != rederived.selected_configuration {
+            Some("selected_configuration")
+        } else if self.execution_grant_hash != rederived.execution_grant_hash {
+            Some("execution_grant_hash")
+        } else if self.backend_class != rederived.backend_class {
+            Some("backend_class")
+        } else if self.profile_digest != rederived.profile_digest {
+            Some("profile_digest")
+        } else if self.profile_authority != rederived.profile_authority {
+            Some("profile_authority")
+        } else if self.backend_implementation_revision != rederived.backend_implementation_revision
+        {
+            Some("backend_implementation_revision")
+        } else if self.planner_version != rederived.planner_version {
+            Some("planner_version")
+        } else if self.capability_report_digest != rederived.capability_report_digest {
+            Some("capability_report_digest")
+        } else if self.physical_claim != rederived.physical_claim {
+            Some("physical_claim")
+        } else if self.physical_claim_hash != rederived.physical_claim_hash {
+            Some("physical_claim_hash")
+        } else if self.aggregate_claim != rederived.aggregate_claim {
+            Some("aggregate_claim")
+        } else if self.aggregate_claim_hash != rederived.aggregate_claim_hash {
+            Some("aggregate_claim_hash")
+        } else if self.governor_version != rederived.governor_version {
+            Some("governor_version")
+        } else if self.reservation_sequence != rederived.reservation_sequence {
+            Some("reservation_sequence")
+        } else if self.reservation_digest != rederived.reservation_digest {
+            Some("reservation_digest")
+        } else if self.device_identity != rederived.device_identity {
+            Some("device_identity")
         } else {
             None
         }
@@ -897,7 +1152,9 @@ mod tests {
             module_hash: [1; 32],
             config_hash: [2; 32],
             grants_hash: [3; 32],
-            claim_hash: [4; 32],
+            resource: AdmittedResource::Declared {
+                claim_hash: [4; 32],
+            },
             genesis_hash: [5; 32],
             role: "trainer".into(),
             incarnation: 1,
@@ -928,6 +1185,161 @@ mod tests {
         let mut moved = base.clone();
         moved.gpu_index = 1;
         assert_eq!(base.first_artifact_mismatch(&moved), Some("gpu_index"));
+    }
+
+    /// A composed resource statement for tests — every member distinct, so a comparison that reads the
+    /// wrong one cannot accidentally pass.
+    fn composed() -> ComposedResource {
+        ComposedResource {
+            logical_resource_plan_hash: [0x10; 32],
+            selection_scope: "uniform-run".into(),
+            selected_configuration: vec![0xA0, 0xA1],
+            execution_grant_hash: [0x11; 32],
+            backend_class: "vulkan".into(),
+            profile_digest: [0x12; 32],
+            profile_authority: [0x13; 32],
+            backend_implementation_revision: "0.10.0".into(),
+            planner_version: 1,
+            capability_report_digest: [0x14; 32],
+            physical_claim: vec![0xB0, 0xB1],
+            physical_claim_hash: [0x15; 32],
+            aggregate_claim: vec![0xC0, 0xC1],
+            aggregate_claim_hash: [0x16; 32],
+            governor_version: 1,
+            reservation_sequence: 7,
+            reservation_digest: [0x17; 32],
+            device_identity: "vulkan:0000:c4:00.0".into(),
+        }
+    }
+
+    /// Every `[DI-9]` member of the certification branch is compared at join, and the member the
+    /// comparison names is the one that moved.
+    ///
+    /// Exhaustive on purpose: each of these can change while every artifact hash stays identical — a
+    /// re-certified profile, a revoked signer, a driver update, a re-probed device, a re-sequenced
+    /// reservation. A member present in the record but absent from the comparison would be a member
+    /// that looks verified and is not, which is worse than a member that was never recorded.
+    #[test]
+    fn every_composed_member_is_compared_and_named() {
+        let base = composed();
+        assert_eq!(base.first_mismatch(&composed()), None);
+
+        /// One case: the member's name, and the edit that moves it.
+        type MovedMember = (&'static str, fn(&mut ComposedResource));
+
+        let cases: &[MovedMember] = &[
+            ("logical_resource_plan_hash", |c| {
+                c.logical_resource_plan_hash = [0xFF; 32]
+            }),
+            ("selection_scope", |c| {
+                c.selection_scope = "per-participant".into()
+            }),
+            ("selected_configuration", |c| {
+                c.selected_configuration = vec![0xFF]
+            }),
+            ("execution_grant_hash", |c| {
+                c.execution_grant_hash = [0xFF; 32]
+            }),
+            ("backend_class", |c| c.backend_class = "metal".into()),
+            ("profile_digest", |c| c.profile_digest = [0xFF; 32]),
+            ("profile_authority", |c| c.profile_authority = [0xFF; 32]),
+            ("backend_implementation_revision", |c| {
+                c.backend_implementation_revision = "0.11.0".into()
+            }),
+            ("planner_version", |c| c.planner_version = 2),
+            ("capability_report_digest", |c| {
+                c.capability_report_digest = [0xFF; 32]
+            }),
+            ("physical_claim", |c| c.physical_claim = vec![0xFF]),
+            ("physical_claim_hash", |c| {
+                c.physical_claim_hash = [0xFF; 32]
+            }),
+            ("aggregate_claim", |c| c.aggregate_claim = vec![0xFF]),
+            ("aggregate_claim_hash", |c| {
+                c.aggregate_claim_hash = [0xFF; 32]
+            }),
+            ("governor_version", |c| c.governor_version = 2),
+            ("reservation_sequence", |c| c.reservation_sequence = 8),
+            ("reservation_digest", |c| c.reservation_digest = [0xFF; 32]),
+            ("device_identity", |c| c.device_identity = "cpu:0".into()),
+        ];
+        for (member, mutate) in cases {
+            let mut moved = base.clone();
+            mutate(&mut moved);
+            assert_eq!(
+                base.first_mismatch(&moved),
+                Some(*member),
+                "changing `{member}` must be reported as `{member}`"
+            );
+        }
+    }
+
+    /// A tuple whose resource **branch** changed between assess and join is refused on the branch
+    /// itself, never by comparing a plan digest to a claim hash.
+    ///
+    /// This is the rename discipline made mechanical: the two statements are about different objects,
+    /// so the only honest verdict when they meet is "these are not the same kind of claim".
+    #[test]
+    fn a_changed_resource_branch_is_itself_the_mismatch() {
+        let declared = AdmittedResource::Declared {
+            claim_hash: [4; 32],
+        };
+        let composed = AdmittedResource::Composed(Box::new(composed()));
+        assert_eq!(
+            declared.first_mismatch(&composed),
+            Some("resource (the admitted ABI minor's resource branch)")
+        );
+        assert_eq!(
+            composed.first_mismatch(&declared),
+            Some("resource (the admitted ABI minor's resource branch)")
+        );
+        // And within a branch, the ordinary comparison still applies.
+        assert_eq!(
+            declared.first_mismatch(&AdmittedResource::Declared {
+                claim_hash: [5; 32]
+            }),
+            Some("claim_hash")
+        );
+    }
+
+    /// A pre-rename tuple (a top-level `claim_hash` member) does **not** decode as a post-rename one.
+    ///
+    /// Deliberate, and the one place the rename is not additive. Defaulting the resource member would
+    /// let a frame that said "the guest declared this claim" arrive as "the guest declared nothing",
+    /// which is `[DI-9]`'s forbidden reinterpretation with a zero in place of the evidence. Refusing to
+    /// decode is safe here because the tuple is never journalled — it exists only in live node↔worker
+    /// frames within one run, and the node and worker ship as one bundle.
+    #[test]
+    fn a_pre_rename_tuple_does_not_decode_as_a_post_rename_one() {
+        #[derive(serde::Serialize)]
+        struct PreRenameTuple {
+            module_hash: [u8; 32],
+            config_hash: [u8; 32],
+            grants_hash: [u8; 32],
+            claim_hash: [u8; 32],
+            genesis_hash: [u8; 32],
+            role: String,
+            incarnation: u64,
+        }
+        let mut bytes = Vec::new();
+        ciborium::into_writer(
+            &PreRenameTuple {
+                module_hash: [1; 32],
+                config_hash: [2; 32],
+                grants_hash: [3; 32],
+                claim_hash: [4; 32],
+                genesis_hash: [5; 32],
+                role: "trainer".into(),
+                incarnation: 2,
+            },
+            &mut bytes,
+        )
+        .expect("encode pre-rename tuple");
+        let decoded: Result<AdmittedTuple, _> = ciborium::from_reader(bytes.as_slice());
+        assert!(
+            decoded.is_err(),
+            "a pre-rename tuple must be refused, not silently read as a declaration of nothing"
+        );
     }
 
     fn round_trip_event(ev: Event) {
@@ -967,7 +1379,9 @@ mod tests {
                 module_hash: [0x11; 32],
                 config_hash: [0x22; 32],
                 grants_hash: [0x33; 32],
-                claim_hash: [0x44; 32],
+                resource: AdmittedResource::Declared {
+                    claim_hash: [0x44; 32],
+                },
                 genesis_hash: [0x55; 32],
                 role: "trainer".into(),
                 incarnation: 3,
@@ -997,7 +1411,9 @@ mod tests {
                 module_hash: [0x5A; 32],
                 config_hash: [0x00; 32],
                 grants_hash: [0x6B; 32],
-                claim_hash: [0x7C; 32],
+                resource: AdmittedResource::Declared {
+                    claim_hash: [0x7C; 32],
+                },
                 genesis_hash: [0x8D; 32],
                 role: "worker".into(),
                 incarnation: 4,
@@ -1120,7 +1536,9 @@ mod tests {
                 module_hash: [0x11; 32],
                 config_hash: [0x22; 32],
                 grants_hash: [0x33; 32],
-                claim_hash: [0x44; 32],
+                resource: AdmittedResource::Declared {
+                    claim_hash: [0x44; 32],
+                },
                 genesis_hash: [0x55; 32],
                 role: "trainer".into(),
                 incarnation: 1,
@@ -1280,9 +1698,13 @@ mod tests {
     }
 
     /// The backend-placement fields are additive on the admitted tuple, and the structured
-    /// backend records are additive on `Hardware`: frames authored before the extension (CBOR
+    /// backend records are additive on `Hardware`: frames authored before *that* extension (CBOR
     /// maps WITHOUT the fields) still decode, with the backend slug defaulting to `""`, the
     /// placement to `0`, and the record list to empty.
+    ///
+    /// The `[DI-9]` resource rename is deliberately NOT additive — see
+    /// [`a_pre_rename_tuple_does_not_decode_as_a_post_rename_one`] for why a frame that predates it
+    /// must be refused rather than defaulted.
     #[test]
     fn backend_placement_and_capability_fields_are_additive_back_compatible() {
         #[derive(serde::Serialize)]
@@ -1290,7 +1712,7 @@ mod tests {
             module_hash: [u8; 32],
             config_hash: [u8; 32],
             grants_hash: [u8; 32],
-            claim_hash: [u8; 32],
+            resource: AdmittedResource,
             genesis_hash: [u8; 32],
             role: String,
             incarnation: u64,
@@ -1299,7 +1721,9 @@ mod tests {
             module_hash: [1; 32],
             config_hash: [2; 32],
             grants_hash: [3; 32],
-            claim_hash: [4; 32],
+            resource: AdmittedResource::Declared {
+                claim_hash: [4; 32],
+            },
             genesis_hash: [5; 32],
             role: "trainer".into(),
             incarnation: 2,

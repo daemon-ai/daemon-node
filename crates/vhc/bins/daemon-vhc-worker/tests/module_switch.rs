@@ -222,7 +222,8 @@ fn switch_tuple(
         module_hash: new_module,
         config_hash: *blake3::hash(&config).as_bytes(),
         grants_hash,
-        claim_hash: *blake3::hash(&admission.claim_bytes).as_bytes(),
+        resource: daemon_vhc_session::protocol::AdmittedResource::from_admission(&admission)
+            .expect("the admission states its resource identity"),
         genesis_hash,
         role: ROLE.to_string(),
         incarnation,

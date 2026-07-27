@@ -796,12 +796,29 @@ async fn perform_switch(
                 .into(),
         );
     }
-    if tuple.claim_hash != *blake3::hash(&admission.claim_bytes).as_bytes() {
-        return refused(
-            current,
-            "the post-switch admitted tuple's claim hash does not match the re-evaluated claim"
-                .into(),
-        );
+    // The whole minor-selected resource statement, not just a claim digest (`[DI-9]`). Below the
+    // certification minor this is the same declared-claim comparison as before; at the certification
+    // minor it re-derives the composition and compares every member, so a profile, capability report,
+    // planner or reservation that moved between the pre-switch assessment and the fence is caught here
+    // — none of which changes any artifact hash, and all of which changes what may run.
+    match crate::protocol::AdmittedResource::from_admission(&admission) {
+        Ok(rederived) => {
+            if let Some(member) = tuple.resource.first_mismatch(&rederived) {
+                return refused(
+                    current,
+                    format!(
+                        "the post-switch admitted tuple's `{member}` does not match the \
+                         re-evaluated admission"
+                    ),
+                );
+            }
+        }
+        Err(e) => {
+            return refused(
+                current,
+                format!("the re-evaluated admission could not state its resource identity: {e}"),
+            )
+        }
     }
     // Grant-expanding upgrades FAIL CLOSED (§10.3 step 3): the re-admitted quotas must be
     // tighten-or-equal against the quotas this instance runs under.

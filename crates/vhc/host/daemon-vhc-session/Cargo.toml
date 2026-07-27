@@ -74,6 +74,12 @@ daemon-vhc-journal = { workspace = true }
 # xtask's vhc_dep_check enforces the direction). `wasm_backend.rs` (the TrainerBackend seam over
 # the wasm host) moved here with the inversion.
 daemon-vhc-host = { workspace = true }
+# The `[DI-9]` admitted tuple's certification branch: the protocol builds the tuple's resource
+# statement from an admission, which means canonically encoding the composed claim, aggregate, grant
+# and reservation. host/* -> host/* is a permitted direction; the edge the model forbids is any
+# guest-linked crate reaching the resource crate, which the dep-check enforces separately. Nothing of
+# the resource vocabulary reaches the wire — what travels is bytes, digests and primitives.
+daemon-vhc-resource = { workspace = true }
 # The E1 checkpoint bridge (refactor §9; architecture §5.3): the state-dict ↔ safetensors converter
 # wired into the checkpoint path so the typed `module` section is a portable, content-addressed
 # safetensors serialization (host/* -> host/*, no sdk edge).
@@ -110,6 +116,11 @@ zeroize = { workspace = true }
 xxhash-rust = { workspace = true }
 
 [dev-dependencies]
+# Test-only re-statement of the normal `daemon-vhc-resource` edge, asking for the fixture feature:
+# `tests/admitted_tuple.rs` builds the `[DI-9]` tuple's certification branch from a REAL composition,
+# which needs an authenticated profile — the one input a test cannot fabricate. Dev-only by gate
+# (`xtask vhc-dep-check` fails any production edge that enables it).
+daemon-vhc-resource = { workspace = true, features = ["test-support"] }
 # Same as the coordinator: the `cfg(test)` harness build uses observe's `digest_tally` / `DesyncVerdict`
 # (the desync trigger) even with the `harness` feature off.
 daemon-vhc-observe = { workspace = true }

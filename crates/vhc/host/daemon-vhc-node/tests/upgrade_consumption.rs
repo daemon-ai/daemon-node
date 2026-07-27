@@ -26,7 +26,7 @@ use daemon_vhc_proto::{
 };
 use daemon_vhc_session::config::VhcConfig;
 use daemon_vhc_session::protocol::{
-    AdmittedTuple, Eligibility, Hardware, JoinPolicy, LeaveMode, SwitchTarget,
+    AdmittedResource, AdmittedTuple, Eligibility, Hardware, JoinPolicy, LeaveMode, SwitchTarget,
 };
 use daemon_vhc_supervisor::SwitchOutcome;
 
@@ -220,7 +220,9 @@ impl WorkerControl for FakeWorker {
                 module_hash: target.new_module,
                 config_hash: *blake3::hash(&[]).as_bytes(),
                 grants_hash: target.grants_hash,
-                claim_hash: [0xCC; 32],
+                resource: AdmittedResource::Declared {
+                    claim_hash: [0xCC; 32],
+                },
                 genesis_hash: self.genesis_hash,
                 role: role.unwrap_or_else(|| "trainer".into()),
                 incarnation: 0,

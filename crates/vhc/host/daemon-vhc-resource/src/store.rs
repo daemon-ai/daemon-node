@@ -35,6 +35,7 @@ use crate::trust::{
     ProfileTrustEnvelope,
 };
 use daemon_vhc_proto::bytes::Hash;
+use daemon_vhc_proto::PeerId;
 
 /// Why a profile could not be taken into the store.
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
@@ -143,6 +144,7 @@ pub struct AuthenticatedProfile<'a> {
     profile: &'a BackendExecutionProfile,
     digest: Hash,
     authority_class: AuthorityClass,
+    authority: PeerId,
 }
 
 impl<'a> AuthenticatedProfile<'a> {
@@ -162,6 +164,17 @@ impl<'a> AuthenticatedProfile<'a> {
     #[must_use]
     pub fn authority_class(&self) -> AuthorityClass {
         self.authority_class
+    }
+
+    /// **Who** vouched for it — the envelope signer this selection authenticated against.
+    ///
+    /// Carried beside the digest because content addressing proves identity and not authority
+    /// (`[PC-12]`): the digest says which profile priced the claim, and this says whose word made that
+    /// profile usable here. A record with the digest alone cannot answer the question an auditor
+    /// actually asks after a revocation, which is *whose* profiles are now suspect.
+    #[must_use]
+    pub fn authenticating_authority(&self) -> PeerId {
+        self.authority
     }
 
     /// Whether this profile may certify a fleet ceremony.
@@ -297,7 +310,8 @@ impl ProfileStore {
             });
         }
 
-        let mut authenticated: Vec<(Hash, &BackendExecutionProfile, AuthorityClass)> = Vec::new();
+        let mut authenticated: Vec<(Hash, &BackendExecutionProfile, AuthorityClass, PeerId)> =
+            Vec::new();
         let mut refusals: Vec<(Hash, AuthenticationRefusal)> = Vec::new();
         for (digest, held) in candidates {
             match authenticate(
@@ -309,7 +323,12 @@ impl ProfileStore {
                 context.planner_version,
                 context.now_ms,
             ) {
-                Ok(class) => authenticated.push((*digest, &held.profile, class)),
+                Ok(class) => authenticated.push((
+                    *digest,
+                    &held.profile,
+                    class,
+                    held.envelope.authority.signer,
+                )),
                 Err(refusal) => refusals.push((*digest, refusal)),
             }
         }
@@ -320,16 +339,17 @@ impl ProfileStore {
                 refusals,
             }),
             1 => {
-                let (digest, profile, authority_class) = authenticated.remove(0);
+                let (digest, profile, authority_class, authority) = authenticated.remove(0);
                 Ok(AuthenticatedProfile {
                     profile,
                     digest,
                     authority_class,
+                    authority,
                 })
             }
             _ => Err(SelectionRefusal::Ambiguous {
                 class: class.slug(),
-                digests: authenticated.into_iter().map(|(d, _, _)| d).collect(),
+                digests: authenticated.into_iter().map(|(d, ..)| d).collect(),
             }),
         }
     }
