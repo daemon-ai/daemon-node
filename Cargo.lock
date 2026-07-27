@@ -4909,6 +4909,7 @@ version = "0.0.1"
 name = "daemon-vhc-host"
 version = "0.0.1"
 dependencies = [
+ "ash",
  "blake3",
  "burn",
  "burn-backend",
@@ -4917,11 +4918,13 @@ dependencies = [
  "burn-router",
  "burn-std",
  "ciborium",
+ "cubecl-runtime",
  "cudarc 0.19.8",
  "daemon-vhc-abi",
  "daemon-vhc-guest-build",
  "daemon-vhc-observe",
  "daemon-vhc-proto",
+ "daemon-vhc-resource",
  "daemon-vhc-sdk-consensus",
  "daemon-vhc-session",
  "libc",
@@ -5011,6 +5014,7 @@ dependencies = [
  "daemon-vhc-abi",
  "daemon-vhc-journal",
  "daemon-vhc-proto",
+ "daemon-vhc-resource",
  "daemon-vhc-sdk-consensus",
  "daemon-vhc-session",
  "serde",
@@ -5027,6 +5031,17 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "daemon-vhc-resource"
+version = "0.0.1"
+dependencies = [
+ "blake3",
+ "ciborium",
+ "daemon-vhc-proto",
+ "serde",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -5195,6 +5210,7 @@ dependencies = [
  "daemon-vhc-net",
  "daemon-vhc-node",
  "daemon-vhc-proto",
+ "daemon-vhc-resource",
  "daemon-vhc-sdk-consensus",
  "daemon-vhc-session",
  "daemon-vhc-supervisor",
@@ -18876,6 +18892,7 @@ dependencies = [
  "daemon-common",
  "daemon-egress",
  "daemon-protocol",
+ "daemon-vhc-abi",
  "daemon-vhc-guest-build",
  "daemon-vhc-net",
  "daemon-vhc-observe",

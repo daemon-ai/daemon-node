@@ -42,13 +42,31 @@ use crate::bytes::{Hash, PeerId, Seed, Signature};
 use crate::canonical::{from_canonical_slice, to_canonical_vec};
 use crate::envelope::{Access, DeviceMinimums};
 use crate::error::VhcProtoError;
+use crate::execution_requirements::RoleExecutionRequirements;
 use crate::hash::blake3_hash;
 use crate::sign::{peer_id, sign_canonical, verify_canonical, SigningKey};
 
-/// The genesis-envelope schema major this build understands (architecture §5.1; the v2 cell of the
-/// ratified mixed-fleet matrix — decisions D3). Distinct from the retired v1 schema major (`1`),
-/// whose only surviving trace is the typed refusal keyed off the outer schema read.
-pub const GENESIS_SCHEMA_MAJOR: u32 = 2;
+/// The genesis-envelope schema major this build understands (architecture §5.1, §5.4).
+///
+/// Major 1 is retired, and its only surviving trace is the typed refusal keyed off the outer
+/// schema read. Major 2 carried a per-role **device-minimums** section: authored physical scalars
+/// that a host compared at a pre-screen. Major **3** withdraws that and carries the role's
+/// [`crate::execution_requirements::RoleExecutionRequirements`] instead — a logical requirement the
+/// planner composes against the participant's own certified profile.
+///
+/// The bump is what makes the new requirement **fail closed**. A requirement an older reader
+/// silently ignores is not a requirement: the participant is admitted, downloads the module, and
+/// fails at first use — the exact outcome the requirement exists to prevent, now with the
+/// additional property that the envelope appears to have been honoured. A required-feature marker
+/// cannot deliver that against readers built before the marker existed; the schema major can,
+/// because every consumer already routes on it. Deployment discipline is not a substitute: "the
+/// host and the envelope ship together" is an operational convention, and this contract declines
+/// that argument here for the same reason the ABI declines it for the module minor.
+///
+/// The bounded refusal itself lives in [`crate::framing`]: routing on the major is only genuinely
+/// pre-decode if the reader can obtain the major without deserializing the payload, which
+/// [`peek_schema`] cannot do.
+pub const GENESIS_SCHEMA_MAJOR: u32 = 3;
 
 /// A control-plane transport a run may bring up (architecture §2 — "the envelope declares which
 /// transports a run uses; the default is iroh-only"). `DualPlane` stops being an always-on host
@@ -295,7 +313,22 @@ pub struct RoleEntry {
     /// The role's grant list.
     pub grants: RoleGrants,
     /// The host-readable per-role device minimums (ABI §9.3), tighten-only vs the lane floor.
+    ///
+    /// **Superseded at schema major 3 by [`RoleEntry::execution`]** and left at its default. It is
+    /// not populated in parallel: an authored physical requirement standing beside a composed one
+    /// is the two-authorities failure in a new place. The field survives only so that a host can
+    /// still read a role entry it decoded, and it carries no requirement.
     pub device_min: DeviceMinimums,
+    /// The role's execution-requirement structure (`[DI-6]` phase 2): the canonical Logical
+    /// Resource Plan, the allowed backend classes, the profile-certification requirements, the
+    /// hardware-independent minima, and the selection scope with its frozen uniform Execution
+    /// Grant or its normalization contract.
+    ///
+    /// Required at [`GENESIS_SCHEMA_MAJOR`]; `None` only in role entries a test or a transitional
+    /// authoring seat builds before it has a plan to embed, which [`GenesisEnvelope::validate`]
+    /// refuses for a runnable envelope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<RoleExecutionRequirements>,
 }
 
 /// `[identities]` — the run's cryptographic identities (architecture §5.1). Opaque-ish to the host
@@ -422,6 +455,23 @@ impl GenesisEnvelope {
                 return Err(VhcProtoError::Validation(format!(
                     "role `{name}` module `{}` has an unpinned (all-zero) blake3",
                     role.module
+                )));
+            }
+            // The execution-requirement structure is what makes a role runnable at this schema
+            // major, and it fails closed: a role with none states no requirement, and a host that
+            // admitted it would be honouring an envelope that asked for nothing.
+            let Some(execution) = &role.execution else {
+                return Err(VhcProtoError::Validation(format!(
+                    "role `{name}` carries no execution-requirement structure, which schema major \
+                     {GENESIS_SCHEMA_MAJOR} requires ([DI-6] phase 2)"
+                )));
+            };
+            execution.validate()?;
+            if role.device_min != DeviceMinimums::default() {
+                return Err(VhcProtoError::Validation(format!(
+                    "role `{name}` populates the superseded device-minimums section; physical \
+                     requirements are members of the composed claim, and an authored one beside a \
+                     composed one is a second authority ([DI-3], [DI-6])"
                 )));
             }
             for granted in &role.grants.artifacts {
@@ -623,6 +673,8 @@ mod tests {
         SigningKey::from_bytes(&[7u8; 32])
     }
 
+    use crate::execution_requirements::sample_for_tests as execution_requirements;
+
     fn sample() -> GenesisEnvelope {
         let mut artifacts = BTreeMap::new();
         artifacts.insert(
@@ -662,12 +714,8 @@ mod tests {
                 abi: "vhc@2".into(),
                 config: ciborium::value::Value::Map(vec![]),
                 grants: worker_grants,
-                device_min: DeviceMinimums {
-                    gpu: Some(2),
-                    vram_bytes: Some(16 << 30),
-                    backend_class: vec!["cuda".into()],
-                    ..Default::default()
-                },
+                device_min: DeviceMinimums::default(),
+                execution: Some(execution_requirements("cuda")),
             },
         );
         roles.insert(
@@ -679,6 +727,7 @@ mod tests {
                 config: ciborium::value::Value::Map(vec![]),
                 grants: RoleGrants::default(),
                 device_min: DeviceMinimums::default(),
+                execution: Some(execution_requirements("cpu")),
             },
         );
 

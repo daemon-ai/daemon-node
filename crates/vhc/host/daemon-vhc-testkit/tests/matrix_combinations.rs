@@ -27,6 +27,8 @@ use daemon_vhc_abi::{AbiRefusalCode, CandidateDriver};
 use daemon_vhc_host::run::RunEnd;
 use daemon_vhc_host::{select_driver, EngineConfig, Worker};
 use daemon_vhc_proto::{peek_schema, peer_id, Hash, SigningKey, GENESIS_SCHEMA_MAJOR};
+use daemon_vhc_testkit::genesis_run::EnvelopeInputs;
+use daemon_vhc_testkit::live_genesis::fixture_authored_execution;
 use daemon_vhc_testkit::{
     configure_coordinator, genesis_envelope, genesis_whole_run, refuse_unconfigurable_envelope,
     CoordError, GenesisRunSpec,
@@ -231,15 +233,16 @@ fn v1_worker_envelope_v2_refused_typed() {
     let coordinator = guest_wasm("coordinator_quorum");
     let coord_hash = Hash(*blake3::hash(&coordinator).as_bytes());
     let author = SigningKey::from_bytes(&[0x11u8; 32]);
-    let genesis = genesis_envelope(
-        "envelope-v2-refusal-run",
-        coord_hash,
-        Hash(hash),
-        peer_id(&author),
-        1,
-        2,
-        2,
-    );
+    let genesis = genesis_envelope(&EnvelopeInputs {
+        run_label: "envelope-v2-refusal-run",
+        coordinator_wasm_blake3: coord_hash,
+        worker_wasm_blake3: Hash(hash),
+        coordinator_identity: peer_id(&author),
+        workers: 1,
+        steps_per_round: 2,
+        global_batch: 2,
+        execution: &fixture_authored_execution(),
+    });
     let frozen = genesis.freeze(&author).expect("genesis freeze");
 
     // The schema read recognizes the genesis form...

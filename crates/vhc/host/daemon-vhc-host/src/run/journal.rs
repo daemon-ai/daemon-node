@@ -71,6 +71,37 @@ impl Dropped {
     }
 }
 
+/// What a run header records about the resources the instance was admitted for — **minor-selected**.
+///
+/// An enum rather than a set of optional members, so a record carrying both a declared claim and a
+/// composed one is not merely refused but **unrepresentable**. The two answer the same question with
+/// different authorities: below the certification minor the module declared its tiers, at it the host
+/// composed them from a plan and a certified profile. A reader given both would have to guess which
+/// figure the run was actually admitted on, and the point of the minor split is that there is never
+/// anything to guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunHeaderResources<'a> {
+    /// ABI ≤ 2.4 — the module's own `da_claim` result, verbatim.
+    Declared(&'a [u8]),
+    /// The certification minor — the plan the module emitted, the claim the host composed from it, the
+    /// node/device aggregate the instance was admitted within, and the grant it runs under.
+    ///
+    /// All four inline rather than by digest: a replay has to be able to re-derive the composition, and
+    /// a digest names bytes a verifier may not hold. The grant especially — it is required before
+    /// initialization, so resolving it from a sidecar would create a dependency at the very point that
+    /// establishes execution identity.
+    Composed {
+        /// The canonical Logical Resource Plan bytes.
+        resource_plan: &'a [u8],
+        /// The composed role Physical Claim, canonical bytes.
+        physical_claim: &'a [u8],
+        /// The node/device aggregate claim, canonical bytes.
+        aggregate_claim: &'a [u8],
+        /// The Execution Grant, canonical bytes.
+        execution_grant: &'a [u8],
+    },
+}
+
 /// The §8.3 records the Phase-A driver produces, as a write-only seam (see module docs).
 ///
 /// All methods take `&mut self`; the driver serializes access behind its pump lock, so an adapter
@@ -87,7 +118,7 @@ pub trait JournalSink: Send {
         manifest: &[u8],
         config: &[u8],
         grants: &[u8],
-        claim: &[u8],
+        resources: RunHeaderResources<'_>,
         channels: &[u8],
         device: &[u8],
     ) -> Result<(), SinkError>;
@@ -101,6 +132,18 @@ pub trait JournalSink: Send {
         &mut self,
         config_hash: [u8; 32],
         grants_hash: [u8; 32],
+        status: u64,
+    ) -> Result<(), SinkError>;
+
+    /// tag 18 — the Execution Grant application result.
+    ///
+    /// Written exactly once after `da_apply_execution_grant` **returns**, whatever the status, and
+    /// before the tag-11 init record. On a trap it is absent and exactly one terminal trap with the
+    /// grant-application context occupies that branch instead; the grammar admits one or the other,
+    /// never both and never neither.
+    fn execution_grant(
+        &mut self,
+        execution_grant_hash: [u8; 32],
         status: u64,
     ) -> Result<(), SinkError>;
 
@@ -196,12 +239,12 @@ impl<S: JournalSink> JournalSink for std::sync::Arc<std::sync::Mutex<S>> {
         manifest: &[u8],
         config: &[u8],
         grants: &[u8],
-        claim: &[u8],
+        resources: RunHeaderResources<'_>,
         channels: &[u8],
         device: &[u8],
     ) -> Result<(), SinkError> {
         self.lock().expect("sink lock").run_header(
-            abi, worlds, bridge, manifest, config, grants, claim, channels, device,
+            abi, worlds, bridge, manifest, config, grants, resources, channels, device,
         )
     }
     fn instantiation(&mut self, counter: u64, reason: u64, at: u64) -> Result<(), SinkError> {
@@ -218,6 +261,15 @@ impl<S: JournalSink> JournalSink for std::sync::Arc<std::sync::Mutex<S>> {
         self.lock()
             .expect("sink lock")
             .init(config_hash, grants_hash, status)
+    }
+    fn execution_grant(
+        &mut self,
+        execution_grant_hash: [u8; 32],
+        status: u64,
+    ) -> Result<(), SinkError> {
+        self.lock()
+            .expect("sink lock")
+            .execution_grant(execution_grant_hash, status)
     }
     fn event(&mut self, at: u64, frame: &[u8]) -> Result<(), SinkError> {
         self.lock().expect("sink lock").event(at, frame)
@@ -305,6 +357,10 @@ pub enum SinkEntry {
     RunHeader {
         abi: u64,
         bridge: bool,
+        /// Which resource branch the header recorded: `false` for a declared claim, `true` for a
+        /// composed one. Mirrored here so a test can assert the minor selected the right branch
+        /// without a durable journal.
+        composed: bool,
     },
     Instantiation {
         counter: u64,
@@ -312,6 +368,11 @@ pub enum SinkEntry {
         at: u64,
     },
     Init {
+        status: u64,
+    },
+    /// tag 18 — the Execution Grant application result.
+    ExecutionGrant {
+        execution_grant_hash: [u8; 32],
         status: u64,
     },
     Event {
@@ -370,6 +431,13 @@ pub enum SinkEntry {
     Terminal {
         kind: u64,
         outcome: Option<u64>,
+        /// The trap info as recorded: `(code, import, context, detail)`.
+        ///
+        /// The **context** is here because it is the field a replay verdict compares — the detail is
+        /// diagnostic text and deliberately is not comparable — and because it was previously a
+        /// hard-coded literal. A sink that dropped it could not witness whether the record is
+        /// truthful, which is exactly what the assertions need to see.
+        trap: Option<(String, String, String, String)>,
     },
 }
 
@@ -389,6 +457,7 @@ impl SinkEntry {
             Self::Terminal { .. } => 9,
             Self::Snapshot { .. } => 10,
             Self::Init { .. } => 11,
+            Self::ExecutionGrant { .. } => daemon_vhc_abi::JOURNAL_TAG_EXECUTION_GRANT,
             Self::SignedFrame { .. } => 12,
             Self::Instantiation { .. } => 13,
             Self::Completion { .. } => 14,
@@ -440,11 +509,15 @@ impl JournalSink for MemorySink {
         _manifest: &[u8],
         _config: &[u8],
         _grants: &[u8],
-        _claim: &[u8],
+        resources: RunHeaderResources<'_>,
         _channels: &[u8],
         _device: &[u8],
     ) -> Result<(), SinkError> {
-        self.entries.push(SinkEntry::RunHeader { abi, bridge });
+        self.entries.push(SinkEntry::RunHeader {
+            abi,
+            bridge,
+            composed: matches!(resources, RunHeaderResources::Composed { .. }),
+        });
         Ok(())
     }
 
@@ -464,6 +537,18 @@ impl JournalSink for MemorySink {
         status: u64,
     ) -> Result<(), SinkError> {
         self.entries.push(SinkEntry::Init { status });
+        Ok(())
+    }
+
+    fn execution_grant(
+        &mut self,
+        execution_grant_hash: [u8; 32],
+        status: u64,
+    ) -> Result<(), SinkError> {
+        self.entries.push(SinkEntry::ExecutionGrant {
+            execution_grant_hash,
+            status,
+        });
         Ok(())
     }
 
@@ -594,9 +679,13 @@ impl JournalSink for MemorySink {
         &mut self,
         kind: u64,
         outcome: Option<u64>,
-        _trap: Option<(String, String, String, String)>,
+        trap: Option<(String, String, String, String)>,
     ) -> Result<(), SinkError> {
-        self.entries.push(SinkEntry::Terminal { kind, outcome });
+        self.entries.push(SinkEntry::Terminal {
+            kind,
+            outcome,
+            trap,
+        });
         Ok(())
     }
 }

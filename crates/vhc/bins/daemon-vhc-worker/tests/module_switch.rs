@@ -72,6 +72,13 @@ fn genesis_wire(run_label: &str) -> Vec<u8> {
     roles.insert(
         "coordinator".to_string(),
         RoleEntry {
+            // A fixture envelope: this exercises paths that have nothing to do with resources, and it
+            // uses the SAME shared trivial construction every compute-free module emits.
+            execution: Some(
+                daemon_vhc_proto::RoleExecutionRequirements::fixture_over_trivial_plan(vec![
+                    "cpu".to_string()
+                ]),
+            ),
             lane: "coordinator".into(),
             module: "coordinator.wasm".into(),
             abi: "vhc@2".into(),
@@ -83,6 +90,13 @@ fn genesis_wire(run_label: &str) -> Vec<u8> {
     roles.insert(
         ROLE.to_string(),
         RoleEntry {
+            // A fixture envelope: this exercises paths that have nothing to do with resources, and it
+            // uses the SAME shared trivial construction every compute-free module emits.
+            execution: Some(
+                daemon_vhc_proto::RoleExecutionRequirements::fixture_over_trivial_plan(vec![
+                    "cpu".to_string()
+                ]),
+            ),
             lane: "trainer".into(),
             module: "counter.wasm".into(),
             abi: "vhc@2".into(),
@@ -90,11 +104,12 @@ fn genesis_wire(run_label: &str) -> Vec<u8> {
             // CBOR unsigned encodes as that single byte.
             config: Value::from(0u8),
             grants: control_channel(),
-            device_min: daemon_vhc_proto::DeviceMinimums {
-                gpu: Some(1), // optional
-                ram_bytes: Some(1 << 20),
-                ..Default::default()
-            },
+            // The superseded device-minimums section stays EMPTY. Physical requirements are members of
+            // the composed claim now, and an authored minimum beside a composed one is a second
+            // authority over the same question — which authoring refuses. This drill exercises the
+            // module-switch identity and journal continuity, not resources, so it has nothing to state
+            // here.
+            device_min: daemon_vhc_proto::DeviceMinimums::default(),
         },
     );
 
@@ -199,6 +214,8 @@ fn switch_tuple(
         },
         None,
         Some(&envelope_grants),
+        // The legacy switch path: a lower-minor module declares its own claim, so no authority.
+        None,
     )
     .expect("target admits");
     let tuple = AdmittedTuple {

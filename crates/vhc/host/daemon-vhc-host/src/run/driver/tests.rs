@@ -63,6 +63,7 @@ fn test_state(sink: Box<dyn JournalSink>) -> PumpState {
             crate::run::state_store::StateStoreConfig::default(),
         ),
         guest_memory_high_water: 0,
+        allocator_samples: Vec::new(),
         buffer_streams: BufferStreams::default(),
         op_requests: Vec::new(),
         stop_enqueued: false,
@@ -592,6 +593,11 @@ fn signed_frame_carries_the_full_scope_tuple_and_verifies() {
             pending_next: None,
             pending_readback: None,
             pending_readback_value: None,
+            in_run: false,
+            slice_ordinal: None,
+            slices_delivered: 0,
+            log_calls_this_phase: 0,
+            log_bytes_this_phase: 0,
             pending_device: None,
         },
         fuel_per_slice: 0,
@@ -661,4 +667,521 @@ fn signed_frame_carries_the_full_scope_tuple_and_verifies() {
         &env_bytes,
     )
     .expect("§12.1 signature verifies");
+}
+
+// -- the journalled terminal context is the real one, not a hard-coded literal --------------------
+
+/// A `SliceState` in the "nothing has happened yet" position, for the derivation table below.
+fn quiescent_slice() -> SliceState {
+    SliceState {
+        in_init: false,
+        in_migrate: false,
+        stopped: false,
+        draining: false,
+        now: 0,
+        op_calls: 0,
+        readback_bytes: 0,
+        pending_next: None,
+        pending_readback: None,
+        pending_readback_value: None,
+        in_run: false,
+        slice_ordinal: None,
+        slices_delivered: 0,
+        log_calls_this_phase: 0,
+        log_bytes_this_phase: 0,
+        pending_device: None,
+    }
+}
+
+/// The context is DERIVED from lifecycle state, and every distinguishable state derives the value
+/// that is true of it.
+///
+/// The four `da_run` states are the point: before this, a trap anywhere in the run loop was recorded
+/// as the same thing, so "between slices" and "in slice 7" were indistinguishable in the one field a
+/// replay verdict compares.
+#[test]
+fn the_execution_context_is_derived_from_lifecycle_state_and_the_four_run_states_are_distinct() {
+    use daemon_vhc_abi::ExecutionContext;
+
+    let mut init = quiescent_slice();
+    init.in_init = true;
+    assert_eq!(init.execution_context(), ExecutionContext::Init);
+
+    let mut migrate = quiescent_slice();
+    migrate.in_migrate = true;
+    assert_eq!(migrate.execution_context(), ExecutionContext::Migrate);
+
+    // In the run loop, before the first event has been delivered.
+    let mut before = quiescent_slice();
+    before.in_run = true;
+    assert_eq!(
+        before.execution_context(),
+        ExecutionContext::RunBeforeFirstSlice
+    );
+
+    // Inside a slice: the ordinal is the one actually active.
+    let mut in_slice = quiescent_slice();
+    in_slice.in_run = true;
+    in_slice.slice_ordinal = Some(7);
+    in_slice.slices_delivered = 8;
+    assert_eq!(in_slice.execution_context(), ExecutionContext::RunSlice(7));
+
+    // Between slices: a slice HAS run, but none is active. Attributing this to slice 7 would point a
+    // reader at code that had already returned.
+    let mut between = quiescent_slice();
+    between.in_run = true;
+    between.slice_ordinal = None;
+    between.slices_delivered = 8;
+    assert_eq!(
+        between.execution_context(),
+        ExecutionContext::RunBetweenSlices
+    );
+    assert_ne!(
+        between.execution_context(),
+        ExecutionContext::RunSlice(7),
+        "a between-slices trap must not borrow the last slice's ordinal"
+    );
+
+    // After a consumed stop no further slice can begin.
+    let mut after = quiescent_slice();
+    after.in_run = true;
+    after.slices_delivered = 8;
+    after.stopped = true;
+    assert_eq!(
+        after.execution_context(),
+        ExecutionContext::RunAfterLastSlice
+    );
+
+    // Initialization takes precedence over the run flag: the phase flags are still set at trap time
+    // (the driver clears them only on the success path), so an init trap must not read as a run one.
+    let mut init_inside_run = quiescent_slice();
+    init_inside_run.in_run = true;
+    init_inside_run.in_init = true;
+    assert_eq!(init_inside_run.execution_context(), ExecutionContext::Init);
+}
+
+/// Drive `journal_terminal_trap` at each context and read the record back.
+fn recorded_context(context: &daemon_vhc_abi::ExecutionContext, abi_minor: u32) -> String {
+    let sink = Arc::new(Mutex::new(MemorySink::new()));
+    let shared = Arc::new(PumpShared {
+        state: Mutex::new(test_state(Box::new(sink.clone()))),
+        wake: Condvar::new(),
+        t0: Instant::now(),
+        hold: AtomicBool::new(false),
+    });
+    let trap = Trap::bare(crate::trap::TrapCode::GuestPanic, "boom");
+    super::lifecycle::journal_terminal_trap(&shared, &trap, context, abi_minor)
+        .expect("the terminal record is written");
+
+    let guard = sink.lock().expect("sink");
+    let entries = &guard.entries;
+    let terminal = entries
+        .iter()
+        .find_map(|e| match e {
+            SinkEntry::Terminal { trap: Some(t), .. } => Some(t.clone()),
+            _ => None,
+        })
+        .expect("a terminal trap record");
+    assert_eq!(terminal.0, "GuestPanic", "the typed code is unchanged");
+    terminal.2
+}
+
+/// The journalled terminal record carries the context the trap actually occurred in.
+///
+/// Before this, `journal_terminal_trap` wrote the literal `"da_run"` for every trap it was handed —
+/// so an initialization trap was recorded as a run-loop trap. That falsified the field a replay
+/// verdict keys on, and it made a correct in-memory diagnosis read as a misattribution bug in the
+/// forwarding, sending the reader to investigate the wrong mechanism. The three preceding tests can
+/// all pass while the record still says otherwise, which is why this one exists separately.
+#[test]
+fn the_journalled_terminal_record_carries_the_phase_the_trap_occurred_in() {
+    use daemon_vhc_abi::{ExecutionContext, CERTIFICATION_MINOR_V2};
+
+    assert_eq!(
+        recorded_context(&ExecutionContext::Init, CERTIFICATION_MINOR_V2),
+        "da_init",
+        "an initialization trap is recorded as an initialization trap"
+    );
+    assert_eq!(
+        recorded_context(&ExecutionContext::Migrate, CERTIFICATION_MINOR_V2),
+        "da_migrate"
+    );
+    assert_eq!(
+        recorded_context(&ExecutionContext::RunSlice(18), CERTIFICATION_MINOR_V2),
+        "slice:18",
+        "a run-loop trap names the slice it was in"
+    );
+    assert_eq!(
+        recorded_context(
+            &ExecutionContext::RunBeforeFirstSlice,
+            CERTIFICATION_MINOR_V2
+        ),
+        "da_run:before"
+    );
+    assert_eq!(
+        recorded_context(&ExecutionContext::RunBetweenSlices, CERTIFICATION_MINOR_V2),
+        "da_run:between"
+    );
+    assert_eq!(
+        recorded_context(&ExecutionContext::RunAfterLastSlice, CERTIFICATION_MINOR_V2),
+        "da_run:after"
+    );
+    assert_eq!(
+        recorded_context(&ExecutionContext::ExecutionGrant, CERTIFICATION_MINOR_V2),
+        "da_apply_execution_grant",
+        "a grant-application trap occupies its own branch and says so"
+    );
+}
+
+/// **The replay half.** A verdict compares the recorded **code** and **context**, never the
+/// detail string — and a journal written at a legacy minor is compared under the legacy renderer,
+/// unchanged, rather than reinterpreted as one of the truthful values its writer never meant.
+#[test]
+fn a_replay_verdict_compares_the_recorded_context_under_the_journals_own_minor() {
+    use daemon_vhc_abi::{
+        terminal_contexts_agree, ExecutionContext, CERTIFICATION_MINOR_V2,
+        LEGACY_CONTEXT_MAX_MINOR, LEGACY_TERMINAL_CONTEXT,
+    };
+
+    // A legacy journal records the bare string for every phase. Replaying it under its own minor
+    // agrees; the recorded string is NOT upgraded into an ABI-2.5 value.
+    let legacy = recorded_context(&ExecutionContext::Init, LEGACY_CONTEXT_MAX_MINOR);
+    assert_eq!(legacy, LEGACY_TERMINAL_CONTEXT);
+    assert!(terminal_contexts_agree(
+        &legacy,
+        &ExecutionContext::Init,
+        LEGACY_CONTEXT_MAX_MINOR
+    ));
+    assert!(
+        ExecutionContext::parse(&legacy).is_none(),
+        "the legacy string is not one of the eleven renderings, so nothing can silently equate them"
+    );
+
+    // A certification-minor journal is compared against the truthful rendering, and a DIFFERENT
+    // phase disagrees — which is the whole reason the field is worth comparing.
+    let init = recorded_context(&ExecutionContext::Init, CERTIFICATION_MINOR_V2);
+    assert!(terminal_contexts_agree(
+        &init,
+        &ExecutionContext::Init,
+        CERTIFICATION_MINOR_V2
+    ));
+    assert!(
+        !terminal_contexts_agree(&init, &ExecutionContext::Migrate, CERTIFICATION_MINOR_V2),
+        "a migration trap does not agree with an initialization record"
+    );
+    assert!(
+        !terminal_contexts_agree(
+            &init,
+            &ExecutionContext::RunBetweenSlices,
+            CERTIFICATION_MINOR_V2
+        ),
+        "nor does a run-phase trap"
+    );
+}
+
+// -- [LX-10]: the held panic detail is context-scoped -----------------------------------------------
+
+/// Build a `Store<Host>` whose pump already holds a forwarded panic line emitted in
+/// `emitted_in`, then take a trap while the slice state says `trap_state`. Returns the trap's detail.
+fn lifted_detail(emitted_in: daemon_vhc_abi::ExecutionContext, trap_state: SliceState) -> String {
+    let worker =
+        crate::runtime::Worker::new(crate::runtime::EngineConfig::default()).expect("engine");
+    let signing = SigningKey::from_bytes(&[9u8; 32]);
+    let sender = peer_id(&signing).0;
+    let shared = Arc::new(PumpShared {
+        state: Mutex::new(test_state(Box::new(MemorySink::new()))),
+        wake: Condvar::new(),
+        t0: Instant::now(),
+        hold: AtomicBool::new(false),
+    });
+    // The line the guest forwarded, tagged with the context it was emitted in.
+    shared.state.lock().expect("pump").guest_panic = Some((
+        emitted_in,
+        "guests/tiny-llama/src/lib.rs:530:9: seed init".into(),
+    ));
+
+    let host = Host {
+        shared: shared.clone(),
+        limits: StoreLimitsBuilder::new().build(),
+        trap: None,
+        slice: trap_state,
+        fuel_per_slice: 0,
+        op_budget: 0,
+        epoch_ticks: 1,
+        max_readback_bytes: 0,
+        max_frame_bytes: 0,
+        hard_accountable_host_bytes: 0,
+        accountable_staged_bytes: 0,
+        migration_max_sections: 0,
+        migration_max_section_bytes: 0,
+        migration_restore: false,
+        compute: None,
+        compute_queue_depth: 0,
+        compute_ops_since_fence: 0,
+        compute_fault_after_ops: None,
+        compute_ops_total: 0,
+        signing,
+        rng_seed: [0u8; 32],
+        device_bytes: Vec::new(),
+        granted_artifacts: std::collections::BTreeSet::new(),
+        identity: RunIdentity {
+            run_id: [1u8; 32],
+            epoch: 4,
+            role: "trainer".into(),
+            instance: 7,
+            module: [2u8; 32],
+        },
+        sender,
+    };
+    let mut store = wasmtime::Store::new(worker.engine(), host);
+    let trap = super::lifecycle::take_trap(
+        &mut store,
+        wasmtime::Error::msg("wasm trap: wasm `unreachable` instruction executed"),
+    );
+    trap.detail
+}
+
+/// **[LX-10], the negative half.** A prefixed line emitted during initialization must NOT be lifted
+/// into a trap that happens later, in a different phase.
+///
+/// Emitting a prefixed line does not imply trapping: a guest may log one and continue, or log one in
+/// an early phase and trap much later for an unrelated reason. An unscoped slot attaches that stale
+/// line to the later trap, producing an authoritative-looking source location that belongs to a
+/// different failure — worse than no diagnostic, because it is believed, and it sends the reader to
+/// the wrong file with confidence.
+#[test]
+fn an_initialization_phase_detail_cannot_contaminate_a_later_trap() {
+    use daemon_vhc_abi::ExecutionContext;
+
+    // In the run loop, inside slice 3 — the state a later, unrelated trap occurs in.
+    let in_slice_3 = || {
+        let mut s = quiescent_slice();
+        s.in_run = true;
+        s.slice_ordinal = Some(3);
+        s.slices_delivered = 4;
+        s
+    };
+
+    // Emitted in `da_init`; the trap happens later, in the run loop.
+    let detail = lifted_detail(ExecutionContext::Init, in_slice_3());
+    assert!(
+        !detail.contains("seed init"),
+        "an init-phase line must not be attached to a run-phase trap: {detail}"
+    );
+    assert!(
+        !detail.contains("tiny-llama"),
+        "and its source location must not be either: {detail}"
+    );
+    assert!(
+        detail.contains("unreachable"),
+        "the trap keeps the detail it would otherwise have had: {detail}"
+    );
+
+    // The migration twin: emitted in `da_migrate`, trapping later in `da_run`.
+    let migrate_detail = lifted_detail(ExecutionContext::Migrate, in_slice_3());
+    assert!(
+        !migrate_detail.contains("seed init"),
+        "a migrate-phase line must not be attached to a run-phase trap: {migrate_detail}"
+    );
+
+    // A between-slices trap does not inherit a line emitted inside a slice, either — the four run
+    // states are distinct for lifting as well as for recording.
+    let mut between = quiescent_slice();
+    between.in_run = true;
+    between.slices_delivered = 4;
+    assert!(
+        !lifted_detail(ExecutionContext::RunSlice(3), between).contains("seed init"),
+        "a slice-scoped line is not lifted into a between-slices trap"
+    );
+}
+
+/// The positive half, so the negative one is not passing for the wrong reason: when the contexts DO
+/// match, the line is lifted to the front of the detail — which is the whole point of forwarding it.
+#[test]
+fn a_matching_context_lifts_the_forwarded_line_to_the_front_of_the_detail() {
+    use daemon_vhc_abi::ExecutionContext;
+
+    let mut init = quiescent_slice();
+    init.in_init = true;
+    let detail = lifted_detail(ExecutionContext::Init, init);
+    assert!(
+        detail.starts_with("guests/tiny-llama/src/lib.rs:530:9: seed init"),
+        "the forwarded line leads the detail: {detail}"
+    );
+    assert!(
+        detail.contains("unreachable"),
+        "and the engine's own text still follows it: {detail}"
+    );
+}
+
+// -- the allocator sampler is read, and its reproducibility keying compares sets ----------------
+
+/// The sample points a record claims must be the ones the driver is actually wired at.
+///
+/// This is the drift that matters: a profile calibrated from slice-end readings is not reproducible on
+/// a binary that samples only at phase boundaries, even though both would truthfully report that
+/// allocator statistics are available. If the enum grows a member nobody wired, or a wired site is
+/// removed, a record claiming that point would be claiming reproducibility it cannot deliver — so the
+/// claim is pinned against the wiring here rather than trusted.
+#[test]
+fn every_sample_point_the_record_may_claim_is_wired_in_the_driver() {
+    use crate::compute::SamplePoint;
+
+    // Every member of the closed domain, so adding one forces this test to be revisited.
+    let all = [
+        SamplePoint::AfterBringUp,
+        SamplePoint::AfterInit,
+        SamplePoint::AfterMigrate,
+        SamplePoint::AfterSlice,
+        SamplePoint::AtTeardown,
+    ];
+    let slugs: Vec<&str> = all.iter().map(|p| p.slug()).collect();
+    assert_eq!(
+        slugs,
+        vec![
+            "after-bring-up",
+            "after-init",
+            "after-migrate",
+            "after-slice",
+            "at-teardown"
+        ],
+        "the slugs are the strings a reproducibility check compares, so they are pinned"
+    );
+
+    // Each one must appear at a call site in the driver. Reading the sources is the only way to
+    // assert this without running five different lifecycles on a device this test cannot require.
+    let lifecycle = include_str!("lifecycle.rs");
+    let event_seam = include_str!("linker/vhc.rs");
+    for point in all {
+        let wired = lifecycle.contains(&format!("SamplePoint::{point:?}"))
+            || event_seam.contains(&format!("SamplePoint::{point:?}"));
+        assert!(
+            wired,
+            "`{}` is in the closed domain but nothing samples at it — a record claiming it would \
+             claim a reproducibility it cannot deliver. Wire it, or remove it from the domain.",
+            point.slug()
+        );
+    }
+}
+
+/// An empty sample series is an absence, and the readout says so rather than printing zeros.
+///
+/// The distinction is the whole point of the sampler's contract: a backend that cannot report
+/// occupancy records nothing, and a reader who took that for `bytes_in_use = 0` would calibrate a
+/// profile against a figure nobody measured. That is the same mislabelling the per-term calibration
+/// basis exists to prevent, one layer down.
+#[test]
+fn an_unsampled_run_reports_an_absence_and_not_a_zero() {
+    let slice = quiescent_slice();
+    assert!(
+        slice.log_calls_this_phase == 0,
+        "the fixture is quiescent so the assertion below is about the samples, not the phase"
+    );
+
+    // A pump that never sampled holds an empty series, which is distinguishable from one that
+    // sampled and read zero.
+    let sampled_nothing: Vec<(crate::compute::SamplePoint, crate::compute::AllocatorSample)> =
+        Vec::new();
+    let sampled_a_zero = [(
+        crate::compute::SamplePoint::AfterInit,
+        crate::compute::AllocatorSample::default(),
+    )];
+    assert!(sampled_nothing.is_empty());
+    assert_eq!(sampled_a_zero.len(), 1);
+    assert_eq!(
+        sampled_a_zero[0].1,
+        crate::compute::AllocatorSample::default(),
+        "a measured zero is a value; the empty series above is not that value"
+    );
+}
+
+/// The run header's resource branch follows the negotiated minor, and a certification-minor run with
+/// no composition **does not start**.
+///
+/// The empty-members case is the one the minor alone cannot decide. Writing the composed branch would
+/// record members asserting a composition that never happened; writing the legacy branch would record a
+/// declared claim the module never declared. Admission refuses such a run first, so reaching this gate
+/// means a caller assembled the configuration directly — which is precisely what the first gate cannot
+/// see, and why there is a second one.
+#[test]
+fn a_certification_minor_run_without_a_composition_refuses_instead_of_recording_empty_members() {
+    use crate::run::driver::config::RunError;
+    use crate::run::driver::lifecycle::run_header_resources;
+    use crate::run::RunHeaderResources;
+
+    let identity = crate::run::RunIdentity {
+        run_id: [7u8; 32],
+        epoch: 1,
+        role: "trainer".into(),
+        instance: 1,
+        module: [9u8; 32],
+    };
+    let base = || {
+        crate::run::RunConfig::new(
+            identity.clone(),
+            [0x33; 32],
+            b"cfg".to_vec(),
+            b"gr".to_vec(),
+        )
+    };
+
+    // A legacy run records what the module declared, whatever the composed fields hold.
+    let mut legacy = base();
+    legacy.abi_minor = daemon_vhc_abi::LEGACY_CONTEXT_MAX_MINOR;
+    legacy.claim_bytes = b"declared".to_vec();
+    assert!(matches!(
+        run_header_resources(&legacy).expect("a legacy run records its declared claim"),
+        RunHeaderResources::Declared(b"declared")
+    ));
+
+    // The certification minor with every member present records the composed branch.
+    let mut composed = base();
+    composed.abi_minor = daemon_vhc_abi::CERTIFICATION_MINOR_V2;
+    composed.resource_plan_bytes = b"plan".to_vec();
+    composed.physical_claim_bytes = b"claim".to_vec();
+    composed.aggregate_claim_bytes = b"aggregate".to_vec();
+    composed.execution_grant = b"grant".to_vec();
+    assert!(matches!(
+        run_header_resources(&composed).expect("a composed run records its composition"),
+        RunHeaderResources::Composed { .. }
+    ));
+
+    // Each member is individually load-bearing: absent, the run refuses and the refusal names it.
+    for (member, blank) in [
+        ("resource_plan", 0usize),
+        ("physical_claim", 1),
+        ("aggregate_claim", 2),
+        ("execution_grant", 3),
+    ] {
+        let mut missing = base();
+        missing.abi_minor = daemon_vhc_abi::CERTIFICATION_MINOR_V2;
+        let mut members = [
+            b"plan".to_vec(),
+            b"claim".to_vec(),
+            b"aggregate".to_vec(),
+            b"grant".to_vec(),
+        ];
+        members[blank] = Vec::new();
+        let [plan, claim, aggregate, grant] = members;
+        missing.resource_plan_bytes = plan;
+        missing.physical_claim_bytes = claim;
+        missing.aggregate_claim_bytes = aggregate;
+        missing.execution_grant = grant;
+
+        let refusal = run_header_resources(&missing).expect_err("an absent member refuses the run");
+        assert!(
+            matches!(refusal, RunError::CompositionMissing { member: m, .. } if m == member),
+            "the refusal names the absent member, got {refusal}"
+        );
+    }
+
+    // And a run that declares the certification minor while carrying only a declared claim is refused
+    // too — the legacy fallback is not available at that minor.
+    let mut declared_at_certification = base();
+    declared_at_certification.abi_minor = daemon_vhc_abi::CERTIFICATION_MINOR_V2;
+    declared_at_certification.claim_bytes = b"declared".to_vec();
+    assert!(matches!(
+        run_header_resources(&declared_at_certification).expect_err("no silent legacy fallback"),
+        RunError::CompositionMissing { .. }
+    ));
 }

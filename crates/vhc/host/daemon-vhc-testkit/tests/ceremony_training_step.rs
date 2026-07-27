@@ -121,7 +121,7 @@ impl JournalSink for MeasuringSink {
         _manifest: &[u8],
         _config: &[u8],
         _grants: &[u8],
-        _claim: &[u8],
+        _resources: daemon_vhc_host::run::RunHeaderResources<'_>,
         _channels: &[u8],
         _device: &[u8],
     ) -> Result<(), SinkError> {
@@ -131,6 +131,9 @@ impl JournalSink for MeasuringSink {
         Ok(())
     }
     fn init(&mut self, _c: [u8; 32], _g: [u8; 32], _status: u64) -> Result<(), SinkError> {
+        Ok(())
+    }
+    fn execution_grant(&mut self, _hash: [u8; 32], _status: u64) -> Result<(), SinkError> {
         Ok(())
     }
     fn event(&mut self, _at: u64, _frame: &[u8]) -> Result<(), SinkError> {
@@ -272,9 +275,12 @@ fn admitted_claim(wasm: &[u8], cfg_bytes: &[u8]) -> MemoryClaim {
         &owner,
         None,
         None,
+        // The trainer declares a tiered claim at its current minor: no composition authority.
+        None,
     )
     .expect("the ceremony trainer's own claim admits under the production trainer lane")
     .claim
+    .expect("a lower-minor trainer declares its own claim")
 }
 
 /// What one gated round produced.

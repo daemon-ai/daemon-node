@@ -601,6 +601,7 @@ mod tests {
                 config: ciborium::value::Value::Map(vec![]),
                 grants: RoleGrants::default(),
                 device_min: DeviceMinimums::default(),
+                execution: Some(crate::execution_requirements::sample_for_tests("cpu")),
             },
         );
         roles.insert(
@@ -612,6 +613,7 @@ mod tests {
                 config: ciborium::value::Value::Map(vec![]),
                 grants: RoleGrants::default(),
                 device_min: DeviceMinimums::default(),
+                execution: Some(crate::execution_requirements::sample_for_tests("cpu")),
             },
         );
 

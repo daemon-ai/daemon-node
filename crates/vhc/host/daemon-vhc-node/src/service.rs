@@ -20,6 +20,7 @@ use daemon_api::{
     ApiError, NodeEvent, VhcApi, VhcCapabilities, VhcEligibility, VhcEvent, VhcEventStream,
     VhcHardwareReport, VhcLeaveMode, VhcPolicy, VhcPolicyMode, VhcRunDetail, VhcRunSummary,
 };
+use daemon_vhc_abi::{AbiRefusalCode, RESERVATION_DEVICE_BYTES_KEY, RESERVATION_HOST_BYTES_KEY};
 use daemon_vhc_session::config::VhcConfig;
 use daemon_vhc_session::protocol::{
     self, Eligibility, Hardware, JoinPolicy, LeaveMode, PolicyMode,
@@ -595,7 +596,7 @@ impl VhcService {
                     self.store.mint_incarnation()?
                 },
             };
-            let charge = self.derive_charge(&run.eligibility, &run.policy, &id.role);
+            let charge = self.derive_charge(&run.eligibility, &run.policy, &id.role)?;
             let priority = self.store.run_priority(&run.run_id)?;
             if let Err(refusal) = self.admit_placed(&id, charge, priority) {
                 if self.worker_factory.is_some() {
@@ -945,7 +946,7 @@ impl VhcService {
             },
             instance: self.store.mint_incarnation()?,
         };
-        let charge = self.derive_charge(&run.eligibility, &run.policy, &id.role);
+        let charge = self.derive_charge(&run.eligibility, &run.policy, &id.role)?;
         let priority = self.store.run_priority(&run.run_id)?;
         if let Err(refusal) = self.admit_placed(&id, charge, priority) {
             if self.worker_factory.is_some() {
@@ -1134,7 +1135,18 @@ impl VhcService {
             role: "trainer".to_string(),
             instance,
         };
-        let charge = self.derive_charge(&eligibility, policy, &id.role);
+        let charge = match self.derive_charge(&eligibility, policy, &id.role) {
+            Ok(charge) => charge,
+            Err(e) => {
+                // Nothing to reserve means nothing to admit. Surrender the worker rather than
+                // charging the owner's ceiling for a figure that was supposed to be derived.
+                warn_co!(format!(
+                    "co-located trainer has no derivable reservation: {e}"
+                ));
+                worker.shutdown().await;
+                return;
+            }
+        };
         let priority = self.store.run_priority(run_id).unwrap_or(0);
         if let Err(refusal) = self.admit_placed(&id, charge, priority) {
             warn_co!(format!(
@@ -1226,34 +1238,71 @@ impl VhcService {
         eligibility: &VhcEligibility,
         policy: &VhcPolicy,
         role: &str,
-    ) -> InstanceCharge {
-        const MIB: u64 = 1 << 20;
-        let claim = |key: &str| {
+    ) -> Result<InstanceCharge, VhcError> {
+        // **Present-and-zero is a figure; absent is not.** A role that performs no accelerator
+        // computation — the consensus seat — has a genuinely derived device figure of zero, and
+        // charging it anything is wrong. The previous lookup discarded zero as though it were
+        // missing, which is exactly what sent a zero-footprint role down the owner-cap fallback and
+        // had it reserve the whole standing budget. Only a key that is not there at all means "no
+        // figure was derived".
+        let figure = |key: &str| {
             eligibility
                 .headroom
                 .get(key)
                 .copied()
-                .filter(|v| *v > 0)
-                .map(|v| v as u64)
+                .map(|v| u64::try_from(v).unwrap_or(0))
         };
-        let claim_host = claim("claim_host_bytes").unwrap_or(0);
-        // The device claim (bytes) when present, else the owner's standing VRAM cap as the
-        // estimate — NEVER a silent zero fall-through (D-10).
-        let cap_bytes = u64::from(policy.vram_cap_mb).saturating_mul(MIB);
-        let device_bytes = claim("claim_device_bytes").unwrap_or(cap_bytes);
-        // The consensus coordinator role claims no accelerator duty (see the doc-comment): duty is
-        // the accelerator's ledger and the seat role does no accelerator compute.
+
+        // The MEMORY reservation derives from the composed claim, and from nothing else.
+        //
+        // The certification path reports the reservation the governor derived: already
+        // scope-correct, with process- and device-scoped terms charged once at their scope rather
+        // than once per role instance, and with the per-allocation constraint excluded because it is
+        // a maximum to validate and not occupancy to hold. A lower-minor module has no composed
+        // claim and reports its legacy declared tiers instead; that path is unchanged.
+        //
+        // **The owner-cap fallback is gone.** It used to substitute the owner's own VRAM cap when no
+        // device figure was present. With the guest's device tiers retired that fallback becomes the
+        // ONLY path for a certification-minor module, and the ledger would charge the owner's
+        // ceiling instead of the workload — reserving the whole budget for every role, refusing the
+        // second one, and calling it a resource decision. An absent figure is now a typed refusal.
+        let reserved_device = figure(RESERVATION_DEVICE_BYTES_KEY);
+        let reserved_host = figure(RESERVATION_HOST_BYTES_KEY);
+        let (device_bytes, host_bytes) = match (reserved_device, reserved_host) {
+            (Some(device), host) => (device, host.unwrap_or(0)),
+            (None, _) => {
+                let legacy_device = figure("claim_device_bytes").ok_or_else(|| {
+                    VhcError::Internal(format!(
+                        "{}: no composed reservation and no declared device claim for role \
+                         `{role}`, so there is nothing to reserve. The owner's cap is not a \
+                         substitute for a figure that was supposed to be derived",
+                        AbiRefusalCode::ClaimNotComposable.slug()
+                    ))
+                })?;
+                (legacy_device, figure("claim_host_bytes").unwrap_or(0))
+            }
+        };
+
+        // The NON-memory ledgers keep their established sources: duty from the run's join policy
+        // under the owner's standing budget, and zero for a role that performs no accelerator
+        // computation so it cannot starve a co-resident sibling that does. They are deliberately not
+        // swept into claim derivation — but they share the prohibition above: an absent input is a
+        // typed refusal or an explicit policy default, never the owner's own ceiling.
         let duty_pct = if role == self.config.seat_role {
             0
         } else {
             policy.duty_cycle_pct.min(100) as u8
         };
-        InstanceCharge {
+        Ok(InstanceCharge {
             device: String::new(),
+            // The reservation is carried in ONE tier on purpose. `device_total()` sums all three,
+            // which is correct for a per-role term and a double-count for any shared-scope term
+            // across co-resident roles; the reservation has already composed every term at its
+            // declared scope, so summing it again here would undo that.
             tiers: ClaimTiers {
                 hard_accountable: TierBytes {
                     device: device_bytes,
-                    host: claim_host,
+                    host: host_bytes,
                 },
                 ..ClaimTiers::default()
             },
@@ -1261,7 +1310,7 @@ impl VhcService {
             net_up_bps: 0,
             net_down_bps: 0,
             duty_pct,
-        }
+        })
     }
 
     /// Node-side placement (decisions D6 point 2 — one accelerator per role-instance): try the
@@ -2506,7 +2555,9 @@ impl VhcApi for VhcService {
                             .map_err(|e| VhcError::from(e).to_api())?
                     },
                 };
-                let charge = self.derive_charge(&eligibility, &policy, &id.role);
+                let charge = self
+                    .derive_charge(&eligibility, &policy, &id.role)
+                    .map_err(|e| e.to_api())?;
                 let priority = self
                     .store
                     .run_priority(&run_id)
@@ -2745,7 +2796,9 @@ impl VhcApi for VhcService {
                 .map(|e| (e.id.clone(), e.worker.clone()))
         };
         if let Some((id, worker)) = entry_worker {
-            let charge = self.derive_charge(&run.eligibility, &run.policy, &id.role);
+            let charge = self
+                .derive_charge(&run.eligibility, &run.policy, &id.role)
+                .map_err(|e| e.to_api())?;
             let priority = self.store.run_priority(&run_id).map_err(map)?;
             if let Err(refusal) = self.admit_placed(&id, charge, priority) {
                 return Err(VhcError::from(refusal).to_api());
@@ -3175,6 +3228,100 @@ mod arbitration_tests {
         }
     }
 
+    /// An eligibility reporting the composed reservation the governor derived — the certification
+    /// path's input shape, already scope-correct.
+    fn reserved_eligibility(device: i64, host: i64) -> VhcEligibility {
+        let mut headroom = BTreeMap::new();
+        headroom.insert(RESERVATION_DEVICE_BYTES_KEY.to_string(), device);
+        headroom.insert(RESERVATION_HOST_BYTES_KEY.to_string(), host);
+        VhcEligibility {
+            eligible: true,
+            reasons: Vec::new(),
+            headroom,
+        }
+    }
+
+    /// An eligibility with no memory figure at all: neither a composed reservation nor a declared
+    /// legacy claim.
+    fn figureless_eligibility() -> VhcEligibility {
+        VhcEligibility {
+            eligible: true,
+            reasons: Vec::new(),
+            headroom: BTreeMap::new(),
+        }
+    }
+
+    /// The owner-cap fallback is GONE. It used to substitute the owner's own VRAM cap whenever no
+    /// device figure was present, which with the guest's device tiers retired would have become the
+    /// only path — reserving the whole budget for every role, refusing the second one, and calling
+    /// that a resource decision. An absent figure is now a typed refusal naming exactly that.
+    #[test]
+    fn a_missing_memory_figure_is_a_typed_refusal_and_never_the_owners_cap() {
+        let probe = Hardware {
+            gpus: 1,
+            vram_mb: 25_559,
+            ram_mb: 32_000,
+            ..Hardware::default()
+        };
+        let budget = OwnerBudget::from_config(&OwnerBudgetConfig::default(), Some(&probe), 50);
+        let svc = coordinator_trainer_service(budget);
+
+        // A generous standing cap is exactly what the old fallback would have charged.
+        let mut generous = policy(100);
+        generous.vram_cap_mb = 24_000;
+
+        let err = svc
+            .derive_charge(&figureless_eligibility(), &generous, "trainer")
+            .expect_err("no figure means no reservation and no admission");
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains(AbiRefusalCode::ClaimNotComposable.slug()),
+            "the refusal names the reason: {rendered}"
+        );
+        assert!(
+            rendered.contains("not a substitute"),
+            "and says why the cap is not used: {rendered}"
+        );
+
+        // A composed reservation is charged verbatim — not the cap, and not a re-sum of tiers.
+        let reserved = svc
+            .derive_charge(
+                &reserved_eligibility(3 << 30, 1 << 30),
+                &generous,
+                "trainer",
+            )
+            .expect("a composed reservation admits");
+        assert_eq!(reserved.tiers.hard_accountable.device, 3 << 30);
+        assert_eq!(reserved.tiers.hard_accountable.host, 1 << 30);
+        assert_eq!(
+            reserved.tiers.device_total(),
+            3 << 30,
+            "the reservation composed every term at its declared scope; summing the tiers again \
+             would double-count a shared-scope term across co-resident roles"
+        );
+        assert_eq!(reserved.tiers.host_total(), 1 << 30);
+
+        // A lower-minor module still reports its declared tiers, and that path is unchanged.
+        let legacy = svc
+            .derive_charge(&eligibility(2 << 30, 512 << 20), &generous, "trainer")
+            .expect("the legacy declared claim still admits");
+        assert_eq!(legacy.tiers.hard_accountable.device, 2 << 30);
+
+        // And the reservation takes precedence when both are reported.
+        let mut both = reserved_eligibility(3 << 30, 1 << 30);
+        both.headroom
+            .insert("claim_device_bytes".to_string(), 9 << 30);
+        assert_eq!(
+            svc.derive_charge(&both, &generous, "trainer")
+                .unwrap()
+                .tiers
+                .hard_accountable
+                .device,
+            3 << 30,
+            "the composed reservation governs, not a legacy declaration beside it"
+        );
+    }
+
     fn policy(duty: u32) -> VhcPolicy {
         VhcPolicy {
             mode: VhcPolicyMode::Always,
@@ -3250,8 +3397,9 @@ mod arbitration_tests {
 
         // The coordinator seat role-instance (role == seat_role): consensus wasm, no device
         // footprint, ZERO accelerator duty by design.
-        let coord_charge =
-            svc.derive_charge(&eligibility(0, 64 << 20), &policy(100), "coordinator");
+        let coord_charge = svc
+            .derive_charge(&eligibility(0, 64 << 20), &policy(100), "coordinator")
+            .unwrap();
         assert_eq!(
             coord_charge.duty_pct, 0,
             "the consensus coordinator claims zero accelerator duty"
@@ -3260,8 +3408,9 @@ mod arbitration_tests {
             .expect("the coordinator seat instance admits");
 
         // The co-located trainer role-instance: the policy duty (full), a real device+host claim.
-        let trainer_charge =
-            svc.derive_charge(&eligibility(5 << 30, 8 << 30), &policy(100), "trainer");
+        let trainer_charge = svc
+            .derive_charge(&eligibility(5 << 30, 8 << 30), &policy(100), "trainer")
+            .unwrap();
         assert_eq!(
             trainer_charge.duty_pct, 100,
             "the co-located trainer claims the policy duty"
@@ -3300,7 +3449,9 @@ mod arbitration_tests {
 
         // The co-located trainer is admitted (full duty) and live.
         let id = instance_id("trainer", 8);
-        let charge = svc.derive_charge(&eligibility(2 << 30, 2 << 30), &policy(100), "trainer");
+        let charge = svc
+            .derive_charge(&eligibility(2 << 30, 2 << 30), &policy(100), "trainer")
+            .unwrap();
         svc.admit_placed(&id, charge, 100).expect("trainer admits");
         svc.co_trainers.lock().unwrap().insert(
             "run-a".to_string(),
@@ -3346,15 +3497,21 @@ mod arbitration_tests {
         let svc = coordinator_trainer_service(budget);
 
         // Coordinator (0%) + one full-duty trainer (100%) fill the ledger.
-        let coord = svc.derive_charge(&eligibility(0, 64 << 20), &policy(100), "coordinator");
+        let coord = svc
+            .derive_charge(&eligibility(0, 64 << 20), &policy(100), "coordinator")
+            .unwrap();
         svc.admit_placed(&instance_id("coordinator", 1), coord, 100)
             .expect("coordinator admits");
-        let trainer = svc.derive_charge(&eligibility(2 << 30, 2 << 30), &policy(100), "trainer");
+        let trainer = svc
+            .derive_charge(&eligibility(2 << 30, 2 << 30), &policy(100), "trainer")
+            .unwrap();
         svc.admit_placed(&instance_id("trainer", 2), trainer, 100)
             .expect("first trainer admits");
 
         // A second full-duty trainer has no duty left — a typed refusal, never a silent admit.
-        let extra = svc.derive_charge(&eligibility(2 << 30, 2 << 30), &policy(100), "trainer");
+        let extra = svc
+            .derive_charge(&eligibility(2 << 30, 2 << 30), &policy(100), "trainer")
+            .unwrap();
         let refusal = svc
             .admit_placed(&instance_id("trainer", 3), extra, 100)
             .expect_err("a second full-duty trainer exceeds the 100% duty ledger");

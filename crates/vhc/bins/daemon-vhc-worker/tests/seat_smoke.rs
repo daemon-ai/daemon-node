@@ -93,11 +93,10 @@ fn genesis_wire(trusted_bases: &[PeerId]) -> (Vec<u8>, [u8; 32]) {
         abi: "vhc@2".into(),
         config: Value::from(2u8), // two publishes, then park until stopped
         grants: control_channel(),
-        device_min: daemon_vhc_proto::DeviceMinimums {
-            gpu: Some(1),
-            ram_bytes: Some(1 << 20),
-            ..Default::default()
-        },
+        // The superseded device-minimums section stays EMPTY: physical requirements are members
+        // of the composed claim, and an authored minimum beside a composed one is a second
+        // authority over the same question, which authoring refuses.
+        device_min: daemon_vhc_proto::DeviceMinimums::default(),
     };
     let mut roles = BTreeMap::new();
     roles.insert(COORD_ROLE.to_string(), role_entry("coordinator"));

@@ -1,0 +1,53 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# SPDX-FileCopyrightText: 2026 Jarrad Hope
+
+[package]
+name = "daemon-vhc-resource"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The HOST side of the three-object resource model (architecture §9.6): the Backend Execution
+# Profile and its trust envelope, the backend implementation revision record, the Device Capability
+# Report, the composition planner, and the resource governor.
+#
+# **This crate must never be linked by `contracts/*` or `sdk/*`, and therefore never by a guest.**
+# That is not a style preference, it is the property the whole redesign exists to provide: if the
+# profile type lived in a crate the guests link, every profile revision — a driver update, a
+# re-calibrated workspace formula — would change every guest hash and re-pin the fleet for a
+# reason having nothing to do with any training algorithm. The Logical Resource Plan and the
+# Execution Grant legitimately live in `daemon-vhc-proto` because they are guest-facing and the
+# re-pin accounting already charges for them; the profile does NOT follow them there. The
+# dependency direction is enforced mechanically by `xtask vhc-dep-check`.
+
+[lib]
+path = "src/lib.rs"
+
+# `test-support` exposes the crate-private fixture constructors (a stocked profile store, an accepting
+# policy, a capability report carrying a measured ceiling, lane bounds, a plan) so that a test in
+# ANOTHER crate can assemble a resource authority. At the certification minor a module declares no
+# physical figure, so admission composes one from an *authenticated* profile — and authentication is
+# reachable only through this crate's private machinery, which would otherwise make such a test
+# impossible to write rather than merely inconvenient.
+#
+# It is deliberately absent from `default`, and it MUST appear only on `dev-dependencies` edges: a
+# production build able to switch it on would be a production build able to mint a profile, defeating
+# the trust gate. `xtask vhc-dep-check` fails if any `[dependencies]`/`[build-dependencies]` edge in
+# the workspace enables it, so the rule is mechanical rather than remembered.
+[features]
+default = []
+test-support = []
+
+[dependencies]
+# The guest-facing halves of the model: the Logical Resource Plan the profile is composed WITH, the
+# Execution Grant, canonical CBOR and blake3. The edge points host -> contracts, never back.
+daemon-vhc-proto = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+# The CBOR value tree the canonical encoder walks.
+ciborium = { workspace = true }
+blake3 = { workspace = true }
+
+[lints]
+workspace = true

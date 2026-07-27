@@ -281,6 +281,13 @@ fn genesis_wire() -> Vec<u8> {
     roles.insert(
         "coordinator".to_string(),
         RoleEntry {
+            // A fixture envelope: this exercises paths that have nothing to do with resources, and it
+            // uses the SAME shared trivial construction every compute-free module emits.
+            execution: Some(
+                daemon_vhc_proto::RoleExecutionRequirements::fixture_over_trivial_plan(vec![
+                    "cpu".to_string()
+                ]),
+            ),
             lane: "coordinator".into(),
             module: "coordinator.wasm".into(),
             abi: "vhc@2".into(),
@@ -292,16 +299,22 @@ fn genesis_wire() -> Vec<u8> {
     roles.insert(
         "trainer".to_string(),
         RoleEntry {
+            // A fixture envelope: this exercises paths that have nothing to do with resources, and it
+            // uses the SAME shared trivial construction every compute-free module emits.
+            execution: Some(
+                daemon_vhc_proto::RoleExecutionRequirements::fixture_over_trivial_plan(vec![
+                    "cpu".to_string()
+                ]),
+            ),
             lane: "trainer".into(),
             module: "worker.wasm".into(),
             abi: "vhc@2".into(),
             config: trainer_role_config(),
             grants: control_channel("control"),
-            device_min: daemon_vhc_proto::DeviceMinimums {
-                gpu: Some(1), // optional
-                ram_bytes: Some(1 << 20),
-                ..Default::default()
-            },
+            // The superseded device-minimums section stays EMPTY: physical requirements are
+            // members of the composed claim, and an authored minimum beside a composed one is a
+            // second authority over the same question, which authoring refuses.
+            device_min: daemon_vhc_proto::DeviceMinimums::default(),
         },
     );
 

@@ -74,14 +74,24 @@ pub fn record_run_header<K: KeyProvider + Clone>(
         manifest: Vec::new(),
         config,
         grants: Vec::new(),
-        claim: Vec::new(),
+        claim: Some(Vec::new()),
         channels: Vec::new(),
         device: Vec::new(),
+        // Not a certification-minor run: this writer records the legacy variant, and the grammar
+        // forbids a record carrying both a declared claim and a composed one.
+        resource_plan: None,
+        resource_plan_hash: None,
+        physical_claim: None,
+        physical_claim_hash: None,
+        aggregate_claim: None,
+        aggregate_claim_hash: None,
+        execution_grant: None,
+        execution_grant_hash: None,
         format: u64::from(super::format_version()),
     };
     // The run header is a durable admission fact → cross a commit barrier (§8.4-style).
     journal
-        .append_committed(Body::RunHeader(header))
+        .append_committed(Body::RunHeader(Box::new(header)))
         .map_err(journal_err)
 }
 

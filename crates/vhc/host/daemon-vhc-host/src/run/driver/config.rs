@@ -38,8 +38,35 @@ pub struct RunConfig {
     /// Run-header fields the admission path pinned (verbatim canonical bytes; §8.3 tag 0). Empty
     /// until the A2 admission funnel wires them — recorded as such.
     pub manifest_bytes: Vec<u8>,
-    /// Run-header claim bytes (see [`RunConfig::manifest_bytes`]).
+    /// Run-header claim bytes (see [`RunConfig::manifest_bytes`]). Empty at the certification minor,
+    /// which records the plan, the composed claims and the grant instead.
     pub claim_bytes: Vec<u8>,
+    /// The composed role Physical Claim's canonical bytes — a certification-minor run-header member.
+    ///
+    /// Empty below the certification minor, where [`RunConfig::claim_bytes`] carries the module's
+    /// declared claim instead. The run header records one branch or the other, never both.
+    pub physical_claim_bytes: Vec<u8>,
+    /// The node/device aggregate claim's canonical bytes (see [`RunConfig::physical_claim_bytes`]).
+    ///
+    /// Distinct from the per-instance claim: a role colocated with another shares device resources, and
+    /// the aggregate is what the node actually reserved.
+    pub aggregate_claim_bytes: Vec<u8>,
+    /// The negotiated major-2 ABI minor for this instance.
+    ///
+    /// It is the selector for the minor-dependent behaviour: which assessment export ran, which
+    /// run-header variant the journal writes, and which terminal-context renderer applies. Defaults
+    /// to the host's own implemented minor; admission overwrites it with the module's declared one.
+    pub abi_minor: u32,
+    /// The canonical Logical Resource Plan bytes (run-header, certification minor). Empty below it.
+    pub resource_plan_bytes: Vec<u8>,
+    /// The canonical Execution Grant bytes to apply before `da_init`.
+    ///
+    /// Empty means there is no grant to apply — a lower-minor module, which has no grant seam at
+    /// all. A certification-minor run carries the exact bytes: copied verbatim from the signed role
+    /// entry for a uniform run, or host-derived and bound to the role instance and incarnation for
+    /// per-participant selection. The span the guest sees is **borrowed** and is reclaimed with the
+    /// instance; neither side frees it.
+    pub execution_grant: Vec<u8>,
     /// Run-header channel-table bytes (the Phase-A default table until D0).
     pub channels_bytes: Vec<u8>,
     /// Run-header device-profile bytes.
@@ -170,6 +197,17 @@ impl RunConfig {
             grants,
             manifest_bytes: Vec::new(),
             claim_bytes: Vec::new(),
+            physical_claim_bytes: Vec::new(),
+            aggregate_claim_bytes: Vec::new(),
+            // A directly-constructed run has negotiated nothing, so it must not claim the newest
+            // contract. Defaulting to the host's own minor made this field track the constant: when
+            // the certification minor landed, every run built without admission silently began
+            // claiming it — which selects the certification run-header variant for a run that
+            // composed nothing. The default is now the highest legacy minor, and admission overwrites
+            // it with what the module actually declared.
+            abi_minor: daemon_vhc_abi::LEGACY_CONTEXT_MAX_MINOR,
+            resource_plan_bytes: Vec::new(),
+            execution_grant: Vec::new(),
             channels_bytes: Vec::new(),
             device_bytes: Vec::new(),
             max_frame_bytes: 1 << 20,
@@ -200,6 +238,14 @@ impl RunConfig {
     }
 }
 
+/// The host stage a device bring-up failure is attributed to.
+///
+/// Numbered past the five admission-funnel stages deliberately: bring-up happens *after* a module has
+/// been admitted, when the instance is being stood up, and it is the first point at which a host-side
+/// failure can occur with no guest phase to name. Reusing an admission stage would place the failure
+/// in the funnel it had already cleared.
+pub const HOST_STAGE_BACKEND_BRING_UP: u32 = 6;
+
 /// Driver-level failures raised before/around guest execution (admission-shaped, not traps).
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -207,6 +253,27 @@ pub enum RunError {
     /// Engine/linker/instantiation plumbing failed.
     #[error("v2 sandbox error: {0}")]
     Sandbox(String),
+    /// The run declares the certification minor but carries no composed claim to record.
+    ///
+    /// A host-side refusal before any guest code runs, and deliberately not a silent fallback to the
+    /// legacy header: writing the composed branch with empty members would produce a record asserting
+    /// that a composition happened for a run that has none, and writing the legacy branch would record
+    /// a declared claim the module never declared. Both are worse than not starting.
+    ///
+    /// Admission already refuses this run — a certification-minor module with no authenticated profile
+    /// gets `ClaimNotComposable` — so reaching here means a caller assembled a run configuration
+    /// directly. That is exactly the path the first gate cannot see.
+    #[error(
+        "CompositionMissing: this run declares major-2 minor {minor}, whose run header records the \
+         composed claim, but `{member}` is empty — so there is nothing to record and the run does \
+         not start"
+    )]
+    CompositionMissing {
+        /// The negotiated minor that selected the certification header variant.
+        minor: u32,
+        /// The first absent member.
+        member: &'static str,
+    },
     /// The module imports the retired `tabi@1` compute bridge — the typed `BridgeRetired`
     /// admission refusal, re-raised here so a caller that skipped the §1.3 front door still
     /// meets it before any guest code runs.
@@ -218,6 +285,31 @@ pub enum RunError {
     /// caller classifies it recoverable (the node reassesses; the device inventory changed).
     #[error("BackendUnavailable: {0}")]
     BackendUnavailable(String),
+    /// The device backend could not be **brought up** for this instance: a host-side failure in
+    /// which no guest code ran at all.
+    ///
+    /// It carries its own stage because it belongs to none of the guest execution contexts. That
+    /// domain describes where *guest* code was executing, and a bring-up failure happens before the
+    /// guest exists — so attributing it to initialization, which is what this used to do, was a
+    /// classification bug rather than a conservative choice: it recorded a guest-trap fact about a
+    /// phase the guest never entered, and a reader of that record would reasonably conclude the
+    /// module's own initialization had failed.
+    ///
+    /// Inventing a twelfth guest context for it would have been the same mistake with more
+    /// machinery. The honest shape is a typed host refusal outside the guest-trap surface entirely,
+    /// and **no terminal guest-trap record is written**.
+    #[error(
+        "BackendBringUp (host stage {stage}): the {backend} lane could not be brought up for this \
+         instance, before any guest code ran: {reason}"
+    )]
+    BackendBringUp {
+        /// The host stage this failed at. See [`HOST_STAGE_BACKEND_BRING_UP`].
+        stage: u32,
+        /// The backend lane that failed to come up.
+        backend: String,
+        /// The captured reason, verbatim.
+        reason: String,
+    },
     /// A journal-sink write failed (journaling is load-bearing, §8.4).
     #[error(transparent)]
     Sink(#[from] SinkError),
@@ -313,6 +405,11 @@ pub enum RunEnd {
     MigrateRefused(u32),
     /// The guest trapped (typed, journaled as terminal kind 1); the subprocess survives (§7.6).
     Trapped(Trap),
+    /// `da_apply_execution_grant` returned nonzero on the run instance, so `da_init` never ran.
+    ///
+    /// Carries the module's status verbatim. Deterministic and non-retryable for that
+    /// `(module, plan, grant)` tuple: retrying needs changed admitted input, not a fresh instance.
+    ExecutionGrantRejected(u32),
 }
 
 /// The accepted snapshot an upgrade transaction carries across the module switch (ABI §10.2/§10.3

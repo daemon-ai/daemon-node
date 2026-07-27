@@ -76,11 +76,22 @@ impl WorkerControl for FakeWorker {
         _role: Option<String>,
     ) -> Result<Eligibility, VhcError> {
         self.calls().assessed_envelopes.push(envelope);
-        // A distinctive verdict so a test can tell the §6.5 assess path from the probe fallback.
+        // A distinctive verdict so a test can tell the §6.5 assess path from the probe fallback — plus
+        // the composed reservation the ledger charges. A verdict with no resource figure is a typed
+        // `ClaimNotComposable` refusal now that the owner-cap fallback is gone (`d9a32ab8`; arbiter-charge
+        // disposition, 2026-07-26), so a drill about the discovery path has to state a need in order to
+        // reach the discovery path at all.
         Ok(Eligibility {
             eligible: true,
             reasons: vec!["assessed against envelope".into()],
-            headroom: vec![("assessed_micro_batch".into(), 64)],
+            headroom: vec![
+                ("assessed_micro_batch".into(), 64),
+                (
+                    daemon_vhc_abi::RESERVATION_DEVICE_BYTES_KEY.into(),
+                    256 << 20,
+                ),
+                (daemon_vhc_abi::RESERVATION_HOST_BYTES_KEY.into(), 512 << 20),
+            ],
             refusal_code: None,
             admitted_tuple: None,
         })

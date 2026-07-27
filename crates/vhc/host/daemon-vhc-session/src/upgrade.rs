@@ -612,6 +612,10 @@ impl UpgradeSteps for LiveUpgradeSteps<'_> {
             &self.owner,
             None,
             Some(&self.envelope_grants),
+            // The upgrade transaction re-runs the funnel over the new module; it composes nothing of
+            // its own, so it carries no authority. A certification-minor target is refused here for
+            // the same reason it is refused at join, and by the same code.
+            None,
         )
         .map_err(|refusal| StepFailure::new(refusal.to_string()))?;
         admission
@@ -789,6 +793,13 @@ mod tests {
             roles.insert(
                 name.to_string(),
                 RoleEntry {
+                    // A fixture envelope: this exercises paths that have nothing to do with resources, and it
+                    // uses the SAME shared trivial construction every compute-free module emits.
+                    execution: Some(
+                        daemon_vhc_proto::RoleExecutionRequirements::fixture_over_trivial_plan(
+                            vec!["cpu".to_string()],
+                        ),
+                    ),
                     lane: if name == "coordinator" {
                         "coordinator"
                     } else {

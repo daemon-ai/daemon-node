@@ -58,6 +58,10 @@ enum Cmd {
     },
     /// Decode every CBOR fixture with the generated C codec (wire-compat gate).
     VerifyCodec,
+    /// Check the tracked ABI specification against the constants the code defines (drift gate).
+    VhcAbiSpecDrift,
+    /// Scan the code for this program's private vocabulary (red-lined scan gate).
+    VhcCodenameScan,
     /// Build the vhc guest experiment modules (`guests/`) for `wasm32-unknown-unknown`.
     BuildGuests,
     /// Run the vhc **CI tier-1** suite: the CPU-only, consensus-critical determinism / round-
@@ -130,6 +134,13 @@ enum Cmd {
         /// pre-release / post-rebase pass, deliberately wired into no workflow).
         #[arg(long)]
         all: bool,
+        /// Ignore the green ledger: every selected lane RUNS, even for a byte-identical workspace.
+        ///
+        /// The certification switch. A full-scope battery whose lanes were skipped because a
+        /// fingerprint matched has verified the ledger, not the tree — so a certification run states
+        /// `--all --no-memo` and the flag is recorded with the verdict.
+        #[arg(long)]
+        no_memo: bool,
         /// Base ref for the diff scope (default: env GATE_BASE, else `vhc-integration`). The
         /// changed set is the merge-base diff vs HEAD unioned with staged/unstaged/untracked.
         #[arg(long)]
@@ -157,6 +168,14 @@ enum Cmd {
         /// The pinned trainer module blake3 (64-hex).
         #[arg(long)]
         trainer_module: String,
+        /// The coordinator module FILE. Required alongside its digest, and checked against it: the
+        /// role's resource requirements are derived by running the module's own assessment export, and
+        /// a digest cannot be asked what it needs.
+        #[arg(long)]
+        coordinator_wasm: PathBuf,
+        /// The trainer module FILE, checked against `--trainer-module`.
+        #[arg(long)]
+        trainer_wasm: PathBuf,
         /// The published `corpus-manifest.cbor` (its blake3 is the genesis corpus pin; its shards
         /// + tokenizer become the trainer's `data@2` fetch grants).
         #[arg(long)]
@@ -333,18 +352,27 @@ fn main() -> anyhow::Result<()> {
         Cmd::ApiFixtures => gen_api_fixtures(),
         Cmd::GenZcbor { cddl, out } => gen_zcbor(cddl, out),
         Cmd::VerifyCodec => verify_codec(),
+        Cmd::VhcAbiSpecDrift => vhc_abi_spec_drift(),
+        Cmd::VhcCodenameScan => vhc_codename_scan(),
         Cmd::BuildGuests => build_guests(),
         Cmd::VhcCiDet => vhc_ci_det(),
         Cmd::VhcCiT2 => vhc_ci_t2(),
         Cmd::VhcCiNode => vhc_ci_node(),
         Cmd::VhcDepCheck => vhc_dep_check(),
         Cmd::VhcAcceptance => vhc_acceptance(),
-        Cmd::VhcProductionGate { all, base, dry_run } => vhc_production_gate(all, base, dry_run),
+        Cmd::VhcProductionGate {
+            all,
+            base,
+            dry_run,
+            no_memo,
+        } => vhc_production_gate(all, base, dry_run, no_memo),
         Cmd::AuthorCeremonyGenesis {
             run_label,
             author_key,
             coordinator_module,
             trainer_module,
+            coordinator_wasm,
+            trainer_wasm,
             corpus_manifest,
             trusted_base,
             roster,
@@ -364,6 +392,8 @@ fn main() -> anyhow::Result<()> {
             author_key,
             coordinator_module,
             trainer_module,
+            coordinator_wasm,
+            trainer_wasm,
             corpus_manifest,
             trusted_base,
             roster,
@@ -679,9 +709,64 @@ fn vhc_ci_det() -> anyhow::Result<()> {
         // fails fast on a host/*->sdk/* regression before spending a compile.
         println!("\n== vhc-ci-det: daemon-vhc dependency-direction check ==");
         vhc_dep_check()?;
+        // The tracked specification against the code it documents — cheap, and it fails before a
+        // compile on a spec sentence a reader would act on and be wrong about.
+        println!("\n== vhc-ci-det: tracked ABI specification vs the code ==");
+        vhc_abi_spec_drift()?;
         build_guests()?;
-        vhc_ci_det_suites(det_schedule_from_env())
+        vhc_ci_det_suites(det_schedule_from_env())?;
+        vhc_cross_lane()
     })
+}
+
+/// Cross-compile the fleet worker for the platforms this machine is not.
+///
+/// **In the mandatory aggregate because a platform arm that is never compiled is not gated.** The
+/// Windows and macOS supply arms sat referencing a struct field that does not exist for four commits,
+/// through two coordinator dispositions implemented into them, because nothing on a Linux build ever
+/// type-checked that code and no lane ever cross-compiled it. The fixtures beside those arms now check
+/// the arithmetic on every build; this checks that the arms themselves still assemble against the real
+/// target's libraries and cfg set, which fixtures cannot do.
+///
+/// Sequential with the cargo suites, never beside them: one build at a time is the standing rule, and a
+/// nix build stacked on a cargo build is the failure mode that rule exists for.
+///
+/// # Errors
+/// The lane's own output when the cross build fails.
+fn vhc_cross_lane() -> anyhow::Result<()> {
+    println!("\n== vhc-ci-det: fleet cross-compile lane (x86_64-pc-windows-gnu) ==");
+    let started = std::time::Instant::now();
+    let status = std::process::Command::new("nix")
+        .args([
+            "build",
+            "--max-jobs",
+            "1",
+            "--cores",
+            "5",
+            ".#daemon-vhc-worker-windows",
+            "--no-link",
+        ])
+        .current_dir(workspace_root())
+        .status()
+        .map_err(|e| anyhow::anyhow!("run the windows cross lane: {e}"))?;
+    anyhow::ensure!(
+        status.success(),
+        "the fleet worker does not cross-compile for x86_64-pc-windows-gnu; no fleet Windows worker \
+         can be built from this revision"
+    );
+    println!(
+        "vhc-ci-det: windows cross lane green in {}s",
+        started.elapsed().as_secs()
+    );
+    // macOS has no cross target on this machine (the devShell carries wasm32 and linux-gnu only), so
+    // the Metal arm is covered by the always-compiled mappers and their fixtures rather than by a
+    // compiler run against Apple's libraries. Named here rather than left as a silence: it is the one
+    // arm this lane does not reach, and closing it needs a darwin std in the shell.
+    println!(
+        "vhc-ci-det: macOS arm not cross-compiled (no darwin target in this shell); its mapping is \
+         compiled and fixture-pinned on every platform instead"
+    );
+    Ok(())
 }
 
 /// The det-lane suite list + scheduler, WITHOUT the dep-check/guest preflight (so the production
@@ -722,6 +807,19 @@ const VHC_DET_SUITES: &[SuiteEntry<'static>] = &[
         (
             "daemon-vhc-proto (wire mechanism: envelopes v1+v2, grants, canonical CBOR)",
             &["-p", "daemon-vhc-proto"],
+        ),
+        (
+            // The host half of the three-object resource model: the composition planner and its
+            // canonical vectors, the Backend Execution Profile and its trust envelope, profile
+            // authentication and the candidate store, the Device Capability Report's supply
+            // derivation, the governor's reservation arithmetic, and the composition-evidence
+            // encoder/validator whose fail-closed behaviour gates certification evidence.
+            //
+            // In the mandatory lane because a resource-subsystem crate whose tests are skippable is
+            // the gate-blindness failure the audit documented: every one of these suites decides
+            // whether a claim is admitted, and none of them was run by the gate.
+            "daemon-vhc-resource (composition, profiles + trust, capability supply, governor, evidence)",
+            &["-p", "daemon-vhc-resource"],
         ),
         (
             // D0: assignment math moved out of the proto (refactor §8/D0). The golden vectors
@@ -911,6 +1009,19 @@ const VHC_DET_SUITES: &[SuiteEntry<'static>] = &[
             // exercised for real by the compute@2 trainer guest in the whole-run suites.
             "daemon-vhc-sdk (main!/migrate scaffolding: sim round-trips + derivations)",
             &["-p", "daemon-vhc-sdk"],
+        ),
+        (
+            // The worker binary's own integration drills: the framed command protocol, join refusal
+            // without a provisioned identity, the command loop across join/leave/shutdown, module
+            // switch with journal continuity, the live attach, and the seat smoke.
+            //
+            // In the mandatory lane because leaving it out is how a red suite survived: these drills
+            // sat failing for two sittings — every one of them refused at its first line by a genesis
+            // fixture the authoring migration had superseded — while the gate ran the crates whose
+            // tests were fast. A suite nobody runs is not coverage, and the drills are the only place
+            // the framed protocol and the durable journal are exercised through the real binary.
+            "daemon-vhc-worker (framed protocol, join refusal, command loop, switch, live attach)",
+            &["-p", "daemon-vhc-worker"],
         ),
         (
             "daemon-vhc-e2e (drills + observe-replay, no iroh/live)",
@@ -1316,7 +1427,7 @@ fn lane_ledger_path(root: &Path, lane: &str) -> PathBuf {
 /// diff-scoped gate folds its selected suite set in). `None` = memoization unavailable (disabled
 /// via env, or the workspace state cannot be proven) — the lane then just runs.
 fn lane_memo_key(root: &Path, extra: &[u8]) -> Option<String> {
-    if std::env::var("VHC_GATE_MEMO").is_ok_and(|v| v == "0") {
+    if memoization_disabled() {
         return None;
     }
     let mut hasher = workspace_fingerprint_hasher(root).ok()?;
@@ -1324,6 +1435,22 @@ fn lane_memo_key(root: &Path, extra: &[u8]) -> Option<String> {
     hasher.update(extra);
     Some(hasher.finalize().to_hex().to_string())
 }
+
+/// Whether lane memoization is switched off for this process.
+///
+/// Two switches, and the difference matters. `VHC_GATE_MEMO=0` is the developer's: ambient, convenient,
+/// and exactly the kind of thing that is set in one shell and forgotten in another. `--no-memo` is the
+/// **certification** switch: it is written in the command an operator runs and recorded in the evidence
+/// beside its verdict, so a full-scope battery cannot be satisfied by a ledger entry from an earlier
+/// tree. A certification claim that rests on "the fingerprint matched last time" rests on the ledger
+/// rather than on the run, and the whole point of the full battery is that it ran.
+fn memoization_disabled() -> bool {
+    std::env::var("VHC_GATE_MEMO").is_ok_and(|v| v == "0")
+        || NO_MEMO.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Set by `--no-memo` before any lane runs; never cleared.
+static NO_MEMO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Does the ledger record a green run of `lane` for exactly this memo key?
 fn lane_memo_green(root: &Path, lane: &str, key: &Option<String>) -> bool {
@@ -1387,7 +1514,18 @@ fn prune_acceptance_cache(cache_root: &Path, keep: usize) {
 /// `vhc-ci-node` + the dependency-direction / negative-architecture check), the tier-2 whole-run
 /// suites, and the multi-process acceptance suite. Every integration branch passes this
 /// aggregate before it merges; nothing merges on the deterministic subset alone.
-fn vhc_production_gate(all: bool, base: Option<String>, dry_run: bool) -> anyhow::Result<()> {
+fn vhc_production_gate(
+    all: bool,
+    base: Option<String>,
+    dry_run: bool,
+    no_memo: bool,
+) -> anyhow::Result<()> {
+    if no_memo {
+        // Before any lane consults the ledger. Recorded in the output as well as taken, so the verdict
+        // says which mode produced it — a full-scope claim and a memoized one are different claims.
+        NO_MEMO.store(true, std::sync::atomic::Ordering::Relaxed);
+        println!("vhc-production-gate: --no-memo — the green ledger is ignored; every lane runs");
+    }
     if all {
         if dry_run {
             println!(
@@ -2036,6 +2174,43 @@ fn vhc_dep_check() -> anyhow::Result<()> {
                     "{from} -> {to} [{kind}]: sdk/* must not link host/*"
                 ));
             }
+            // The Backend Execution Profile must stay unreachable from a guest (architecture §9.6
+            // [RC-4], §9.7 [PC-11]). The two hard rules above already imply it, but this one is
+            // named and separate on purpose: the consequence of getting it wrong is silent and
+            // expensive — a profile type reachable from a guest-linked crate makes every profile
+            // revision change every guest hash, so a driver update re-pins and re-certifies a
+            // training algorithm that did not change. That is the coupling the three-object model
+            // exists to remove, and a crate-layout slip is all it takes to reintroduce it. A
+            // failure here should say so rather than read as a generic layering complaint.
+            if to == "daemon-vhc-resource"
+                && (from_role == Some("contracts") || from_role == Some("sdk"))
+            {
+                violations.push(format!(
+                    "{from} -> {to} [{kind}]: the resource crate carries the Backend Execution \
+                     Profile and MUST NOT be reachable from a guest — a profile revision would \
+                     then change every guest hash, so a driver update would re-pin the fleet"
+                ));
+            }
+            // The resource crate's `test-support` feature exposes the fixture constructors that can
+            // MINT a Backend Execution Profile — the one act the store's crate-private surface exists
+            // to keep out of a shipping binary (architecture §9.6: composition takes an authenticated
+            // profile because there is no other constructor to reach for). A test in another crate
+            // legitimately needs them, so the feature exists; it may travel on a `dev` edge only. A
+            // production edge that enables it would hand a shipping binary the ability to author its
+            // own trust, which is a hole no amount of downstream care closes.
+            if to == "daemon-vhc-resource" && kind != "dev" {
+                let enables_test_support = d["features"]
+                    .as_array()
+                    .is_some_and(|fs| fs.iter().any(|f| f.as_str() == Some("test-support")));
+                if enables_test_support {
+                    violations.push(format!(
+                        "{from} -> {to} [{kind}]: this edge enables the `test-support` feature, \
+                         whose fixture constructors can mint a Backend Execution Profile — it is \
+                         permitted on `dev-dependencies` edges only, so that no shipping binary can \
+                         author the trust it is supposed to be authenticated against"
+                    ));
+                }
+            }
             // The A2 dependency inversion (refactor §5 A2 item 3; architecture §7 SESS → HOSTC):
             // the session links the host — the host must NEVER re-grow a runtime edge onto the
             // session (run policy). A dev-only edge (fixture/parity tests) is permitted.
@@ -2072,6 +2247,35 @@ fn vhc_dep_check() -> anyhow::Result<()> {
                 ));
             }
         }
+    }
+
+    // --- The fixture feature is off by default, at the source. The edge check above catches a
+    // consumer that asks for `test-support`; this catches the far worse slip of the resource crate
+    // handing it out unasked, which would make every production edge a profile-minting edge without
+    // any consumer manifest showing it.
+    {
+        let manifest = root.join("crates/vhc/host/daemon-vhc-resource/Cargo.toml");
+        let text = std::fs::read_to_string(&manifest)
+            .map_err(|e| anyhow::anyhow!("read {}: {e}", manifest.display()))?;
+        let default_line = text
+            .lines()
+            .find(|l| l.trim_start().starts_with("default ="))
+            .unwrap_or_default();
+        if default_line.contains("test-support") {
+            violations.push(format!(
+                "daemon-vhc-resource: `test-support` is in the crate's DEFAULT feature set \
+                 ({}) — the fixture constructors that can mint a Backend Execution Profile must \
+                 never be on unless a dev edge asks for them by name",
+                default_line.trim()
+            ));
+        }
+        anyhow::ensure!(
+            text.contains("test-support = []"),
+            "daemon-vhc-resource: the `test-support` feature is not declared in {} — this gate \
+             asserts a property of a feature that must exist; if the feature was removed, remove \
+             the check with it deliberately rather than letting it pass vacuously",
+            manifest.display()
+        );
     }
 
     // --- HARNESS QUARANTINE (source-level): the engine-era surfaces stay unmistakably
@@ -2178,6 +2382,10 @@ fn vhc_dep_check() -> anyhow::Result<()> {
          sdk-consensus)"
     );
     println!(
+        "  rule: daemon-vhc-resource (the Backend Execution Profile) is unreachable from a guest \
+         — a profile revision must never move a guest hash"
+    );
+    println!(
         "  rule: no production host crate resolves a schema crate ({}) in its default normal \
          graph",
         SCHEMA_CRATES.join(", ")
@@ -2208,6 +2416,8 @@ fn vhc_dep_check() -> anyhow::Result<()> {
         anyhow::bail!("{} dependency-direction violation(s)", violations.len());
     }
     println!("\nok: no dependency-direction violations");
+    provenance_scan()?;
+    vhc_codename_scan()?;
     Ok(())
 }
 
@@ -4531,6 +4741,362 @@ fn verify_codec() -> anyhow::Result<()> {
     println!(
         "verified {} fixtures decode with the generated zcbor codec",
         fixtures.len()
+    );
+    Ok(())
+}
+
+/// The red-lined scan: the provenance constructors must not be reachable from non-test code.
+///
+/// The authoring migration made the module's own assessment the single source of a resource plan, and
+/// it made that structural — a seat receives derived requirements and has no constructor to invent one
+/// with. But three constructors *do* mint provenance, and for them the guarantee is about **who may
+/// call them**, which no type can express:
+///
+/// - `from_module_assessment` stamps a plan as module-derived. Called anywhere but the assessment path,
+///   it would let a hand-authored plan claim a module produced it — the exact drift the invariant
+///   exists to prevent, wearing the invariant's own badge.
+/// - `ModuleDerivedPlan::fixture` and `fixture_authored_execution` mint a plan no module produced.
+///   Honest in a fixture that pins digests resolving to no bytes; a silent bypass on the real path.
+///
+/// A naming convention is not a gate, so this is a gate. The heuristic — an occurrence is allowed if a
+/// `#[cfg(test)]` appears earlier in the file — is sound *here* because clippy's `items after a test
+/// module` already forbids the arrangement that would defeat it: non-test items cannot follow a test
+/// module, so anything after the first `#[cfg(test)]` is test code.
+fn provenance_scan() -> anyhow::Result<()> {
+    /// `(symbol, allowed non-test sites, why)`. An allowed site is a path suffix.
+    const GUARDED: &[(&str, &[&str], &str)] = &[
+        (
+            "ModuleDerivedPlan::from_module_assessment",
+            &[
+                // The definition, and the assessment path that is the single source.
+                "contracts/daemon-vhc-proto/src/execution_requirements.rs",
+                "host/daemon-vhc-host/src/run/admission.rs",
+            ],
+            "only the module's own assessment may stamp a plan as module-derived",
+        ),
+        (
+            "ModuleDerivedPlan::fixture",
+            &[
+                "contracts/daemon-vhc-proto/src/execution_requirements.rs",
+                // The testkit's labelled fixture helper. The testkit is test tooling by charter and
+                // is already exempt wholesale from the dependency-direction rules above; the gate
+                // that matters for it is that its CALLERS are test targets, which is checked below
+                // for `fixture_authored_execution`.
+                "host/daemon-vhc-testkit/src/live_genesis.rs",
+            ],
+            "a fixture's plan must not be mintable on the real authoring path",
+        ),
+        (
+            "fixture_authored_execution",
+            &[
+                "host/daemon-vhc-testkit/src/live_genesis.rs",
+                // The ceremony seat's own in-crate tests live beside it in a `#[cfg(test)]` module,
+                // which the earlier-cfg rule already covers; this entry is for the module path.
+                "host/daemon-vhc-testkit/src/ceremony.rs",
+            ],
+            "authoring a genesis from a fixture's requirements must stay in test targets",
+        ),
+        (
+            // The fourth minting constructor, found while verifying the authoring-site migration. It
+            // stamps a role's execution requirements over a trivial plan no module produced — the same
+            // provenance forgery as the three above, and it was outside the gate because the gate was
+            // written before it existed. Every current caller is a test target; this is what keeps
+            // that true.
+            "RoleExecutionRequirements::fixture_over_trivial_plan",
+            &["contracts/daemon-vhc-proto/src/execution_requirements.rs"],
+            "a role's execution requirements must come from a module's own assessment, never from a \
+             fixture's trivial plan, on any shipping path",
+        ),
+    ];
+
+    let mut violations: Vec<String> = Vec::new();
+    let mut checked = 0usize;
+    for path in rust_sources(std::path::Path::new("crates"))? {
+        let display = path.display().to_string();
+        // A test target is test code wholesale: an integration test directory, or the conventional
+        // in-module `tests.rs`.
+        let is_test_target = display.contains("/tests/")
+            || display.ends_with("/tests.rs")
+            || display.contains("/benches/");
+        if is_test_target {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path)?;
+        checked += 1;
+        let first_cfg_test = text.find("#[cfg(test)]").unwrap_or(usize::MAX);
+        for (symbol, allowed, why) in GUARDED {
+            // The literal spelling. All three are associated functions or a free function reached by
+            // path, so the qualified form is the only way to call them — a bare-name search instead
+            // matched the word "fixture" in unrelated crates and reported 58 phantom violations.
+            let needle = *symbol;
+            let mut from = 0usize;
+            while let Some(at) = text[from..].find(needle) {
+                let at = from + at;
+                from = at + needle.len();
+                if at > first_cfg_test {
+                    continue; // test code, per the note above
+                }
+                if allowed.iter().any(|ok| display.ends_with(ok)) {
+                    continue;
+                }
+                let line = text[..at].lines().count();
+                violations.push(format!("{display}:{line} reaches `{symbol}` — {why}"));
+            }
+        }
+    }
+
+    if !violations.is_empty() {
+        eprintln!("\nprovenance scan violations:");
+        for v in &violations {
+            eprintln!("  x {v}");
+        }
+        anyhow::bail!(
+            "{} provenance violation(s): a fixture or an unstamped plan is reachable from non-test \
+             code",
+            violations.len()
+        );
+    }
+    println!(
+        "ok: provenance constructors unreachable from non-test code ({checked} files scanned)"
+    );
+    Ok(())
+}
+
+/// Every `.rs` file under `root`, excluding build artifacts.
+fn rust_sources(root: &std::path::Path) -> anyhow::Result<Vec<std::path::PathBuf>> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if entry.file_type()?.is_dir() {
+                if name != "target" && name != ".git" {
+                    stack.push(path);
+                }
+            } else if name.ends_with(".rs") {
+                out.push(path);
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// The tracked ABI specification states values the code defines — check that they still agree.
+///
+/// A text mirror can only drift from another text. A specification drifts from the **implementation**,
+/// and that is the drift that costs something: an author reading a stated constant, writing a profile
+/// range or a permitted minor against it, and being wrong. So the check compares the spec's own
+/// sentences against `daemon-vhc-abi`'s constants rather than against a copy of itself.
+///
+/// It is deliberately narrow: the values a reader would act on. A spec sentence the code contradicts
+/// fails; prose the code has no opinion about is not this gate's business.
+///
+/// # Errors
+/// Names every statement that no longer matches, with the value the code defines.
+fn vhc_abi_spec_drift() -> anyhow::Result<()> {
+    let spec_path = workspace_root().join("docs/specs/vhc-module-abi-spec.md");
+    let spec = std::fs::read_to_string(&spec_path)
+        .map_err(|e| anyhow::anyhow!("read {}: {e}", spec_path.display()))?;
+
+    // `(what the spec must state, the value the code defines)`. Each is a value a reader acts on: a
+    // declared minor, an export name a module must provide, a journal tag a replay must decode, or a
+    // bound a guest is clamped to.
+    let expectations: Vec<(String, String)> = vec![
+        (
+            format!("`DA_ABI_MAJOR_V2` | `{}`", daemon_vhc_abi::DA_ABI_MAJOR_V2),
+            "the ABI major".into(),
+        ),
+        (
+            format!("`DA_ABI_MINOR_V2` | `{}`", daemon_vhc_abi::DA_ABI_MINOR_V2),
+            "the highest implemented minor".into(),
+        ),
+        (
+            format!(
+                "`CERTIFICATION_MINOR_V2` | `{}`",
+                daemon_vhc_abi::CERTIFICATION_MINOR_V2
+            ),
+            "the certification minor".into(),
+        ),
+        (
+            format!(
+                "`LEGACY_CONTEXT_MAX_MINOR` | `{}`",
+                daemon_vhc_abi::LEGACY_CONTEXT_MAX_MINOR
+            ),
+            "the highest legacy minor".into(),
+        ),
+        (
+            daemon_vhc_abi::DA_RESOURCE_PLAN_EXPORT.to_string(),
+            "the resource-plan export name".into(),
+        ),
+        (
+            daemon_vhc_abi::DA_APPLY_EXECUTION_GRANT_EXPORT.to_string(),
+            "the grant-application export name".into(),
+        ),
+        (
+            format!("**Tag {}**", daemon_vhc_abi::JOURNAL_TAG_EXECUTION_GRANT),
+            "the grant-application journal tag".into(),
+        ),
+        (
+            "`LOG_CALLS_PER_PHASE_MAX`".into(),
+            "the per-phase log call bound".into(),
+        ),
+        (
+            "`LOG_BYTES_PER_PHASE_MAX`".into(),
+            "the per-phase log byte bound".into(),
+        ),
+        (
+            "`LOG_MESSAGE_BYTES_MAX`".into(),
+            "the per-message log byte bound".into(),
+        ),
+    ];
+
+    let mut missing: Vec<String> = Vec::new();
+    for (needle, what) in &expectations {
+        if !spec.contains(needle) {
+            missing.push(format!("  {what}: the spec does not state `{needle}`"));
+        }
+    }
+
+    // The closed context domain: the spec's table must carry every canonical string the code renders,
+    // or a reader cannot tell which context a record's string belongs to. Enumerated here rather than
+    // iterated, so adding a twelfth variant to the code fails this gate until the table says so — which
+    // is the point, the domain being closed at eleven.
+    use daemon_vhc_abi::execution_context::ExecutionContext;
+    let domain = [
+        ExecutionContext::Init,
+        ExecutionContext::Migrate,
+        ExecutionContext::RunBeforeFirstSlice,
+        ExecutionContext::RunBetweenSlices,
+        ExecutionContext::RunAfterLastSlice,
+        ExecutionContext::RunSlice(0),
+        ExecutionContext::Assessment,
+        ExecutionContext::Claim,
+        ExecutionContext::ResourcePlan,
+        ExecutionContext::Manifest,
+        ExecutionContext::ExecutionGrant,
+    ];
+    for context in &domain {
+        let rendered = context.render();
+        // The slice context is parameterized, so the table states its shape rather than one instance.
+        let needle = if rendered.starts_with(daemon_vhc_abi::SLICE_CONTEXT_PREFIX) {
+            format!("`{}<canonical u64>`", daemon_vhc_abi::SLICE_CONTEXT_PREFIX)
+        } else {
+            format!("`{rendered}`")
+        };
+        if !spec.contains(&needle) {
+            missing.push(format!(
+                "  the execution-context table is missing {needle}, which the code renders"
+            ));
+        }
+    }
+
+    anyhow::ensure!(
+        missing.is_empty(),
+        "the tracked ABI specification has drifted from the code it documents:\n{}\n\
+         Fix the specification (or the code, if the code is what moved) — a stated constant a reader \
+         acts on must be the one the implementation defines.",
+        missing.join("\n")
+    );
+    println!(
+        "ok: the tracked ABI specification agrees with the code on {} stated values + the {}-value \
+         execution-context domain",
+        expectations.len(),
+        domain.len()
+    );
+    Ok(())
+}
+
+/// The red-lined scan: this program's private vocabulary MUST NOT reach the code.
+///
+/// Defect letters, wave ids, measurement finding ids and divergence ids are how a program talks about
+/// itself while it is running. They are useless to anyone reading the code afterwards — worse than
+/// useless, because they look like references to something a reader could go and find, and the thing
+/// they name is a status document that was never shipped. What a comment must carry is the *substance*:
+/// what is true and why, in words that survive the program that discovered them.
+///
+/// Specification **rule identifiers** are the opposite and are deliberately not scanned: `[RC-4]`,
+/// `[SF-6]`, `[EB-4]` and their kin name normative text that ships in `docs/specs`, and tracked code
+/// cites them precisely so a reader can find the rule.
+///
+/// **The needles are assembled from fragments at runtime**, so this function's own source contains none
+/// of them whole. A scanner that had to exempt its own file would be a scanner with a hole in it, and
+/// the hole would be in exactly the file someone edits when they want to add a codename.
+///
+/// # Errors
+/// Every occurrence, with its file, line and why the vocabulary is forbidden.
+fn vhc_codename_scan() -> anyhow::Result<()> {
+    // `(prefix, suffix, what it is)` — the needle is `prefix + suffix`.
+    const FORBIDDEN: &[(&str, &str, &str)] = &[
+        ("MEAS", "-F", "a measurement-wave finding id"),
+        ("MEAS", "-O", "a measurement-wave observation id"),
+        ("DV", "-1", "a program divergence id"),
+        ("DV", "-2", "a program divergence id"),
+        ("W-", "SF", "a program wave id"),
+        ("W-", "host", "a program wave id"),
+        ("W-", "guest", "a program wave id"),
+        ("W-", "measure", "a program wave id"),
+        (
+            "wait",
+            "point",
+            "the program's own status-document vocabulary",
+        ),
+        ("Stage", " R ", "a program stage label"),
+    ];
+
+    let mut violations: Vec<String> = Vec::new();
+    let mut scanned = 0usize;
+    // The tracked specifications are scanned too. They ship inside every certification candidate, so a
+    // spec citing a wave id names a document its reader does not have — the same defect as a comment
+    // doing it, in a document with a wider audience.
+    let mut targets: Vec<PathBuf> = [
+        "vhc-architecture-spec.md",
+        "vhc-module-abi-spec.md",
+        "vhc-fleet-ceremony-runbook.md",
+    ]
+    .iter()
+    .map(|name| workspace_root().join("docs/specs").join(name))
+    .filter(|p| p.is_file())
+    .collect();
+    for root in ["crates", "xtask", "bins", "tests"] {
+        let dir = workspace_root().join(root);
+        if dir.is_dir() {
+            targets.extend(rust_sources(&dir)?);
+        }
+    }
+    {
+        for path in targets {
+            let text = std::fs::read_to_string(&path)?;
+            scanned += 1;
+            for (prefix, suffix, what) in FORBIDDEN {
+                let needle = format!("{prefix}{suffix}");
+                for (lineno, line) in text.lines().enumerate() {
+                    if line.contains(&needle) {
+                        violations.push(format!(
+                            "  {}:{}: `{needle}` is {what}; say what is true instead",
+                            path.display(),
+                            lineno + 1
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    anyhow::ensure!(
+        violations.is_empty(),
+        "{} occurrence(s) of program vocabulary in the code:\n{}\n\
+         Program vocabulary lives in the plan and status documents. A comment that cites one names a \
+         document the reader does not have; write the substance instead.",
+        violations.len(),
+        violations.join("\n")
+    );
+    println!(
+        "ok: no program vocabulary in {scanned} tracked sources and specifications ({} needles)",
+        FORBIDDEN.len()
     );
     Ok(())
 }

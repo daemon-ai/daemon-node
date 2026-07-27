@@ -32,6 +32,64 @@ It is never "re-run and hope". The convergence and round-overhead research crite
 out of scope: this is a structural proof (digest agreement, churn, restore, replay), not a scale
 study. Loss values are recorded as evidence but adjudicate nothing.
 
+### 1.1 The freeze record is two layers, and every artifact cites both
+
+*Owner-approved 2026-07-26 (the T7 amendment). This is what an operator has to do differently, and it
+is not optional: an artifact citing one digest instead of two is incomplete and is not admissible
+evidence.*
+
+The candidate is frozen by one full `vhc-production-gate --all` battery on the merge to
+`vhc-integration`. The freeze record has **two layers**, because the ratified resource model introduced
+artifacts whose lifecycles are deliberately independent of the guest and of the code freeze — a Backend
+Execution Profile, a Device Capability Report, a composed Physical Claim, an Execution Grant. Putting
+those in the candidate tuple would force a full re-freeze for a driver update; leaving them out
+entirely would leave recertification triggers with nothing to compare against.
+
+**Layer 1 — the candidate tuple (slow, code-frozen).** One ledger entry, one digest, pinning
+together: the node commit; the cloud commit + deployed version id; the `guests.blake3` module hashes;
+the tooling binary hashes; the **planner version identity**; the **governor implementation/version**;
+the **full ABI `{major, minor}`** — not the major alone, since the certification minor carries the
+pre-loop diagnostic semantics and both new exports together; and the **genesis schema major**. The four
+added members are **contract identifiers, not release versions**: they move under their own contract
+rules and never through a `VERSION` file. A change to any member re-freezes the tuple and re-runs the
+full battery, exactly as before.
+
+**Layer 2 — the composition evidence record (per backend, per fleet box).** One record per
+`(participant, backend, admitted role instance)`, binding **twelve** members: role/incarnation
+identity; participant/device identity; profile digest **+ profile authority**; capability-report
+digest; logical resource plan hash; the Execution Grant's canonical-bytes digest; the composed role
+Physical Claim and the node/device aggregate claims; planner identity; governor identity;
+`reservation_identity`; a canonical **reservation digest**; and **scope-separated reservation
+components** including the profiled hidden-overhead reserve as its own visible component, with directly
+enforceable and profiled-and-measured amounts separated.
+
+The last three are not optional: the earlier members bind the reservation's *inputs*, so an auditor
+holding only those can recompute what should have been charged without learning what was. Identity
+alone locates a reservation; it does not prove what was charged. And totals without scope separation
+cannot distinguish a correctly-shared process-scoped term from a double-counted per-role one, which is
+the arithmetic error the package exists to prevent.
+
+A layer-2 record **never forces a battery by itself** — a profile correction, a capability-probe fix, a
+grant reselection or a backend implementation revision produces a **new record** and leaves the guest
+hash untouched. The two triggers that *do* reach layer 1 are a planner fix and a governor fix, which is
+exactly why layer 1 now carries those two identities.
+
+**The co-citation rule.** Every artifact produced after the freeze — certification statement, journal
+evidence, replay verdict, preflight or conformance record — cites the **pair**
+`(candidate_tuple_digest, composition_evidence_digest)`. **The candidate tuple never points forward**
+at composition records: a frozen artifact cannot reference evidence created after it was frozen, so the
+join is made by the citing artifact at the time it is written. An artifact spanning several participants
+cites one candidate-tuple digest and the **set** of composition-evidence digests it covers, naming each.
+
+**Cross-layer agreement is checked, not assumed.** A record's planner and governor identities MUST
+equal the candidate tuple's, and a profile whose named compatible planner version excludes that planner
+is not composable. A mismatch is a validation failure of the citing artifact, not a note.
+
+**Append-only.** Records are never edited or deleted. Each carries `supersedes` (the digest it
+replaces, or null), the trigger reason in plain language, and the consequence class that fired. A
+**superseded, revoked or dangling** record fails a citing statement **closed** — which is why the
+encoder/validator lands before any evidence is emitted under this regime.
+
 ---
 
 ## 2. The topology
@@ -143,6 +201,8 @@ A thin wrapper around the frozen, reviewed library (`daemon_vhc_testkit::ceremon
 cargo run -p xtask -- author-ceremony-genesis \
   --run-label <s> --author-key <file|hex> \
   --coordinator-module <blake3-hex> --trainer-module <blake3-hex> \
+  --coordinator-wasm <path/to/coordinator_quorum.wasm> \      # the FILE, checked against its digest
+  --trainer-wasm <path/to/tiny_llama.wasm> \                  # the FILE, checked against its digest
   --corpus-manifest <path/to/corpus-manifest.cbor> \
   --trusted-base <hex> --trusted-base <hex> --trusted-base <hex>   # ORDERED; first = authority
   --roster <hex> --roster <hex> --roster <hex> \
@@ -151,6 +211,14 @@ cargo run -p xtask -- author-ceremony-genesis \
   --warmup-s <n> --round-max-s <n> --witness-s <n> --cooldown-s <n> --stop-rounds <n> \
   --out <dir>
 ```
+
+**The two module FILE flags are required, and they are not a convenience.** `--coordinator-wasm` and
+`--trainer-wasm` are checked against `--coordinator-module` / `--trainer-module`, and the file is needed
+because a role's **execution requirements are derived by running the module's own assessment export**
+(architecture §5.4 [DI-1], §9.6 [RC-1]). A digest cannot be asked what it needs. Authoring has no
+constructor for stating a requirement by hand, so an authoring run without the files cannot produce a
+role entry at all — and that is the intended shape: the module is the only authority on its own
+resource plan.
 
 The real run timers were added to the library's genesis spec with defaults equal to the prior
 synthetic-clock values, so an untuned authoring is byte-identical to before; only tuned timers move

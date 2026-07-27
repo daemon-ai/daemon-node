@@ -14,7 +14,7 @@ use std::time::Instant;
 
 use wasmtime::{Linker, Module, Store, StoreLimitsBuilder};
 
-use daemon_vhc_abi::{NS_COMPUTE_V2, NS_TABI_V1};
+use daemon_vhc_abi::{ExecutionContext, NS_COMPUTE_V2, NS_TABI_V1};
 use daemon_vhc_proto::{peer_id, SigningKey};
 
 use crate::run::buffer::BufferTable;
@@ -126,7 +126,11 @@ pub fn start_run_migrating(
             ));
         }
     }
-    let abi_packed = u64::from(daemon_vhc_abi::DA_ABI_MAJOR_V2) << 16;
+    // The negotiated major-2 minor. It selects the terminal-context rendering: a journal written at a
+    // legacy minor keeps the bare string it has always carried, and the certification minor is the
+    // first that records the truthful eleven-value context.
+    let abi_minor = run.abi_minor;
+    let abi_packed = (u64::from(daemon_vhc_abi::DA_ABI_MAJOR_V2) << 16) | u64::from(abi_minor);
     let worlds: Vec<(String, u64)> = module
         .imports()
         .map(|i| (i.module().to_string(), 0u64))
@@ -136,6 +140,7 @@ pub fn start_run_migrating(
     // tag 0 first — the run header precedes everything (§8.3). The header's `bridge` field is
     // keep-reserved (always `false`: no bridge exists; the field stays so the record grammar is
     // unchanged and pre-existing journals stay parseable).
+    let resources = run_header_resources(&run)?;
     sink.run_header(
         abi_packed,
         &worlds,
@@ -143,7 +148,7 @@ pub fn start_run_migrating(
         &run.manifest_bytes,
         &run.config,
         &run.grants,
-        &run.claim_bytes,
+        resources,
         &run.channels_bytes,
         &run.device_bytes,
     )?;
@@ -200,6 +205,7 @@ pub fn start_run_migrating(
                 },
             ),
             guest_memory_high_water: 0,
+            allocator_samples: Vec::new(),
             buffer_streams: BufferStreams::default(),
             op_requests: Vec::new(),
             stop_enqueued: false,
@@ -267,15 +273,21 @@ pub fn start_run_migrating(
                         Some(runner)
                     }
                     Err(reason) => {
-                        let trap = Trap::bare(
-                            TrapCode::ComputeFault,
-                            format!(
-                                "backend unavailable at device bring-up ({}): {reason}",
-                                engine_cfg.backend.slug()
-                            ),
-                        );
-                        journal_terminal_trap(&shared, &trap)?;
-                        return Ok(RunEnd::Trapped(trap));
+                        // A host-side typed refusal, and **no guest-trap record at all**: no guest
+                        // code has run, so there is no guest execution context to name and nothing
+                        // about the module to report.
+                        //
+                        // This used to journal a terminal trap attributed to initialization. That was
+                        // a classification bug, not a conservative choice — it recorded a guest-trap
+                        // fact about a phase the guest never entered, and a reader would reasonably
+                        // have concluded the module's own initialization failed when the truth was
+                        // that this host could not bring up its device. Inventing a context for it
+                        // would have been the same mistake with more machinery.
+                        return Err(RunError::BackendBringUp {
+                            stage: crate::run::driver::config::HOST_STAGE_BACKEND_BRING_UP,
+                            backend: engine_cfg.backend.slug().to_string(),
+                            reason,
+                        });
                     }
                 }
             } else {
@@ -298,6 +310,11 @@ pub fn start_run_migrating(
                     pending_next: None,
                     pending_readback: None,
                     pending_readback_value: None,
+                    in_run: false,
+                    slice_ordinal: None,
+                    slices_delivered: 0,
+                    log_calls_this_phase: 0,
+                    log_bytes_this_phase: 0,
                     pending_device: None,
                 },
                 fuel_per_slice: engine_cfg.fuel_per_call,
@@ -368,8 +385,70 @@ pub fn start_run_migrating(
             let cfg_ptr = write_span(&mut store, &run.config)?;
             let grants_ptr = write_span(&mut store, &run.grants)?;
 
-            // da_init — once, on the run instance, imports illegal inside it (§3.1/§6.6).
+            // da_apply_execution_grant — exactly once, on the admitted run instance, BEFORE
+            // `da_init` (ABI §2.1 at the certification minor; [RC-12]).
+            //
+            // The span is host-written and BORROWED, on the same lifetime convention as the
+            // configuration and Capability Grants above: the guest decodes or copies it
+            // synchronously and never frees it, the host does not free it either, and it is
+            // reclaimed with the instance. That is why nothing below pairs a `da_free` with it —
+            // an unpaired free here would be a double free the moment the store drops.
+            //
+            // The grant is deliberately NOT part of the Capability Grants: those are the bytes the
+            // plan was derived from, and inserting the grant into them would make the grant an
+            // input to its own derivation.
+            if !run.execution_grant.is_empty() {
+                let grant_ptr = write_span(&mut store, &run.execution_grant)?;
+                let apply = instance
+                    .get_typed_func::<(u32, u32), u32>(
+                        &mut store,
+                        daemon_vhc_abi::DA_APPLY_EXECUTION_GRANT_EXPORT,
+                    )
+                    .map_err(|_| {
+                        RunError::Sandbox(format!(
+                            "missing/mis-typed {}",
+                            daemon_vhc_abi::DA_APPLY_EXECUTION_GRANT_EXPORT
+                        ))
+                    })?;
+                let status =
+                    match apply.call(&mut store, (grant_ptr, run.execution_grant.len() as u32)) {
+                        Ok(status) => status,
+                        Err(e) => {
+                            // A trap here means initialization never occurs. The terminal record carries
+                            // the grant-application context, and tag 18 is absent — the grammar admits
+                            // exactly one of the result record or this trap.
+                            let trap = take_trap(&mut store, e);
+                            journal_terminal_trap(
+                                &shared,
+                                &trap,
+                                &ExecutionContext::ExecutionGrant,
+                                abi_minor,
+                            )?;
+                            return Ok(RunEnd::Trapped(trap));
+                        }
+                    };
+                {
+                    // Written exactly once after the export RETURNS, whatever the status, and before
+                    // the tag-11 init record.
+                    let mut st = shared.state.lock().expect("pump lock");
+                    st.sink.execution_grant(
+                        *blake3::hash(&run.execution_grant).as_bytes(),
+                        u64::from(status),
+                    )?;
+                }
+                if status != 0 {
+                    // A deterministic, non-retryable refusal for this (module, plan, grant) tuple:
+                    // a retry needs changed admitted input, not a fresh instance.
+                    return Ok(RunEnd::ExecutionGrantRejected(status));
+                }
+            }
+
+            // da_init — once, on the run instance. Every capability import is illegal inside it
+            // except the observational `sys@2::log` exemption (§3.1/§6.6, §6.6.1). Each exempt phase
+            // gets its OWN budget, reset as the phase is entered.
             store.data_mut().slice.in_init = true;
+            store.data_mut().slice.log_calls_this_phase = 0;
+            store.data_mut().slice.log_bytes_this_phase = 0;
             let da_init = instance
                 .get_typed_func::<(u32, u32, u32, u32), u32>(&mut store, "da_init")
                 .map_err(|_| RunError::Sandbox("missing/mis-typed da_init".into()))?;
@@ -385,11 +464,12 @@ pub fn start_run_migrating(
                 Ok(s) => s,
                 Err(e) => {
                     let trap = take_trap(&mut store, e);
-                    journal_terminal_trap(&shared, &trap)?;
+                    journal_terminal_trap(&shared, &trap, &ExecutionContext::Init, abi_minor)?;
                     return Ok(RunEnd::Trapped(trap));
                 }
             };
             store.data_mut().slice.in_init = false;
+            sample_allocator_at(&store, &shared, crate::compute::SamplePoint::AfterInit);
             {
                 let mut st = shared.state.lock().expect("pump lock");
                 st.sink.init(
@@ -459,6 +539,8 @@ pub fn start_run_migrating(
                     .map_err(|e| RunError::Sandbox(e.to_string()))?;
                 store.set_epoch_deadline(epoch_ticks);
                 store.data_mut().slice.in_migrate = true;
+                store.data_mut().slice.log_calls_this_phase = 0;
+                store.data_mut().slice.log_bytes_this_phase = 0;
                 let migrate_status =
                     match da_migrate.call(&mut store, (desc_ptr, descriptor.len() as u32)) {
                         Ok(s) => s,
@@ -473,11 +555,17 @@ pub fn start_run_migrating(
                                     format!("migrate budget exhausted: {}", trap.detail),
                                 );
                             }
-                            journal_terminal_trap(&shared, &trap)?;
+                            journal_terminal_trap(
+                                &shared,
+                                &trap,
+                                &ExecutionContext::Migrate,
+                                abi_minor,
+                            )?;
                             return Ok(RunEnd::Trapped(trap));
                         }
                     };
                 store.data_mut().slice.in_migrate = false;
+                sample_allocator_at(&store, &shared, crate::compute::SamplePoint::AfterMigrate);
                 store
                     .set_fuel(engine_cfg.fuel_per_call)
                     .map_err(|e| RunError::Sandbox(e.to_string()))?;
@@ -516,7 +604,10 @@ pub fn start_run_migrating(
             let da_run = instance
                 .get_typed_func::<(), u32>(&mut store, "da_run")
                 .map_err(|_| RunError::Sandbox("missing/mis-typed da_run".into()))?;
+            store.data_mut().slice.in_run = true;
+            sample_allocator_at(&store, &shared, crate::compute::SamplePoint::AfterBringUp);
             let run_result = da_run.call(&mut store, ());
+            sample_allocator_at(&store, &shared, crate::compute::SamplePoint::AtTeardown);
             {
                 let mut st = shared.state.lock().expect("pump lock");
                 // Force-reclaim the instance's buffers + outstanding ops + streams through the
@@ -537,8 +628,12 @@ pub fn start_run_migrating(
                     Ok(RunEnd::Outcome(outcome))
                 }
                 Err(e) => {
+                    // The run-phase context is read from the slice state BEFORE the trap is taken,
+                    // so it is the state the trap actually occurred in — one of four distinct
+                    // values, never an invented slice ordinal.
+                    let context = store.data().slice.execution_context();
                     let trap = take_trap(&mut store, e);
-                    journal_terminal_trap(&shared, &trap)?;
+                    journal_terminal_trap(&shared, &trap, &context, abi_minor)?;
                     Ok(RunEnd::Trapped(trap))
                 } // `store` (instance, handle table, device allocations) drops HERE, on the guest
                   // thread — the only thread allowed to (§11.3).
@@ -556,11 +651,25 @@ pub fn start_run_migrating(
 /// runtime executed `unreachable` (ABI [`daemon_vhc_abi::GUEST_PANIC_LOG_PREFIX`]); that message
 /// is lifted to the FRONT of the detail here, so a `GuestPanic` names the assertion that failed
 /// and the `file:line:col` it failed at instead of only the engine's backtrace.
-fn take_trap(store: &mut Store<Host>, e: wasmtime::Error) -> Trap {
+/// [`ExecutionContext`]-scoped: the held message is lifted **only** when the trap's context is
+/// identical to the context the message was emitted in. A held message whose context does not match
+/// is discarded, and the trap keeps the detail it would otherwise have had.
+///
+/// The check lives at the single point of consumption rather than as a sweep at every phase
+/// boundary, because boundaries get added over time and a missed one fails silently and
+/// misleadingly — the failure mode being an authoritative-looking source location that belongs to a
+/// different phase and a different bug.
+pub(super) fn take_trap(store: &mut Store<Host>, e: wasmtime::Error) -> Trap {
+    let context = store.data().slice.execution_context();
     let forwarded = {
         let shared = store.data().shared.clone();
         let mut st = shared.state.lock().expect("pump lock");
-        st.guest_panic.take()
+        // Consuming clears the slot either way: a message that did not match this trap is not left
+        // behind to be mis-lifted into the next one.
+        match st.guest_panic.take() {
+            Some((emitted_in, message)) if emitted_in == context => Some(message),
+            _ => None,
+        }
     };
     let mut trap = classify_trap(store, e);
     if let Some(message) = forwarded {
@@ -571,6 +680,48 @@ fn take_trap(store: &mut Store<Host>, e: wasmtime::Error) -> Trap {
         };
     }
     trap
+}
+
+/// Which resources the run header records — selected by the **negotiated minor**, and fail-closed.
+///
+/// The minor decides, not which fields happen to be populated. Reading it off the data would make an
+/// empty declared claim on a certification-minor run look like a legacy record, and a legacy run that
+/// never populated the composed fields look like a broken certification one.
+///
+/// Which leaves the case the minor alone cannot handle: a run that declares the certification minor and
+/// carries no composition. Writing the composed branch there would produce a header whose members claim
+/// a composition happened over empty bytes — a record asserting a fact about a run that has none. In
+/// production admission refuses such a run before it starts, so this is the second gate on the same
+/// rule, and it exists because the first one can be bypassed by any caller assembling a `RunConfig`
+/// directly.
+///
+/// # Errors
+/// [`RunError::CompositionMissing`] naming the first absent member.
+pub(crate) fn run_header_resources(
+    run: &RunConfig,
+) -> Result<crate::run::RunHeaderResources<'_>, RunError> {
+    if !daemon_vhc_abi::run_header_is_certification_variant(run.abi_minor) {
+        return Ok(crate::run::RunHeaderResources::Declared(&run.claim_bytes));
+    }
+    for (member, bytes) in [
+        ("resource_plan", &run.resource_plan_bytes),
+        ("physical_claim", &run.physical_claim_bytes),
+        ("aggregate_claim", &run.aggregate_claim_bytes),
+        ("execution_grant", &run.execution_grant),
+    ] {
+        if bytes.is_empty() {
+            return Err(RunError::CompositionMissing {
+                minor: run.abi_minor,
+                member,
+            });
+        }
+    }
+    Ok(crate::run::RunHeaderResources::Composed {
+        resource_plan: &run.resource_plan_bytes,
+        physical_claim: &run.physical_claim_bytes,
+        aggregate_claim: &run.aggregate_claim_bytes,
+        execution_grant: &run.execution_grant,
+    })
 }
 
 fn classify_trap(store: &mut Store<Host>, e: wasmtime::Error) -> Trap {
@@ -599,7 +750,22 @@ fn classify_trap(store: &mut Store<Host>, e: wasmtime::Error) -> Trap {
     Trap::bare(code, msg)
 }
 
-fn journal_terminal_trap(shared: &Arc<PumpShared>, trap: &Trap) -> Result<(), SinkError> {
+/// Journal a terminal trap with its **real** execution context.
+///
+/// The context used to be the literal `"da_run"` for every trap, whatever phase it occurred in, so an
+/// initialization trap was recorded as a run-loop trap. That falsified the one field a replay verdict
+/// can compare — the detail string is diagnostic text and is deliberately not comparable — and it
+/// made a correct in-memory diagnosis read as a misattribution bug in the forwarding, sending the
+/// reader to investigate the wrong mechanism.
+///
+/// Rendering is selected by the negotiated ABI minor: a journal written at a legacy minor keeps the
+/// bare string it has always carried, because those bytes are evidence and evidence is not rewritten.
+pub(super) fn journal_terminal_trap(
+    shared: &Arc<PumpShared>,
+    trap: &Trap,
+    context: &ExecutionContext,
+    abi_minor: u32,
+) -> Result<(), SinkError> {
     let mut st = shared.state.lock().expect("pump lock");
     st.sink.terminal(
         1,
@@ -607,8 +773,37 @@ fn journal_terminal_trap(shared: &Arc<PumpShared>, trap: &Trap) -> Result<(), Si
         Some((
             trap.code.slug().to_string(),
             trap.import.to_string(),
-            "da_run".to_string(),
+            context.render_for_minor(abi_minor),
             trap.detail.clone(),
         )),
     )
+}
+
+/// Take one backend-allocator reading at a phase boundary and record it in order.
+///
+/// Boundaries rather than a timer, and **in process**: an external sampler cannot see a phase
+/// boundary at all — on one fleet platform the device phase is around two milliseconds inside a
+/// process lasting fifty, so sampling from outside misses the shape entirely, which is the shape a
+/// pooling term is calibrated against.
+///
+/// A backend that cannot report occupancy records nothing. It deliberately does not record a zero: a
+/// zero is a measurement, absence is not, and a profile calibrated against a manufactured zero would
+/// be calibrated against nothing at all.
+fn sample_allocator_at(
+    store: &Store<Host>,
+    shared: &Arc<PumpShared>,
+    point: crate::compute::SamplePoint,
+) {
+    let Some(compute) = store.data().compute.as_ref() else {
+        return;
+    };
+    let Some(sample) = compute.sample_allocator() else {
+        return;
+    };
+    shared
+        .state
+        .lock()
+        .expect("pump lock")
+        .allocator_samples
+        .push((point, sample));
 }

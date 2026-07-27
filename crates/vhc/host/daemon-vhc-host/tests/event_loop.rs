@@ -22,8 +22,8 @@ use daemon_vhc_abi::{DEFAULT_CHANNEL_CONTROL_ID, FRAME_ENVELOPE_DOMAIN_V2};
 use daemon_vhc_host::run::{start_run, JournalSink, RunConfig, RunEnd, RunIdentity, SinkError};
 use daemon_vhc_host::{select_driver, EngineConfig, Worker};
 use daemon_vhc_observe::journal::record::{
-    ClockRec, DropId, DropRec, EventRec, InitRec, InstantiationRec, RunHeader, SignedFrameRec,
-    TerminalRec, TimerArmRec, TimerCancelRec, TrapInfo,
+    ClockRec, DropId, DropRec, EventRec, ExecutionGrantRec, InitRec, InstantiationRec, RunHeader,
+    SignedFrameRec, TerminalRec, TimerArmRec, TimerCancelRec, TrapInfo,
 };
 use daemon_vhc_observe::journal::{Body, ExecIdentity, Journal, RotatePolicy, StaticKey};
 use daemon_vhc_proto::sign::verify_bytes;
@@ -53,12 +53,17 @@ impl JournalSink for JournalAdapter {
         manifest: &[u8],
         config: &[u8],
         grants: &[u8],
-        claim: &[u8],
+        resources: daemon_vhc_host::run::RunHeaderResources<'_>,
         channels: &[u8],
         device: &[u8],
     ) -> Result<(), SinkError> {
+        // This adapter journals the legacy branch only; the composed branch is exercised through the
+        // durable sink, which is the one a certification run writes with.
+        let daemon_vhc_host::run::RunHeaderResources::Declared(claim) = resources else {
+            panic!("the event-loop adapter is a lower-minor seat and records a declared claim");
+        };
         self.journal
-            .append(Body::RunHeader(RunHeader {
+            .append(Body::RunHeader(Box::new(RunHeader {
                 run_id: self.id.run_id,
                 epoch: self.id.epoch,
                 role: self.id.role.clone(),
@@ -70,11 +75,19 @@ impl JournalSink for JournalAdapter {
                 manifest: manifest.to_vec(),
                 config: config.to_vec(),
                 grants: grants.to_vec(),
-                claim: claim.to_vec(),
+                claim: Some(claim.to_vec()),
                 channels: channels.to_vec(),
                 device: device.to_vec(),
+                resource_plan: None,
+                resource_plan_hash: None,
+                physical_claim: None,
+                physical_claim_hash: None,
+                aggregate_claim: None,
+                aggregate_claim_hash: None,
+                execution_grant: None,
+                execution_grant_hash: None,
                 format: u64::from(daemon_vhc_observe::journal::format_version()),
-            }))
+            })))
             .map(|_| ())
             .map_err(|e| SinkError(e.to_string()))
     }
@@ -101,6 +114,16 @@ impl JournalSink for JournalAdapter {
             .append(Body::Init(InitRec {
                 config_hash: Hash(config_hash),
                 grants_hash: Hash(grants_hash),
+                status,
+            }))
+            .map(|_| ())
+            .map_err(|e| SinkError(e.to_string()))
+    }
+
+    fn execution_grant(&mut self, hash: [u8; 32], status: u64) -> Result<(), SinkError> {
+        self.journal
+            .append(Body::ExecutionGrant(ExecutionGrantRec {
+                execution_grant_hash: Hash(hash),
                 status,
             }))
             .map(|_| ())

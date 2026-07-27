@@ -68,6 +68,8 @@ use daemon_vhc_sdk_consensus::messages::{
 };
 use daemon_vhc_sdk_consensus::{SignedMessage, VhcMessage};
 use daemon_vhc_testkit::genesis_run::phase_a_grants;
+use daemon_vhc_testkit::genesis_run::EnvelopeInputs;
+use daemon_vhc_testkit::live_genesis::fixture_authored_execution;
 use daemon_vhc_testkit::{
     configure_coordinator, coordinator_state_from_capture, genesis_envelope, Coordinator,
     CoordinatorSpec,
@@ -303,7 +305,16 @@ fn standby_resumes_from_archive_plus_journal_tail_byte_identically() {
     ];
 
     // The genesis envelope v2 + the coordinator spec derived from it (the end-state seat).
-    let genesis = genesis_envelope(RUN_LABEL, coord_hash, Hash([0x77; 32]), base_id, 2, 2, 4);
+    let genesis = genesis_envelope(&EnvelopeInputs {
+        run_label: RUN_LABEL,
+        coordinator_wasm_blake3: coord_hash,
+        worker_wasm_blake3: Hash([0x77; 32]),
+        coordinator_identity: base_id,
+        workers: 2,
+        steps_per_round: 2,
+        global_batch: 4,
+        execution: &fixture_authored_execution(),
+    });
     let author = SigningKey::from_bytes(blake3::hash(b"failover/author").as_bytes());
     let frozen = genesis.freeze(&author).expect("genesis freeze");
     let spec = configure_coordinator(&frozen).expect("coordinator configurable");
@@ -618,7 +629,16 @@ fn coordinator_state_export_resumes_byte_identically() {
         SigningKey::from_bytes(blake3::hash(b"export/worker/1").as_bytes()),
     ];
 
-    let genesis = genesis_envelope(RUN_LABEL, coord_hash, Hash([0x77; 32]), base_id, 2, 2, 4);
+    let genesis = genesis_envelope(&EnvelopeInputs {
+        run_label: RUN_LABEL,
+        coordinator_wasm_blake3: coord_hash,
+        worker_wasm_blake3: Hash([0x77; 32]),
+        coordinator_identity: base_id,
+        workers: 2,
+        steps_per_round: 2,
+        global_batch: 4,
+        execution: &fixture_authored_execution(),
+    });
     let author = SigningKey::from_bytes(blake3::hash(b"export/author").as_bytes());
     let frozen = genesis.freeze(&author).expect("genesis freeze");
     let spec = configure_coordinator(&frozen).expect("coordinator configurable");

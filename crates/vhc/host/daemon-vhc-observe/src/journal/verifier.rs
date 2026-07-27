@@ -114,13 +114,19 @@ pub struct ReplayPlan {
     pub steps: Vec<ReplayStep>,
     /// The recorded outbound decisions (the oracle the guest's actions must match).
     pub expected: Vec<ExpectedDecision>,
+    /// What the run header says about the composition the run was admitted on, checked when the plan
+    /// was derived so a replay cannot begin against a record it has not authenticated.
+    pub composition: RecordedCompositionCheck,
 }
 
 impl ReplayPlan {
     /// Derive a replay plan from a journal's records (in ordinal order).
     #[must_use]
     pub fn from_records(records: &[Record]) -> Self {
-        let mut plan = ReplayPlan::default();
+        let mut plan = ReplayPlan {
+            composition: check_recorded_composition(records),
+            ..ReplayPlan::default()
+        };
         for record in records {
             match &record.body {
                 Body::Event(e) => plan.steps.push(ReplayStep::Event {
@@ -170,6 +176,74 @@ impl ReplayPlan {
     }
 }
 
+/// What a journal's run header says about the composition the run was admitted on.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum RecordedCompositionCheck {
+    /// The journal carries no certification run header, so there is no composition to check.
+    ///
+    /// A legacy run recorded the claim its module declared; there is nothing composed to re-derive, and
+    /// that is not a gap in the journal.
+    #[default]
+    NotComposed,
+    /// The recorded members are internally consistent and their digests match their bytes.
+    Valid,
+    /// They are not, with the reason.
+    Invalid(String),
+}
+
+/// Check the composed members of a certification run's header, before any value in it is used.
+///
+/// A replay re-drives a run from its journal, and the header is where that journal says what the run was
+/// admitted on. Reading the claim, the plan or the grant out of it without checking the digests recorded
+/// beside them — and without checking that the three agree about each other — would mean re-driving from
+/// a record nobody had authenticated. The check is cheap and total, so it runs first.
+///
+/// Re-deriving the claim needs the profile it cites, which a journal does not carry; that stronger check
+/// is [`daemon_vhc_resource::recompose_recorded_claim`], for a replay running where the profile is held.
+#[must_use]
+pub fn check_recorded_composition(records: &[Record]) -> RecordedCompositionCheck {
+    let Some(header) = records.iter().find_map(|record| match &record.body {
+        Body::RunHeader(header) => Some(header),
+        _ => None,
+    }) else {
+        return RecordedCompositionCheck::NotComposed;
+    };
+    let (
+        Some(plan),
+        Some(plan_hash),
+        Some(claim),
+        Some(claim_hash),
+        Some(aggregate),
+        Some(aggregate_hash),
+        Some(grant),
+        Some(grant_hash),
+    ) = (
+        header.resource_plan.as_deref(),
+        header.resource_plan_hash,
+        header.physical_claim.as_deref(),
+        header.physical_claim_hash,
+        header.aggregate_claim.as_deref(),
+        header.aggregate_claim_hash,
+        header.execution_grant.as_deref(),
+        header.execution_grant_hash,
+    )
+    else {
+        return RecordedCompositionCheck::NotComposed;
+    };
+
+    match daemon_vhc_resource::validate_recorded_composition(
+        daemon_vhc_resource::RecordedComposition {
+            resource_plan: (plan, plan_hash),
+            physical_claim: (claim, claim_hash),
+            aggregate_claim: (aggregate, aggregate_hash),
+            execution_grant: (grant, grant_hash),
+        },
+    ) {
+        Ok(()) => RecordedCompositionCheck::Valid,
+        Err(e) => RecordedCompositionCheck::Invalid(e.to_string()),
+    }
+}
+
 /// The typed result of a worker replay (ABI §8.7). `Diverged`/`MissingPayload` are never a pass.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -188,6 +262,15 @@ pub enum ReplayOutcome {
         hash: Hash,
         /// The journal ordinal that referenced it.
         ord: u64,
+    },
+    /// The run header's composed members do not hold together, so the journal cannot be replayed.
+    ///
+    /// **Never a pass**, and checked before any step is fed: re-driving a run from a record whose
+    /// digests do not match its bytes, or whose claim and grant disagree about which plan they describe,
+    /// would produce a verdict about a run the journal does not actually describe.
+    CompositionInvalid {
+        /// Which inconsistency, in the validator's own words.
+        detail: String,
     },
     /// A recorded terminal fault (tag 9 kind 1–2) was injected at its recorded ordinal (§8.7).
     TerminalFault {
@@ -238,6 +321,13 @@ pub fn run_replay<G: GuestUnderReplay, P: PayloadSource>(
     guest: &mut G,
     payloads: &P,
 ) -> ReplayOutcome {
+    // Before any step: a journal whose recorded composition does not hold together cannot produce a
+    // verdict about the run it claims to describe.
+    if let RecordedCompositionCheck::Invalid(detail) = &plan.composition {
+        return ReplayOutcome::CompositionInvalid {
+            detail: detail.clone(),
+        };
+    }
     let mut expected = plan.expected.iter();
     let mut verified = 0u64;
 

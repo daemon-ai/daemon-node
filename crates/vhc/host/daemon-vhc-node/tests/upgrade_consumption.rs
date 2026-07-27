@@ -69,6 +69,13 @@ fn genesis_wire(old_module: Hash) -> (Vec<u8>, Hash, GenesisEnvelope) {
         roles.insert(
             name.to_string(),
             RoleEntry {
+                // A fixture envelope: this exercises paths that have nothing to do with resources, and it
+                // uses the SAME shared trivial construction every compute-free module emits.
+                execution: Some(
+                    daemon_vhc_proto::RoleExecutionRequirements::fixture_over_trivial_plan(vec![
+                        "cpu".to_string(),
+                    ]),
+                ),
                 lane: lane.into(),
                 module: module.into(),
                 abi: "vhc@2".into(),
@@ -179,6 +186,14 @@ impl WorkerControl for FakeWorker {
     ) -> Result<Eligibility, VhcError> {
         Ok(Eligibility {
             eligible: true,
+            // The need the ledger charges; an absent figure is a typed refusal now.
+            headroom: vec![
+                (
+                    daemon_vhc_abi::RESERVATION_DEVICE_BYTES_KEY.into(),
+                    256 << 20,
+                ),
+                (daemon_vhc_abi::RESERVATION_HOST_BYTES_KEY.into(), 512 << 20),
+            ],
             ..Eligibility::default()
         })
     }
@@ -191,7 +206,15 @@ impl WorkerControl for FakeWorker {
         Ok(Eligibility {
             eligible: true,
             reasons: vec!["switch target admitted".into()],
-            headroom: Vec::new(),
+            // As elsewhere in this crate: the ledger charges a derived need, and an absent figure is a
+            // typed refusal rather than the owner's cap (arbiter-charge disposition, 2026-07-26).
+            headroom: vec![
+                (
+                    daemon_vhc_abi::RESERVATION_DEVICE_BYTES_KEY.into(),
+                    256 << 20,
+                ),
+                (daemon_vhc_abi::RESERVATION_HOST_BYTES_KEY.into(), 512 << 20),
+            ],
             refusal_code: None,
             admitted_tuple: Some(AdmittedTuple {
                 module_hash: target.new_module,

@@ -66,6 +66,7 @@ use daemon_vhc_testkit::ceremony::{
 };
 use daemon_vhc_testkit::coordinator_config::WALL_CLOCK_TICK_PERIOD_MS;
 use daemon_vhc_testkit::genesis_run::phase_a_grants;
+use daemon_vhc_testkit::live_genesis::fixture_authored_execution;
 use daemon_vhc_testkit::{configure_coordinator, Coordinator};
 
 /// The ratified fleet membership: three certified trainer seats, floor == ceiling
@@ -109,6 +110,9 @@ fn author_fleet_genesis(coordinator_wasm: &[u8], roster: &[PeerId]) -> FrozenGen
         ),
     ];
     let spec = CeremonyGenesisSpec {
+        // A fixture: these pin module digests that resolve to no bytes, so there is no module to
+        // assess. Reports itself as not module-derived rather than passing as an assessment result.
+        execution: fixture_authored_execution(),
         run_label: RUN_LABEL,
         coordinator_module: blake3_hash(coordinator_wasm),
         trainer_module: Hash([0x7A; 32]),

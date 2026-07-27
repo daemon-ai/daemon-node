@@ -34,10 +34,14 @@ pub mod det_state;
 pub mod domains;
 pub mod envelope;
 pub mod error;
+pub mod execution_grant;
+pub mod execution_requirements;
+pub mod framing;
 pub mod genesis;
 pub mod grants;
 pub mod hash;
 pub mod merkle;
+pub mod resource_plan;
 pub mod revocation;
 pub mod roster;
 pub mod seat;
@@ -71,6 +75,18 @@ pub use det_state::{
 };
 pub use envelope::{DeviceMinimums, SignedEnvelope};
 pub use error::VhcProtoError;
+pub use execution_grant::{
+    ExecutionGrant, GrantValue, EXECUTION_GRANT_BYTES_MAX, EXECUTION_GRANT_SCHEMA,
+};
+pub use execution_requirements::{
+    AcceleratorRequirement, AuthoredExecution, HardwareIndependentMinima, ModuleDerivedPlan,
+    ProfileCertificationRequirements, RoleExecutionRequirements, SelectionRequirement,
+};
+pub use framing::{
+    frame, unframe, GenesisFrameHeader, GENESIS_FEATURE_EXECUTION_REQUIREMENTS,
+    GENESIS_FRAME_HEADER_LEN, GENESIS_FRAME_MAGIC, GENESIS_PAYLOAD_BYTES_MAX,
+    GENESIS_SUPPORTED_FEATURES,
+};
 pub use genesis::{
     peek_schema, BufferReq, ChannelDecl, ControlTransport, EventCap, EventCaps, FrozenGenesis,
     GenesisEnvelope, GrantBound, Identities, MigrationGrant, RoleEntry, RoleGrants, RunSection,
@@ -80,6 +96,16 @@ pub use genesis::{
 pub use grants::{derive_admitted_quotas, AdmittedQuotas, GrantsDoc, GrantsError, LaneCeilings};
 pub use hash::blake3_hash;
 pub use merkle::{commit_set, MembershipProof, SetCommitment, SetCommitmentTree};
+pub use resource_plan::{
+    plan_derivation_fuel, Binding, Dimension, DimensionValue, Domain, Dtype, Expr, Lifetime,
+    LinearLifetime, LinearMemoryTerm, LogicalResourcePlan, OperationDecl, PlanFootprint,
+    PlanRefusal, Retention, SelectionScope, TensorDecl, TransferDecl, TransferKind,
+    LOGICAL_RESOURCE_PLAN_BYTES_MAX, LOGICAL_RESOURCE_PLAN_DIMENSIONS_MAX,
+    LOGICAL_RESOURCE_PLAN_EXPR_DEPTH_MAX, LOGICAL_RESOURCE_PLAN_IDENT_BYTES_MAX,
+    LOGICAL_RESOURCE_PLAN_NODES_MAX, LOGICAL_RESOURCE_PLAN_SCHEMA, PLAN_DERIVATION_FUEL_BASE,
+    PLAN_DERIVATION_FUEL_CEILING, PLAN_DERIVATION_FUEL_PER_NODE,
+    PLAN_DERIVATION_FUEL_PER_OUTPUT_BYTE, WASM_GUEST_LINEAR_FLOOR_BYTES,
+};
 pub use revocation::{
     RevocationError, RevocationLedger, RunKeyRevocation, RunKeyRevocationBody, REVOCATION_DOMAIN_V2,
 };

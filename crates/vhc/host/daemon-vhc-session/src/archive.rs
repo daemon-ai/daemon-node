@@ -130,7 +130,7 @@ mod tests {
                 b"m",
                 b"c",
                 b"g",
-                b"cl",
+                daemon_vhc_host::run::RunHeaderResources::Declared(b"cl"),
                 b"ch",
                 b"d",
             )

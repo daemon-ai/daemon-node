@@ -374,6 +374,146 @@ pub struct WgpuProbe {
     /// Whether this is a unified-memory device (`device_type` is `IntegratedGpu` or `Cpu`): the GPU
     /// shares host DRAM, so the budget math uses a joint memory pool (see [`DeviceLimits`]).
     pub unified: bool,
+    /// Whether this adapter is a **software rasterizer**.
+    ///
+    /// The framework exposes no explicit flag the way DXGI does, so this is a determination rather
+    /// than a read: a `Cpu` device type is one definitionally, and the known software
+    /// implementations are matched by name. It matters because a device-lane role admitted against a
+    /// rasterizer that reports a device backend class is the silent CPU fallback the platform rules
+    /// forbid — and the loader on at least one fleet box enumerates one beside the real adapter, so
+    /// it is reachable without any operator intending it.
+    pub is_software: bool,
+    /// The adapter's PCI vendor id (`get_info().vendor`), `None` where the platform supplies none.
+    pub vendor_id: Option<u32>,
+    /// The adapter's PCI device id (`get_info().device`).
+    pub device_id: Option<u32>,
+    /// The driver name (`get_info().driver`, e.g. `"radv"`). Empty where the platform supplies none —
+    /// which is why the caller converts an empty string to a typed unavailability rather than
+    /// recording it as a driver whose name is the empty string.
+    pub driver: String,
+    /// The driver's own version text (`get_info().driver_info`, e.g. `"Mesa 25.2.6"`). This is the
+    /// numbering a profile's permitted revision range constrains.
+    pub driver_info: String,
+}
+
+/// Names the known software rasterizers carry. Matched case-insensitively as substrings, because a
+/// platform decorates them differently (`"llvmpipe (LLVM 18.1.0, 256 bits)"`,
+/// `"Microsoft Basic Render Driver"`).
+const SOFTWARE_RASTERIZER_NAMES: &[&str] = &[
+    "llvmpipe",
+    "lavapipe",
+    "swiftshader",
+    "warp",
+    "basic render driver",
+    "software rasterizer",
+];
+
+/// Whether an adapter of this name and device type is a software rasterizer.
+///
+/// Pure, so the determination is testable without a device: the fleet's reachable case is a loader
+/// that enumerates `llvmpipe` beside real hardware and reports it under a device backend class.
+#[must_use]
+pub fn is_software_adapter(adapter_name: &str, device_type: &str) -> bool {
+    if device_type == "Cpu" {
+        return true;
+    }
+    let lowered = adapter_name.to_ascii_lowercase();
+    SOFTWARE_RASTERIZER_NAMES
+        .iter()
+        .any(|name| lowered.contains(name))
+}
+
+/// Why no device could be probed. A **typed** answer, replacing the inference a caller had to make
+/// from a zero reading.
+///
+/// A zero resource reading is an admission refusal wearing a measurement's clothes: it refuses the
+/// machine rather than reporting the defect. Worse, in the case that produced this type, it did
+/// something actively misleading — a GPU-capable box whose graphics loader was absent from the
+/// process environment reported `gpus: 0` and was silently reclassified as CPU-only, which a run
+/// would then admit as a CPU participant. The environment was the fault, and nothing said so.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DeviceProbeUnavailability {
+    /// This binary carries no device lane at all — the backend feature was compiled out. A `cfg`
+    /// fact, not an observation about the machine, and the first thing to rule out when a box that
+    /// has an accelerator reports none.
+    FeatureCompiledOut,
+    /// The lane is compiled in and the adapter could not be brought up. The captured reason is
+    /// carried **verbatim**, never parsed for policy: it distinguishes an absent loader from absent
+    /// hardware for a human reading it, and the two are not yet distinguished mechanically — that
+    /// needs a loader probe, and guessing from message text would be a policy decision resting on a
+    /// vendor's phrasing.
+    BringUpFailed(String),
+}
+
+impl DeviceProbeUnavailability {
+    /// The stable slug for evidence and logs.
+    #[must_use]
+    pub fn slug(&self) -> &'static str {
+        match self {
+            Self::FeatureCompiledOut => "DeviceLaneCompiledOut",
+            Self::BringUpFailed(_) => "DeviceBringUpFailed",
+        }
+    }
+}
+
+impl std::fmt::Display for DeviceProbeUnavailability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FeatureCompiledOut => write!(
+                f,
+                "{}: this binary was built without a device backend lane, so it reports no \
+                 accelerator regardless of what the machine has",
+                self.slug()
+            ),
+            Self::BringUpFailed(reason) => write!(
+                f,
+                "{}: the device lane is compiled in but no adapter could be brought up — check the \
+                 graphics loader is present in this process's environment before concluding the \
+                 machine has no accelerator ({reason})",
+                self.slug()
+            ),
+        }
+    }
+}
+
+/// The recorded reason the last wgpu bring-up failed, for [`wgpu_unavailability`].
+#[cfg(feature = "wgpu")]
+fn wgpu_bring_up_failure() -> Option<String> {
+    WGPU_BRING_UP_FAILURE
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+}
+
+/// Record it. Set once by the memoized probe; a later reader gets the reason the probe actually saw.
+#[cfg(feature = "wgpu")]
+fn record_wgpu_bring_up_failure(reason: &str) {
+    if let Ok(mut guard) = WGPU_BRING_UP_FAILURE.lock() {
+        *guard = Some(reason.to_string());
+    }
+}
+
+#[cfg(feature = "wgpu")]
+static WGPU_BRING_UP_FAILURE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// The typed reason no wgpu device is available, or `None` when one is.
+///
+/// Callers use this instead of inferring absence from a zero device count.
+#[must_use]
+pub fn wgpu_unavailability() -> Option<DeviceProbeUnavailability> {
+    #[cfg(feature = "wgpu")]
+    {
+        if probe_wgpu().is_some() {
+            return None;
+        }
+        Some(DeviceProbeUnavailability::BringUpFailed(
+            wgpu_bring_up_failure().unwrap_or_else(|| "no reason was recorded".to_string()),
+        ))
+    }
+    #[cfg(not(feature = "wgpu"))]
+    {
+        Some(DeviceProbeUnavailability::FeatureCompiledOut)
+    }
 }
 
 /// Probe the default wgpu device for its adapter info + limits (feature `wgpu`). Returns `None`
@@ -422,6 +562,11 @@ fn probe_wgpu_uncached() -> Option<WgpuProbe> {
         WgpuProbe {
             gpus: 1,
             max_alloc_mb,
+            is_software: is_software_adapter(&info.name, &device_type),
+            vendor_id: Some(info.vendor),
+            device_id: Some(info.device),
+            driver: info.driver.clone(),
+            driver_info: info.driver_info.clone(),
             adapter: info.name.clone(),
             backend: format!("{:?}", info.backend),
             device_type,
@@ -432,6 +577,9 @@ fn probe_wgpu_uncached() -> Option<WgpuProbe> {
     match attempt {
         Ok(probe) => Some(probe),
         Err(msg) => {
+            // The reason is recorded so `wgpu_unavailability` can report it verbatim rather than
+            // leaving a caller to infer absence from a zero.
+            record_wgpu_bring_up_failure(&msg);
             // Tier 2 — register-or-reuse: an "already registered" panic means an adapter is up
             // (a burn op registered the default client before this probe). Report availability
             // rather than caching `None`; the per-buffer limit / device_type are unknown via reuse
@@ -444,12 +592,163 @@ fn probe_wgpu_uncached() -> Option<WgpuProbe> {
                     backend: "wgpu".to_string(),
                     device_type: "Unknown".to_string(),
                     unified: false,
+                    // Nothing was observed through a reuse, so nothing is claimed. An adapter whose
+                    // class is unknown is conservatively a rasterizer here: the alternative is
+                    // asserting real hardware on the strength of a race we lost.
+                    is_software: true,
+                    vendor_id: None,
+                    device_id: None,
+                    driver: String::new(),
+                    driver_info: String::new(),
                 })
             } else {
                 None
             }
         }
     }
+}
+
+// =====================================================================================
+// Vulkan device-heap budget (the Linux device lane's own statement of supply).
+//
+// This is the platform budget query Linux was missing. Windows has DXGI's local budget and macOS has
+// Metal's recommended working set — both read below — and on both, the platform states what this
+// process may use. On Linux the analogue is `VK_EXT_memory_budget` on the heap the runtime allocates
+// from: the driver's own budget for that heap, which accounts for the split it presents to allocators
+// and for what else on the box already holds memory.
+//
+// Why it matters that this is a *query* and not arithmetic: the static derivation from
+// `mem_info_vram_total` + `mem_info_gtt_total` can exceed the device-local heap the driver advertises,
+// because on a unified part the driver divides one DRAM pool into a device-local heap and a
+// host-visible one. A supply figure above that heap is memory no allocation can reach, so it moves the
+// refusal from admission to the first allocation. The heap SIZE is returned alongside the budget for
+// exactly that reason — it bounds the static fallback when the budget query is unavailable.
+// =====================================================================================
+
+/// What Vulkan says about the device-local heap the runtime allocates from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VulkanHeapBudget {
+    /// `VkMemoryHeap::size` for the selected heap — what the backend advertises as its device heap.
+    pub heap_size_bytes: u64,
+    /// `VkPhysicalDeviceMemoryBudgetPropertiesEXT::heapBudget` for that heap, when the device supports
+    /// the extension. `None` is an absence: the driver stated no budget, and a total is not a budget.
+    pub heap_budget_bytes: Option<u64>,
+}
+
+/// Query the selected device's Vulkan device-local heap: its advertised size and, where the driver
+/// exposes it, its budget.
+///
+/// **Memoized**, because it creates and destroys a Vulkan instance and nothing about the answer moves
+/// within a process — the budget is deliberately the *stable* figure, not an instantaneous one
+/// (volatile pressure is the governor's business, `[RC-4]`).
+///
+/// `None` throughout rather than a zero or a guess: no loader, no matching device, no device-local heap
+/// are all absences, and a supply derivation that inferred a number from any of them would be inventing
+/// the one figure this whole path exists to measure.
+///
+/// The physical device is matched to the adapter the graphics probe actually brought up, by vendor and
+/// device id. Reading the *first* device's heap on a multi-adapter box would attribute one adapter's
+/// budget to another — the same mistake as filling one lane's revision record from another lane's probe.
+#[cfg(all(feature = "wgpu", target_os = "linux"))]
+#[must_use]
+pub fn probe_vulkan_heap_budget() -> Option<VulkanHeapBudget> {
+    use std::sync::OnceLock;
+    static BUDGET: OnceLock<Option<VulkanHeapBudget>> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        // A bring-up failure inside the loader panics on some drivers; this whole query is an expected
+        // absence when Vulkan is not present, so it is captured quietly like the adapter probe.
+        crate::device_panic::catch(true, vk_heap_budget).unwrap_or(None)
+    })
+}
+
+/// Neither the extension nor the API exists to be queried here, so the absence is a `cfg` fact.
+#[cfg(not(all(feature = "wgpu", target_os = "linux")))]
+#[must_use]
+pub fn probe_vulkan_heap_budget() -> Option<VulkanHeapBudget> {
+    None
+}
+
+/// The Vulkan calls themselves. Scoped `unsafe` under the crate's `#![deny(unsafe_code)]`, exactly as
+/// the DXGI and Metal probes below are.
+#[cfg(all(feature = "wgpu", target_os = "linux"))]
+#[allow(unsafe_code)]
+fn vk_heap_budget() -> Option<VulkanHeapBudget> {
+    use ash::vk;
+
+    // SAFETY: `Entry::load` dlopens the Vulkan loader. Absent loader is an `Err`, not a crash.
+    let entry = unsafe { ash::Entry::load() }.ok()?;
+    let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_1);
+    let create = vk::InstanceCreateInfo::default().application_info(&app);
+    // SAFETY: `create` outlives the call; no extensions or layers are requested.
+    let instance = unsafe { entry.create_instance(&create, None) }.ok()?;
+
+    let selected = probe_wgpu();
+    let result = (|| {
+        // SAFETY: the instance is live for the whole closure.
+        let devices = unsafe { instance.enumerate_physical_devices() }.ok()?;
+        let physical = devices.into_iter().find(|pd| {
+            // SAFETY: `pd` came from this instance.
+            let props = unsafe { instance.get_physical_device_properties(*pd) };
+            match selected.as_ref() {
+                // The adapter the graphics probe brought up, by identity rather than by position.
+                Some(probe) => {
+                    probe.vendor_id == Some(props.vendor_id)
+                        && probe.device_id == Some(props.device_id)
+                }
+                // No adapter identity to match (the reuse path claims none): any real GPU beats none,
+                // and a CPU-type Vulkan device is not a device lane's supply.
+                None => props.device_type != vk::PhysicalDeviceType::CPU,
+            }
+        })?;
+
+        // SAFETY: `physical` came from this instance.
+        let extensions =
+            unsafe { instance.enumerate_device_extension_properties(physical) }.ok()?;
+        let budget_supported = extensions.iter().any(|ext| {
+            ext.extension_name_as_c_str()
+                .is_ok_and(|name| name == c"VK_EXT_memory_budget")
+        });
+
+        let mut budget_props = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+        let (heaps, heap_count, budgets) = {
+            let mut props2 = vk::PhysicalDeviceMemoryProperties2::default();
+            if budget_supported {
+                props2 = props2.push_next(&mut budget_props);
+            }
+            // SAFETY: `physical` came from this instance and `props2` is a live, correctly chained
+            // output struct; the call only writes it.
+            unsafe { instance.get_physical_device_memory_properties2(physical, &mut props2) };
+            let memory = props2.memory_properties;
+            (
+                memory.memory_heaps,
+                usize::try_from(memory.memory_heap_count).unwrap_or(0),
+                budget_supported,
+            )
+        };
+
+        // The heap the runtime allocates device memory from: the largest device-local one. On a
+        // unified part the driver presents several heaps over one DRAM pool, and the device-local one
+        // is the heap a device allocation is served from.
+        let (index, heap) = heaps
+            .iter()
+            .take(heap_count.min(heaps.len()))
+            .enumerate()
+            .filter(|(_, heap)| heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
+            .max_by_key(|(_, heap)| heap.size)?;
+
+        Some(VulkanHeapBudget {
+            heap_size_bytes: heap.size,
+            // Zero from the driver is not a budget, so it stays an absence rather than becoming a
+            // supply figure of zero — which would refuse the machine instead of reporting the gap.
+            heap_budget_bytes: budgets
+                .then(|| budget_props.heap_budget[index])
+                .filter(|b| *b > 0),
+        })
+    })();
+
+    // SAFETY: no Vulkan object created from this instance outlives this point (none was created).
+    unsafe { instance.destroy_instance(None) };
+    result
 }
 
 // =====================================================================================
@@ -904,6 +1203,38 @@ pub fn probe_windows_device_limits() -> Option<DeviceLimits> {
     }
 }
 
+/// The raw DXGI adapter memory scalars for the selected adapter.
+///
+/// Carried separately from [`probe_windows_device_limits`] because the mapper *combines* two numbers of
+/// different kinds: on a unified part it folds the **live** local budget together with the **static**
+/// `SharedSystemMemory` ceiling, after which a supply derivation can no longer tell them apart. One is
+/// the platform saying what this process may use at this instant; the other is a limit on what could
+/// ever be borrowed. A stable statement of supply needs the second, and the first is a pressure reading.
+#[must_use]
+pub fn probe_windows_adapter_memory() -> Option<DxgiAdapterMemory> {
+    #[cfg(windows)]
+    {
+        win_ffi::probe().map(|(_, raw)| raw)
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+/// The DXGI **live local budget** for the selected adapter — a pressure reading, not supply.
+///
+/// Dynamic by documentation: it moves with co-tenant pressure and OS policy, and a budget *shrink* is
+/// the Windows analogue of a preemption signal. That makes it the governor's input and disqualifies it
+/// from the capability report, which is cited by digest and must not be a different report each time it
+/// is taken. Zero is not a budget, so it comes back as an absence.
+#[must_use]
+pub fn probe_windows_local_budget_bytes() -> Option<u64> {
+    probe_windows_adapter_memory()
+        .map(|raw| raw.budget_local)
+        .filter(|budget| *budget > 0)
+}
+
 // -------------------------------------------------------------------------------------
 // macOS FFI (Metal + libSystem sysctl). Compiled only for macOS. No new dependency — raw `extern`
 // FFI to the Objective-C runtime + Metal/Foundation frameworks + libSystem `sysctlbyname`. All
@@ -1232,5 +1563,72 @@ mod tests {
         assert_eq!(limits.ram_mb, 8192);
         assert_eq!(limits.shared_mb, 8192);
         assert!(limits.unified);
+    }
+}
+
+#[cfg(test)]
+mod software_adapter_tests {
+    use super::{is_software_adapter, DeviceProbeUnavailability};
+
+    /// The determination is pure, so it is testable without a device — which matters because the
+    /// reachable case on a fleet box is a loader enumerating a rasterizer beside real hardware and
+    /// reporting it under a device backend class.
+    #[test]
+    fn known_software_rasterizers_are_recognized_whatever_the_platform_calls_them() {
+        for (name, device_type) in [
+            ("llvmpipe (LLVM 18.1.0, 256 bits)", "Cpu"),
+            ("lavapipe (LLVM 18.1.0, 256 bits)", "Other"),
+            ("SwiftShader Device (Subzero)", "Other"),
+            ("Microsoft Basic Render Driver", "Other"),
+            ("Microsoft Direct3D12 (WARP)", "Other"),
+        ] {
+            assert!(
+                is_software_adapter(name, device_type),
+                "`{name}` is a software rasterizer"
+            );
+        }
+
+        // A CPU device type is one definitionally, whatever it is called.
+        assert!(is_software_adapter("Some Vendor Compute Device", "Cpu"));
+    }
+
+    /// Real hardware is not swept up by the name match — a floor that refused real adapters would be
+    /// worse than the fallback it replaces.
+    #[test]
+    fn real_adapters_are_not_mistaken_for_rasterizers() {
+        for (name, device_type) in [
+            ("Radeon 8060S Graphics (RADV GFX1151)", "IntegratedGpu"),
+            ("NVIDIA GeForce RTX 5090", "DiscreteGpu"),
+            ("Apple M4 Pro", "IntegratedGpu"),
+            ("Intel(R) Arc(tm) A770 Graphics", "DiscreteGpu"),
+        ] {
+            assert!(
+                !is_software_adapter(name, device_type),
+                "`{name}` is real hardware"
+            );
+        }
+    }
+
+    /// The absence of a device is reported as a typed reason, and the two reasons are distinguishable
+    /// — the first thing to rule out when a box that has an accelerator reports none is that the
+    /// binary was built without the lane at all.
+    #[test]
+    fn device_absence_carries_a_typed_reason_that_names_the_environment() {
+        let compiled_out = DeviceProbeUnavailability::FeatureCompiledOut;
+        assert_eq!(compiled_out.slug(), "DeviceLaneCompiledOut");
+        assert!(compiled_out
+            .to_string()
+            .contains("without a device backend lane"));
+
+        let bring_up = DeviceProbeUnavailability::BringUpFailed("no adapter matched".into());
+        assert_eq!(bring_up.slug(), "DeviceBringUpFailed");
+        let rendered = bring_up.to_string();
+        assert!(
+            rendered.contains("graphics loader is present in this process's environment"),
+            "the message points at the environment before the hardware: {rendered}"
+        );
+        // The captured reason travels verbatim; it is never parsed for policy.
+        assert!(rendered.contains("no adapter matched"));
+        assert_ne!(compiled_out, bring_up);
     }
 }

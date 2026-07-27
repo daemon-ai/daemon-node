@@ -24,6 +24,10 @@ daemon-vhc-abi = { workspace = true }
 # The host worker runtime this binary drives: driver selection (`select_driver`), the device
 # probe, `EngineConfig`, and the per-backend lanes (forwarded features below).
 daemon-vhc-host = { workspace = true }
+# The backend implementation revision record this binary makes about itself (architecture §9.7
+# [PC-10](1)): the structure that replaces a Debug-printed adapter line no code path could act on.
+# Host-side only — the profile types it sits beside must never be reachable from a guest.
+daemon-vhc-resource = { workspace = true }
 # The R↔E seam + the frozen node↔worker wire (`daemon_vhc_session::protocol`) this binary speaks.
 daemon-vhc-session = { workspace = true }
 # Envelope open/verify (`SignedEnvelope`) on the assess path.

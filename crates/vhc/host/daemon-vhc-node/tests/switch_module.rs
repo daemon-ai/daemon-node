@@ -225,6 +225,13 @@ fn build_scenario(worker: &Worker, frames: u64) -> (Scenario, TransitionChain) {
         roles.insert(
             name.to_string(),
             RoleEntry {
+                // A fixture envelope: this exercises paths that have nothing to do with resources, and it
+                // uses the SAME shared trivial construction every compute-free module emits.
+                execution: Some(
+                    daemon_vhc_proto::RoleExecutionRequirements::fixture_over_trivial_plan(vec![
+                        "cpu".to_string(),
+                    ]),
+                ),
                 lane: lane.into(),
                 module: module.into(),
                 abi: "vhc@2".into(),
@@ -398,6 +405,16 @@ impl WorkerControl for InProcessUpgradeWorker {
     ) -> Result<Eligibility, VhcError> {
         Ok(Eligibility {
             eligible: true,
+            // The composed reservation the ledger charges. A verdict with no resource figure is a typed
+            // `ClaimNotComposable` refusal since the owner-cap fallback was removed, so a switch drill
+            // has to state a need to reach the switch at all (arbiter-charge disposition, 2026-07-26).
+            headroom: vec![
+                (
+                    daemon_vhc_abi::RESERVATION_DEVICE_BYTES_KEY.into(),
+                    256 << 20,
+                ),
+                (daemon_vhc_abi::RESERVATION_HOST_BYTES_KEY.into(), 512 << 20),
+            ],
             ..Eligibility::default()
         })
     }

@@ -98,10 +98,12 @@ fn honest_claim_admits_and_runs_with_deterministic_claim_bytes() {
         &owner_uncapped(),
         None,
         None,
+        // A lower-minor module declares its own claim; no composition authority is involved.
+        None,
     )
     .expect("honest claim admits");
-    assert_eq!(admission.claim.hard_accountable.host, 1 << 16);
-    assert_eq!(admission.claim.under_pressure, vec![0, 1]);
+    assert_eq!(admission.claim_host_bytes(), 1 << 16);
+    assert_eq!(admission.declared_pressure_order(), vec![0, 1]);
     assert!(!admission.claim_bytes.is_empty());
     assert!(!admission.manifest_bytes.is_empty());
 
@@ -117,6 +119,8 @@ fn honest_claim_admits_and_runs_with_deterministic_claim_bytes() {
         &owner_uncapped(),
         None,
         None,
+        // A lower-minor module declares its own claim; no composition authority is involved.
+        None,
     )
     .expect("second assessment");
     assert_eq!(admission.claim_bytes, again.claim_bytes);
@@ -125,7 +129,7 @@ fn honest_claim_admits_and_runs_with_deterministic_claim_bytes() {
     let mut run_cfg = RunConfig::new(identity(&wasm, 1), [0x61; 32], cfg, Vec::new());
     run_cfg.claim_bytes = admission.claim_bytes.clone();
     run_cfg.manifest_bytes = admission.manifest_bytes.clone();
-    run_cfg.hard_accountable_host_bytes = admission.claim.hard_accountable.host;
+    run_cfg.hard_accountable_host_bytes = admission.claim_host_bytes();
     let sink = Arc::new(Mutex::new(MemorySink::new()));
     let run = start_run(&w, &wasm, run_cfg, Box::new(sink)).expect("start");
     run.pump
@@ -160,6 +164,8 @@ fn over_claim_rejected_against_owner_policy() {
         &owner,
         None,
         None,
+        // A lower-minor module declares its own claim; no composition authority is involved.
+        None,
     )
     .unwrap_err();
     assert_eq!(err.stage, 5);
@@ -185,6 +191,8 @@ fn claim_outside_lane_bounds_refused() {
         &owner_uncapped(),
         None,
         None,
+        // A lower-minor module declares its own claim; no composition authority is involved.
+        None,
     )
     .unwrap_err();
     assert_eq!(err.stage, 4);
@@ -208,6 +216,8 @@ fn inconsistent_claim_refused() {
         &owner_uncapped(),
         None,
         None,
+        // A lower-minor module declares its own claim; no composition authority is involved.
+        None,
     )
     .unwrap_err();
     assert_eq!(err.stage, 4);
@@ -229,6 +239,8 @@ fn manifest_channel_beyond_table_refused_grants_exceed_lane() {
         &device(),
         &owner_uncapped(),
         None,
+        None,
+        // A lower-minor module declares its own claim; no composition authority is involved.
         None,
     )
     .unwrap_err();
@@ -255,13 +267,15 @@ fn under_claim_traps_attributably_at_the_hard_cap() {
         &owner_uncapped(),
         None,
         None,
+        // A lower-minor module declares its own claim; no composition authority is involved.
+        None,
     )
     .expect("the under-claimer's CLAIM is well-formed and within bounds — it admits");
-    assert_eq!(admission.claim.hard_accountable.host, 512);
+    assert_eq!(admission.claim_host_bytes(), 512);
 
     let mut run_cfg = RunConfig::new(identity(&wasm, 2), [0x62; 32], cfg, Vec::new());
+    run_cfg.hard_accountable_host_bytes = admission.claim_host_bytes();
     run_cfg.claim_bytes = admission.claim_bytes;
-    run_cfg.hard_accountable_host_bytes = admission.claim.hard_accountable.host;
     let sink = Arc::new(Mutex::new(MemorySink::new()));
     let run = start_run(&w, &wasm, run_cfg, Box::new(sink.clone())).expect("start");
     match run.wait().expect("join") {
@@ -309,6 +323,8 @@ fn device_below_envelope_minimums_refuses_at_stage_3() {
         &owner_uncapped(),
         Some(&min),
         None,
+        // A lower-minor module declares its own claim; no composition authority is involved.
+        None,
     )
     .unwrap_err();
     assert_eq!(err.stage, 3);
@@ -332,6 +348,8 @@ fn gpu_required_by_envelope_refuses_on_gpu_less_device() {
         &device(),
         &owner_uncapped(),
         Some(&min),
+        None,
+        // A lower-minor module declares its own claim; no composition authority is involved.
         None,
     )
     .unwrap_err();
@@ -361,7 +379,9 @@ fn device_meeting_envelope_minimums_admits_the_module() {
         &owner_uncapped(),
         Some(&min),
         None,
+        // A lower-minor module declares its own claim; no composition authority is involved.
+        None,
     )
     .expect("minima met: the pre-screen passes and assessment admits");
-    assert!(admission.claim.host_total() > 0);
+    assert!(admission.charged_host_bytes() > 0);
 }

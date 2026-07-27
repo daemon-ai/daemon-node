@@ -30,8 +30,8 @@ use std::path::{Path, PathBuf};
 use daemon_vhc_host::run::{Dropped, JournalSink, RunIdentity, SinkError};
 use daemon_vhc_journal::record::{
     Body, ClockRec, CompletionRec, ConditionRec, DeviceProfileRec, DropId, DropRec, EventRec,
-    ExecIdentity, InitRec, InstantiationRec, RunHeader, SignedFrameRec, SnapshotRec, TerminalRec,
-    TimerArmRec, TimerCancelRec, TrapInfo,
+    ExecIdentity, ExecutionGrantRec, InitRec, InstantiationRec, RunHeader, SignedFrameRec,
+    SnapshotRec, TerminalRec, TimerArmRec, TimerCancelRec, TrapInfo,
 };
 use daemon_vhc_journal::{format_version, Journal, JournalError, RotatePolicy, StaticKey};
 use daemon_vhc_proto::Hash;
@@ -190,12 +190,37 @@ impl JournalSink for DurableSink {
         manifest: &[u8],
         config: &[u8],
         grants: &[u8],
-        claim: &[u8],
+        resources: daemon_vhc_host::run::RunHeaderResources<'_>,
         channels: &[u8],
         device: &[u8],
     ) -> Result<(), SinkError> {
+        use daemon_vhc_host::run::RunHeaderResources;
+
+        // The minor-selected branch, written as the grammar requires: a declared claim and a composed
+        // one are never both present, and the enum is what makes carrying both impossible rather than
+        // merely wrong. Hashes are computed here from the very bytes being written, so a record cannot
+        // carry a digest of something else.
+        let digest = |bytes: &[u8]| daemon_vhc_proto::blake3_hash(bytes);
+        let (claim, resource_plan, physical_claim, aggregate_claim, execution_grant) =
+            match resources {
+                RunHeaderResources::Declared(claim) => {
+                    (Some(claim.to_vec()), None, None, None, None)
+                }
+                RunHeaderResources::Composed {
+                    resource_plan,
+                    physical_claim,
+                    aggregate_claim,
+                    execution_grant,
+                } => (
+                    None,
+                    Some(resource_plan.to_vec()),
+                    Some(physical_claim.to_vec()),
+                    Some(aggregate_claim.to_vec()),
+                    Some(execution_grant.to_vec()),
+                ),
+            };
         self.journal
-            .append(Body::RunHeader(RunHeader {
+            .append(Body::RunHeader(Box::new(RunHeader {
                 run_id: self.id.run_id,
                 epoch: self.id.epoch,
                 role: self.id.role.clone(),
@@ -207,11 +232,19 @@ impl JournalSink for DurableSink {
                 manifest: manifest.to_vec(),
                 config: config.to_vec(),
                 grants: grants.to_vec(),
-                claim: claim.to_vec(),
+                claim,
                 channels: channels.to_vec(),
                 device: device.to_vec(),
+                resource_plan_hash: resource_plan.as_deref().map(digest),
+                resource_plan,
+                physical_claim_hash: physical_claim.as_deref().map(digest),
+                physical_claim,
+                aggregate_claim_hash: aggregate_claim.as_deref().map(digest),
+                aggregate_claim,
+                execution_grant_hash: execution_grant.as_deref().map(digest),
+                execution_grant,
                 format: u64::from(format_version()),
-            }))
+            })))
             .map(|_| ())
             .map_err(sink_err)
     }
@@ -239,6 +272,20 @@ impl JournalSink for DurableSink {
             .append(Body::Init(InitRec {
                 config_hash: Hash(config_hash),
                 grants_hash: Hash(grants_hash),
+                status,
+            }))
+            .map(|_| ())
+            .map_err(sink_err)
+    }
+
+    fn execution_grant(
+        &mut self,
+        execution_grant_hash: [u8; 32],
+        status: u64,
+    ) -> Result<(), SinkError> {
+        self.journal
+            .append(Body::ExecutionGrant(ExecutionGrantRec {
+                execution_grant_hash: Hash(execution_grant_hash),
                 status,
             }))
             .map(|_| ())
@@ -455,6 +502,111 @@ mod tests {
         );
     }
 
+    /// The run header records one resource branch or the other, and the hashes are of the bytes it
+    /// actually wrote.
+    ///
+    /// The two branches are the minor split made durable: a reader of a certification run's journal
+    /// finds the plan, the composed claim, the aggregate and the grant, and finds **no** declared claim
+    /// to mistake for the figure the run was admitted on. A record carrying both would leave whoever
+    /// reconstructs the run to choose, which is exactly what the grammar forbids.
+    #[test]
+    fn the_run_header_records_the_minor_selected_resource_branch() {
+        use daemon_vhc_host::run::RunHeaderResources;
+
+        let expect_header = |jdir: &std::path::Path| -> daemon_vhc_journal::record::RunHeader {
+            let scan = scan_file(jdir.join("segment-00000000.dvhcjrn")).expect("scan");
+            match &scan.records.first().expect("a header was written").body {
+                daemon_vhc_journal::record::Body::RunHeader(header) => (**header).clone(),
+                other => panic!("tag 0 is written first, got tag {}", other.tag()),
+            }
+        };
+
+        // The certification branch: four members, each with the digest of the bytes beside it.
+        let dir = tempfile::tempdir().unwrap();
+        let jdir = journal_dir(dir.path(), "run-composed", "trainer", 1);
+        {
+            let mut sink = DurableSink::open(&jdir, &identity(), [0x11; 32]).expect("journal");
+            sink.run_header(
+                (2 << 16) | 5,
+                &[("vhc".into(), 2)],
+                false,
+                b"m",
+                b"c",
+                b"g",
+                RunHeaderResources::Composed {
+                    resource_plan: b"plan-bytes",
+                    physical_claim: b"claim-bytes",
+                    aggregate_claim: b"aggregate-bytes",
+                    execution_grant: b"grant-bytes",
+                },
+                b"ch",
+                b"d",
+            )
+            .unwrap();
+        }
+        let header = expect_header(&jdir);
+        assert!(
+            header.claim.is_none(),
+            "a composed run declares no claim, so the legacy member must be absent"
+        );
+        for (bytes, recorded, hash) in [
+            (
+                &b"plan-bytes"[..],
+                header.resource_plan.as_deref(),
+                header.resource_plan_hash,
+            ),
+            (
+                &b"claim-bytes"[..],
+                header.physical_claim.as_deref(),
+                header.physical_claim_hash,
+            ),
+            (
+                &b"aggregate-bytes"[..],
+                header.aggregate_claim.as_deref(),
+                header.aggregate_claim_hash,
+            ),
+            (
+                &b"grant-bytes"[..],
+                header.execution_grant.as_deref(),
+                header.execution_grant_hash,
+            ),
+        ] {
+            assert_eq!(recorded, Some(bytes), "the member carries the exact bytes");
+            assert_eq!(
+                hash,
+                Some(daemon_vhc_proto::blake3_hash(bytes)),
+                "and the hash is of those bytes, not of something else"
+            );
+        }
+
+        // The legacy branch: the declared claim, and none of the certification members.
+        let jdir = journal_dir(dir.path(), "run-declared", "trainer", 1);
+        {
+            let mut sink = DurableSink::open(&jdir, &identity(), [0x11; 32]).expect("journal");
+            sink.run_header(
+                (2 << 16) | 4,
+                &[("vhc".into(), 2)],
+                false,
+                b"m",
+                b"c",
+                b"g",
+                RunHeaderResources::Declared(b"declared-claim"),
+                b"ch",
+                b"d",
+            )
+            .unwrap();
+        }
+        let header = expect_header(&jdir);
+        assert_eq!(header.claim.as_deref(), Some(&b"declared-claim"[..]));
+        assert!(
+            header.resource_plan.is_none()
+                && header.physical_claim.is_none()
+                && header.aggregate_claim.is_none()
+                && header.execution_grant.is_none(),
+            "a lower-minor run composed nothing, so it records none of the composed members"
+        );
+    }
+
     #[test]
     fn durable_sink_writes_recover_across_reopen() {
         // The crash-resume half of the incarnation policy: the SAME incarnation re-opens its
@@ -472,7 +624,7 @@ mod tests {
                 b"m",
                 b"c",
                 b"g",
-                b"cl",
+                daemon_vhc_host::run::RunHeaderResources::Declared(b"cl"),
                 b"ch",
                 b"d",
             )
@@ -515,7 +667,7 @@ mod tests {
                 b"m",
                 b"c",
                 b"g",
-                b"cl",
+                daemon_vhc_host::run::RunHeaderResources::Declared(b"cl"),
                 b"ch",
                 b"d",
             )
@@ -543,7 +695,7 @@ mod tests {
             b"m2",
             b"c2",
             b"g2",
-            b"cl2",
+            daemon_vhc_host::run::RunHeaderResources::Declared(b"cl2"),
             b"ch2",
             b"d2",
         )

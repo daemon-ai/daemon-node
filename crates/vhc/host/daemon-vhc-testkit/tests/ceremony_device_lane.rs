@@ -151,7 +151,7 @@ impl JournalSink for TerseSink {
         _manifest: &[u8],
         _config: &[u8],
         _grants: &[u8],
-        _claim: &[u8],
+        _resources: daemon_vhc_host::run::RunHeaderResources<'_>,
         _channels: &[u8],
         _device: &[u8],
     ) -> Result<(), SinkError> {
@@ -161,6 +161,9 @@ impl JournalSink for TerseSink {
         Ok(())
     }
     fn init(&mut self, _c: [u8; 32], _g: [u8; 32], _status: u64) -> Result<(), SinkError> {
+        Ok(())
+    }
+    fn execution_grant(&mut self, _hash: [u8; 32], _status: u64) -> Result<(), SinkError> {
         Ok(())
     }
     fn event(&mut self, _at: u64, _frame: &[u8]) -> Result<(), SinkError> {
