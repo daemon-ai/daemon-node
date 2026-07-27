@@ -3033,6 +3033,13 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
                 } else {
                     std::path::PathBuf::from(&cfg.vhc.identity_dir)
                 };
+                // The provisioned-profile home (`[PC-12]`): certified Backend Execution Profiles
+                // with their trust envelopes, the owner's acceptance policy and the lane bounds,
+                // written by dev tooling / a release provisioner — never by this process. Handed
+                // to workers as a path REFERENCE, exactly like the identity dir; an absent
+                // directory is the un-provisioned box, where a certification-minor module
+                // truthfully refuses `EstimateNotComposable`.
+                let profile_dir = cfg.data_dir.join("vhc").join("profiles");
                 // The run-state root: per-incarnation durable journal homes + the filesystem
                 // payload plane live under it (`<data_dir>/vhc/runs/<blake3(label)>/…`). Handed
                 // to workers as a path REFERENCE, exactly like the identity dir.
@@ -3072,6 +3079,10 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
                         daemon_vhc_session::journal_home::RUN_DIR_ENV.to_string(),
                         run_dir.display().to_string(),
                     ));
+                    wc.env.push((
+                        daemon_vhc_resource::PROFILE_DIR_ENV.to_string(),
+                        profile_dir.display().to_string(),
+                    ));
                     if let Some(dir) = &payload_dir {
                         wc.env.push((
                             daemon_vhc_session::journal_home::PAYLOAD_DIR_ENV.to_string(),
@@ -3091,6 +3102,7 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
                 let worker_path = cfg.vhc.worker_path.clone();
                 let factory_identity_dir = identity_dir.clone();
                 let factory_run_dir = run_dir.clone();
+                let factory_profile_dir = profile_dir.clone();
                 let worker_factory: daemon_vhc_node::service::WorkerFactory = Arc::new(move || {
                     let mut wc = daemon_vhc_supervisor::TrainClientConfig::new(&worker_path);
                     wc.assess_timeout = assess_timeout;
@@ -3101,6 +3113,10 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
                     wc.env.push((
                         daemon_vhc_session::journal_home::RUN_DIR_ENV.to_string(),
                         factory_run_dir.display().to_string(),
+                    ));
+                    wc.env.push((
+                        daemon_vhc_resource::PROFILE_DIR_ENV.to_string(),
+                        factory_profile_dir.display().to_string(),
                     ));
                     if let Some(dir) = &payload_dir_for_factory {
                         wc.env.push((

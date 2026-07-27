@@ -629,11 +629,92 @@ pub fn fixture_authored_execution_for(roles: &[&str]) -> daemon_vhc_proto::Autho
 /// a fixture's stand-in. That is the whole point of the seam — a harness with modules has no excuse
 /// to author a requirement nothing derived.
 ///
+/// The trainer's Logical Resource Plan is a function of its configuration (geometry, micro-batch,
+/// steps per round, the state contract's chunk size), so its assessment runs against the same
+/// plan-relevant bytes [`live_genesis`] will pin for the role — built by the SAME authoring
+/// function over the SAME corpus manifest, so the pinned plan and the plan every worker's own
+/// assessment derives at admission cannot drift apart here. The run label inside the config is
+/// join wiring that never enters the plan; the coordinator's plan does not vary with its opaque
+/// config (the round schedule, authored after the envelope's roles exist), so empty is what its
+/// assessment genuinely receives.
+///
 /// # Errors
-/// A human-readable failure when a module cannot be assessed or its plan will not derive.
+/// A human-readable failure when the corpus manifest cannot be read, a module cannot be assessed,
+/// or its plan will not derive.
+// Reads the vendored corpus fixture from disk: harness authoring tooling (never a shipped node
+// path), so the workspace's raw-fs ban does not apply here.
+#[allow(clippy::disallowed_methods)]
 pub fn live_execution(
     coordinator_wasm: &[u8],
     trainer_wasm: &[u8],
+    corpus_dir: &Path,
+    steps_per_round: u32,
 ) -> Result<daemon_vhc_proto::AuthoredExecution, String> {
-    crate::ceremony::ceremony_execution(coordinator_wasm, trainer_wasm)
+    live_execution_with_certification(
+        coordinator_wasm,
+        trainer_wasm,
+        corpus_dir,
+        steps_per_round,
+        daemon_vhc_proto::ProfileCertificationRequirements::default(),
+    )
+}
+
+/// [`live_execution`] with an explicit run-side profile-certification policy — the seam a harness
+/// that provisions a `[PC-12]` development authority names it through.
+///
+/// # Errors
+/// A human-readable failure when the corpus manifest cannot be read, a module cannot be assessed,
+/// or its plan will not derive.
+#[allow(clippy::disallowed_methods)]
+pub fn live_execution_with_certification(
+    coordinator_wasm: &[u8],
+    trainer_wasm: &[u8],
+    corpus_dir: &Path,
+    steps_per_round: u32,
+    profile_certification: daemon_vhc_proto::ProfileCertificationRequirements,
+) -> Result<daemon_vhc_proto::AuthoredExecution, String> {
+    use daemon_vhc_host::run::{author_execution, GrantPolicy, RoleAuthoringInput};
+
+    let manifest_bytes = std::fs::read(corpus_dir.join("corpus-manifest.cbor"))
+        .map_err(|e| format!("read the vendored corpus manifest: {e}"))?;
+    let manifest = CorpusManifest::from_canonical_bytes(&manifest_bytes)
+        .map_err(|e| format!("parse the vendored corpus manifest: {e}"))?;
+    let manifest_hash = blake3_hash(&manifest_bytes);
+    // The representative trainer config: the same authoring function [`live_genesis`] pins, over
+    // the same manifest — only the run label (plan-irrelevant join wiring) is a stand-in, because
+    // the requirements are derived once and reused across differently-labeled runs.
+    let trainer_cfg = to_canonical_vec(&trainer_live_config(
+        "live-assess",
+        &manifest,
+        manifest_hash,
+        steps_per_round,
+    ))
+    .map_err(|e| format!("encode the trainer assess config: {e}"))?;
+
+    let engine = daemon_vhc_host::Worker::new(daemon_vhc_host::EngineConfig::default())
+        .map_err(|e| format!("authoring engine: {e}"))?;
+    let make = |name, wasm, config| RoleAuthoringInput {
+        role: name,
+        wasm,
+        config,
+        grants: &[],
+        // The run's own policy about where each role may execute — not an inference from what any
+        // particular box turned out to have.
+        allowed_backend_classes: vec![
+            "cpu".to_string(),
+            "cuda".to_string(),
+            "metal".to_string(),
+            "vulkan".to_string(),
+        ],
+        profile_certification: profile_certification.clone(),
+        minima: daemon_vhc_proto::HardwareIndependentMinima::default(),
+        grant: GrantPolicy::DomainMinimum,
+    };
+    author_execution(
+        &engine,
+        vec![
+            make("coordinator", coordinator_wasm, &[][..]),
+            make("trainer", trainer_wasm, &trainer_cfg),
+        ],
+    )
 }

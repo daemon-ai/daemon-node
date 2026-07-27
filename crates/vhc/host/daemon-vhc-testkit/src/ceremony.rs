@@ -1016,34 +1016,64 @@ pub fn ceremony_execution(
     coordinator_wasm: &[u8],
     trainer_wasm: &[u8],
 ) -> Result<daemon_vhc_proto::AuthoredExecution, String> {
+    ceremony_execution_with_certification(
+        coordinator_wasm,
+        trainer_wasm,
+        daemon_vhc_proto::ProfileCertificationRequirements::default(),
+    )
+}
+
+/// [`ceremony_execution`] with an explicit run-side profile-certification policy.
+///
+/// The requirements are a **run-authoring decision** — which authorities' vouching this run
+/// accepts a Backend Execution Profile under — so they are a parameter here rather than a
+/// constant: the default (accept nothing beyond owner policy, never a development authority) is
+/// the ceremony's stance, and the `[PC-12]` integration lane names its development authority
+/// explicitly through this seam. Applied to every role uniformly: a run whose roles accepted
+/// different authorities would be certifying its own coordinator to a different bar than its
+/// trainers.
+pub fn ceremony_execution_with_certification(
+    coordinator_wasm: &[u8],
+    trainer_wasm: &[u8],
+    profile_certification: daemon_vhc_proto::ProfileCertificationRequirements,
+) -> Result<daemon_vhc_proto::AuthoredExecution, String> {
     use daemon_vhc_host::run::{author_execution, GrantPolicy, RoleAuthoringInput};
 
     let engine = daemon_vhc_host::Worker::new(daemon_vhc_host::EngineConfig::default())
         .map_err(|e| format!("authoring engine: {e}"))?;
-    fn role<'a>(name: &'a str, wasm: &'a [u8]) -> RoleAuthoringInput<'a> {
-        RoleAuthoringInput {
-            role: name,
-            wasm,
-            config: &[],
-            grants: &[],
-            // The run's own policy about where each role may execute — not an inference from what any
-            // particular box turned out to have.
-            allowed_backend_classes: vec![
-                "cpu".to_string(),
-                "cuda".to_string(),
-                "metal".to_string(),
-                "vulkan".to_string(),
-            ],
-            profile_certification: daemon_vhc_proto::ProfileCertificationRequirements::default(),
-            minima: daemon_vhc_proto::HardwareIndependentMinima::default(),
-            grant: GrantPolicy::DomainMinimum,
-        }
-    }
+    // The trainer's Logical Resource Plan is a function of its configuration (geometry,
+    // micro-batch, steps per round, the state contract's chunk size), so its assessment runs
+    // against the frozen ceremony shape — the harness form of the SAME frozen halves
+    // [`ceremony_genesis`] pins for the role, so the pinned plan and the plan every worker's own
+    // assessment derives at admission cannot drift apart here. The roster inside a trainer config
+    // is join wiring that never enters the plan, so a stand-in member serves; the coordinator's
+    // plan does not vary with its opaque config (the round schedule, authored after the envelope's
+    // roles exist), so empty is what its assessment genuinely receives.
+    let trainer_cfg =
+        daemon_vhc_proto::to_canonical_vec(&ceremony_trainer_config_harness(&[PeerId([0xA5; 32])]))
+            .map_err(|e| format!("encode the trainer assess config: {e}"))?;
+    let make = |name, wasm, config| RoleAuthoringInput {
+        role: name,
+        wasm,
+        config,
+        grants: &[],
+        // The run's own policy about where each role may execute — not an inference from what any
+        // particular box turned out to have.
+        allowed_backend_classes: vec![
+            "cpu".to_string(),
+            "cuda".to_string(),
+            "metal".to_string(),
+            "vulkan".to_string(),
+        ],
+        profile_certification: profile_certification.clone(),
+        minima: daemon_vhc_proto::HardwareIndependentMinima::default(),
+        grant: GrantPolicy::DomainMinimum,
+    };
     author_execution(
         &engine,
         vec![
-            role("coordinator", coordinator_wasm),
-            role("trainer", trainer_wasm),
+            make("coordinator", coordinator_wasm, &[][..]),
+            make("trainer", trainer_wasm, &trainer_cfg),
         ],
     )
 }

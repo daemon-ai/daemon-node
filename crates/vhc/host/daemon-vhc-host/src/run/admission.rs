@@ -245,6 +245,79 @@ pub struct ResourceAuthority<'a> {
     pub frozen_binding: Option<&'a daemon_vhc_proto::resource_plan::Binding>,
 }
 
+/// The **owned** assembly a [`ResourceAuthority`] is borrowed from.
+///
+/// [`ResourceAuthority`] is deliberately a borrowed bundle, and the authenticated profile it
+/// borrows can only be selected *against* a store — so a call site that assembles its authority
+/// from provisioned data needs somewhere for the store, the policies and the measured report to
+/// live across the `admit` call. This is that place: build it once from the node-provisioned
+/// profile file and the envelope's requirements, then [`Self::select`] the profile and borrow the
+/// [`ResourceAuthority`](Self::authority) for the funnel.
+///
+/// It also travels: a live-switch fence re-runs admission in the session, after the worker's
+/// pre-flight assembled the inputs — an owned value is what a binding can carry there.
+pub struct ResourceAuthorityParts {
+    /// The store stocked from the provisioned entries.
+    pub store: daemon_vhc_resource::ProfileStore,
+    /// The machine owner's acceptance policy, as provisioned.
+    pub owner_policy: daemon_vhc_resource::ProfileAcceptancePolicy,
+    /// The run's acceptance policy, as the signed envelope's requirements state it.
+    pub run_policy: daemon_vhc_resource::ProfileAcceptancePolicy,
+    /// The revision record of the backend implementation actually about to execute.
+    pub running: daemon_vhc_resource::BackendImplementationRevision,
+    /// This node's Device Capability Report for the selected lane.
+    pub report: daemon_vhc_resource::DeviceCapabilityReport,
+    /// The lane's estimate sanity bounds, as provisioned.
+    pub lane_bounds: daemon_vhc_resource::LaneEstimateBounds,
+    /// Role instances sharing this device, this one included.
+    pub co_resident_roles: u64,
+    /// The reservation identity this admission would hold.
+    pub reservation_identity: daemon_vhc_resource::ReservationIdentity,
+    /// The frozen configuration from the signed role entry, when the run is uniform.
+    pub frozen_binding: Option<daemon_vhc_proto::resource_plan::Binding>,
+    /// Now, for the profile's validity window.
+    pub now_ms: u64,
+}
+
+impl ResourceAuthorityParts {
+    /// Select the one profile that authenticates for this assembly, the only way an
+    /// [`daemon_vhc_resource::AuthenticatedProfile`] can be obtained.
+    ///
+    /// # Errors
+    /// [`daemon_vhc_resource::SelectionRefusal`], verbatim — no candidate, every candidate
+    /// refused (with each reason), or an ambiguous store.
+    pub fn select(
+        &self,
+    ) -> Result<daemon_vhc_resource::AuthenticatedProfile<'_>, daemon_vhc_resource::SelectionRefusal>
+    {
+        self.store
+            .select(&daemon_vhc_resource::AuthenticationContext {
+                owner: &self.owner_policy,
+                run: &self.run_policy,
+                running: &self.running,
+                planner_version: daemon_vhc_resource::PLANNER_VERSION,
+                now_ms: self.now_ms,
+            })
+    }
+
+    /// Borrow the [`ResourceAuthority`] the funnel consumes, over a profile selected from this
+    /// same assembly.
+    #[must_use]
+    pub fn authority<'a>(
+        &'a self,
+        profile: &'a daemon_vhc_resource::AuthenticatedProfile<'a>,
+    ) -> ResourceAuthority<'a> {
+        ResourceAuthority {
+            profile,
+            report: &self.report,
+            lane_bounds: &self.lane_bounds,
+            co_resident_roles: self.co_resident_roles,
+            reservation_identity: self.reservation_identity.clone(),
+            frozen_binding: self.frozen_binding.as_ref(),
+        }
+    }
+}
+
 /// The envelope-v2 grants input to the funnel (D0): one role's grant list from the genesis
 /// envelope plus the run's committed artifact-map hashes. `None` at the funnel means "no envelope
 /// grants" — the pre-D0 (v1-envelope / Phase-A default) path, where the driver defaults stand.

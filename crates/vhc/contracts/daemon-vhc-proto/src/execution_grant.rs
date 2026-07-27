@@ -300,6 +300,33 @@ impl ExecutionGrant {
         Ok(grant)
     }
 
+    /// The grant's values as a plan [`Binding`], **without** the plan-side check.
+    ///
+    /// For a consumer that holds the frozen grant but not (yet) the plan — a participant reading
+    /// the signed role entry before its own module has been assessed. The values are converted,
+    /// never validated: composition re-checks the binding against the plan it composes, so a
+    /// value outside its dimension's domain still refuses, just at the step that holds the plan.
+    ///
+    /// # Errors
+    /// [`PlanRefusal::Invalid`] when a value has a shape no schema-1 dimension domain can take.
+    pub fn values_binding(&self) -> Result<Binding, PlanRefusal> {
+        let mut binding = Binding::new();
+        for (key, value) in &self.values {
+            let selected = match value {
+                GrantValue::Uint(n) => DimensionValue::Uint(*n),
+                GrantValue::Text(s) => DimensionValue::Enum(s.clone()),
+                GrantValue::Int(_) | GrantValue::Bool(_) => {
+                    return Err(PlanRefusal::Invalid(format!(
+                        "grant value for `{key}` has no matching dimension domain; schema-1 plan \
+                         dimensions are uint ranges and enums"
+                    )))
+                }
+            };
+            binding.insert(key.clone(), selected);
+        }
+        Ok(binding)
+    }
+
     /// Check the grant against the plan it names: the digest matches, the scope agrees with the
     /// plan's declared scope, every declared dimension is selected exactly once and no other key
     /// is present, and every value satisfies its dimension's declared type and bounds. Returns
@@ -324,20 +351,7 @@ impl ExecutionGrant {
             ));
         }
 
-        let mut binding = Binding::new();
-        for (key, value) in &self.values {
-            let selected = match value {
-                GrantValue::Uint(n) => DimensionValue::Uint(*n),
-                GrantValue::Text(s) => DimensionValue::Enum(s.clone()),
-                GrantValue::Int(_) | GrantValue::Bool(_) => {
-                    return Err(PlanRefusal::Invalid(format!(
-                        "grant value for `{key}` has no matching dimension domain; schema-1 plan \
-                         dimensions are uint ranges and enums"
-                    )))
-                }
-            };
-            binding.insert(key.clone(), selected);
-        }
+        let binding = self.values_binding()?;
         plan.check_binding(&binding)?;
         Ok(binding)
     }

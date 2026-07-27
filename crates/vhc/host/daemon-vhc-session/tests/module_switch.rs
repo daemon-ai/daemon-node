@@ -284,6 +284,9 @@ fn switch_binding_for(
         lane: lane(),
         device: device(),
         owner: owner(),
+        // Un-provisioned: these fixtures drive declared-claim modules, which never needed an
+        // authority; the composed fence path is the worker's business.
+        resources: None,
         journal,
         deadline_ms: 10_000,
         migrate_fuel,

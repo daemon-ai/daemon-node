@@ -3623,6 +3623,7 @@ dependencies = [
  "daemon-tool-web",
  "daemon-transport",
  "daemon-vhc-node",
+ "daemon-vhc-resource",
  "daemon-vhc-session",
  "daemon-vhc-supervisor",
  "daemon-wechat",
@@ -4871,6 +4872,7 @@ dependencies = [
  "daemon-vhc-journal",
  "daemon-vhc-net",
  "daemon-vhc-proto",
+ "daemon-vhc-resource",
  "daemon-vhc-session",
  "daemon-vhc-testkit",
  "futures",
@@ -5041,6 +5043,7 @@ dependencies = [
  "ciborium",
  "daemon-vhc-proto",
  "serde",
+ "tempfile",
  "thiserror 2.0.18",
 ]
 

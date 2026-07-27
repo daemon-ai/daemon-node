@@ -336,6 +336,52 @@ async fn main() {
         return;
     }
 
+    // Revision-record export mode (the provisioning seam, `[PC-12]`): write each advertised
+    // backend class's `BackendImplementationRevision` — the record admission will compare a
+    // profile's trust envelope against, sealed-binary identity included — as canonical CBOR into
+    // the named directory, then exit. This exists because profile AUTHORING lives outside this
+    // binary (dev tooling, a release provisioner) while the revision record can only truthfully
+    // come from the binary that will run: an author that re-derived it independently would be
+    // vouching for a record nobody will ever present. One file per class:
+    // `revision-<class>.cbor`.
+    if let Some(dir) = std::env::var_os("DAEMON_TRAIN_REVISION_OUT") {
+        let dir = std::path::PathBuf::from(dir);
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            eprintln!(
+                "daemon-vhc-worker: revision export: create {}: {e}",
+                dir.display()
+            );
+            std::process::exit(1);
+        }
+        for capability in backend::backend_inventory() {
+            let record = backend::revision_record(&capability);
+            let bytes = match daemon_vhc_proto::to_canonical_vec(&record) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    eprintln!(
+                        "daemon-vhc-worker: revision export: encode `{}`: {e}",
+                        capability.class
+                    );
+                    std::process::exit(1);
+                }
+            };
+            let path = dir.join(format!("revision-{}.cbor", capability.class));
+            if let Err(e) = std::fs::write(&path, bytes) {
+                eprintln!(
+                    "daemon-vhc-worker: revision export: write {}: {e}",
+                    path.display()
+                );
+                std::process::exit(1);
+            }
+            println!(
+                "revision-record[{}] -> {}",
+                capability.class,
+                path.display()
+            );
+        }
+        return;
+    }
+
     // Fleet cache-warming mode (the artifact-distribution path): fetch the run's module/corpus by
     // content hash from the payload store into the on-disk content cache, print per-object
     // evidence, then exit — the fleet-staging entry point (replaces the earlier scp pre-staging).
@@ -453,12 +499,24 @@ async fn main() {
                                 role: &g.worker_role,
                                 incarnation: 0,
                             });
+                        // The role's envelope context: the requirements the run signed for this
+                        // role, from which a provisioned box composes its resource authority.
+                        let role_context =
+                            resolved.genesis.as_ref().map(|g| backend::RoleContext {
+                                role: &g.worker_role,
+                                execution: g
+                                    .env
+                                    .roles
+                                    .get(&g.worker_role)
+                                    .and_then(|entry| entry.execution.as_ref()),
+                            });
                         match backend::assess(
                             &resolved.module,
                             &resolved.config,
                             resolved.module_blake3.as_ref(),
                             resolved.device_min.as_ref(),
                             resolved.envelope_grants().as_ref(),
+                            role_context,
                             tuple_identity,
                         ) {
                             Ok((elig, is_v2)) => {
@@ -559,12 +617,23 @@ async fn main() {
                         role: &expected.role,
                         incarnation: expected.incarnation,
                     };
+                    // The same role context assess composed with, so the rederivation holds the
+                    // same authority and the composed members compare byte-for-byte.
+                    let role_context = backend::RoleContext {
+                        role: &genesis.worker_role,
+                        execution: genesis
+                            .env
+                            .roles
+                            .get(&genesis.worker_role)
+                            .and_then(|entry| entry.execution.as_ref()),
+                    };
                     match backend::assess(
                         &resolved.module,
                         &resolved.config,
                         resolved.module_blake3.as_ref(),
                         resolved.device_min.as_ref(),
                         resolved.envelope_grants().as_ref(),
+                        Some(role_context),
                         Some(tuple_identity),
                     ) {
                         Ok((rederived_elig, _)) => {

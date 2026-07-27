@@ -146,3 +146,55 @@ pub fn trivial_plan() -> LogicalResourcePlan {
 pub fn trivial_binding(micro_batch: u64) -> Binding {
     crate::planner::fixtures::binding(micro_batch)
 }
+
+/// A complete provisioned-profile set for a **real** running revision under a named
+/// **development** authority — the `[PC-12]` integration lane's authoring path.
+///
+/// This is where a test or an acceptance harness mints what an operator's tooling would mint on a
+/// real box: a conservative profile priced for `running` (the record the worker binary itself
+/// exported — fixtures cannot stand in for it, because authentication compares the sealed-binary
+/// identity and the implementation revision against what actually runs), a trust envelope binding
+/// that profile and permitting exactly the revision signal `running` reports, an owner policy
+/// naming `authority` as a development authority, and generous lane bounds.
+///
+/// Deliberately behind the `test-support` fence with the rest of the minting surface: a
+/// production binary that could call this could vouch for itself. The run side must name the same
+/// `authority` in its `accepted_development_authorities` — a development authority authenticates
+/// only when BOTH sides opt in, and the resulting [`crate::trust::AuthorityClass::Development`]
+/// can never certify a ceremony.
+#[must_use]
+pub fn development_provisioned_profiles(
+    running: &BackendImplementationRevision,
+    authority: daemon_vhc_proto::PeerId,
+) -> crate::provision::ProvisionedProfiles {
+    let profile = crate::trust::fixtures::profile_for(running);
+    let mut envelope = crate::trust::fixtures::envelope_for(&profile, running);
+    envelope.authority = crate::trust::ProfileAuthority {
+        signer: authority,
+        release_authority: "development authority (PC-12 integration lane)".into(),
+    };
+    // The fixture window is a unit-test clock; a provisioned file authenticates at wall-clock
+    // `now_ms`, so the envelope's validity must contain it. Generous on purpose: expiry policy is
+    // an operator decision, and a dev profile that silently lapsed mid-run would read as a
+    // composition defect.
+    envelope.validity.not_before_ms = 0;
+    envelope.validity.not_after_ms = u64::MAX;
+
+    let owner_policy = crate::trust::ProfileAcceptancePolicy {
+        accepted_authorities: std::collections::BTreeSet::new(),
+        accepted_development_authorities: [authority].into_iter().collect(),
+        min_profile_schema: 1,
+        accepted_planner_versions: [crate::planner::PLANNER_VERSION].into_iter().collect(),
+        require_conformance_evidence: true,
+        require_measured_allocation_ceiling: true,
+        require_full_calibration: true,
+        revoked_profiles: std::collections::BTreeSet::new(),
+    };
+
+    crate::provision::ProvisionedProfiles {
+        schema: crate::provision::PROVISIONED_PROFILES_SCHEMA,
+        owner_policy,
+        lane_bounds: generous_lane_bounds(),
+        entries: vec![crate::provision::ProvisionedEntry { profile, envelope }],
+    }
+}

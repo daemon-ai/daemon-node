@@ -91,6 +91,72 @@ fn module_path(name: &str) -> PathBuf {
     daemon_vhc_guest_build::built_module_path(name)
 }
 
+/// The suite's **development authority** (`[PC-12]`): pure data — nothing signs with it —
+/// acceptable only because BOTH the provisioned owner policy and the run's requirements name it.
+fn development_authority() -> PeerId {
+    PeerId(*blake3::hash(b"join-suite/development-authority").as_bytes())
+}
+
+/// The provisioned profile home (`DAEMON_VHC_PROFILE_DIR`) for the worker this suite spawns: the
+/// development-authority CPU profile set, built against the revision record the REAL worker
+/// binary exports about itself (`DAEMON_TRAIN_REVISION_OUT`) — a record this test derived
+/// independently would vouch for a binary nobody runs.
+fn provisioned_profile_dir() -> &'static tempfile::TempDir {
+    static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let export = tempfile::tempdir().expect("revision export dir");
+        let status = std::process::Command::new(env!("CARGO_BIN_EXE_daemon-vhc-worker"))
+            .env("DAEMON_TRAIN_REVISION_OUT", export.path())
+            .stdout(std::process::Stdio::null())
+            .status()
+            .expect("run the worker's revision export");
+        assert!(status.success(), "worker revision export failed");
+        let bytes = std::fs::read(export.path().join("revision-cpu.cbor"))
+            .expect("the worker exported its CPU-lane revision record");
+        let record: daemon_vhc_resource::BackendImplementationRevision =
+            daemon_vhc_proto::from_canonical_slice(&bytes)
+                .expect("the exported revision record decodes");
+        let set = daemon_vhc_resource::test_support::development_provisioned_profiles(
+            &record,
+            development_authority(),
+        );
+        let dir = tempfile::tempdir().expect("profile dir");
+        daemon_vhc_resource::provision::write(dir.path(), &set).expect("write provisioned set");
+        dir
+    })
+}
+
+/// The trainer role's execution requirements, derived from the module's own assessment over the
+/// SAME config the role runs (the plan is a function of the configuration), through the single
+/// authoring seam — naming the suite's development authority so the provisioned profile above is
+/// acceptable to the run side too.
+fn trainer_execution(worker_wasm: &[u8]) -> daemon_vhc_proto::RoleExecutionRequirements {
+    use daemon_vhc_host::run::{author_execution, GrantPolicy, RoleAuthoringInput};
+    let engine = daemon_vhc_host::Worker::new(daemon_vhc_host::EngineConfig::default())
+        .expect("authoring engine");
+    let config = to_canonical_vec(&trainer_role_config()).expect("trainer config cbor");
+    let authored = author_execution(
+        &engine,
+        vec![RoleAuthoringInput {
+            role: "trainer",
+            wasm: worker_wasm,
+            config: &config,
+            grants: &[],
+            allowed_backend_classes: vec!["cpu".to_string()],
+            profile_certification: daemon_vhc_proto::ProfileCertificationRequirements {
+                accepted_development_authorities: vec![development_authority()],
+                ..Default::default()
+            },
+            minima: daemon_vhc_proto::HardwareIndependentMinima::default(),
+            grant: GrantPolicy::DomainMinimum,
+        }],
+    )
+    .expect("derive the trainer execution requirements");
+    authored
+        .for_role("trainer")
+        .expect("the authored set carries the trainer role")
+}
+
 /// The trainer's canonical parameter element counts for the tiny parity-shape model below
 /// (`ModelCfg::param_numels` — tok, per-block 9 params, final norm).
 fn param_numels() -> Vec<usize> {
@@ -299,13 +365,10 @@ fn genesis_wire() -> Vec<u8> {
     roles.insert(
         "trainer".to_string(),
         RoleEntry {
-            // A fixture envelope: this exercises paths that have nothing to do with resources, and it
-            // uses the SAME shared trivial construction every compute-free module emits.
-            execution: Some(
-                daemon_vhc_proto::RoleExecutionRequirements::fixture_over_trivial_plan(vec![
-                    "cpu".to_string()
-                ]),
-            ),
+            // Derived, not a fixture: the trainer emits a real Logical Resource Plan, so the
+            // envelope pins what the module's own assessment said (over this role's config) and
+            // names the suite's development authority for profile acceptance.
+            execution: Some(trainer_execution(&worker_wasm)),
             lane: "trainer".into(),
             module: "worker.wasm".into(),
             abi: "vhc@2".into(),
@@ -392,6 +455,12 @@ async fn worker_joins_and_runs_rounds_under_the_coordinator() {
         (
             IDENTITY_DIR_ENV.to_string(),
             identity_fixture().dir.path().display().to_string(),
+        ),
+        // The provisioned-profile reference the node would pass (`[PC-12]`): the dev-authority
+        // CPU profile set the plan-emitting trainer composes its Physical Estimate against.
+        (
+            daemon_vhc_resource::provision::PROFILE_DIR_ENV.to_string(),
+            provisioned_profile_dir().path().display().to_string(),
         ),
     ];
     cfg.spawn_timeout = Duration::from_secs(30);

@@ -36,6 +36,11 @@ daemon-vhc-session = { workspace = true }
 daemon-vhc-testkit = { workspace = true }
 daemon-vhc-journal = { workspace = true }
 daemon-vhc-proto = { workspace = true }
+# The `[PC-12]` development-authority provisioning seam: the harness authors each node's
+# provisioned-profile file (dev tooling minting, legal on a dev edge only — `xtask vhc-dep-check`
+# enforces that this feature never rides a production edge) against the revision record the real
+# worker binary exports.
+daemon-vhc-resource = { workspace = true, features = ["test-support"] }
 daemon-vhc-net = { workspace = true, features = ["harness"] }
 tokio = { workspace = true }
 ciborium = { workspace = true }

@@ -147,7 +147,12 @@ impl AuthorityClass {
 
 /// One side's acceptance policy. The effective policy is the intersection of the owner's and the
 /// run's.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+///
+/// Serializable because the **owner's** policy is provisioned data: it rides the node-provisioned
+/// profile file ([`crate::provision`]) exactly as the operator authored it. The run's policy is
+/// never serialized from here — it is derived, at the point of use, from the signed envelope's
+/// [`ProfileCertificationRequirements`] via [`ProfileAcceptancePolicy::from_requirements`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProfileAcceptancePolicy {
     /// The **release** authorities this side accepts. Empty means this side names no authority of its
     /// own and defers to the other — it never means "any authority", which is why the intersection
@@ -181,6 +186,40 @@ pub struct ProfileAcceptancePolicy {
     pub require_full_calibration: bool,
     /// Profile digests this side has revoked.
     pub revoked_profiles: BTreeSet<Hash>,
+}
+
+impl ProfileAcceptancePolicy {
+    /// The **run's** acceptance policy, as the signed envelope stated it.
+    ///
+    /// This is a translation, not a judgement: every member the run's
+    /// [`ProfileCertificationRequirements`](daemon_vhc_proto::ProfileCertificationRequirements)
+    /// vocabulary carries maps across verbatim, and every member that vocabulary deliberately does
+    /// **not** carry (measured-ceiling and full-calibration requirements, revocations) stays at its
+    /// permissive default — those are owner-side judgements about a machine, and a run that stated
+    /// them would be claiming an opinion about hardware it has never seen.
+    #[must_use]
+    pub fn from_requirements(
+        requirements: &daemon_vhc_proto::ProfileCertificationRequirements,
+    ) -> Self {
+        Self {
+            accepted_authorities: requirements.accepted_authorities.iter().copied().collect(),
+            accepted_development_authorities: requirements
+                .accepted_development_authorities
+                .iter()
+                .copied()
+                .collect(),
+            min_profile_schema: requirements.min_profile_schema,
+            accepted_planner_versions: requirements
+                .accepted_planner_versions
+                .iter()
+                .copied()
+                .collect(),
+            require_conformance_evidence: requirements.require_conformance_evidence,
+            require_measured_allocation_ceiling: false,
+            require_full_calibration: false,
+            revoked_profiles: BTreeSet::new(),
+        }
+    }
 }
 
 /// Which policy refused.

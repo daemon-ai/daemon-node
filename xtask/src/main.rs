@@ -1189,6 +1189,13 @@ const VHC_T2_SUITES: &[SuiteEntry<'static>] = &[
 /// watchdog, so the acceptance suite spawns the release binaries (located via
 /// `VHC_ACCEPTANCE_BIN_DIR`, the durable finding baked into the lane). The suite itself is a
 /// debug test binary; only the spawned product binaries are release.
+///
+/// This lane is **C0 — the ceremony ladder's one-box rung** (`docs/vhc-program-state.md` §5,
+/// ceremony runbook): coordinator + two
+/// trainers as three real processes at the pinned structural geometry, with digest agreement,
+/// checkpoint restore, churn/hard-kill drills, and a live module switch. It runs on every merge as
+/// the production gate's non-negotiable core beside the det suites; the higher rungs (C1 two-box,
+/// C2 the fleet ceremony) are strict supersets and never the first place a defect can surface.
 fn vhc_acceptance() -> anyhow::Result<()> {
     let root = workspace_root();
     run_lane_memoized(&root, "vhc-acceptance", &[], || {

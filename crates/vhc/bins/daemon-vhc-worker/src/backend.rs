@@ -1231,6 +1231,7 @@ pub(crate) fn assess(
     module_blake3: Option<&[u8; 32]>,
     device_min: Option<&daemon_vhc_proto::DeviceMinimums>,
     envelope_grants: Option<&daemon_vhc_host::run::EnvelopeRoleGrants>,
+    role_context: Option<RoleContext<'_>>,
     tuple_identity: Option<TupleIdentity<'_>>,
 ) -> Result<(Eligibility, bool), String> {
     // `DAEMON_TRAIN_BACKEND` set ⇒ the roomy 160M-scale budgets (real-scale param layouts exceed
@@ -1251,6 +1252,7 @@ pub(crate) fn assess(
                     module_blake3,
                     device_min,
                     envelope_grants,
+                    role_context,
                     tuple_identity,
                 ),
                 true,
@@ -1267,6 +1269,21 @@ pub(crate) fn assess(
             false,
         )),
     }
+}
+
+/// The envelope-role context an assessment composes its resource authority from: the role label
+/// (the reservation's stable scope) and the signed role entry's execution requirements (the run's
+/// profile-certification policy and the frozen uniform-run grant).
+///
+/// Separate from [`TupleIdentity`] because the two arrive at different times: the role context
+/// exists whenever a genesis is resolved (every assess), while the tuple identity exists only when
+/// the caller means to produce an admitted tuple.
+#[derive(Clone, Copy)]
+pub(crate) struct RoleContext<'a> {
+    /// The envelope-level role label being assessed.
+    pub(crate) role: &'a str,
+    /// The signed role entry's execution requirements, when the envelope carries them.
+    pub(crate) execution: Option<&'a daemon_vhc_proto::RoleExecutionRequirements>,
 }
 
 /// The non-artifact identity fields the admitted tuple needs beyond what the module/config/grants
@@ -1335,6 +1352,24 @@ pub(crate) fn role_binding(
         vram_cap_bytes: 0,
         host_cap_bytes: 0,
     };
+    // The resource authority, when this box is provisioned (`[PC-12]`): the same measured
+    // selection assess ran, the same provisioned store, the same envelope requirements — so the
+    // join's re-admission composes the identical estimate. An un-provisioned box passes `None`
+    // and a certification-minor module keeps refusing `EstimateNotComposable`, typed.
+    let selection = measured_backend(resolved.device_min.as_ref())
+        .map_err(|detail| format!("join re-admission: backend selection: {detail}"))?;
+    let role_execution = genesis
+        .env
+        .roles
+        .get(&genesis.worker_role)
+        .and_then(|entry| entry.execution.as_ref());
+    let parts = resource_authority_parts(&selection, &genesis.worker_role, role_execution)
+        .map_err(|detail| format!("join re-admission: resource authority: {detail}"))?;
+    let profile = selected_profile(parts.as_ref());
+    let authority = match (parts.as_ref(), profile.as_ref()) {
+        (Some(parts), Some(profile)) => Some(parts.authority(profile)),
+        _ => None,
+    };
     let admission = daemon_vhc_host::run::admit(
         &worker,
         &resolved.module,
@@ -1346,12 +1381,7 @@ pub(crate) fn role_binding(
         &owner,
         resolved.device_min.as_ref(),
         envelope_grants.as_ref(),
-        // No resource authority is assembled on this path yet, so a certification-minor module is
-        // refused `EstimateNotComposable` here — which is the correct answer today rather than a gap
-        // being papered over. Assembling one needs a certified profile to select, and no certified
-        // profile artifact exists on any box: profile certification is the measurement wave's
-        // deliverable and release signing is fenced. The funnel composes as soon as one is present.
-        None,
+        authority.as_ref(),
     )
     .map_err(|refusal| format!("join re-admission: {refusal}"))?;
 
@@ -1602,6 +1632,22 @@ pub(crate) async fn assess_switch(
     };
     let envelope_grants =
         daemon_vhc_host::run::EnvelopeRoleGrants::from_genesis(&genesis.env, &genesis.worker_role);
+    // As on the join path: the provisioned authority when this box holds one, else the truthful
+    // `None` floor. The fence re-runs this same assembly from the binding it is handed.
+    let role_execution = genesis
+        .env
+        .roles
+        .get(&genesis.worker_role)
+        .and_then(|entry| entry.execution.as_ref());
+    let parts = match resource_authority_parts(&selection, &genesis.worker_role, role_execution) {
+        Ok(parts) => parts,
+        Err(reason) => return Ok(ineligible(reason, None)),
+    };
+    let profile = selected_profile(parts.as_ref());
+    let authority = match (parts.as_ref(), profile.as_ref()) {
+        (Some(parts), Some(profile)) => Some(parts.authority(profile)),
+        _ => None,
+    };
     match daemon_vhc_host::run::admit(
         &worker,
         &bytes,
@@ -1615,8 +1661,7 @@ pub(crate) async fn assess_switch(
         &owner,
         resolved.device_min.as_ref(),
         envelope_grants.as_ref(),
-        // As on the join path: no certified profile exists to select, so no authority is assembled.
-        None,
+        authority.as_ref(),
     ) {
         Ok(admission) => Ok(Eligibility {
             eligible: true,
@@ -1797,6 +1842,39 @@ pub(crate) fn switch_binding(
             }),
         };
 
+    // The provisioned resource authority, assembled here (the worker holds the provisioning env
+    // and the probe machinery) and carried owned so the fence — which runs in the session —
+    // re-runs owner law over the same authority the pre-switch assessment composed with. The
+    // placement is the tuple's own recorded selection — the fence's subject is the committed
+    // target at the admitted placement, not a fresh ladder walk — and the class is read off this
+    // build's inventory record for that engine slug.
+    let resources = {
+        let selection = backend_inventory()
+            .into_iter()
+            .find(|c| c.backend == tuple.backend)
+            .map(|c| BackendSelection {
+                slug: tuple.backend.clone(),
+                class: c.class,
+                gpu_index: tuple.gpu_index,
+            })
+            .ok_or_else(|| {
+                format!(
+                    "the admitted tuple's backend `{}` has no inventory record on this build",
+                    tuple.backend
+                )
+            })?;
+        resource_authority_parts(
+            &selection,
+            &genesis.worker_role,
+            genesis
+                .env
+                .roles
+                .get(&genesis.worker_role)
+                .and_then(|entry| entry.execution.as_ref()),
+        )
+        .map_err(|detail| format!("switch resource authority: {detail}"))?
+    };
+
     Ok(daemon_vhc_session::role_session::SwitchBinding {
         epoch,
         new_module,
@@ -1817,6 +1895,7 @@ pub(crate) fn switch_binding(
         lane: selected_lane(),
         device,
         owner,
+        resources,
         journal,
         deadline_ms,
         migrate_fuel: None,
@@ -1858,6 +1937,7 @@ pub(crate) fn selected_lane() -> daemon_vhc_host::run::ParticipationLane {
 /// - **Stage 5 owner caps** are uncapped at assess time: the standing resource policy
 ///   (`JoinPolicy{vram_cap_mb, …}`) arrives with `JoinRun`, where the join-time re-check judges
 ///   it (§9.4 step 10 re-runs stage 5 against the recorded claim).
+#[allow(clippy::too_many_arguments)]
 fn assess_module(
     worker: &Worker,
     module: &[u8],
@@ -1865,6 +1945,7 @@ fn assess_module(
     module_blake3: Option<&[u8; 32]>,
     device_min: Option<&daemon_vhc_proto::DeviceMinimums>,
     envelope_grants: Option<&daemon_vhc_host::run::EnvelopeRoleGrants>,
+    role_context: Option<RoleContext<'_>>,
     tuple_identity: Option<TupleIdentity<'_>>,
 ) -> Eligibility {
     let lane = selected_lane();
@@ -1911,6 +1992,30 @@ fn assess_module(
             }
         }
     };
+    // The resource authority for a provisioned box (`[PC-12]`): assembled from the selected
+    // backend, the provisioned store and the signed role entry's requirements. `None` — the
+    // truthful certification-minor refusal — when the box is un-provisioned, when the envelope
+    // carries no role context, or when nothing authenticates (the refusal goes to stderr).
+    let parts = match role_context {
+        Some(ctx) => match resource_authority_parts(&selection, ctx.role, ctx.execution) {
+            Ok(parts) => parts,
+            Err(detail) => {
+                return Eligibility {
+                    eligible: false,
+                    reasons: vec![detail],
+                    headroom: Vec::new(),
+                    refusal_code: None,
+                    admitted_tuple: None,
+                }
+            }
+        },
+        None => None,
+    };
+    let profile = selected_profile(parts.as_ref());
+    let authority = match (parts.as_ref(), profile.as_ref()) {
+        (Some(parts), Some(profile)) => Some(parts.authority(profile)),
+        _ => None,
+    };
     match daemon_vhc_host::run::admit(
         worker,
         module,
@@ -1926,8 +2031,7 @@ fn assess_module(
         // the lane at stage 4.0 (mixed-fleet retired-native-coordinator). `None` on the v1-envelope path, where the
         // funnel's pre-D0 defaults stand.
         envelope_grants,
-        // As on the join path: no certified profile exists to select, so no authority is assembled.
-        None,
+        authority.as_ref(),
     ) {
         Ok(admission) => {
             // The immutable admitted tuple this assessment produced (architecture §6.3): the exact
@@ -2736,6 +2840,265 @@ pub(crate) fn device_capability_report() -> Option<daemon_vhc_resource::DeviceCa
     })
 }
 
+/// The **CPU lane's** Device Capability Report, or `None` when host RAM could not be measured.
+///
+/// The device path above produces nothing on a CPU-only selection, which used to be the end of the
+/// story — and with the certification minor it no longer can be: a CPU participant composes its
+/// estimate like any other lane, so it needs a report stating what its "device" — the host DRAM
+/// pool the CPU allocator draws on — supplies.
+///
+/// Every figure is either measured here or produced by the same derivation the device path uses:
+/// the pool is [`MemoryPoolTopology::Unified`] with the shared pool equal to physical RAM (a CPU
+/// tensor and a guest linear memory draw on exactly one DRAM), the supply comes out of
+/// `derive_device_supply` (90% of the pool, RAM-clamped — conservative on purpose), and the
+/// per-allocation ceiling is measured by allocating on the CPU engine. Free disk is deliberately a
+/// typed absence rather than a reading: it moves between two calls on an otherwise idle box, and
+/// this report is compared **by digest** between assess and join — a figure that drifts would
+/// refuse joins for a fact no admission consumes.
+fn cpu_capability_report() -> Option<daemon_vhc_resource::DeviceCapabilityReport> {
+    use daemon_vhc_resource::{
+        DeviceCapabilityReport, HostDeviceFacts, LinkCapacity, Maybe, MemoryPoolTopology,
+        SupplyPlatform, Unavailable, DEVICE_CAPABILITY_REPORT_SCHEMA,
+    };
+
+    let ram_bytes = host_ram_mb() << 20;
+    if ram_bytes == 0 {
+        // The probe failed; a report built on a zero would refuse the machine while looking
+        // measured. Absence is the honest answer and admission refuses on it, typed.
+        return None;
+    }
+    let platform = if cfg!(target_os = "macos") {
+        SupplyPlatform::Macos
+    } else if cfg!(target_os = "windows") {
+        SupplyPlatform::Windows
+    } else {
+        SupplyPlatform::Linux
+    };
+    let facts = HostDeviceFacts {
+        platform,
+        unified: true,
+        dedicated_bytes: 0,
+        shared_pool_bytes: ram_bytes,
+        host_ram_bytes: ram_bytes,
+        platform_budget_bytes: None,
+        advertised_device_heap_bytes: None,
+    };
+    let supply = daemon_vhc_resource::derive_device_supply(&facts);
+
+    let cpu_capability = backend_inventory().into_iter().find(|c| c.class == "cpu")?;
+    let revision_digest =
+        daemon_vhc_resource::revision_record_digest(&revision_record(&cpu_capability)).ok()?;
+
+    Some(DeviceCapabilityReport {
+        schema: DEVICE_CAPABILITY_REPORT_SCHEMA,
+        backend_class: daemon_vhc_resource::BackendClass::Cpu,
+        adapter_name: if cpu_capability.adapter.trim().is_empty() {
+            "cpu".to_string()
+        } else {
+            cpu_capability.adapter.clone()
+        },
+        device_supply: supply,
+        memory_pool: MemoryPoolTopology::Unified,
+        // **There is no such thing for this lane** — the CPU class allocates through the host
+        // allocator, which has no driver refusal boundary short of supply itself, so a measured
+        // per-allocation ceiling is absent by construction (the measurement hook says so: its CPU
+        // arm answers a different question). The pool-bound check validates a CPU estimate's
+        // largest allocation against usable supply instead.
+        measured_max_allocation: Maybe::Unavailable(Unavailable::NotApplicableToLane),
+        host_memory_bytes: Maybe::Available(ram_bytes),
+        // A typed absence by design (see the doc comment): nothing in admission consumes disk from
+        // the report, and a volatile reading would move the digest between assess and join.
+        disk_bytes: Maybe::Unavailable(Unavailable::NotExposedByPlatform),
+        // Not enumerated by anything in this build; a family gate reading this set must refuse for
+        // want of evidence rather than find entries nobody probed (same stance as the device path).
+        supported_operation_families: std::collections::BTreeSet::new(),
+        supported_dtypes: std::collections::BTreeSet::new(),
+        link: LinkCapacity {
+            uplink_bps: Maybe::Unavailable(Unavailable::ProbeFailed),
+            downlink_bps: Maybe::Unavailable(Unavailable::ProbeFailed),
+        },
+        implementation_revision_digest: revision_digest,
+        applicable_profile_digest: Maybe::default(),
+    })
+}
+
+/// The capability report for one backend class, computed once per process.
+///
+/// Cached because the report travels **by digest** inside the admitted tuple's composed branch,
+/// and join re-derives and compares: two calls that measured twice (a per-allocation bisection, a
+/// moving free-disk figure) could disagree about a machine that did not change, and the mismatch
+/// would read as a swapped artifact. One process, one statement per class.
+fn capability_report_for_class(
+    class: daemon_vhc_resource::BackendClass,
+) -> Option<daemon_vhc_resource::DeviceCapabilityReport> {
+    use std::sync::Mutex;
+    static REPORTS: Mutex<
+        std::collections::BTreeMap<
+            &'static str,
+            Option<daemon_vhc_resource::DeviceCapabilityReport>,
+        >,
+    > = Mutex::new(std::collections::BTreeMap::new());
+
+    let mut cache = REPORTS.lock().expect("capability report cache");
+    cache
+        .entry(class.slug())
+        .or_insert_with(|| {
+            if class == daemon_vhc_resource::BackendClass::Cpu {
+                cpu_capability_report()
+            } else {
+                // The device path reports the class the probe actually found; attributing one
+                // lane's supply to another class would be the substitution the report refuses.
+                device_capability_report().filter(|report| report.backend_class == class)
+            }
+        })
+        .clone()
+}
+
+/// Assemble the owned [`ResourceAuthorityParts`] for one admission, from the node-provisioned
+/// profile file and the signed envelope's role requirements — or `Ok(None)` on an un-provisioned
+/// box, which stays today's truthful floor (a certification-minor module refuses
+/// `EstimateNotComposable`; a declared-claim module never needed an authority).
+///
+/// What each member is sourced from, and why:
+/// - **store + owner policy + lane bounds** — the provisioned file (`DAEMON_VHC_PROFILE_DIR`),
+///   the operator's data. A file that exists but cannot be read is a hard error, never a silent
+///   `None`: mis-reading provisioned data would run the box on a configuration nobody stated.
+/// - **run policy** — the envelope role's `profile_certification`, translated verbatim
+///   ([`daemon_vhc_resource::ProfileAcceptancePolicy::from_requirements`]). A run that stated no
+///   requirements gets the default policy, under which a development authority never
+///   authenticates — PC-12's both-sides rule enforcing itself.
+/// - **running** — [`revision_record`] over this build's own inventory entry for the selected
+///   class: the only provenance authentication admits.
+/// - **report** — [`capability_report_for_class`], measured here, cached for digest stability.
+/// - **frozen binding** — the signed role entry's uniform-run Execution Grant, decoded and
+///   converted; participants verify the frozen choice rather than reselecting (`[RC-11]`).
+/// - **reservation identity** — deliberately derived from stable inputs only (role and the
+///   selected placement, zero incarnation/sequence): the identity rides the admitted tuple's
+///   composed branch and join re-derives and compares, so a node-minted counter in it would make
+///   the same admission hash differently on the two paths. The governor's node-side ledger is not
+///   wired at this seam yet; when it is, the sequence becomes its business.
+pub(crate) fn resource_authority_parts(
+    selection: &BackendSelection,
+    worker_role: &str,
+    role_execution: Option<&daemon_vhc_proto::RoleExecutionRequirements>,
+) -> Result<Option<daemon_vhc_host::run::ResourceAuthorityParts>, String> {
+    use daemon_vhc_resource::provision;
+
+    let Some(provisioned) =
+        provision::load_from_env().map_err(|e| format!("provisioned profiles: {e}"))?
+    else {
+        return Ok(None);
+    };
+
+    let class = match selection.class.as_str() {
+        "vulkan" => daemon_vhc_resource::BackendClass::Vulkan,
+        "metal" => daemon_vhc_resource::BackendClass::Metal,
+        "dx12" => daemon_vhc_resource::BackendClass::Dx12,
+        "cuda" => daemon_vhc_resource::BackendClass::Cuda,
+        "cpu" => daemon_vhc_resource::BackendClass::Cpu,
+        other => {
+            return Err(format!(
+                "the selected backend class `{other}` is not one the resource model prices"
+            ))
+        }
+    };
+    let capability = backend_inventory()
+        .into_iter()
+        .find(|c| c.class == selection.class)
+        .ok_or_else(|| {
+            format!(
+                "the selected backend class `{}` has no inventory record on this build",
+                selection.class
+            )
+        })?;
+    let running = revision_record(&capability);
+
+    let report = capability_report_for_class(class).ok_or_else(|| {
+        format!(
+            "no capability report could be produced for the `{}` lane on this box, so a composed \
+             admission has no supply statement to authorize against",
+            selection.class
+        )
+    })?;
+
+    let mut store = daemon_vhc_resource::ProfileStore::new();
+    provisioned
+        .stock(&mut store)
+        .map_err(|e| format!("provisioned profiles do not stock: {e}"))?;
+
+    let run_policy = role_execution
+        .map(|execution| {
+            daemon_vhc_resource::ProfileAcceptancePolicy::from_requirements(
+                &execution.profile_certification,
+            )
+        })
+        .unwrap_or_default();
+
+    let frozen_binding = match role_execution.map(|e| &e.selection) {
+        Some(daemon_vhc_proto::SelectionRequirement::UniformRun {
+            execution_grant, ..
+        }) => {
+            let grant = daemon_vhc_proto::ExecutionGrant::decode_canonical(execution_grant)
+                .map_err(|e| {
+                    format!("the signed role entry's frozen Execution Grant does not decode: {e}")
+                })?;
+            Some(
+                grant
+                    .values_binding()
+                    .map_err(|e| format!("the frozen Execution Grant's values do not bind: {e}"))?,
+            )
+        }
+        _ => None,
+    };
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
+
+    Ok(Some(daemon_vhc_host::run::ResourceAuthorityParts {
+        store,
+        owner_policy: provisioned.owner_policy,
+        run_policy,
+        running,
+        report,
+        lane_bounds: provisioned.lane_bounds,
+        co_resident_roles: 1,
+        reservation_identity: daemon_vhc_resource::ReservationIdentity {
+            role: worker_role.to_string(),
+            incarnation: 0,
+            device_identity: format!("{}:{}", selection.slug, selection.gpu_index),
+            sequence: 0,
+        },
+        frozen_binding,
+        now_ms,
+    }))
+}
+
+/// Select the authenticated profile from an assembled authority, or `None` — with the refusal on
+/// stderr — when nothing authenticates.
+///
+/// The `None` is truthful, not lenient: a provisioned box whose profile does not authenticate
+/// holds no authority, so a certification-minor module refuses `EstimateNotComposable` exactly as
+/// an un-provisioned box does, while a declared-claim module (which never needed an authority)
+/// keeps admitting. The refusal's own words go to the diagnostics channel so the operator hears
+/// *why* the provisioning did not take, instead of a generic not-composable downstream.
+pub(crate) fn selected_profile(
+    parts: Option<&daemon_vhc_host::run::ResourceAuthorityParts>,
+) -> Option<daemon_vhc_resource::AuthenticatedProfile<'_>> {
+    let parts = parts?;
+    match parts.select() {
+        Ok(profile) => Some(profile),
+        Err(refusal) => {
+            eprintln!(
+                "[daemon-vhc-worker] provisioned profile did not authenticate (admitting without \
+                 a resource authority): {refusal}"
+            );
+            None
+        }
+    }
+}
+
 /// The derived usable supply in MiB for one advertised backend class, or `0` when there is none.
 ///
 /// Class-matched on purpose: a build carrying two device lanes probes one of them, and attributing that
@@ -2811,12 +3174,20 @@ fn probe_device_lane() -> daemon_vhc_host::runtime::BackendKind {
 fn probe_measured_allocation_ceiling(
     supply_bytes: Option<u64>,
 ) -> Option<daemon_vhc_resource::MeasuredAllocationCeiling> {
+    measured_allocation_ceiling_on(probe_device_lane(), supply_bytes)
+}
+
+/// [`probe_measured_allocation_ceiling`] on an **explicit** lane — the CPU report's producer names
+/// the CPU engine here, where the probe-path default deliberately names the device lane.
+fn measured_allocation_ceiling_on(
+    backend: daemon_vhc_host::runtime::BackendKind,
+    supply_bytes: Option<u64>,
+) -> Option<daemon_vhc_resource::MeasuredAllocationCeiling> {
     /// The most of the derived supply this probe will ask for in one allocation.
     const SUPPLY_SHARE_PERCENT: u64 = 25;
     /// The smallest allocation worth probing: below this the device is not serving a training role.
     const FLOOR_BYTES: u64 = 1 << 20;
 
-    let backend = probe_device_lane();
     let stated_ceiling = device_limits().max_alloc_mb << 20;
     let supply_share = supply_bytes.map(|bytes| bytes / 100 * SUPPLY_SHARE_PERCENT);
     let start = match (stated_ceiling, supply_share) {

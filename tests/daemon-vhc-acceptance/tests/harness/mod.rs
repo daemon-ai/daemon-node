@@ -38,6 +38,68 @@ pub use registry::FixtureRegistry;
 /// The vhc control channel the guest publishes its tag-N voices on.
 const CONTROL_CHANNEL: u64 = 0;
 
+/// The suite's **development authority** (`[PC-12]`): the identity whose vouching every node's
+/// provisioned profile carries, and which the genesis names in each role's
+/// `accepted_development_authorities`. Pure data — nothing signs with it — and acceptance
+/// requires BOTH sides to name it, which is exactly what this harness does. A development
+/// authority satisfies integration evidence and can never certify a ceremony; that fence lives
+/// in the authentication result, not here.
+pub fn development_authority() -> daemon_vhc_proto::PeerId {
+    daemon_vhc_proto::PeerId(*blake3::hash(b"vhc-acceptance/development-authority").as_bytes())
+}
+
+/// The run-side profile-certification policy this suite authors into every role: name the
+/// development authority, defer everything else.
+pub fn profile_certification() -> daemon_vhc_proto::ProfileCertificationRequirements {
+    daemon_vhc_proto::ProfileCertificationRequirements {
+        accepted_development_authorities: vec![development_authority()],
+        ..Default::default()
+    }
+}
+
+/// The worker binary's own CPU-lane revision record, exported once per suite process through the
+/// worker's `DAEMON_TRAIN_REVISION_OUT` seam and cached.
+///
+/// The record must come from the binary the nodes will spawn — authentication compares the
+/// sealed-binary identity (blake3+size of that very file) and the implementation revision against
+/// what actually runs, so a record the harness derived itself would vouch for a worker nobody
+/// executes.
+fn worker_cpu_revision_record() -> daemon_vhc_resource::BackendImplementationRevision {
+    use std::sync::OnceLock;
+    static RECORD: OnceLock<daemon_vhc_resource::BackendImplementationRevision> = OnceLock::new();
+    RECORD
+        .get_or_init(|| {
+            let worker = locate_bin("daemon-vhc-worker");
+            let out_dir = tempfile::tempdir().expect("revision export dir");
+            let status = Command::new(&worker)
+                .env_clear()
+                .env("PATH", std::env::var("PATH").unwrap_or_default())
+                .env("DAEMON_TRAIN_REVISION_OUT", out_dir.path())
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit())
+                .status()
+                .expect("run the worker's revision export");
+            assert!(status.success(), "worker revision export failed");
+            let bytes = std::fs::read(out_dir.path().join("revision-cpu.cbor"))
+                .expect("the worker exported its CPU-lane revision record");
+            daemon_vhc_proto::from_canonical_slice(&bytes)
+                .expect("the exported revision record decodes")
+        })
+        .clone()
+}
+
+/// Provision one node's profile home (`<data_dir>/vhc/profiles`) with the development-authority
+/// profile set for the worker this suite spawns. Written BEFORE the node boots, exactly like the
+/// pre-created identity keystore: the node hands the directory to its workers by path reference.
+fn provision_dev_profiles(data_dir: &Path) {
+    let set = daemon_vhc_resource::test_support::development_provisioned_profiles(
+        &worker_cpu_revision_record(),
+        development_authority(),
+    );
+    let dir = data_dir.join("vhc").join("profiles");
+    daemon_vhc_resource::provision::write(&dir, &set).expect("write provisioned profiles");
+}
+
 /// Locate a sibling product binary in the cargo target profile dir (the xtask acceptance lane
 /// builds `daemon` + `daemon-vhc-worker` before the suite runs). Walks up from the test
 /// executable to the profile dir (the parent of `deps/`) and expects `<profile>/<name>`.
@@ -293,6 +355,10 @@ pub fn spawn_node_with_budget(
     let keystore =
         daemon_vhc_session::keystore::VhcKeystore::open(&identity_dir).expect("open node keystore");
     let base_key = keystore.base_identity().expect("node base identity");
+    // Provision the box (`[PC-12]`): the development-authority profile set the certification-minor
+    // trainer composes its Physical Estimate against. Pre-created like the keystore; the node
+    // hands `<data_dir>/vhc/profiles` to its workers by path reference.
+    provision_dev_profiles(data_dir.path());
 
     // The node config TOML (the `[vhc]` section drives everything the suite needs).
     let worker_bin = locate_bin("daemon-vhc-worker");
@@ -823,11 +889,20 @@ pub async fn start_cluster_with(
     let coordinator_wasm = guest_wasm("coordinator_quorum");
     let trainer_wasm = guest_wasm("tiny_llama");
     let corpus = corpus_dir();
-    // Derived from the real guests this cluster runs, so the envelope pins what those modules' own
+    let steps_per_round = 2;
+    // Derived from the real guests this cluster runs — over the same corpus manifest and
+    // steps-per-round the genesis pins — so the envelope carries what those modules' own
     // assessment said rather than a stand-in.
-    let execution =
-        daemon_vhc_testkit::live_genesis::live_execution(&coordinator_wasm, &trainer_wasm)
-            .expect("derive the live cluster execution requirements");
+    let execution = daemon_vhc_testkit::live_genesis::live_execution_with_certification(
+        &coordinator_wasm,
+        &trainer_wasm,
+        &corpus,
+        steps_per_round,
+        // The run names the suite's development authority (`[PC-12]`): acceptance requires BOTH
+        // the owner policy (the provisioned file) and the run to opt in.
+        profile_certification(),
+    )
+    .expect("derive the live cluster execution requirements");
     let genesis = live_genesis(&LiveGenesisSpec {
         execution,
         run_label,
@@ -841,7 +916,7 @@ pub async fn start_cluster_with(
         max_peers: 4,
         epoch_rounds,
         global_batch,
-        steps_per_round: 2,
+        steps_per_round,
         k_absences,
         timing,
         upgrade_authority: vec![peer_id(&upgrade_authority_key())],
@@ -871,11 +946,20 @@ pub async fn start_cluster_membership(
     let coordinator_wasm = guest_wasm("coordinator_quorum");
     let trainer_wasm = guest_wasm("tiny_llama");
     let corpus = corpus_dir();
-    // Derived from the real guests this cluster runs, so the envelope pins what those modules' own
+    let steps_per_round = 2;
+    // Derived from the real guests this cluster runs — over the same corpus manifest and
+    // steps-per-round the genesis pins — so the envelope carries what those modules' own
     // assessment said rather than a stand-in.
-    let execution =
-        daemon_vhc_testkit::live_genesis::live_execution(&coordinator_wasm, &trainer_wasm)
-            .expect("derive the live cluster execution requirements");
+    let execution = daemon_vhc_testkit::live_genesis::live_execution_with_certification(
+        &coordinator_wasm,
+        &trainer_wasm,
+        &corpus,
+        steps_per_round,
+        // The run names the suite's development authority (`[PC-12]`): acceptance requires BOTH
+        // the owner policy (the provisioned file) and the run to opt in.
+        profile_certification(),
+    )
+    .expect("derive the live cluster execution requirements");
     let genesis = live_genesis(&LiveGenesisSpec {
         execution,
         run_label,
@@ -889,7 +973,7 @@ pub async fn start_cluster_membership(
         max_peers,
         epoch_rounds,
         global_batch,
-        steps_per_round: 2,
+        steps_per_round,
         k_absences: 6,
         timing: daemon_vhc_testkit::live_genesis::LiveTiming::default(),
         upgrade_authority: vec![peer_id(&upgrade_authority_key())],

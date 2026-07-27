@@ -5,7 +5,8 @@ appended — at every program boundary, and it is status, not normative text. No
 in the tracked specs (§2). If this file contradicts a chat log, a memory, or an archived
 document, this file wins; if it contradicts a tracked spec, the spec wins.
 
-Last rewritten: 2026-07-27 (trunk converged; doctrine amendment landed).
+Last rewritten: 2026-07-27 (C0 green: PC-12 dev-authority provisioning landed; acceptance lane
+promoted to the pinned one-box rung).
 
 ## 1. What we are building, and the next milestone
 
@@ -62,9 +63,11 @@ Each rung is a strict subset of the one above and runs continuously below it. De
 discovered at the lowest rung capable of showing them.
 
 - **C0 — every merge (CI).** One box, three real daemon processes (coordinator seat + trainers)
-  through the product path: training rounds, digest agreement, churn/hard-kill restore, replay.
-  This is the existing acceptance lane, pinned as the merge gate's core. Status: lane exists
-  (`tests/daemon-vhc-acceptance`); promotion to pinned C0 rung in progress.
+  through the product path: training rounds, digest agreement, churn/hard-kill restore, replay,
+  live module switch. This is the acceptance lane (`tests/daemon-vhc-acceptance`), pinned as the
+  merge gate's non-negotiable core (`xtask vhc-acceptance`, folded into `vhc-production-gate`).
+  Status: **green** — the plan-emitting trainer admits through PC-12 dev-authority provisioning;
+  all twelve gates pass.
 - **C1 — on demand / nightly.** Two real boxes, real transport (relay), small geometry; adds
   WAN churn drills and remote product-path drive. Status: not yet run under this framing.
 - **C2 — the milestone.** Three boxes over WAN at ceremony geometry per the runbook
@@ -95,23 +98,32 @@ None of these blocks C0 or C1.
   and wire keys; `FitVerdict`/`FitProbeKey`/`FitVerdictStore` types in `daemon-vhc-resource`;
   the caller-less estimate-driven selection path (`select`/`SelectionPolicy`/`validate_against`)
   deleted.
-- Known truthful gap: no certified/authenticated Backend Execution Profile artifact exists on
-  any box, so the worker refuses certification-minor modules `EstimateNotComposable` at assess
-  (asserted by test). Node-side profile provisioning (PC-12 dev-authority lane for C0/C1) is the
-  next code deliverable; the probe runner that writes fit verdicts rides the fit-probe rung.
-- C0 promotion: pending. C1: not run. Fit probes: not run. Freeze/C2: not reached.
+- PC-12 provisioning: landed. The provisioned-profile file (`daemon-vhc-resource::provision`,
+  `DAEMON_VHC_PROFILE_DIR`, path-reference like the identity store) carries profiles + envelopes,
+  the owner acceptance policy, and lane bounds; the node hands `<data>/vhc/profiles` to workers;
+  the worker assembles a `ResourceAuthority` from it at every admission site (assess, join
+  re-verify, switch fence). Development authorities are a separate, doubly-opt-in acceptance
+  (`accepted_development_authorities` on BOTH the owner policy and the run's requirements);
+  integration evidence only, never ceremony certification. The worker's
+  `DAEMON_TRAIN_REVISION_OUT` mode exports its own revision records for provisioning tools.
+  An un-provisioned box still refuses `EstimateNotComposable`, typed (asserted by test).
+- Genesis authoring: requirement derivation runs the module's assessment against the SAME
+  plan-relevant config the genesis pins for the role (empty-config assessment was refused by the
+  plan-emitting trainer, rightly). A CPU-lane capability report states `NotApplicableToLane` for
+  the per-allocation ceiling; the pool-bound check validates a CPU estimate against usable supply.
+- The node's join surfaces an ineligible assessment's own reasons instead of converting every
+  assess refusal into a "nothing to reserve" internal error.
+- C0: green and pinned. C1: not run. Fit probes: not run. Freeze/C2: not reached.
 - Program archive: frozen and locked read-only 2026-07-27.
 
 ## 8. Next actions (in order)
 
-1. Provision profiles: a dev-authority-signed CPU-class profile artifact, node-provisioned to
-   the worker (PC-12: both policies name the authority; integration evidence only), so the
-   certification-minor trainer assesses eligible on the product path.
-2. Promote the acceptance lane to the pinned C0 rung of the mandatory gate.
-3. Run C1 on two boxes; fix what it surfaces.
-4. Fit probes on all three boxes at ceremony geometry (one fixed retention policy); the probe
+1. Run C1 on two boxes (real transport/relay, small geometry, churn drills); fix what it
+   surfaces. A real-box provisioning path exists via the worker's revision export; wrap it in an
+   xtask command if hand-provisioning proves error-prone.
+2. Fit probes on all three boxes at ceremony geometry (one fixed retention policy); the probe
    runner records content-addressed verdicts (`[RC-15]`).
-5. Freeze; memoized preflight; run C2; evidence closure; human-signed master merge.
+3. Freeze; memoized preflight; run C2; evidence closure; human-signed master merge.
 
 ## 9. Agent contract
 

@@ -2505,6 +2505,26 @@ impl VhcApi for VhcService {
             }
         };
 
+        // An ineligible assessment refuses HERE, in the funnel's own words. Letting it fall
+        // through to charge derivation used to convert every assess refusal into the same
+        // "nothing to reserve" internal error — the worker's typed reasons (a profile that did
+        // not authenticate, an estimate that would not compose, a missing backend) were swallowed
+        // by a message about ledger arithmetic that never got the chance to be the problem.
+        if !eligibility.eligible {
+            if fresh_child {
+                worker.shutdown().await;
+            }
+            return Err(VhcError::Worker(format!(
+                "assessment refused the join: {}",
+                if eligibility.reasons.is_empty() {
+                    "(no reason reported)".to_string()
+                } else {
+                    eligibility.reasons.join("; ")
+                }
+            ))
+            .to_api());
+        }
+
         // The admission funnel's LAST stage (decisions D6 point 5; architecture §3.5): the
         // aggregate owner arbitration — an atomic check-and-reserve against the remaining
         // per-device + host-wide ledgers, committed BEFORE the run instance is created. Owner

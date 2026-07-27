@@ -173,6 +173,12 @@ pub struct SwitchBinding {
     pub device: DeviceProfile,
     /// The owner policy the re-admission enforces (fail-closed).
     pub owner: OwnerPolicy,
+    /// The provisioned resource authority the fence's re-admission composes with, assembled by
+    /// the worker's pre-flight (the worker holds the provisioning env and the probe machinery;
+    /// the fence holds the moment of truth). `None` on an un-provisioned box, where a
+    /// certification-minor target refuses `EstimateNotComposable` at the fence — typed, with the
+    /// running instance untouched.
+    pub resources: Option<daemon_vhc_host::run::ResourceAuthorityParts>,
     /// The seam journal opener (per migrate attempt).
     pub journal: SeamJournal,
     /// The quiesce drain deadline in ms (§4.4), also the per-attempt validate window.
@@ -770,6 +776,25 @@ async fn perform_switch(
             "re-derived grants do not match the committed record's grants anchor".into(),
         );
     }
+    // The worker-assembled resource authority, when this box is provisioned: the fence re-runs
+    // owner law over the same store, report and frozen binding the pre-switch assessment composed
+    // with. An authentication refusal here degrades to `None` — the truthful no-authority floor —
+    // and a certification-minor target then refuses `EstimateNotComposable`, typed, with the
+    // running instance untouched.
+    let profile = match binding.resources.as_ref() {
+        Some(parts) => match parts.select() {
+            Ok(profile) => Some(profile),
+            Err(refusal) => {
+                tracing::warn!(%refusal, "provisioned profile did not authenticate at the switch fence");
+                None
+            }
+        },
+        None => None,
+    };
+    let authority = match (binding.resources.as_ref(), profile.as_ref()) {
+        (Some(parts), Some(profile)) => Some(parts.authority(profile)),
+        _ => None,
+    };
     let admission = match daemon_vhc_host::run::admit(
         &admission_worker,
         &module_bytes,
@@ -781,9 +806,7 @@ async fn perform_switch(
         &binding.owner,
         None,
         binding.envelope_grants.as_ref(),
-        // No certified profile exists to select on this path yet; a certification-minor module is
-        // refused `EstimateNotComposable` rather than admitted against a substituted figure.
-        None,
+        authority.as_ref(),
     ) {
         Ok(a) => a,
         Err(refusal) => return refused(current, format!("switch re-admission: {refusal}")),

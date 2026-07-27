@@ -636,19 +636,37 @@ fn configured_worst_case(pooling: &crate::profile::PoolingBehavior, device_total
 ///
 /// The sizing a configured build would apply is returned alongside, unapplied. See [`PoolSizing`].
 ///
+/// **The CPU class has no device allocator to have measured.** The ceiling requirement exists
+/// because a *driver's* stated per-allocation limit differs from what it honours, so only a
+/// measurement through the device allocator counts — and the measurement hook deliberately
+/// declines to run on the CPU arm, where allocations go through the host allocator and the probe
+/// would answer a different question. Requiring the measurement here anyway would make the CPU
+/// lane permanently inadmissible for want of evidence no probe can produce. The host allocator's
+/// only refusal boundary is supply itself, so on [`crate::BackendClass::Cpu`] the composed
+/// estimate's largest single allocation is checked against the report's usable supply — the same
+/// figure, from the same report, that stage 3 admits totals against — and the block-granularity
+/// check below still runs against the profile's own pooling terms.
+///
 /// # Errors
 /// [`GovernorError`] if the claim's largest single allocation exceeds what the device was measured
-/// to accept, or if the report carries no measured ceiling to check against — an unmeasured device
-/// is not a device that passed, and admitting against an absent measurement would admit everything.
+/// to accept, or if a device-allocator report carries no measured ceiling to check against — an
+/// unmeasured device is not a device that passed, and admitting against an absent measurement
+/// would admit everything.
 pub fn check_pool_admissible(
     reservation: &Reservation,
     claim: &PhysicalEstimate,
     report: &DeviceCapabilityReport,
     profile: &BackendExecutionProfile,
 ) -> Result<PoolAdmission, GovernorError> {
-    let measured_ceiling = report
-        .max_allocation_bytes()
-        .map_err(|e| GovernorError::Invalid(e.to_string()))?;
+    let measured_ceiling = if report.backend_class == crate::BackendClass::Cpu {
+        report
+            .usable_device_supply_bytes()
+            .map_err(|e| GovernorError::Invalid(e.to_string()))?
+    } else {
+        report
+            .max_allocation_bytes()
+            .map_err(|e| GovernorError::Invalid(e.to_string()))?
+    };
     let alignment = profile.allocation_alignment_bytes.max(1);
 
     let requested = claim

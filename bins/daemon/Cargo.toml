@@ -70,6 +70,11 @@ daemon-vhc-session = { workspace = true }
 # daemon-vhc-net's off-by-default `iroh` feature — confirmed by the default-gate dependency check.
 daemon-vhc-node = { workspace = true }
 daemon-vhc-supervisor = { workspace = true }
+# The provisioned-profile env reference (`PROFILE_DIR_ENV`) the node hands its workers, exactly
+# like the identity-dir reference. Contracts-weight only (serde/ciborium/blake3): no burn,
+# wasmtime or iroh rides this edge, and `test-support` stays off — this process can read a
+# provisioned file's NAME but can never mint a profile.
+daemon-vhc-resource = { workspace = true }
 # The `vision_analyze` tool; opt-in at runtime via `[vision].provider`.
 daemon-tool-vision = { workspace = true }
 # Core chat tools registered on every role: the per-session `todo` planner and the `clarify` ask.

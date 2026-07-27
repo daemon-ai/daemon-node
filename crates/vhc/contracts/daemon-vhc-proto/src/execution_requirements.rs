@@ -79,6 +79,16 @@ pub struct ProfileCertificationRequirements {
     /// owner policy — it never means "any authority".
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub accepted_authorities: Vec<PeerId>,
+    /// The **development** authorities this run accepts, a separate and deliberately awkward
+    /// decision from accepting a release authority (`[PC-12]`).
+    ///
+    /// Deferral-on-silence applies to release authorities only: for a development authority,
+    /// silence is never consent, so acceptance requires the owner's policy **and** this run-side
+    /// set to each name the authority explicitly. A development-authenticated profile satisfies
+    /// integration evidence and never ceremony certification — the class fence lives in the
+    /// authentication result, not in this list's good intentions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accepted_development_authorities: Vec<PeerId>,
     /// The lowest profile schema version this run accepts.
     #[serde(default)]
     pub min_profile_schema: u32,

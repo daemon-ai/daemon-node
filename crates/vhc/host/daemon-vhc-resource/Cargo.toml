@@ -49,5 +49,9 @@ thiserror = { workspace = true }
 ciborium = { workspace = true }
 blake3 = { workspace = true }
 
+[dev-dependencies]
+# Provisioned-profile file round-trips in throwaway directories.
+tempfile = "3"
+
 [lints]
 workspace = true

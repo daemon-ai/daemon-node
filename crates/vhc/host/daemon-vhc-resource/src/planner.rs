@@ -593,7 +593,10 @@ pub fn aggregate(
 ///
 /// A class with no entry is **not** unbounded. It is a lane that has not been configured for that
 /// backend, and it refuses — see [`PlannerError::LaneStatesNoBoundsForClass`].
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+///
+/// Serializable because the bounds are owner-side lane configuration: they ride the
+/// node-provisioned profile file ([`crate::provision`]) next to the owner's acceptance policy.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LaneEstimateBounds {
     /// `[min, max]` device bytes per backend class slug.
     pub by_backend_class: std::collections::BTreeMap<String, [u64; 2]>,

@@ -88,6 +88,9 @@ fn genesis_wire(trusted_bases: &[PeerId]) -> (Vec<u8>, [u8; 32]) {
         ..RoleGrants::default()
     };
     let role_entry = |lane: &str| RoleEntry {
+        // No execution requirements: this fixture drives declared-claim roles, so the worker's
+        // admission takes the truthful no-authority path.
+        execution: None,
         lane: lane.into(),
         module: "role.wasm".into(),
         abi: "vhc@2".into(),

@@ -35,6 +35,7 @@ pub mod composition_record;
 pub mod governor;
 pub mod planner;
 pub mod profile;
+pub mod provision;
 pub mod revision;
 pub mod store;
 // Fixture assemblers for tests in OTHER crates. Behind a non-default feature that no production
@@ -78,6 +79,11 @@ pub use profile::{
     CompositionRule, CostExpr, CostInput, CostInputs, CostTerm, EnforcementClass, Headroom,
     PoolingBehavior, ProfileError, StagingBehavior, WorkspaceFormula,
     BACKEND_EXECUTION_PROFILE_SCHEMA,
+};
+pub use provision::{
+    load as load_provisioned_profiles, load_from_env as load_provisioned_profiles_from_env,
+    write as write_provisioned_profiles, ProvisionError, ProvisionedEntry, ProvisionedProfiles,
+    PROFILES_FILE_NAME, PROFILE_DIR_ENV, PROVISIONED_PROFILES_SCHEMA,
 };
 pub use revision::{
     Adapter, AdapterDeviceType, AdapterIdentity, AllocatorImplementation, ApiSelectionSource,
