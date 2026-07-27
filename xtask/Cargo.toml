@@ -49,6 +49,12 @@ daemon-vhc-guest-build = { workspace = true }
 # The chunk-addressed corpus contract (`tokenize-corpus` / `publish-corpus`): the canonical-CBOR
 # CorpusManifest + shard fold identities live in the proto contracts crate.
 daemon-vhc-proto = { workspace = true }
+# `vhc-provision-dev-profile` (`[PC-12]`): the operator dev-tooling seat that mints a
+# development-authority provisioned-profile set for a real box, against the revision record the
+# box's own worker binary exports. xtask is the ONE named non-dev edge `vhc-dep-check` permits to
+# enable `test-support` (the minting fence): xtask never ships, and a minted profile is inert
+# until the box owner provisions the matching acceptance policy beside it.
+daemon-vhc-resource = { workspace = true, features = ["test-support"] }
 # `publish-module` / `publish-corpus` (the fleet artifact-distribution path): upload artifacts to
 # the payload store by content hash (presigned PUT direct-to-R2). Both are existing workspace deps
 # already in the lock via daemon-vhc-net, so no new third-party crate / deny change.

@@ -347,3 +347,79 @@ fn resync_watermark_never_reingests() {
     assert!(out.is_empty());
     assert_eq!(driver.experiment().ingested.len(), 1);
 }
+
+#[test]
+fn a_record_gapped_above_the_restore_watermark_is_refused_not_folded() {
+    let me = peer(9);
+    let mut driver = BarrierRound::new(Recorder::default(), cfg(me, vec![me]));
+    let mut source: BTreeMap<(u64, PeerId), Vec<u8>> = BTreeMap::new();
+
+    // A restorer whose checkpoint folds through round 2 attaches while the run is at round 5:
+    // rounds 3–4 were committed before it attached and the ordered records channel never
+    // re-delivers them. Folding round 5 over the round-2 base would fork the det trajectory
+    // (the C1 relay churn drill's divergence), so the driver refuses — nothing is ingested.
+    driver.resume_from(Some(2));
+    let e5 = vec![entry(me, b"m5")];
+    source.insert((5, me), b"m5".to_vec());
+    let out = driver.on_round_record(&round_record(5, &e5), e5, &mut source);
+    assert_eq!(
+        out,
+        vec![Outbound::GapRefused {
+            restored: 2,
+            head: 5
+        }]
+    );
+    assert!(driver.experiment().ingested.is_empty());
+    assert_eq!(driver.last_ingested(), Some(2));
+}
+
+#[test]
+fn the_contiguous_next_round_after_a_restore_folds_normally() {
+    let me = peer(9);
+    let mut driver = BarrierRound::new(Recorder::default(), cfg(me, vec![me]));
+    let mut source: BTreeMap<(u64, PeerId), Vec<u8>> = BTreeMap::new();
+
+    // watermark + 1 is exactly the round the restored state is the base for — no gap, no refusal.
+    driver.resume_from(Some(2));
+    let e3 = vec![entry(me, b"m3")];
+    source.insert((3, me), b"m3".to_vec());
+    let out = driver.on_round_record(&round_record(3, &e3), e3, &mut source);
+    assert!(matches!(out[0], Outbound::RoundComplete { round: 3, .. }));
+    assert_eq!(driver.last_ingested(), Some(3));
+}
+
+#[test]
+fn a_pending_contiguous_head_covers_a_higher_arrival_no_gap_refusal() {
+    let me = peer(9);
+    let mut driver = BarrierRound::new(Recorder::default(), cfg(me, vec![me]));
+    let mut source: BTreeMap<(u64, PeerId), Vec<u8>> = BTreeMap::new();
+
+    // Round 3 arrives first but its payload is not yet fetchable (a stall, not a gap): the head
+    // of the queue is contiguous with the watermark, so a higher round arriving behind it must
+    // NOT read as a gap — it queues behind the stalled head, and both fold when the payload
+    // lands (the existing catch-up ladder).
+    driver.resume_from(Some(2));
+    let e3 = vec![entry(me, b"m3")];
+    let out = driver.on_round_record(&round_record(3, &e3), e3, &mut source);
+    assert!(matches!(out[0], Outbound::Straggle { round: 3, .. }));
+    let e4 = vec![entry(me, b"m4")];
+    source.insert((4, me), b"m4".to_vec());
+    let out = driver.on_round_record(&round_record(4, &e4), e4, &mut source);
+    assert!(
+        !out.iter().any(|o| matches!(o, Outbound::GapRefused { .. })),
+        "a stalled-but-pending contiguous head is not a gap: {out:?}"
+    );
+
+    // The payload lands; a later record triggers the catch-up and both rounds fold in order.
+    source.insert((3, me), b"m3".to_vec());
+    let e5 = vec![entry(me, b"m5")];
+    source.insert((5, me), b"m5".to_vec());
+    let out = driver.on_round_record(&round_record(5, &e5), e5, &mut source);
+    let rounds: Vec<u64> = driver
+        .experiment()
+        .ingested
+        .iter()
+        .map(|(r, _)| *r)
+        .collect();
+    assert_eq!(rounds, vec![3, 4, 5], "ascending catch-up: {out:?}");
+}

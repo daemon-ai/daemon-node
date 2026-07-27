@@ -1820,6 +1820,19 @@ fn classify_natural_end(
     }
     match end {
         Ok(RunEnd::Outcome(0)) => TerminalOutcome::Completed { outcome: 0 },
+        // `StaleRestore` (ABI §4.5 code 3): the module refused to fold a record history gapped
+        // above its restored watermark. Unlike every other nonzero outcome this is NOT
+        // deterministic for the (module, plan, grant) tuple — the environment moved (rounds were
+        // committed before this incarnation attached), and a retry restores a FRESHER checkpoint
+        // pointer (live pointers advance every ingested round), so reconvergence is the designed
+        // recovery, exactly like a churn respawn.
+        Ok(RunEnd::Outcome(code)) if code == daemon_vhc_abi::OUTCOME_STALE_RESTORE => {
+            TerminalOutcome::FailedRetryable {
+                reason: "stale restore: the record history is gapped above the restored \
+                         watermark; rejoining to restore a fresher checkpoint"
+                    .into(),
+            }
+        }
         Ok(RunEnd::Outcome(code)) => TerminalOutcome::FailedTerminal {
             reason: format!("module ended with outcome {code}"),
         },

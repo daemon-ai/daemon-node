@@ -96,7 +96,7 @@ fn parse_hash(what: &str, s: &str) -> Result<Hash> {
     Ok(Hash::new(parse_hex32(what, s)?))
 }
 
-fn parse_peer(what: &str, s: &str) -> Result<PeerId> {
+pub(crate) fn parse_peer(what: &str, s: &str) -> Result<PeerId> {
     Ok(PeerId::new(parse_hex32(what, s)?))
 }
 

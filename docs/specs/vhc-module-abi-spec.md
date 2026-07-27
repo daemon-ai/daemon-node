@@ -1029,13 +1029,15 @@ Upgrade and throttle both use `Quiesce` first and forced interruption only on ex
 | 0 | `Ok` | Clean finish after a `Stop`. |
 | 1 | `Left` | The module chose to leave the run (its own policy). |
 | 2 | `QuiesceReady` | Returned during a `Quiesce` drain; snapshot manifest published (§10.2). |
-| 3–15 | reserved | assigned only by a future minor of this document. |
+| 3 | `StaleRestore` | The module refuses to fold a record history **gapped above its restored resync watermark** (rounds committed before this incarnation attached are never re-delivered on the ordered records channel; folding across them would fork the det trajectory). The node treats this outcome as **retryable**: the recovery is a rejoin restoring a fresher checkpoint, and live pointers advance every ingested round, so the retry converges on the live edge. |
+| 4–15 | reserved | assigned only by a future minor of this document. |
 | ≥16 | module-defined | journaled verbatim; treated by the host exactly as `Left`. |
 
 (Resolution of OQ-5: the vocabulary stays small; module-specific exit information belongs in a
-published frame or the snapshot manifest, not in the Outcome. Unknown reserved codes 3–15 from a
+published frame or the snapshot manifest, not in the Outcome. Unknown reserved codes 4–15 from a
 future-minor module never reach an older host by §1.4; a host receiving one anyway treats it as
-`Left` and journals it.)
+`Left` and journals it — which is also the sound degraded reading of `StaleRestore` on a host
+older than its assignment.)
 
 A guest that returns from `da_run` without having consumed a `Stop`/`Quiesce` (it fell out of its
 own loop) is treated as `Left` with a journaled warning. A trap during `da_run` is handled per §7.6

@@ -108,6 +108,32 @@ enum Cmd {
     /// disables; any other value overrides the cache dir (default
     /// `$HOME/.cache/vhc-acceptance-bins`).
     VhcAcceptance,
+    /// Mint a `[PC-12]` **development-authority** provisioned-profile set for a real box: run the
+    /// box's own worker binary in its revision-export mode (`DAEMON_TRAIN_REVISION_OUT` — the
+    /// record can only truthfully come from the binary that will run, sealed-binary identity
+    /// included), price a conservative profile for that record under a development trust envelope,
+    /// and write the provisioned file (`profiles.cbor`: profiles + envelopes, owner acceptance
+    /// policy naming the authority, lane bounds) into the directory the node's
+    /// `DAEMON_VHC_PROFILE_DIR` will reference (`<data>/vhc/profiles`).
+    ///
+    /// Development authentication is doubly opt-in: the run's genesis must name the SAME authority
+    /// in its `accepted_development_authorities`, or nothing authenticates. The resulting profile
+    /// satisfies integration evidence (C0/C1) and can never certify a ceremony — that fence lives
+    /// in the authentication result's authority class, not in this command's intentions.
+    VhcProvisionDevProfile {
+        /// The box's `daemon-vhc-worker` binary — the very file the node will spawn.
+        #[arg(long)]
+        worker_bin: PathBuf,
+        /// The output profile directory (what the node's `DAEMON_VHC_PROFILE_DIR` names).
+        #[arg(long)]
+        out: PathBuf,
+        /// The development authority PeerId (64-hex). Pure data — nothing signs with it.
+        #[arg(long)]
+        authority: String,
+        /// The backend class to provision (a `revision-<class>.cbor` the worker exports).
+        #[arg(long, default_value = "cpu")]
+        class: String,
+    },
     /// The merge gate (D-P10): the tier-1 det aggregate (which folds `vhc-ci-node`), the tier-2
     /// whole-run suites, and the multi-process acceptance suite.
     ///
@@ -360,6 +386,12 @@ fn main() -> anyhow::Result<()> {
         Cmd::VhcCiNode => vhc_ci_node(),
         Cmd::VhcDepCheck => vhc_dep_check(),
         Cmd::VhcAcceptance => vhc_acceptance(),
+        Cmd::VhcProvisionDevProfile {
+            worker_bin,
+            out,
+            authority,
+            class,
+        } => vhc_provision_dev_profile(&worker_bin, &out, &authority, &class),
         Cmd::VhcProductionGate {
             all,
             base,
@@ -1196,6 +1228,76 @@ const VHC_T2_SUITES: &[SuiteEntry<'static>] = &[
 /// checkpoint restore, churn/hard-kill drills, and a live module switch. It runs on every merge as
 /// the production gate's non-negotiable core beside the det suites; the higher rungs (C1 two-box,
 /// C2 the fleet ceremony) are strict supersets and never the first place a defect can surface.
+/// `vhc-provision-dev-profile` — mint a `[PC-12]` development-authority provisioned-profile set
+/// for a real box (see the `Cmd` doc for the trust posture; the double opt-in fence lives in the
+/// authentication path, not here).
+fn vhc_provision_dev_profile(
+    worker_bin: &Path,
+    out: &Path,
+    authority: &str,
+    class: &str,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+
+    let authority = ceremony::parse_peer("--authority", authority)?;
+
+    // The revision record comes from the worker binary itself (its export mode), never from a
+    // hand-written figure: the record's sealed-binary identity is the binary hashing itself, and a
+    // profile priced for any other record would refuse to authenticate against the running worker.
+    let export = tempfile_dir("vhc-revision-export")?;
+    let status = Command::new(worker_bin)
+        .env("DAEMON_TRAIN_REVISION_OUT", &export)
+        .status()
+        .with_context(|| format!("run {} in revision-export mode", worker_bin.display()))?;
+    anyhow::ensure!(status.success(), "worker revision export failed: {status}");
+
+    let record_path = export.join(format!("revision-{class}.cbor"));
+    let bytes = std::fs::read(&record_path).with_context(|| {
+        format!(
+            "the worker exported no `{class}` lane record ({}) — the class must be one the \
+             binary's backend inventory actually offers",
+            record_path.display()
+        )
+    })?;
+    let record: daemon_vhc_resource::BackendImplementationRevision =
+        daemon_vhc_proto::from_canonical_slice(&bytes).context("decode the revision record")?;
+    std::fs::remove_dir_all(&export).ok();
+
+    let set =
+        daemon_vhc_resource::test_support::development_provisioned_profiles(&record, authority);
+    let path = daemon_vhc_resource::write_provisioned_profiles(out, &set)
+        .with_context(|| format!("write the provisioned file under {}", out.display()))?;
+
+    println!(
+        "provisioned {} development profile(s) for backend class `{class}` -> {}",
+        set.entries.len(),
+        path.display()
+    );
+    println!(
+        "  sealed binary: blake3 {} ({} bytes)",
+        blake3::Hash::from(record.sealed_binary.blake3).to_hex(),
+        record.sealed_binary.size_bytes
+    );
+    println!(
+        "  authority: {} — the run's genesis must name this PeerId in its \
+         `accepted_development_authorities`, or nothing authenticates (double opt-in).",
+        authority.to_hex()
+    );
+    println!(
+        "  point the node's DAEMON_VHC_PROFILE_DIR at {}",
+        out.display()
+    );
+    Ok(())
+}
+
+/// A private scratch directory under the system temp dir (xtask has no tempfile dep; dev tooling,
+/// crate-wide fs allowance).
+fn tempfile_dir(label: &str) -> anyhow::Result<PathBuf> {
+    let dir = std::env::temp_dir().join(format!("{label}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
 fn vhc_acceptance() -> anyhow::Result<()> {
     let root = workspace_root();
     run_lane_memoized(&root, "vhc-acceptance", &[], || {
@@ -2202,10 +2304,14 @@ fn vhc_dep_check() -> anyhow::Result<()> {
             // MINT a Backend Execution Profile — the one act the store's crate-private surface exists
             // to keep out of a shipping binary (architecture §9.6: composition takes an authenticated
             // profile because there is no other constructor to reach for). A test in another crate
-            // legitimately needs them, so the feature exists; it may travel on a `dev` edge only. A
-            // production edge that enables it would hand a shipping binary the ability to author its
-            // own trust, which is a hole no amount of downstream care closes.
-            if to == "daemon-vhc-resource" && kind != "dev" {
+            // legitimately needs them, so the feature exists; it may travel on a `dev` edge only —
+            // with ONE named exemption: `xtask` itself, the operator dev-tooling home the provision
+            // module's charter names for real-box development provisioning (`[PC-12]`,
+            // `vhc-provision-dev-profile`). xtask never ships, and a minted profile is inert until
+            // the box OWNER provisions the matching acceptance policy beside it — minting is not
+            // vouching. A production edge that enables the feature would hand a shipping binary the
+            // ability to author its own trust, which is a hole no amount of downstream care closes.
+            if to == "daemon-vhc-resource" && kind != "dev" && from != "xtask" {
                 let enables_test_support = d["features"]
                     .as_array()
                     .is_some_and(|fs| fs.iter().any(|f| f.as_str() == Some("test-support")));
@@ -2213,8 +2319,9 @@ fn vhc_dep_check() -> anyhow::Result<()> {
                     violations.push(format!(
                         "{from} -> {to} [{kind}]: this edge enables the `test-support` feature, \
                          whose fixture constructors can mint a Backend Execution Profile — it is \
-                         permitted on `dev-dependencies` edges only, so that no shipping binary can \
-                         author the trust it is supposed to be authenticated against"
+                         permitted on `dev-dependencies` edges only (and on `xtask`, the named \
+                         operator dev-tooling seat), so that no shipping binary can author the \
+                         trust it is supposed to be authenticated against"
                     ));
                 }
             }

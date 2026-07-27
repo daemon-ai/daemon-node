@@ -354,6 +354,26 @@ fn proto7_k_absences_drops_and_proto10_rejoin() {
         .any(|o| matches!(o, Output::Note(Notice::Admitted(_)))));
     let c_member = state.roster.iter().find(|m| m.peer == c_id).unwrap();
     assert_eq!(c_member.state, ClientState::Healthy, "C rejoined healthy");
+
+    // Replay-forward: the admission re-publishes the retained ring's committed records,
+    // ascending — a rejoiner whose restore watermark lags the live round folds the gap from
+    // these instead of ending `StaleRestore`; every peer already at/past a record's round skips
+    // the duplicate by the resync guard.
+    let reemitted: Vec<u64> = out
+        .iter()
+        .filter_map(|o| match o {
+            Output::Publish(m) => match m.as_ref() {
+                VhcMessage::RoundRecord(rr) => Some(rr.round),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        reemitted,
+        vec![0, 1],
+        "the rejoin admission re-publishes the retained committed records in ascending order"
+    );
 }
 
 #[test]

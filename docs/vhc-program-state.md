@@ -5,8 +5,10 @@ appended — at every program boundary, and it is status, not normative text. No
 in the tracked specs (§2). If this file contradicts a chat log, a memory, or an archived
 document, this file wins; if it contradicts a tracked spec, the spec wins.
 
-Last rewritten: 2026-07-27 (C0 green: PC-12 dev-authority provisioning landed; acceptance lane
-promoted to the pinned one-box rung).
+Last rewritten: 2026-07-27 (C1 transport delta landed as a gate: relay-carried mesh + churn in
+the acceptance lane; gapped-restore divergence fixed — `StaleRestore` outcome + coordinator
+replay-forward; operator provisioning command shipped; physical two-box run blocked on box
+reachability).
 
 ## 1. What we are building, and the next milestone
 
@@ -69,7 +71,12 @@ discovered at the lowest rung capable of showing them.
   Status: **green** — the plan-emitting trainer admits through PC-12 dev-authority provisioning;
   all twelve gates pass.
 - **C1 — on demand / nightly.** Two real boxes, real transport (relay), small geometry; adds
-  WAN churn drills and remote product-path drive. Status: not yet run under this framing.
+  WAN churn drills and remote product-path drive. Status: **software delta green, hardware
+  blocked.** The relay-carried transport posture is a merge gate now
+  (`iroh_relay_plane.rs`: real `iroh-relay`, roster records with zero direct addresses so the
+  relay is the only dial path, training + the full graceful-churn choreography through it).
+  The physical two-box execution is blocked: the relay box times out and no other fleet seat
+  is reachable from the build host (§8.1).
 - **C2 — the milestone.** Three boxes over WAN at ceremony geometry per the runbook
   (G-1..G-6), on a frozen candidate. Preflight is only what G-1..G-6 require — relay, sealed
   binaries, identities, corpus, genesis, seat, and a green fit verdict per box — each item
@@ -113,17 +120,38 @@ None of these blocks C0 or C1.
   the per-allocation ceiling; the pool-bound check validates a CPU estimate against usable supply.
 - The node's join surfaces an ineligible assessment's own reasons instead of converting every
   assess refusal into a "nothing to reserve" internal error.
-- C0: green and pinned. C1: not run. Fit probes: not run. Freeze/C2: not reached.
+- Operator provisioning: `cargo run -p xtask -- vhc-provision-dev-profile --worker-bin <bin>
+  --out <dir> --authority <64-hex> [--class cpu]` runs the box's own worker in revision-export
+  mode and writes the PC-12 provisioned file the node's `DAEMON_VHC_PROFILE_DIR` reads. xtask is
+  the ONE named non-dev edge `vhc-dep-check` permits to enable the profile-minting
+  `test-support` feature (dev tooling, never shipped; minting is not vouching — acceptance
+  still requires the owner policy and the run's genesis to both name the authority).
+- C1 relay gate: landed in the acceptance lane (`iroh_relay_plane.rs`, ~160 s, rides
+  `xtask vhc-acceptance`). Relay-only reachability is representable in shipped config:
+  `[vhc.iroh] relays = "<url>"` + `advertise_ips = []`.
+- Gapped-restore divergence (found by the relay gate under load): a rejoiner whose restored
+  watermark lagged the live round silently skipped committed rounds and forked the det
+  trajectory. Fixed at both ends, both gate-proven: the rounds SDK refuses a gapped fold
+  (`Outbound::GapRefused` → ABI §4.5 outcome 3 `StaleRestore`, classified RETRYABLE — the
+  only nonzero outcome that is, because a retry restores a fresher checkpoint), and the
+  coordinator's join admission re-publishes its retained ring of committed records ascending
+  (replay-forward), so a rejoiner inside the retention window folds the gap instead of ending.
+- C0: green and pinned. C1: software delta green; two-box run blocked on hardware (§8.1).
+  Fit probes: not run. Freeze/C2: not reached.
 - Program archive: frozen and locked read-only 2026-07-27.
 
 ## 8. Next actions (in order)
 
-1. Run C1 on two boxes (real transport/relay, small geometry, churn drills); fix what it
-   surfaces. A real-box provisioning path exists via the worker's revision export; wrap it in an
-   xtask command if hand-provisioning proves error-prone.
-2. Fit probes on all three boxes at ceremony geometry (one fixed retention policy); the probe
+1. **[HUMAN] Restore fleet reachability.** The relay box (`intelligent-city-fades-fin-03`,
+   31.22.104.86) times out on ssh, and the Mac / Windows seats are not in the build host's ssh
+   config. C1's physical run needs one reachable second box; C2 needs all of them.
+2. Run C1 on two boxes: provision each box with `vhc-provision-dev-profile`, start the relay
+   per the runbook §4.2, point both nodes' `[vhc.iroh]` at it with WAN `advertise_ips`, drive
+   over `ssh → daemon-cli`; fix what it surfaces. The transport/churn semantics are already
+   gate-proven; this run is about real WAN, real hardware heterogeneity.
+3. Fit probes on all three boxes at ceremony geometry (one fixed retention policy); the probe
    runner records content-addressed verdicts (`[RC-15]`).
-3. Freeze; memoized preflight; run C2; evidence closure; human-signed master merge.
+4. Freeze; memoized preflight; run C2; evidence closure; human-signed master merge.
 
 ## 9. Agent contract
 

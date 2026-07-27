@@ -152,6 +152,10 @@ const EV_COMPLETION: u64 = 6;
 const EV_QUIESCE: u64 = 7;
 /// `da_run` outcome after a §10.2 snapshot-accepted drain.
 const OUTCOME_QUIESCE_READY: u32 = 2;
+/// `da_run` outcome for a record history gapped above the restore watermark (ABI §4.5 code 3,
+/// reserved): the driver's [`daemon_vhc_sdk_rounds::Outbound::GapRefused`] — rejoin restoring a
+/// fresher checkpoint; the node classifies it retryable.
+const OUTCOME_STALE_RESTORE: u32 = 3;
 /// `da_migrate` Incompatible detail: a section is missing/unknown or its length mismatches the
 /// model layout (§10.2 — module-defined detail codes are ≥ 16).
 const MIGRATE_INCOMPATIBLE_SECTIONS: u32 = 16;
@@ -1231,12 +1235,24 @@ fn report_round_metrics(committed: u32, out: &[daemon_vhc_sdk_rounds::Outbound])
 
 /// Run the barrier on a fully-staged record and voice the outbounds.
 fn dispatch_record(
+    core: &Rc<RefCell<Core>>,
     driver: &mut BarrierRound<C3Round, HostStaged>,
     payloads: &mut PayloadMap,
     wire: bool,
     pending: PendingRecord,
 ) {
     let out = driver.on_round_record(&pending.rr, pending.entries, payloads);
+    // A gapped record history above the restore watermark is the driver's typed refusal, and this
+    // module's answer is the reserved `StaleRestore` outcome (ABI §4.5 code 3): folding across the
+    // gap would fork the det trajectory, and the recovery — rejoin restoring a fresher checkpoint
+    // — belongs to the node, not to this instance. Latched like every other boundary refusal.
+    for o in &out {
+        if let daemon_vhc_sdk_rounds::Outbound::GapRefused { restored, head } = o {
+            let _ = (restored, head);
+            core.borrow_mut().refusal = Some(OUTCOME_STALE_RESTORE);
+            return;
+        }
+    }
     emit_round_outbounds(wire, &out);
 }
 
@@ -2499,7 +2515,13 @@ fn run_module(mut cfg: GuestCfg, restored: Option<RestoredRefs>) -> u32 {
                         let pending = PendingRecord { rr, entries, ops };
                         let pending_round = pending.rr.round;
                         if pending.ops.is_empty() {
-                            dispatch_record(&mut driver, &mut payloads, live.is_some(), pending);
+                            dispatch_record(
+                                &core,
+                                &mut driver,
+                                &mut payloads,
+                                live.is_some(),
+                                pending,
+                            );
                             // The live checkpoint fires at SEAL (in the ingest-walk `Sealed`
                             // handler), not here: `dispatch_record` only KICKS OFF the async
                             // deferred fold, so the canonical master has not yet advanced to
@@ -2775,7 +2797,7 @@ fn run_module(mut cfg: GuestCfg, restored: Option<RestoredRefs>) -> u32 {
                         let pending = pending_records
                             .remove(&round)
                             .expect("the completed record");
-                        dispatch_record(&mut driver, &mut payloads, live.is_some(), pending);
+                        dispatch_record(&core, &mut driver, &mut payloads, live.is_some(), pending);
                         // The live checkpoint fires at SEAL (in the ingest-walk `Sealed`
                         // handler), not here: `dispatch_record` only kicks off the async
                         // deferred fold, so the canonical master is not yet this round's.

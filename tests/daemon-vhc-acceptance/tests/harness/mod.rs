@@ -345,7 +345,19 @@ pub fn spawn_node_with_budget(
     extra_vhc_toml: &str,
     owner_budget_body: &str,
 ) -> Node {
-    let data_dir = tempfile::tempdir().expect("node data dir");
+    let mut data_dir = tempfile::tempdir().expect("node data dir");
+    // Forensics seam: `VHC_ACCEPTANCE_KEEP_STATE=1` leaves every node's state dir (journals,
+    // payload plane, config) on disk after the test — a failing gate's evidence would otherwise
+    // unwind with the tempdirs. The kept path is printed so a human (or the failing assert's
+    // reader) can find it.
+    if std::env::var_os("VHC_ACCEPTANCE_KEEP_STATE").is_some_and(|v| v == "1") {
+        data_dir.disable_cleanup(true);
+        eprintln!(
+            "keep-state: node `{}` state dir kept at {}",
+            spec.name,
+            data_dir.path().display()
+        );
+    }
     let socket = data_dir.path().join("api.sock");
     // Pre-create the identity keystore so the harness can read the node's base pubkey BEFORE the
     // node boots (the genesis trust set names every node's base identity). The node opens the

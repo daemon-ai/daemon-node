@@ -255,6 +255,27 @@ fn on_join(
                 state.pending.push(m);
             }
             out.push(Output::Note(Notice::Admitted(signer)));
+            // Replay-forward for a rejoiner (architecture: "a rejoiner replays forward from the
+            // freshest reachable checkpoint"): re-publish the retained ring's committed records,
+            // ascending, so a restorer whose resync watermark lags the live round folds the gap
+            // instead of ending `StaleRestore` (ABI §4.5 code 3) — rounds committed while it was
+            // detached are otherwise never re-delivered on the live-only control plane, and a
+            // restore that outlasts a round leaves every retry exactly as stale (the C1 relay
+            // churn drill's livelock). Bounded by the ring ([`NUM_STORED_ROUNDS`], the same bound
+            // payload retention is validated against at authoring); idempotent fleet-wide — every
+            // peer at/below its own watermark skips a re-emitted record by the resync guard.
+            // Deterministic: the records are frozen state, the emission is a pure function of
+            // (state, join), and replay re-derives it (I1).
+            let mut retained: Vec<&RoundRecord> = state
+                .rounds
+                .slots
+                .iter()
+                .filter_map(|rs| rs.record.as_ref())
+                .collect();
+            retained.sort_by_key(|r| r.round);
+            for record in retained {
+                out.push(Output::publish(VhcMessage::RoundRecord(record.clone())));
+            }
         }
     }
 }

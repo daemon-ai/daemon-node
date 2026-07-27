@@ -1148,6 +1148,15 @@ pub const OUTCOME_OK: u32 = 0;
 pub const OUTCOME_LEFT: u32 = 1;
 /// Outcome 2: returned during a `Quiesce` drain; snapshot manifest published (ABI §4.5, §10.2).
 pub const OUTCOME_QUIESCE_READY: u32 = 2;
+/// Outcome 3: the module refuses to fold a **gapped record history** (ABI §4.5): its restored
+/// resync watermark cannot reach the live round contiguously, because rounds between them were
+/// committed before this incarnation attached and are not re-delivered. Folding across the gap
+/// would silently fork the det trajectory (the C1 churn drill caught exactly that), so the module
+/// ends instead — contained and typed. The correct recovery is environmental, not modular: rejoin
+/// restoring a **fresher checkpoint** (live pointers advance every ingested round, so the retry
+/// converges on the live edge). The node therefore classifies this outcome RETRYABLE, unlike other
+/// nonzero outcomes — a fresh instance with a fresh restore does NOT reach the same status.
+pub const OUTCOME_STALE_RESTORE: u32 = 3;
 /// Outcomes ≥ this are module-defined; journaled verbatim, treated by the host as `Left` (ABI §4.5).
 pub const OUTCOME_MODULE_DEFINED_MIN: u32 = 16;
 

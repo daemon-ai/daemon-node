@@ -178,6 +178,20 @@ pub enum Outbound {
         /// The round the peer was stuck on.
         round: RoundId,
     },
+    /// The record history is **gapped above the resync watermark**: a record arrived for a round
+    /// past `restored + 1` while the intervening rounds are neither ingested nor pending — they
+    /// were committed before this incarnation attached and the ordered records channel will never
+    /// re-deliver them. Folding across the gap would fork the det trajectory (`master` would miss
+    /// the gap rounds' aggregates while every peer that lived through them folded them), so the
+    /// driver refuses the record instead. The module should end with the reserved
+    /// `StaleRestore` outcome (ABI §4.5 code 3): recovery is a rejoin restoring a fresher
+    /// checkpoint, never a fold-and-hope.
+    GapRefused {
+        /// The resync watermark the restore established (last round this state folds).
+        restored: RoundId,
+        /// The earliest queued round — strictly past `restored + 1`.
+        head: RoundId,
+    },
 }
 
 /// The barrier-mode round driver: the engine's round logic as a reusable, sans-io library core.
@@ -319,6 +333,22 @@ impl<E: RoundExperiment<P>, P: PayloadRepr> BarrierRound<E, P> {
             }
         }
         self.pending.insert(rr.round, entries);
+        // Forward contiguity above the watermark ([AL-1] — post-state is a pure function of
+        // (checkpoint, records, payloads), which requires ALL the records): the records channel is
+        // ordered (§12.1 attach), so if the earliest round on the queue is past `watermark + 1`,
+        // the intervening rounds were committed before this incarnation attached and will never
+        // arrive. The watermark guard above protects the past; this protects the future — without
+        // it a restorer that attached late trains on a base missing the gap rounds' aggregates and
+        // silently diverges (the C1 relay churn drill surfaced exactly that).
+        if let (Some(last), Some(&head)) = (self.last_ingested, self.pending.keys().next()) {
+            if head > last + 1 {
+                out.push(Outbound::GapRefused {
+                    restored: last,
+                    head,
+                });
+                return out;
+            }
+        }
         self.advance(Some(rr.round), source, &mut out);
         if self.pending.contains_key(&rr.round) {
             self.straggling = true;
