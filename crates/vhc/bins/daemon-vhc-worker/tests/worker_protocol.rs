@@ -47,7 +47,7 @@ fn guest_dir() -> PathBuf {
 /// Stale-guest guard (Merge-1 adjudication): compare every module named in the committed
 /// `guests/guests.blake3` against the `.wasm` in `dir`. A **missing / unreadable** module still
 /// fails loud; a **hash mismatch** only WARNS (guest bytes are byte-reproducible within one
-/// checkout, not across worktrees — see the Merge-1 decision in `docs/specs/swarm-p2-ledger.md`).
+/// checkout, not across worktrees — see the Merge-1 decision in `docs/archive/swarm-p2-ledger.md`).
 fn verify_guest_manifest(dir: &Path) {
     let manifest = daemon_vhc_guest_build::guests_root().join("guests.blake3");
     let text = std::fs::read_to_string(&manifest).unwrap_or_else(|e| {
