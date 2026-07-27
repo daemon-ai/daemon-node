@@ -669,7 +669,7 @@ fn signed_frame_carries_the_full_scope_tuple_and_verifies() {
     .expect("§12.1 signature verifies");
 }
 
-// -- DV-15: the journalled terminal context is the real one -----------------------------------------
+// -- the journalled terminal context is the real one, not a hard-coded literal --------------------
 
 /// A `SliceState` in the "nothing has happened yet" position, for the derivation table below.
 fn quiescent_slice() -> SliceState {
@@ -786,7 +786,7 @@ fn recorded_context(context: &daemon_vhc_abi::ExecutionContext, abi_minor: u32) 
     terminal.2
 }
 
-/// **DV-15.** The journalled terminal record carries the context the trap actually occurred in.
+/// The journalled terminal record carries the context the trap actually occurred in.
 ///
 /// Before this, `journal_terminal_trap` wrote the literal `"da_run"` for every trap it was handed —
 /// so an initialization trap was recorded as a run-loop trap. That falsified the field a replay
@@ -833,7 +833,7 @@ fn the_journalled_terminal_record_carries_the_phase_the_trap_occurred_in() {
     );
 }
 
-/// **DV-15, the replay half.** A verdict compares the recorded **code** and **context**, never the
+/// **The replay half.** A verdict compares the recorded **code** and **context**, never the
 /// detail string — and a journal written at a legacy minor is compared under the legacy renderer,
 /// unchanged, rather than reinterpreted as one of the truthful values its writer never meant.
 #[test]
@@ -1014,7 +1014,7 @@ fn a_matching_context_lifts_the_forwarded_line_to_the_front_of_the_detail() {
     );
 }
 
-// -- MEAS-F11: the sampler is read, and its keying compares sets ------------------------------------
+// -- the allocator sampler is read, and its reproducibility keying compares sets ----------------
 
 /// The sample points a record claims must be the ones the driver is actually wired at.
 ///

@@ -783,7 +783,7 @@ mod tests {
         authenticate(&p, &e, owner, run, &revision(), 1, NOW)
     }
 
-    /// **MEAS-F8.** A device profile cannot authenticate against a CPU lane.
+    /// A device profile cannot authenticate against a CPU lane.
     ///
     /// The reachable version of this was not hypothetical. This box's CPU-lane record carried the
     /// *Vulkan* adapter's vendor and device ids and its RADV driver strings — filled from a shared

@@ -300,7 +300,7 @@ pub fn ceremony_state_contract() -> StateContract {
     }
 }
 
-// ---- ceremony genesis authoring (§15 W-SF6; the trainer + coordinator envelope) ---------------
+// ---- ceremony genesis authoring (the trainer + coordinator envelope) -------------------------
 
 /// The FROZEN ceremony compression profile (SparseLoco), raw canonical CBOR against the trainer
 /// guest's schema. `chunk` is the profile chunk ([`ceremony_profile_chunk`], = `d_model`); `topk`
@@ -761,7 +761,7 @@ pub struct CeremonyGenesisSpec<'a> {
     pub execution: daemon_vhc_proto::AuthoredExecution,
 }
 
-/// Author + freeze the ceremony genesis (§15 W-SF6): the trainer role carrying the FROZEN model +
+/// Author + freeze the ceremony genesis: the trainer role carrying the FROZEN model +
 /// the seed-form state contract (pinned `expected_root`) + the corpus pin, the coordinator role,
 /// the fleet trust set, and the upgrade authority. Signs with `author`. The corpus + init pins
 /// commit into the genesis hash (the run's cryptographic id).
@@ -1220,7 +1220,7 @@ mod tests {
 
     /// The ceremony genesis authors from the frozen model + a (ceremony-time) corpus pin + trust
     /// set: it validates, freezes, re-opens, and commits the corpus + seed-init pins into the run
-    /// id — the executable-locally proof of the W-SF6 authoring path (the real fleet supplies the
+    /// id — the executable-locally proof of the ceremony authoring path (the real fleet supplies the
     /// published corpus + certified peer identities at preflight).
     #[test]
     fn ceremony_genesis_authors_and_commits_the_pins() {

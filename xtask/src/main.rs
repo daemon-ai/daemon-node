@@ -60,6 +60,8 @@ enum Cmd {
     VerifyCodec,
     /// Check the tracked ABI specification against the constants the code defines (drift gate).
     VhcAbiSpecDrift,
+    /// Scan the code for this program's private vocabulary (red-lined scan gate).
+    VhcCodenameScan,
     /// Build the vhc guest experiment modules (`guests/`) for `wasm32-unknown-unknown`.
     BuildGuests,
     /// Run the vhc **CI tier-1** suite: the CPU-only, consensus-critical determinism / round-
@@ -344,6 +346,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::GenZcbor { cddl, out } => gen_zcbor(cddl, out),
         Cmd::VerifyCodec => verify_codec(),
         Cmd::VhcAbiSpecDrift => vhc_abi_spec_drift(),
+        Cmd::VhcCodenameScan => vhc_codename_scan(),
         Cmd::BuildGuests => build_guests(),
         Cmd::VhcCiDet => vhc_ci_det(),
         Cmd::VhcCiT2 => vhc_ci_t2(),
@@ -2326,6 +2329,7 @@ fn vhc_dep_check() -> anyhow::Result<()> {
     }
     println!("\nok: no dependency-direction violations");
     provenance_scan()?;
+    vhc_codename_scan()?;
     Ok(())
 }
 
@@ -4914,6 +4918,83 @@ fn vhc_abi_spec_drift() -> anyhow::Result<()> {
          execution-context domain",
         expectations.len(),
         domain.len()
+    );
+    Ok(())
+}
+
+/// The red-lined scan: this program's private vocabulary MUST NOT reach the code.
+///
+/// Defect letters, wave ids, measurement finding ids and divergence ids are how a program talks about
+/// itself while it is running. They are useless to anyone reading the code afterwards — worse than
+/// useless, because they look like references to something a reader could go and find, and the thing
+/// they name is a status document that was never shipped. What a comment must carry is the *substance*:
+/// what is true and why, in words that survive the program that discovered them.
+///
+/// Specification **rule identifiers** are the opposite and are deliberately not scanned: `[RC-4]`,
+/// `[SF-6]`, `[EB-4]` and their kin name normative text that ships in `docs/specs`, and tracked code
+/// cites them precisely so a reader can find the rule.
+///
+/// **The needles are assembled from fragments at runtime**, so this function's own source contains none
+/// of them whole. A scanner that had to exempt its own file would be a scanner with a hole in it, and
+/// the hole would be in exactly the file someone edits when they want to add a codename.
+///
+/// # Errors
+/// Every occurrence, with its file, line and why the vocabulary is forbidden.
+fn vhc_codename_scan() -> anyhow::Result<()> {
+    // `(prefix, suffix, what it is)` — the needle is `prefix + suffix`.
+    const FORBIDDEN: &[(&str, &str, &str)] = &[
+        ("MEAS", "-F", "a measurement-wave finding id"),
+        ("MEAS", "-O", "a measurement-wave observation id"),
+        ("DV", "-1", "a program divergence id"),
+        ("DV", "-2", "a program divergence id"),
+        ("W-", "SF", "a program wave id"),
+        ("W-", "host", "a program wave id"),
+        ("W-", "guest", "a program wave id"),
+        ("W-", "measure", "a program wave id"),
+        (
+            "wait",
+            "point",
+            "the program's own status-document vocabulary",
+        ),
+        ("Stage", " R ", "a program stage label"),
+    ];
+
+    let mut violations: Vec<String> = Vec::new();
+    let mut scanned = 0usize;
+    for root in ["crates", "xtask", "bins", "tests"] {
+        let dir = workspace_root().join(root);
+        if !dir.is_dir() {
+            continue;
+        }
+        for path in rust_sources(&dir)? {
+            let text = std::fs::read_to_string(&path)?;
+            scanned += 1;
+            for (prefix, suffix, what) in FORBIDDEN {
+                let needle = format!("{prefix}{suffix}");
+                for (lineno, line) in text.lines().enumerate() {
+                    if line.contains(&needle) {
+                        violations.push(format!(
+                            "  {}:{}: `{needle}` is {what}; say what is true instead",
+                            path.display(),
+                            lineno + 1
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    anyhow::ensure!(
+        violations.is_empty(),
+        "{} occurrence(s) of program vocabulary in the code:\n{}\n\
+         Program vocabulary lives in the plan and status documents. A comment that cites one names a \
+         document the reader does not have; write the substance instead.",
+        violations.len(),
+        violations.join("\n")
+    );
+    println!(
+        "ok: no program vocabulary in {scanned} rust sources ({} needles)",
+        FORBIDDEN.len()
     );
     Ok(())
 }
