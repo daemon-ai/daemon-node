@@ -57,12 +57,15 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ciborium::value::Value;
+use daemon_vhc_host::run::admission::{Admission, ResourceAuthority};
 use daemon_vhc_host::run::{
-    admit, start_run, DeviceProfile, Dropped, JournalSink, MemoryClaim, OwnerPolicy,
-    ParticipationLane, RunConfig, RunEnd, RunIdentity, SinkError,
+    admit, start_run, DeviceProfile, Dropped, JournalSink, OwnerPolicy, ParticipationLane,
+    RunConfig, RunEnd, RunIdentity, SinkError,
 };
 use daemon_vhc_host::{BackendKind, EngineConfig, Worker};
 use daemon_vhc_proto::{to_canonical_vec, Hash, PeerId, Seed};
+use daemon_vhc_resource::revision::BackendClass;
+use daemon_vhc_resource::{test_support, ReservationIdentity};
 use daemon_vhc_sdk_consensus::messages::{BatchWindow, RoundOpen, VhcMessage};
 use daemon_vhc_testkit::ceremony::{
     ceremony_param_numels, ceremony_state_chunk_size, ceremony_trainer_config_training_step,
@@ -241,11 +244,12 @@ fn batch_wrapper(round: u64, step: u32) -> Vec<u8> {
     .expect("batch wrapper")
 }
 
-/// Run the REAL admission funnel over this config and return the claim the module derives for it —
-/// the number the production join engine enforces as the sandbox's memory cap (the `ceremony_round`
-/// derivation, unchanged: the lane is the production trainer lane with its DEVICE floor relaxed for
-/// the CPU backend, every ceiling production).
-fn admitted_claim(wasm: &[u8], cfg_bytes: &[u8]) -> MemoryClaim {
+/// Run the REAL admission funnel over this config and return the admission carrying the figures
+/// the production join engine enforces as the sandbox's memory cap (the `ceremony_round`
+/// derivation, unchanged: the lane is the production trainer lane with its DEVICE floor relaxed
+/// for the CPU backend, every ceiling production). The trainer declares the certification minor,
+/// so the funnel composes its physical estimate against the fixture-assembled resource authority.
+fn admitted(wasm: &[u8], cfg_bytes: &[u8]) -> Admission {
     let mut lane = ParticipationLane::trainer_launch_defaults();
     lane.gpu = 1;
     lane.vram_bytes = 0;
@@ -262,6 +266,28 @@ fn admitted_claim(wasm: &[u8], cfg_bytes: &[u8]) -> MemoryClaim {
         vram_cap_bytes: 0,
         host_cap_bytes: 0,
     };
+    let (store, running) = test_support::stocked_profile_store(BackendClass::Cpu);
+    let policy = test_support::accepting_policy();
+    let profile = store
+        .select(&test_support::authentication_context(&running, &policy))
+        .expect("the fixture profile authenticates under the fixture policy");
+    // Supply raised above the ceremony-geometry conservative estimate: this gate's subject is the
+    // training step under the production budgets, not device supply.
+    let report = test_support::capability_report_with_supply(BackendClass::Cpu, 128 << 30);
+    let lane_bounds = test_support::generous_lane_bounds();
+    let authority = ResourceAuthority {
+        profile: &profile,
+        report: &report,
+        lane_bounds: &lane_bounds,
+        co_resident_roles: 1,
+        reservation_identity: ReservationIdentity {
+            role: "trainer".into(),
+            incarnation: 1,
+            device_identity: "training-step-device".into(),
+            sequence: 1,
+        },
+        frozen_binding: None,
+    };
     let assessment =
         Worker::new(EngineConfig::real_model(BackendKind::Cpu, None)).expect("assessment engine");
     admit(
@@ -275,12 +301,9 @@ fn admitted_claim(wasm: &[u8], cfg_bytes: &[u8]) -> MemoryClaim {
         &owner,
         None,
         None,
-        // The trainer declares a tiered claim at its current minor: no composition authority.
-        None,
+        Some(&authority),
     )
     .expect("the ceremony trainer's own claim admits under the production trainer lane")
-    .claim
-    .expect("a lower-minor trainer declares its own claim")
 }
 
 /// What one gated round produced.
@@ -311,9 +334,9 @@ fn drive_round(wasm: &[u8], steps: u64) -> RoundOutcome {
     .expect("ceremony trainer config (training-step form)");
 
     // The cap is the module's OWN admitted claim for this config, through the real funnel.
-    let claim = admitted_claim(wasm, &cfg_bytes);
+    let admission = admitted(wasm, &cfg_bytes);
     let engine = EngineConfig::real_model(BackendKind::Cpu, None)
-        .with_claimed_memory(claim.hard_accountable.host);
+        .with_claimed_memory(admission.claim_host_bytes());
     let worker = Worker::new(engine).expect("engine");
 
     let identity = RunIdentity {
@@ -330,7 +353,7 @@ fn drive_round(wasm: &[u8], steps: u64) -> RoundOutcome {
     run_cfg.max_readback_bytes_per_slice = TRAINER_LANE_READBACK_BYTES;
     run_cfg.max_live_buffer_bytes = TRAINER_LANE_BUFFER_BYTES;
     run_cfg.max_live_buffer_handles = TRAINER_LANE_BUFFER_HANDLES;
-    run_cfg.hard_accountable_host_bytes = claim.declared_peak.host;
+    run_cfg.hard_accountable_host_bytes = admission.hard_accountable_host_bytes();
 
     let sink = MeasuringSink::shared();
     let t0 = Instant::now();
@@ -398,7 +421,7 @@ fn drive_round(wasm: &[u8], steps: u64) -> RoundOutcome {
                  count; an OutOfFuel is the per-slice fuel budget under a REAL training slice — \
                  which was measured on init and on the training-free round walk, and is measured \
                  with the math ON only here",
-                claim.hard_accountable.host
+                admission.claim_host_bytes()
             );
         }
         assert!(
@@ -424,7 +447,7 @@ fn drive_round(wasm: &[u8], steps: u64) -> RoundOutcome {
     RoundOutcome {
         container: container.expect("the round PUTs its committed container"),
         peak,
-        claim_host: claim.hard_accountable.host,
+        claim_host: admission.claim_host_bytes(),
         max_export_readback: measured.max_export_readback,
         export_readbacks: measured.export_readbacks,
         wall,

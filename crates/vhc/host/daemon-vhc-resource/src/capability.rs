@@ -782,8 +782,20 @@ pub mod fixtures {
             measured_max_allocation: Maybe::Available(measured_ceiling(4 << 30)),
             host_memory_bytes: Maybe::Available(64 << 30),
             disk_bytes: Maybe::Available(247 << 30),
-            supported_operation_families: ["gemm".to_string()].into_iter().collect(),
-            supported_dtypes: ["f32".to_string(), "bool1".to_string()]
+            // Kept in step with the fixture profile: the families a real trainer plan names, plus
+            // the original synthetic one.
+            supported_operation_families: [
+                "gemm",
+                "matmul",
+                "softmax",
+                "elementwise",
+                "gather",
+                "reduction",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+            supported_dtypes: ["f32".to_string(), "bool1".to_string(), "i64".to_string()]
                 .into_iter()
                 .collect(),
             link: LinkCapacity {

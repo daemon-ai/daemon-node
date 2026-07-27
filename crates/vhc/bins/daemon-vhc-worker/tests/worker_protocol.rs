@@ -539,13 +539,18 @@ async fn v1_module_assess_is_refused_abi_unsupported_major() {
     let _ = std::fs::remove_file(&module);
 }
 
-// -- the v2 positive over the signed-envelope seam ------------------------------------------------
+// -- the certification-minor truth over the signed-envelope seam ---------------------------------
 
-/// The envelope seam over the genesis form: the worker receives the real signed genesis, verifies
-/// it, and the **major-2** module assesses eligible through the claim funnel (the full v2
-/// whole-run join is `tests/join.rs`).
+/// The envelope seam over the genesis form for a **certification-minor** module: the worker
+/// verifies the real signed genesis, the trainer emits its Logical Resource Plan — and the worker
+/// refuses `ClaimNotComposable`, TYPED and healthy, because no authenticated Backend Execution
+/// Profile is provisioned on this box to compose a physical estimate with. That refusal is the
+/// correct answer today, not a gap: composing without an authenticated profile would be the exact
+/// substitution the resource model exists to prevent. When node-side profile provisioning lands
+/// (the measurement wave's deliverable), this seam flips eligible and this test flips with it.
+/// The declared-claim positive over the same seam lives in `tests/seat_smoke.rs`.
 #[tokio::test]
-async fn module_assesses_eligible_over_the_signed_envelope() {
+async fn certification_minor_assess_refuses_claim_not_composable_without_a_profile() {
     let module = module_path("tiny_llama.wasm");
     let sup = supervisor_for(&module);
 
@@ -554,10 +559,18 @@ async fn module_assesses_eligible_over_the_signed_envelope() {
         .await
         .expect("assess over the signed genesis");
     assert!(
-        elig.eligible,
-        "the v2 module assesses eligible: {:?}",
+        !elig.eligible,
+        "no authenticated profile is provisioned, so a certification-minor module must refuse"
+    );
+    assert!(
+        elig.reasons
+            .iter()
+            .any(|r| r.contains("ClaimNotComposable")),
+        "the refusal carries the stable typed slug: {:?}",
         elig.reasons
     );
+    sup.ping().await.expect("worker healthy after the refusal");
+    assert_eq!(sup.restarts().await, 0, "no respawn");
     sup.shutdown().await;
 }
 

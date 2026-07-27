@@ -394,3 +394,23 @@ pub extern "C" fn da_run() -> u32 {
         }
     }
 }
+
+// ---- da_resource_plan (the certification rung's assessment export) ------------------------------
+
+/// This module's Logical Resource Plan. Its algorithm holds nothing device-resident, so the
+/// canonical trivial plan IS its plan: the module's linear-memory floor, and no device tensor, no
+/// operation family and no bounded transfer.
+///
+/// It is emitted here rather than written down beside the module because authoring consumes module
+/// output with no fallback — a plan that exists anywhere except as this export's result is a second
+/// source that can drift from the module it claims to describe.
+#[no_mangle]
+pub extern "C" fn da_resource_plan(_c: u32, _cl: u32, _g: u32, _gl: u32) -> u64 {
+    let plan = daemon_vhc_proto::resource_plan::LogicalResourcePlan::trivial(
+        daemon_vhc_proto::resource_plan::WASM_GUEST_LINEAR_FLOOR_BYTES,
+    );
+    match plan.to_canonical_bytes() {
+        Ok(bytes) => emit_cbor(&bytes),
+        Err(_) => 0,
+    }
+}

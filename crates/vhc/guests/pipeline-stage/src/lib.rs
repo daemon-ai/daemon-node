@@ -60,6 +60,20 @@ impl GuestModule for Pipeline {
         }
     }
 
+    /// This module's Logical Resource Plan. Its algorithm holds nothing device-resident, so the
+    /// canonical trivial plan IS its plan — it carries the module's own linear-memory floor and
+    /// declares no device tensor, no operation family and no bounded transfer. It is emitted here
+    /// rather than written down beside the module because a plan authoring could publish without
+    /// the module having produced it is a second source, however small its contents.
+    fn resource_plan(
+        config: &[u8],
+        _capability_grants: &[u8],
+    ) -> Result<daemon_vhc_sdk::LogicalResourcePlan, u32> {
+        Ok(daemon_vhc_sdk::trivial_resource_plan(
+            &Self::decl_for_config(config),
+        ))
+    }
+
     fn init(config: &[u8], _grants: &[u8]) -> Result<Self, u32> {
         if config.len() < 35 {
             return Err(16);

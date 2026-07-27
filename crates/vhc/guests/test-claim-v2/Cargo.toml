@@ -17,3 +17,6 @@ crate-type = ["cdylib"]
 
 [dependencies]
 ciborium = "0.2"
+# The plan format + its canonical encoder. Every module emits its own Logical Resource Plan;
+# a plan written down anywhere but inside the module it describes is a second source.
+daemon-vhc-proto = { path = "../../contracts/daemon-vhc-proto" }

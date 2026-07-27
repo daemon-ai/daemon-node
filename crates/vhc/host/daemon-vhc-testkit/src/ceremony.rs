@@ -590,8 +590,8 @@ pub fn staging_gate_state_contract() -> StateContract {
 /// ([`STAGING_GATE_D_MODEL`] and friends), because a 30-step round over 786_507_264 parameters at
 /// 2048 tokens is ~290 TFLOP — not a gate on any CPU. What that does NOT touch is what this lane
 /// is for: the staging path is parameter-independent, and the forward pass's own guest-resident
-/// working set is a function of `(seq_len, vocab)` — the target rows and the one-hot over the
-/// vocabulary — both of which are the frozen values here. `ceremony_training_step` covers the
+/// working set is a function of `(seq_len, vocab)` — the target rows and the `rows × vocab` logit
+/// plane they index into — both of which are the frozen values here. `ceremony_training_step` covers the
 /// complementary axis (the frozen parameter count at a shortened sequence), so between the two
 /// lanes a real training step is driven at full size along each axis.
 ///

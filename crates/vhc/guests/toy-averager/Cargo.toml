@@ -18,3 +18,6 @@ crate-type = ["cdylib"]
 [dependencies]
 # Event frames are canonical CBOR (ABI §5.1); ciborium decodes them (pure Rust, wasm32-clean).
 ciborium = "0.2"
+# The plan format + its canonical encoder. Every module emits its own Logical Resource Plan;
+# a plan written down anywhere but inside the module it describes is a second source.
+daemon-vhc-proto = { path = "../../contracts/daemon-vhc-proto" }

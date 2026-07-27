@@ -164,9 +164,13 @@ impl GuestModule for Coordinator {
         ModuleDecl {
             name: "coordinator-quorum",
             version: env!("CARGO_PKG_VERSION"),
-            // Phase-A subset + the §3.4 payload plane (minor 1): `payload_get` backs the
-            // coordinator-as-storage-client availability verification (§6.4 I6).
-            abi_minor: 1,
+            // The certification rung. This module's IMPORTS would fix it at the payload-plane
+            // rung — `payload_get` backs the coordinator-as-storage-client availability
+            // verification — but the rung is what the host dispatches assessment on, and a
+            // production role whose envelope entry is authored from its own emitted plan has to
+            // be asked for that plan. Below the rung the host would call the retired claim export
+            // instead and the plan this module emits would never be read.
+            abi_minor: daemon_vhc_sdk::CERTIFICATION_MINOR_V2,
             // The control channel it publishes RoundOpen/RoundRecord on (§6.2).
             channels: vec![0],
             // Small host-accountable state (the round ring + roster); no device residency.
@@ -175,6 +179,20 @@ impl GuestModule for Coordinator {
             device_state_bytes: 0,
             device_scratch_bytes: 0,
         }
+    }
+
+    /// This module's Logical Resource Plan. Its algorithm holds nothing device-resident, so the
+    /// canonical trivial plan IS its plan — it carries the module's own linear-memory floor and
+    /// declares no device tensor, no operation family and no bounded transfer. It is emitted here
+    /// rather than written down beside the module because a plan authoring could publish without
+    /// the module having produced it is a second source, however small its contents.
+    fn resource_plan(
+        config: &[u8],
+        _capability_grants: &[u8],
+    ) -> Result<daemon_vhc_sdk::LogicalResourcePlan, u32> {
+        Ok(daemon_vhc_sdk::trivial_resource_plan(
+            &Self::decl_for_config(config),
+        ))
     }
 
     fn init(config: &[u8], _grants: &[u8]) -> Result<Self, u32> {

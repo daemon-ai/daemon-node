@@ -906,27 +906,44 @@ pub fn genesis_whole_run<'a>(
     // and a drift between the pinned plan and the running code cannot open up here.
     let authoring_engine =
         Worker::new(EngineConfig::default()).map_err(|e| format!("authoring engine: {e}"))?;
-    let role_input = |role: &'static str, wasm: &'a [u8]| RoleAuthoringInput {
-        role,
-        wasm,
-        // The role config each module's assessment runs against. Empty is what these two modules
-        // receive at assess time in this harness; a run whose plan varied with its configuration
-        // would have to pass the same bytes the envelope pins, or the plan would describe a
-        // configuration the run never uses.
-        config: &[],
-        grants: &grants,
-        allowed_backend_classes: vec!["cpu".to_string()],
-        profile_certification: ProfileCertificationRequirements::default(),
-        minima: HardwareIndependentMinima::default(),
-        // The floor, chosen explicitly: this harness's subject is the run lifecycle, not the
-        // configuration, so the smallest admissible selection is the honest one to freeze.
-        grant: GrantPolicy::DomainMinimum,
-    };
+    // The trainer's Logical Resource Plan is a function of its configuration (geometry,
+    // micro-batch, steps per round, the state contract's chunk size), so its assessment must run
+    // against the same plan-relevant bytes its workers run under — an empty config would be asking
+    // the module to describe a configuration the run never uses, and the module rightly refuses.
+    // The peer identity and roster inside the config are join wiring that never enters the plan,
+    // so the representative config below (worker 0's shape) derives byte-identical plan bytes to
+    // every worker's own assessment.
+    let trainer_assess_config =
+        trainer_config(&roster[0], &roster, spec.steps_per_round, MICRO_BATCH, 2);
     let execution = author_execution(
         &authoring_engine,
         vec![
-            role_input("coordinator", coordinator_wasm),
-            role_input("trainer", worker_wasm),
+            RoleAuthoringInput {
+                role: "coordinator",
+                wasm: coordinator_wasm,
+                // The coordinator's plan does not vary with its configuration, and its opaque
+                // config (the round schedule) is authored after the envelope's roles exist —
+                // empty is what its assessment genuinely receives.
+                config: &[],
+                grants: &grants,
+                allowed_backend_classes: vec!["cpu".to_string()],
+                profile_certification: ProfileCertificationRequirements::default(),
+                minima: HardwareIndependentMinima::default(),
+                // The floor, chosen explicitly: this harness's subject is the run lifecycle, not
+                // the configuration, so the smallest admissible selection is the honest one to
+                // freeze.
+                grant: GrantPolicy::DomainMinimum,
+            },
+            RoleAuthoringInput {
+                role: "trainer",
+                wasm: worker_wasm,
+                config: &trainer_assess_config,
+                grants: &grants,
+                allowed_backend_classes: vec!["cpu".to_string()],
+                profile_certification: ProfileCertificationRequirements::default(),
+                minima: HardwareIndependentMinima::default(),
+                grant: GrantPolicy::DomainMinimum,
+            },
         ],
     )?;
     let genesis = genesis_envelope(&EnvelopeInputs {

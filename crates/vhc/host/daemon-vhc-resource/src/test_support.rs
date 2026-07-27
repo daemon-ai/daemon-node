@@ -97,6 +97,24 @@ pub fn capability_report(class: BackendClass) -> DeviceCapabilityReport {
     crate::capability::fixtures::report(class)
 }
 
+/// The fixture report with its derived usable device supply raised to `usable_bytes`.
+///
+/// For gates whose subject is something other than device supply, run at geometries whose
+/// conservative composed estimate exceeds the stock fixture figure: raising the fixture's supply is
+/// fixture policy — the same act as picking the stock figure — not a statement about hardware, and
+/// it keeps the refusal path (`admit_node_memory_bytes`) exercised where supply IS the subject.
+#[must_use]
+pub fn capability_report_with_supply(
+    class: BackendClass,
+    usable_bytes: u64,
+) -> DeviceCapabilityReport {
+    let mut report = crate::capability::fixtures::report(class);
+    report.device_supply = crate::revision::Maybe::Available(
+        crate::capability::fixtures::derived_supply(usable_bytes),
+    );
+    report
+}
+
 /// Lane bounds wide enough for any composed claim, for a test that is not about lane bounds.
 ///
 /// Every backend class is populated on purpose. A class with no entry refuses

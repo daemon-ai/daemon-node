@@ -64,14 +64,17 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ciborium::value::Value;
+use daemon_vhc_host::run::admission::{Admission, ResourceAuthority};
 use daemon_vhc_host::run::{
-    admit, start_run, DeviceProfile, Dropped, JournalSink, MemoryClaim, OpOutcome, OpRequest,
-    OwnerPolicy, ParticipationLane, RunConfig, RunEnd, RunIdentity, SinkError,
+    admit, start_run, DeviceProfile, Dropped, JournalSink, OpOutcome, OpRequest, OwnerPolicy,
+    ParticipationLane, RunConfig, RunEnd, RunIdentity, SinkError,
 };
 use daemon_vhc_host::{BackendKind, EngineConfig, Worker};
 use daemon_vhc_proto::det_state::family_byte_len;
 use daemon_vhc_proto::merkle::commit_set;
 use daemon_vhc_proto::{blake3_hash, to_canonical_vec, Hash, PeerId, Seed};
+use daemon_vhc_resource::revision::BackendClass;
+use daemon_vhc_resource::{test_support, ReservationIdentity};
 use daemon_vhc_sdk_consensus::messages::{
     BatchWindow, Locator, RecordEntry, RoundOpen, RoundRecord, VhcMessage,
 };
@@ -420,16 +423,20 @@ fn wait_for(
     }
 }
 
-/// Run the REAL admission funnel over the ceremony trainer config and return the claim the module
-/// derives for this exact geometry (`decl_for_config` → `da_claim`). This is the number the
-/// production join engine enforces as the sandbox's memory cap and the number this gate measures
-/// against — obtained the same way the worker obtains it, not restated.
+/// Run the REAL admission funnel over the ceremony trainer config and return the admission whose
+/// composed figures the production join engine enforces as the sandbox's memory cap and this gate
+/// measures against — obtained the same way the worker obtains them, not restated.
+///
+/// The trainer declares the certification minor, so the funnel composes its physical estimate from
+/// the Logical Resource Plan the module emitted plus an authenticated Backend Execution Profile —
+/// assembled here from the resource crate's fixture assemblers, the one input a test cannot
+/// fabricate by hand.
 ///
 /// The lane is the production trainer lane with its DEVICE floor relaxed: this gate runs the CPU
 /// backend, and the floor is about which hardware may join, not about what the module may use. Its
-/// ceilings — the claim bounds the funnel checks the claim against, the buffer and readback quotas
-/// the run then runs under — are the production ones, unmodified.
-fn admitted_claim(wasm: &[u8], cfg_bytes: &[u8]) -> MemoryClaim {
+/// ceilings — the claim bounds the funnel checks against, the buffer and readback quotas the run
+/// then runs under — are the production ones, unmodified.
+fn admitted(wasm: &[u8], cfg_bytes: &[u8]) -> Admission {
     let mut lane = ParticipationLane::trainer_launch_defaults();
     lane.gpu = 1;
     lane.vram_bytes = 0;
@@ -446,6 +453,29 @@ fn admitted_claim(wasm: &[u8], cfg_bytes: &[u8]) -> MemoryClaim {
         vram_cap_bytes: 0,
         host_cap_bytes: 0,
     };
+    let (store, running) = test_support::stocked_profile_store(BackendClass::Cpu);
+    let policy = test_support::accepting_policy();
+    let profile = store
+        .select(&test_support::authentication_context(&running, &policy))
+        .expect("the fixture profile authenticates under the fixture policy");
+    // Supply raised above the ceremony-geometry conservative estimate: this gate's subject is
+    // streaming under the production linear-memory budgets, not device supply, and the fixture's
+    // stock figure would refuse the geometry before the budgets were ever exercised.
+    let report = test_support::capability_report_with_supply(BackendClass::Cpu, 128 << 30);
+    let lane_bounds = test_support::generous_lane_bounds();
+    let authority = ResourceAuthority {
+        profile: &profile,
+        report: &report,
+        lane_bounds: &lane_bounds,
+        co_resident_roles: 1,
+        reservation_identity: ReservationIdentity {
+            role: "trainer".into(),
+            incarnation: 1,
+            device_identity: "ceremony-round-device".into(),
+            sequence: 1,
+        },
+        frozen_binding: None,
+    };
     // The worker's assessment seat: manifest/claim evaluation never runs compute, so it stays on
     // the roomy CPU profile (`backend::assess_engine_config`) regardless of the measured selection.
     let assessment =
@@ -461,13 +491,9 @@ fn admitted_claim(wasm: &[u8], cfg_bytes: &[u8]) -> MemoryClaim {
         &owner,
         None,
         None,
-        // The ceremony trainer declares a tiered claim at its current minor, so no composition
-        // authority is involved and the declared claim is what comes back.
-        None,
+        Some(&authority),
     )
     .expect("the ceremony trainer's own claim admits under the production trainer lane")
-    .claim
-    .expect("a lower-minor trainer declares its own claim")
 }
 
 #[test]
@@ -487,19 +513,17 @@ fn ceremony_geometry_trainer_round_streams_under_the_production_budgets() {
     let cfg_bytes = to_canonical_vec(&ceremony_trainer_config_round_walk(&roster))
         .expect("ceremony trainer config (round-walk form)");
 
-    // The cap is the module's OWN admitted claim at this geometry, through the real funnel.
-    let claim = admitted_claim(&wasm, &cfg_bytes);
-    assert!(
-        claim.hard_accountable.host <= UNRAISED_MEMORY_CAP,
-        "the ceremony trainer's honest linear-memory claim is {} B, past the {UNRAISED_MEMORY_CAP} \
-         B the host used to hardcode — the defect was enforcement wiring, not a low ceiling, so a \
-         claim that needs MORE than the old constant is a residency regression, not a bigger cap",
-        claim.hard_accountable.host
-    );
+    // The cap is the module's OWN composed figure at this geometry, through the real funnel. It is
+    // a conservative budget — the plan's walk peaks plus a named fragmentation allowance — so it is
+    // allowed to sit above the historical 64 MiB constant; what must NOT exceed that constant is
+    // the MEASURED peak, asserted below where the measurement exists. Bounding the estimate by a
+    // measurement-era constant would compare a budget to a footprint.
+    let admission = admitted(&wasm, &cfg_bytes);
     let engine = EngineConfig::real_model(BackendKind::Cpu, None)
-        .with_claimed_memory(claim.hard_accountable.host);
+        .with_claimed_memory(admission.claim_host_bytes());
     assert_eq!(
-        engine.max_memory_bytes as u64, claim.hard_accountable.host,
+        engine.max_memory_bytes as u64,
+        admission.claim_host_bytes(),
         "the sandbox's memory cap IS the admitted claim (architecture §3.5), not a host constant"
     );
     let worker = Worker::new(engine).expect("engine");
@@ -522,7 +546,7 @@ fn ceremony_geometry_trainer_round_streams_under_the_production_budgets() {
     // The other exactly-metered tier of the same declaration: the host-side bytes the module stages
     // above its linear-memory floor — for this round, the committed container it builds through
     // `buffer_append` and never holds itself (`role_binding` wires exactly this on the live path).
-    run_cfg.hard_accountable_host_bytes = claim.declared_peak.host;
+    run_cfg.hard_accountable_host_bytes = admission.hard_accountable_host_bytes();
 
     let sink = MeasuringSink::shared();
     let run = start_run(&worker, &wasm, run_cfg, Box::new(sink.clone())).expect("start");
@@ -627,7 +651,7 @@ fn ceremony_geometry_trainer_round_streams_under_the_production_budgets() {
              fleet geometry — a whole-θ export collection, a whole master assembly, a whole moment \
              family at seal, or a whole decoded peer payload; OutOfFuel is the per-slice fuel \
              budget). Peak guest linear memory reached {peak} B.",
-            claim.hard_accountable.host
+            admission.claim_host_bytes()
         ),
     }
 
@@ -636,11 +660,20 @@ fn ceremony_geometry_trainer_round_streams_under_the_production_budgets() {
     // trapped"; this says how much was actually resident — and it is what makes the claim honest
     // evidence rather than a number nobody checks.
     assert!(
-        peak <= claim.hard_accountable.host,
+        peak <= admission.claim_host_bytes(),
         "measured peak guest linear memory {peak} B exceeds the admitted claim {} B — the module \
          under-claimed at this geometry (the claim is derived in `decl_for_config`; fix the \
          derivation, do not raise the cap)",
-        claim.hard_accountable.host
+        admission.claim_host_bytes()
+    );
+    // The anti-regression tripwire, on the measurement rather than the budget: the residency the
+    // enforcement-wiring defect era proved possible at this geometry. A measured peak past this
+    // constant is a real residency regression regardless of what the conservative budget permits.
+    assert!(
+        peak <= UNRAISED_MEMORY_CAP,
+        "measured peak guest linear memory {peak} B exceeds the {UNRAISED_MEMORY_CAP} B the host \
+         used to hardcode — the defect back then was enforcement wiring, not a low ceiling, so \
+         residency above the old constant is a regression, not a bigger appetite"
     );
 
     let stats = pump.state_store_stats();
@@ -713,10 +746,10 @@ fn ceremony_geometry_trainer_round_streams_under_the_production_budgets() {
         CEREMONY_PARAM_COUNT,
         payload.len(),
         PEERS.len(),
-        claim.hard_accountable.host,
-        claim.declared_peak.host,
+        admission.claim_host_bytes(),
+        admission.hard_accountable_host_bytes(),
         peak,
-        100.0 * peak as f64 / claim.hard_accountable.host as f64,
+        100.0 * peak as f64 / admission.claim_host_bytes() as f64,
         100.0 * peak as f64 / UNRAISED_MEMORY_CAP as f64,
         UNRAISED_MEMORY_CAP,
     );
@@ -747,7 +780,7 @@ fn ceremony_geometry_whole_payload_ingest_cannot_fit_the_admitted_claim() {
     let roster: Vec<PeerId> = PEERS.iter().map(|p| PeerId(*p)).collect();
     let cfg_bytes = to_canonical_vec(&ceremony_trainer_config_round_walk(&roster))
         .expect("ceremony trainer config (round-walk form)");
-    let claim = admitted_claim(&wasm, &cfg_bytes);
+    let admission = admitted(&wasm, &cfg_bytes);
 
     // -- half 1: the retired residency, derived from the frozen geometry -------------------------
     let chunk = ceremony_profile_chunk();
@@ -763,26 +796,32 @@ fn ceremony_geometry_whole_payload_ingest_cannot_fit_the_admitted_claim() {
     let whole_blob_per_peer = resident_indices + resident_values + container;
 
     assert!(
-        whole_blob_per_peer > claim.hard_accountable.host,
+        whole_blob_per_peer > admission.claim_host_bytes(),
         "the red line is not red: one peer's whole-blob residency {whole_blob_per_peer} B fits the \
          admitted claim {} B",
-        claim.hard_accountable.host
+        admission.claim_host_bytes()
     );
-    let over = whole_blob_per_peer as f64 / claim.hard_accountable.host as f64;
+    // The comfort margin is taken against the MEASURED-residency bar (the streaming gate's
+    // constant), not against the composed budget: the budget is conservative by design — it
+    // carries workspace and fragmentation allowances — so a margin computed against it shrinks
+    // whenever the estimate gets more honest, which is the opposite of what this guard watches.
+    let over = whole_blob_per_peer as f64 / UNRAISED_MEMORY_CAP as f64;
     assert!(
         over >= 4.0,
-        "one peer's whole-blob residency is only {over:.1}x the claim — the frozen geometry's \
-         margin collapsed; re-derive before trusting either gate"
+        "one peer's whole-blob residency is only {over:.1}x the measured-residency bar \
+         ({UNRAISED_MEMORY_CAP} B) — the frozen geometry's margin collapsed; re-derive before \
+         trusting either gate"
     );
     eprintln!(
         "ceremony_round[red line]: {rows} compression rows x topk {CEREMONY_TOPK} = {selected} \
          selected values per peer -> retired resident form {whole_blob_per_peer} B ({} B indices \
-         + {} B values + {} B container) = {over:.1}x the admitted claim {} B, PER PEER, x {} \
-         peers; the streamed form reads {} B of container rows per fold window per peer",
+         + {} B values + {} B container) = {over:.1}x the measured-residency bar, against the \
+         admitted claim {} B, PER PEER, x {} peers; the streamed form reads {} B of container \
+         rows per fold window per peer",
         resident_indices,
         resident_values,
         container,
-        claim.hard_accountable.host,
+        admission.claim_host_bytes(),
         PEERS.len(),
         window_section_bytes(),
     );
@@ -794,7 +833,7 @@ fn ceremony_geometry_whole_payload_ingest_cannot_fit_the_admitted_claim() {
     // image and the zeroed `ef` window. So the guest must fail to bring its state plane up.
     let starved = 2 * ceremony_state_chunk_size();
     assert!(
-        starved < claim.hard_accountable.host,
+        starved < admission.claim_host_bytes(),
         "the starved cap must be below the honest claim to prove anything"
     );
     let engine = EngineConfig::real_model(BackendKind::Cpu, None).with_claimed_memory(starved);
@@ -827,7 +866,7 @@ fn ceremony_geometry_whole_payload_ingest_cannot_fit_the_admitted_claim() {
                  {} B — brought its ceremony-geometry state plane up anyway: the claim-derived cap \
                  is NOT being enforced, which would make the streaming gate's completion assertion \
                  vacuous",
-                claim.hard_accountable.host
+                admission.claim_host_bytes()
             );
             eprintln!("ceremony_round[red line]: starved to {starved} B, run ended {end:?}");
         }

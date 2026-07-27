@@ -9,6 +9,10 @@
 //! Native-visible on purpose: sim tests drive [`GuestModule`] methods and the derivations directly
 //! (the `main!` exports are wasm32-only, exactly like the v1 `experiment!` macro).
 
+pub use daemon_vhc_abi::CERTIFICATION_MINOR_V2;
+pub use daemon_vhc_proto::execution_grant::ExecutionGrant;
+pub use daemon_vhc_proto::resource_plan::LogicalResourcePlan;
+
 use crate::migrate::{MigrationDescriptor, SectionReader};
 
 /// What a module declares about itself — the input the SDK derives the manifest + claim from.
@@ -46,6 +50,50 @@ pub struct ModuleDecl {
     pub device_scratch_bytes: u64,
 }
 
+/// Whether a module declaring `module_minor` gets pre-loop panic forwarding armed.
+///
+/// Pre-loop panic forwarding is a **behavioral** dependency on the host: it imports no new symbol,
+/// so the import-shape floor (`daemon_vhc_abi::required_v2_minor`) cannot see it, and a module
+/// relying on it must declare the certification rung deliberately. The declaration is therefore
+/// the switch: the SDK arms the hook **exactly when** the module declares that rung, so the two
+/// cannot disagree in the direction that matters. A module declaring a lower minor is never armed,
+/// and its pre-loop panic stays as anonymous as it was — correct, because an older host would
+/// otherwise turn its legal-looking log call into a phase-violation trap at initialization.
+///
+/// The second conjunct is a build-time floor, not a second switch: guests compiled against an ABI
+/// contract whose host generation does not implement the rung are left unarmed. That degrades in
+/// the safe direction (no diagnostic) rather than the unsafe one (a trap where a message was
+/// wanted).
+#[must_use]
+pub const fn pre_loop_diagnostics_armed(module_minor: u32) -> bool {
+    module_minor >= daemon_vhc_abi::CERTIFICATION_MINOR_V2
+        && daemon_vhc_abi::pre_loop_log_legal(daemon_vhc_abi::DA_ABI_MINOR_V2)
+}
+
+/// The **canonical trivial plan**: what a module emits when its algorithm's device demand is
+/// genuinely nothing.
+///
+/// A compute-free role still has a wasm heap, so the plan is not empty — it carries that module's
+/// own linear-memory floor, taken from the declaration the module already derives. It carries no
+/// device tensor, no operation family and no bounded transfer, because a module with none of those
+/// has none to declare.
+///
+/// This exists so that **no plan is ever hand-authored, for any role**. A trivially-derivable plan
+/// written down beside the module rather than emitted by it is still a value maintained in two
+/// places: it drifts when the schema or the encoding changes, and it opens a path by which
+/// authoring could publish a plan the module never produced. One derivation path for every role is
+/// simpler than one path with a carve-out, and the carve-out buys nothing — emitting a trivial plan
+/// is trivial.
+///
+/// **A module with device-resident tensors must not use this.** It is the *true* plan for a
+/// compute-free module and an under-declaration for any other, so each module states it at its own
+/// site rather than inheriting it: the trait's default refuses instead, so a new module cannot
+/// acquire a trivial plan by forgetting to think about it.
+#[must_use]
+pub fn trivial_resource_plan(decl: &ModuleDecl) -> LogicalResourcePlan {
+    LogicalResourcePlan::trivial(decl.host_state_bytes.max(WASM_LINEAR_MEMORY_FLOOR_BYTES))
+}
+
 /// A major-2 module under [`crate::main!`]: the v2 analogue of the v1 SDK's `Experiment`.
 pub trait GuestModule: Sized {
     /// The static declaration the manifest + claim derive from.
@@ -81,6 +129,45 @@ pub trait GuestModule: Sized {
         let _ = (descriptor, reader);
         1
     }
+
+    /// The module's **Logical Resource Plan** for the admitted configuration (`da_resource_plan`),
+    /// emitted at the certification rung in place of the tiered physical claim.
+    ///
+    /// What a module says here is what its ALGORITHM needs, in logical units — symbolic shapes,
+    /// dtypes, lifetimes, overlap groups, transfer windows, its own linear-memory terms — and
+    /// where a dimension is genuinely free, the bounded set of values it is willing to run at.
+    /// What it must not say is anything physical: no backend, allocator, driver or measurement,
+    /// and no constant calibrated against one. The host prices the plan against the machine's
+    /// certified profile and hands back the value it selected; a module that priced itself would
+    /// be pricing hardware it is forbidden to know about, and would have to be rebuilt whenever
+    /// that hardware's driver changed.
+    ///
+    /// Derivation runs on a capability-free instance with no imports available: it is
+    /// compute-free, allocation-free and execution-free by construction — symbolic formulas over
+    /// the configuration, never a walk over a materialized tensor graph.
+    ///
+    /// The default refuses, which is correct for every module below the certification rung: the
+    /// host never calls this export for them.
+    fn resource_plan(config: &[u8], capability_grants: &[u8]) -> Result<LogicalResourcePlan, u32> {
+        let _ = (config, capability_grants);
+        Err(1)
+    }
+
+    /// Consume the host's **Execution Grant** (`da_apply_execution_grant`), called exactly once on
+    /// the run instance before `da_init`.
+    ///
+    /// The grant carries logical values only — the selected micro-batch, token window, concurrency
+    /// and the like — chosen by the host from the bounded sets [`GuestModule::resource_plan`]
+    /// declared. It carries no backend identity, no device memory figure and no profile content,
+    /// so a module can branch on the choice without ever learning what made it.
+    ///
+    /// Returns `0` to accept. A nonzero status refuses the join deterministically for this exact
+    /// `(module, plan, grant)` triple — retrying with a fresh instance changes nothing, so a
+    /// module should refuse only what it genuinely cannot run.
+    fn apply_execution_grant(grant: &ExecutionGrant) -> u32 {
+        let _ = grant;
+        0
+    }
 }
 
 /// Guest-memory page granularity for claim rounding (wasm32 page = 64 KiB is the growth unit,
@@ -104,7 +191,8 @@ const CLAIM_PAGE: u64 = 4096;
 /// double the measured minimum so a toy module has real working margin. A floor can only ever
 /// RAISE a claim, so it cannot hide an over-run, and any module whose own derived figure is larger
 /// (the trainer's is ~59 MiB at the ceremony geometry) is unaffected.
-pub const WASM_LINEAR_MEMORY_FLOOR_BYTES: u64 = 4 << 20;
+pub const WASM_LINEAR_MEMORY_FLOOR_BYTES: u64 =
+    daemon_vhc_proto::resource_plan::WASM_GUEST_LINEAR_FLOOR_BYTES;
 
 fn round_page(v: u64) -> u64 {
     v.div_ceil(CLAIM_PAGE) * CLAIM_PAGE
@@ -229,6 +317,28 @@ pub mod rt {
         // SAFETY: `ptr` is a fresh `len`-byte allocation; regions don't overlap.
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, len) };
         ((ptr as u64) << 32) | len as u64
+    }
+
+    /// Retain the accepted Execution Grant for the instance's lifetime.
+    ///
+    /// The span the host wrote it into is BORROWED for the duration of the call and is reclaimed
+    /// with the instance, so what is kept is the decoded value — never the pointer. Called only
+    /// after the module accepted the grant, so a refused grant is never observable afterwards.
+    pub fn retain_execution_grant(grant: super::ExecutionGrant) {
+        GRANT.with(|slot| *slot.borrow_mut() = Some(grant));
+    }
+
+    /// The accepted Execution Grant, if one was applied — the logical configuration the host
+    /// selected out of this module's declared choice sets. `None` below the certification rung,
+    /// where no grant exists.
+    #[must_use]
+    pub fn execution_grant() -> Option<super::ExecutionGrant> {
+        GRANT.with(|slot| slot.borrow().clone())
+    }
+
+    std::thread_local! {
+        static GRANT: std::cell::RefCell<Option<super::ExecutionGrant>> =
+            const { std::cell::RefCell::new(None) };
     }
 
     /// The longest forwarded panic line; a payload past this is truncated with an ellipsis. A
@@ -360,10 +470,12 @@ pub mod rt {
     /// trap with no message, since the payload dies with the linear memory. The hook is the only
     /// moment the message is both formed and still reachable.
     ///
-    /// `main!` calls this at the top of `da_run` and nowhere else, deliberately: capability
-    /// imports are illegal during `da_init`/`da_migrate` (ABI §6.6), so logging from a hook armed
-    /// there would re-class the guest's panic as a `PhaseViolation` and destroy the classification
-    /// the forwarding exists to preserve.
+    /// `main!` calls this at the top of `da_run` unconditionally, and at the top of `da_init` and
+    /// `da_migrate` only through [`arm_pre_loop_diagnostics`]. The distinction is the whole of the
+    /// exemption's safety: capability imports are illegal in the two pre-loop phases below the
+    /// certification minor, so a hook armed there against an older host would re-class the guest's
+    /// panic as a `PhaseViolation` and destroy the very classification the forwarding exists to
+    /// preserve.
     #[cfg(target_arch = "wasm32")]
     pub fn forward_panics() {
         use std::sync::Once;
@@ -398,5 +510,55 @@ pub mod rt {
                 crate::abi::log(daemon_vhc_abi::LOG_LEVEL_ERROR, &line);
             }));
         });
+    }
+
+    /// Arm panic forwarding for the two PRE-LOOP phases — `da_init` and `da_migrate` — where a
+    /// guest is most likely to die and where, until the certification minor, it could only die
+    /// anonymously: initialization allocates the state plane and migration reconstructs it, and a
+    /// wasm allocation failure aborts through the same path as a panic, so the message and its
+    /// `file:line:col` are the entire diagnosis and they die with the linear memory.
+    ///
+    /// Armed exactly when the module declares the certification rung
+    /// ([`super::pre_loop_diagnostics_armed`]), so an older host refuses such a module with a
+    /// typed, minor-naming admission refusal instead of trapping it at initialization.
+    #[cfg(target_arch = "wasm32")]
+    pub fn arm_pre_loop_diagnostics(module_minor: u32) {
+        if super::pre_loop_diagnostics_armed(module_minor) {
+            forward_panics();
+        }
+    }
+}
+
+/// The certification rung sits above every rung whose floor the import shape can derive, so a
+/// module never reaches it by accident — and this build's contract implements it, or the arming
+/// predicate below would be dead. A compile error rather than a test failure, following the rung
+/// ladder's own discipline: a constant that went backwards would silently disarm every module.
+const _: () =
+    assert!(daemon_vhc_abi::CERTIFICATION_MINOR_V2 > daemon_vhc_abi::BUFFER_STAGE_MINOR_V2);
+
+#[cfg(test)]
+mod tests {
+    use super::pre_loop_diagnostics_armed;
+    use daemon_vhc_abi::CERTIFICATION_MINOR_V2;
+
+    /// The behavioral-floor coupling, asserted in BOTH directions: a module is armed for pre-loop
+    /// diagnostics only if it declares the certification rung, and every module that declares it
+    /// is armed. Neither half may drift from the other — the declaration is what makes an older
+    /// host refuse the module cleanly instead of trapping it at initialization.
+    #[test]
+    fn arming_pre_loop_forwarding_and_declaring_the_rung_are_one_decision() {
+        for module_minor in 0..CERTIFICATION_MINOR_V2 {
+            assert!(
+                !pre_loop_diagnostics_armed(module_minor),
+                "a module declaring minor {module_minor} must NOT be armed: on a host at that \
+                 rung its pre-loop log call is a phase violation, not a diagnostic"
+            );
+        }
+        for module_minor in CERTIFICATION_MINOR_V2..=CERTIFICATION_MINOR_V2 + 3 {
+            assert!(
+                pre_loop_diagnostics_armed(module_minor),
+                "a module declaring minor {module_minor} negotiated the rung and must be armed"
+            );
+        }
     }
 }

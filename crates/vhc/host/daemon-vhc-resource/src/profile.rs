@@ -860,8 +860,23 @@ pub mod fixtures {
             backend_class: class,
             implementation_revision: "0.10.0".into(),
             allocator_revision: "0.10.0".into(),
-            supported_operation_families: ["gemm".to_string()].into_iter().collect(),
-            supported_dtypes: ["f32".to_string(), "bool1".to_string()]
+            // The families a REAL trainer plan names (matmul/softmax/elementwise/gather/reduction)
+            // beside the original synthetic one (gemm): the fixture exists so tests outside this
+            // crate can admit the production trainer through the funnel, and a fixture that priced
+            // a family no plan names while refusing every family plans do name would only ever
+            // exercise the refusal path.
+            supported_operation_families: [
+                "gemm",
+                "matmul",
+                "softmax",
+                "elementwise",
+                "gather",
+                "reduction",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+            supported_dtypes: ["f32".to_string(), "bool1".to_string(), "i64".to_string()]
                 .into_iter()
                 .collect(),
             allocation_alignment_bytes: 256,
@@ -869,10 +884,21 @@ pub mod fixtures {
                 reported_bytes: 2 << 30,
                 measured_bytes: Maybe::Available(4 << 30),
             },
-            workspace_formulas: vec![WorkspaceFormula {
-                operation_family: "gemm".into(),
+            // One formula per supported family (a supported-but-unpriced family fails validation),
+            // all with the same conservative shape.
+            workspace_formulas: [
+                "gemm",
+                "matmul",
+                "softmax",
+                "elementwise",
+                "gather",
+                "reduction",
+            ]
+            .into_iter()
+            .map(|family| WorkspaceFormula {
+                operation_family: family.into(),
                 term: term(
-                    "gemm_workspace",
+                    &format!("{family}_workspace"),
                     AllocationScope::PerRoleInstance,
                     CompositionRule::Sum,
                     EnforcementClass::DirectlyEnforceable,
@@ -882,7 +908,8 @@ pub mod fixtures {
                         denominator: 8,
                     },
                 ),
-            }],
+            })
+            .collect(),
             standing_terms: vec![
                 term(
                     "resident_tensors",
