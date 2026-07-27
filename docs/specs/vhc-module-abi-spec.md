@@ -1902,10 +1902,11 @@ Three replay tiers (architecture §3.6); this document fixes the **input-replay 
 > **The `claim()` export and its tiered-envelope schema are superseded at ABI major 2 minor 5**, per
 > `[RC-11]` and `[RC-12]` of the ratified amendments. A guest declares **no device physics**: it
 > exports `da_resource_plan`, emitting a backend-neutral **Logical Resource Plan**; the host composes
-> `PhysicalClaim = compose(plan, authenticated Backend Execution Profile)` and validates it against a
-> measured **Device Capability Report**; the selected configuration returns through
-> **`da_apply_execution_grant`** as a logical **ExecutionGrant**. `da_claim` retains its meaning only
-> for modules at a lower minor.
+> `PhysicalEstimate = compose(plan, authenticated Backend Execution Profile)` — a conservative
+> estimate that refuses cheaply and sizes the enforced budget, never a proof of fit (architecture
+> `[RC-15]`) — and validates it against a measured **Device Capability Report**; the bound
+> configuration returns through **`da_apply_execution_grant`** as a logical **ExecutionGrant**.
+> `da_claim` retains its meaning only for modules at a lower minor.
 >
 > **The body below is unrevised and is left that way deliberately.** The minor-5 normative surface is
 > the host wave's to write, in the canonical tracked copy `docs/specs/vhc-module-abi-spec.md`. Read
@@ -3638,10 +3639,10 @@ is wrong — symbolic formulas over bounded operation classes are the required f
 ### 17.4 Minor-selected tag-0, and tag 18
 
 At minor ≤ 4 the run header carries `claim`. **At minor 5 `claim` is FORBIDDEN** and the header
-instead carries, inline: the canonical Logical Resource Plan, the composed role Physical Claim, the
-node/device aggregate claim, and the Execution Grant — each with its blake3 digest. A record carrying
-both a declared claim and a composed one is refused: a reader given both would have to guess which
-figure the run was admitted on.
+instead carries, inline: the canonical Logical Resource Plan, the composed role Physical Estimate,
+the node/device aggregate estimate, and the Execution Grant — each with its blake3 digest. A record
+carrying both a declared claim and a composed estimate is refused: a reader given both would have to
+guess which figure the run was admitted on.
 
 The grant is recorded **inline** rather than by sidecar reference on purpose: it is required before
 initialization and before replay can execute guest code, so resolving it from a sidecar would create a
@@ -3652,8 +3653,8 @@ large readback values is unchanged.
 after `da_apply_execution_grant` returns, whatever the status. Exactly one tag-18 record **or** one
 terminal grant-application trap follows tag 0, and **replay reproduces the branch**. A replay verifies
 every recorded digest against the bytes recorded with it before using any value, and checks that the
-members agree about each other — the claim names the plan it prices and the grant that configured it,
-and the grant names the plan it configures.
+members agree about each other — the estimate names the plan it prices and the grant that configured
+it, and the grant names the plan it configures.
 
 ### 17.5 The typed execution context (replaces §7.6's enumeration)
 
@@ -3700,16 +3701,16 @@ span. A reader that copied the whole span and then truncated has already paid fo
 length. Panic and log text is **untrusted**: it is escaped at the sink, never parsed for
 classification, and never used to decide a refusal.
 
-### 17.7 The lane's claim bounds are profile-keyed
+### 17.7 The lane's sanity bounds are profile-keyed
 
 At minor ≤ 4 the participation lane's claim bounds are checked against the module's declared
 `claim.device_total()` / `host_total()`, unchanged. At minor 5 the lane's **profile-keyed** sanity
-bounds are applied to the **selected composed role Physical Claim**, after composition and grant
-selection and **before** capability comparison and owner authorization, refusing
-`PhysicalClaimExceedsLane`. A lane that states no bounds for the backend class the profile prices
-refuses `LaneProfileUnsupported` — silence is not permission. The order is load-bearing: a claim absurd
-for the lane is a lane violation, and reporting it as a machine that is too small sends an operator to
-inspect hardware for a fault that lives in a plan or a profile.
+bounds are applied to the **composed role Physical Estimate**, after composition and grant binding
+and **before** capability comparison and owner authorization, refusing
+`PhysicalEstimateExceedsLane`. A lane that states no bounds for the backend class the profile prices
+refuses `LaneProfileUnsupported` — silence is not permission. The order is load-bearing: an estimate
+absurd for the lane is a lane violation, and reporting it as a machine that is too small sends an
+operator to inspect hardware for a fault that lives in a plan or a profile.
 
 ### 17.8 Permitted revision ranges name their numbering
 

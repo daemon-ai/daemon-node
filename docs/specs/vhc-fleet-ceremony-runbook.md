@@ -41,7 +41,7 @@ evidence.*
 The candidate is frozen by one full `vhc-production-gate --all` battery on the merge to
 `vhc-integration`. The freeze record has **two layers**, because the ratified resource model introduced
 artifacts whose lifecycles are deliberately independent of the guest and of the code freeze — a Backend
-Execution Profile, a Device Capability Report, a composed Physical Claim, an Execution Grant. Putting
+Execution Profile, a Device Capability Report, a composed Physical Estimate, an Execution Grant. Putting
 those in the candidate tuple would force a full re-freeze for a driver update; leaving them out
 entirely would leave recertification triggers with nothing to compare against.
 
@@ -58,7 +58,7 @@ full battery, exactly as before.
 `(participant, backend, admitted role instance)`, binding **twelve** members: role/incarnation
 identity; participant/device identity; profile digest **+ profile authority**; capability-report
 digest; logical resource plan hash; the Execution Grant's canonical-bytes digest; the composed role
-Physical Claim and the node/device aggregate claims; planner identity; governor identity;
+Physical Estimate and the node/device aggregate estimates; planner identity; governor identity;
 `reservation_identity`; a canonical **reservation digest**; and **scope-separated reservation
 components** including the profiled hidden-overhead reserve as its own visible component, with directly
 enforceable and profiled-and-measured amounts separated.

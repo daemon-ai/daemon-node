@@ -705,8 +705,8 @@ pub(crate) fn run_header_resources(
     }
     for (member, bytes) in [
         ("resource_plan", &run.resource_plan_bytes),
-        ("physical_claim", &run.physical_claim_bytes),
-        ("aggregate_claim", &run.aggregate_claim_bytes),
+        ("physical_estimate", &run.physical_estimate_bytes),
+        ("aggregate_estimate", &run.aggregate_claim_bytes),
         ("execution_grant", &run.execution_grant),
     ] {
         if bytes.is_empty() {
@@ -718,8 +718,8 @@ pub(crate) fn run_header_resources(
     }
     Ok(crate::run::RunHeaderResources::Composed {
         resource_plan: &run.resource_plan_bytes,
-        physical_claim: &run.physical_claim_bytes,
-        aggregate_claim: &run.aggregate_claim_bytes,
+        physical_estimate: &run.physical_estimate_bytes,
+        aggregate_estimate: &run.aggregate_claim_bytes,
         execution_grant: &run.execution_grant,
     })
 }

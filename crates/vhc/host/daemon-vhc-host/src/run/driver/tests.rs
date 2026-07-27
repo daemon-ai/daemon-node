@@ -1138,7 +1138,7 @@ fn a_certification_minor_run_without_a_composition_refuses_instead_of_recording_
     let mut composed = base();
     composed.abi_minor = daemon_vhc_abi::CERTIFICATION_MINOR_V2;
     composed.resource_plan_bytes = b"plan".to_vec();
-    composed.physical_claim_bytes = b"claim".to_vec();
+    composed.physical_estimate_bytes = b"claim".to_vec();
     composed.aggregate_claim_bytes = b"aggregate".to_vec();
     composed.execution_grant = b"grant".to_vec();
     assert!(matches!(
@@ -1149,8 +1149,8 @@ fn a_certification_minor_run_without_a_composition_refuses_instead_of_recording_
     // Each member is individually load-bearing: absent, the run refuses and the refusal names it.
     for (member, blank) in [
         ("resource_plan", 0usize),
-        ("physical_claim", 1),
-        ("aggregate_claim", 2),
+        ("physical_estimate", 1),
+        ("aggregate_estimate", 2),
         ("execution_grant", 3),
     ] {
         let mut missing = base();
@@ -1164,7 +1164,7 @@ fn a_certification_minor_run_without_a_composition_refuses_instead_of_recording_
         members[blank] = Vec::new();
         let [plan, claim, aggregate, grant] = members;
         missing.resource_plan_bytes = plan;
-        missing.physical_claim_bytes = claim;
+        missing.physical_estimate_bytes = claim;
         missing.aggregate_claim_bytes = aggregate;
         missing.execution_grant = grant;
 

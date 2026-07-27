@@ -5,7 +5,7 @@ appended — at every program boundary, and it is status, not normative text. No
 in the tracked specs (§2). If this file contradicts a chat log, a memory, or an archived
 document, this file wins; if it contradicts a tracked spec, the spec wins.
 
-Last rewritten: 2026-07-27 (program reset).
+Last rewritten: 2026-07-27 (trunk converged; doctrine amendment landed).
 
 ## 1. What we are building, and the next milestone
 
@@ -88,25 +88,30 @@ None of these blocks C0 or C1.
 
 ## 7. Current state (rewrite this section at every boundary)
 
-- Integration trunk: `vhc-integration` @ `b895d7ee` (resource subsystem + host wave merged).
-- Admitted-tuple extension (session-side tuple + tests, ~840 lines): staged work recovered from
-  the stopped workers; being verified and committed as part of trunk convergence.
-- Guest line: `vhc/guest-wave-a` @ `5f8e1f4b`, green on its own gates; merge into
-  `vhc-integration` pending (trunk convergence).
-- Doctrine amendment (§3) to the tracked specs + code: pending.
+- Integration trunk: `vhc-integration`, converged — admitted-tuple extension committed, guest
+  wave merged green (`98eae678`), topic branches pruned, one worktree per line.
+- Doctrine amendment: landed — `[RC-15]` (estimate demoted, verdict is authority) in the
+  architecture spec; composed-side `claim` vocabulary renamed to `estimate` across specs, code
+  and wire keys; `FitVerdict`/`FitProbeKey`/`FitVerdictStore` types in `daemon-vhc-resource`;
+  the caller-less estimate-driven selection path (`select`/`SelectionPolicy`/`validate_against`)
+  deleted.
+- Known truthful gap: no certified/authenticated Backend Execution Profile artifact exists on
+  any box, so the worker refuses certification-minor modules `EstimateNotComposable` at assess
+  (asserted by test). Node-side profile provisioning (PC-12 dev-authority lane for C0/C1) is the
+  next code deliverable; the probe runner that writes fit verdicts rides the fit-probe rung.
 - C0 promotion: pending. C1: not run. Fit probes: not run. Freeze/C2: not reached.
 - Program archive: frozen and locked read-only 2026-07-27.
 
 ## 8. Next actions (in order)
 
-1. Land the doctrine amendment: spec text (§3) + estimate/verdict types; delete the caller-less
-   selection path; rationalize the plan/claim/profile vocabulary.
-2. Converge the trunk: commit the admitted-tuple work, merge the guest line, prune topic
-   branches, one worktree per line.
-3. Promote the acceptance lane to the pinned C0 rung of the mandatory gate.
-4. Run C1 on two boxes; fix what it surfaces.
-5. Fit probes on all three boxes at ceremony geometry (one fixed retention policy).
-6. Freeze; memoized preflight; run C2; evidence closure; human-signed master merge.
+1. Provision profiles: a dev-authority-signed CPU-class profile artifact, node-provisioned to
+   the worker (PC-12: both policies name the authority; integration evidence only), so the
+   certification-minor trainer assesses eligible on the product path.
+2. Promote the acceptance lane to the pinned C0 rung of the mandatory gate.
+3. Run C1 on two boxes; fix what it surfaces.
+4. Fit probes on all three boxes at ceremony geometry (one fixed retention policy); the probe
+   runner records content-addressed verdicts (`[RC-15]`).
+5. Freeze; memoized preflight; run C2; evidence closure; human-signed master merge.
 
 ## 9. Agent contract
 

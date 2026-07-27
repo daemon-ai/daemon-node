@@ -93,10 +93,10 @@ pub enum RunHeaderResources<'a> {
     Composed {
         /// The canonical Logical Resource Plan bytes.
         resource_plan: &'a [u8],
-        /// The composed role Physical Claim, canonical bytes.
-        physical_claim: &'a [u8],
+        /// The composed role Physical Estimate, canonical bytes.
+        physical_estimate: &'a [u8],
         /// The node/device aggregate claim, canonical bytes.
-        aggregate_claim: &'a [u8],
+        aggregate_estimate: &'a [u8],
         /// The Execution Grant, canonical bytes.
         execution_grant: &'a [u8],
     },

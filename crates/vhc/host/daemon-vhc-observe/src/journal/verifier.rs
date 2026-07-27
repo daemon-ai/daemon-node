@@ -199,7 +199,7 @@ pub enum RecordedCompositionCheck {
 /// a record nobody had authenticated. The check is cheap and total, so it runs first.
 ///
 /// Re-deriving the claim needs the profile it cites, which a journal does not carry; that stronger check
-/// is [`daemon_vhc_resource::recompose_recorded_claim`], for a replay running where the profile is held.
+/// is [`daemon_vhc_resource::recompose_recorded_estimate`], for a replay running where the profile is held.
 #[must_use]
 pub fn check_recorded_composition(records: &[Record]) -> RecordedCompositionCheck {
     let Some(header) = records.iter().find_map(|record| match &record.body {
@@ -220,10 +220,10 @@ pub fn check_recorded_composition(records: &[Record]) -> RecordedCompositionChec
     ) = (
         header.resource_plan.as_deref(),
         header.resource_plan_hash,
-        header.physical_claim.as_deref(),
-        header.physical_claim_hash,
-        header.aggregate_claim.as_deref(),
-        header.aggregate_claim_hash,
+        header.physical_estimate.as_deref(),
+        header.physical_estimate_hash,
+        header.aggregate_estimate.as_deref(),
+        header.aggregate_estimate_hash,
         header.execution_grant.as_deref(),
         header.execution_grant_hash,
     )
@@ -234,8 +234,8 @@ pub fn check_recorded_composition(records: &[Record]) -> RecordedCompositionChec
     match daemon_vhc_resource::validate_recorded_composition(
         daemon_vhc_resource::RecordedComposition {
             resource_plan: (plan, plan_hash),
-            physical_claim: (claim, claim_hash),
-            aggregate_claim: (aggregate, aggregate_hash),
+            physical_estimate: (claim, claim_hash),
+            aggregate_estimate: (aggregate, aggregate_hash),
             execution_grant: (grant, grant_hash),
         },
     ) {

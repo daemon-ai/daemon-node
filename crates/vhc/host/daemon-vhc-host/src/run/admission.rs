@@ -222,7 +222,7 @@ pub struct OwnerPolicy {
 
 /// What the node brings to a certification-minor admission so a claim can be **composed** here.
 ///
-/// Absent, a certification-minor module is refused `ClaimNotComposable` — which is the correct floor
+/// Absent, a certification-minor module is refused `EstimateNotComposable` — which is the correct floor
 /// and not a defect: the module declares no physical figure, so without an authenticated profile and a
 /// capability report there is nothing to reserve, and the owner's own cap is never substituted for a
 /// figure that was supposed to be derived.
@@ -235,8 +235,8 @@ pub struct ResourceAuthority<'a> {
     pub profile: &'a daemon_vhc_resource::AuthenticatedProfile<'a>,
     /// This node's Device Capability Report — measured supply, stable rather than instantaneous.
     pub report: &'a daemon_vhc_resource::DeviceCapabilityReport,
-    /// The lane's profile-keyed Physical Claim sanity bounds.
-    pub lane_bounds: &'a daemon_vhc_resource::LaneClaimBounds,
+    /// The lane's profile-keyed Physical Estimate sanity bounds.
+    pub lane_bounds: &'a daemon_vhc_resource::LaneEstimateBounds,
     /// Role instances sharing this device, this one included.
     pub co_resident_roles: u64,
     /// The reservation identity this admission would hold.
@@ -354,24 +354,24 @@ impl Admission {
     /// The host linear-memory ceiling this admission authorizes, whichever authority set it.
     ///
     /// Below the certification minor it is the declared claim's peak host tier. At the certification
-    /// minor it is the composed claim's linear-memory figure, which the planner derives from the
+    /// minor it is the composed estimate's linear-memory figure, which the planner derives from the
     /// module's own backend-neutral host-memory terms — the same quantity, now derived rather than
     /// declared. Both are reviewed, bounded figures by the time they reach here.
     #[must_use]
     pub fn hard_accountable_host_bytes(&self) -> u64 {
         match (&self.claim, &self.composition) {
             (Some(claim), _) => claim.declared_peak.host,
-            (None, Some(composed)) => composed.claim().linear_memory_bytes,
+            (None, Some(composed)) => composed.estimate().linear_memory_bytes,
             (None, None) => 0,
         }
     }
 
     /// The host bytes the engine caps the guest's linear memory at.
     #[must_use]
-    pub fn claim_host_bytes(&self) -> u64 {
+    pub fn admitted_host_bytes(&self) -> u64 {
         match (&self.claim, &self.composition) {
             (Some(claim), _) => claim.hard_accountable.host,
-            (None, Some(composed)) => composed.claim().linear_memory_bytes,
+            (None, Some(composed)) => composed.estimate().linear_memory_bytes,
             (None, None) => 0,
         }
     }
@@ -386,7 +386,7 @@ impl Admission {
     pub fn charged_device_bytes(&self) -> u64 {
         match (&self.claim, &self.composition) {
             (Some(claim), _) => claim.device_total(),
-            (None, Some(composed)) => composed.claim().device_total_bytes(),
+            (None, Some(composed)) => composed.estimate().device_total_bytes(),
             (None, None) => 0,
         }
     }
@@ -396,7 +396,7 @@ impl Admission {
     pub fn charged_host_bytes(&self) -> u64 {
         match (&self.claim, &self.composition) {
             (Some(claim), _) => claim.host_total(),
-            (None, Some(composed)) => composed.claim().linear_memory_bytes,
+            (None, Some(composed)) => composed.estimate().linear_memory_bytes,
             (None, None) => 0,
         }
     }
@@ -437,7 +437,7 @@ impl Admission {
             return Ok(());
         };
         cfg.resource_plan_bytes = self.resource_plan_bytes.clone();
-        cfg.physical_claim_bytes = composed.claim().to_canonical_bytes()?;
+        cfg.physical_estimate_bytes = composed.estimate().to_canonical_bytes()?;
         cfg.aggregate_claim_bytes = composed.aggregate.to_canonical_bytes()?;
         cfg.execution_grant = composed.grant().to_canonical_bytes().map_err(|e| {
             daemon_vhc_resource::PlannerError::Invalid(format!("grant encoding: {e}"))
@@ -787,7 +787,7 @@ pub fn admit(
                 FunnelRefusal::typed(
                     4,
                     AbiRefusal::new(
-                        AbiRefusalCode::ClaimNotComposable,
+                        AbiRefusalCode::EstimateNotComposable,
                         "the module declared the certification minor but the assessment produced \
                          neither a tiered claim nor a Logical Resource Plan"
                             .to_string(),
@@ -798,11 +798,11 @@ pub fn admit(
                 return Err(FunnelRefusal::typed(
                     4,
                     AbiRefusal::new(
-                        AbiRefusalCode::ClaimNotComposable,
+                        AbiRefusalCode::EstimateNotComposable,
                         format!(
                             "the module declares major-2 minor {} and emitted a Logical Resource \
                              Plan, but this node has no authenticated Backend Execution Profile to \
-                             compose a Physical Claim with; no claim means no reservation and no \
+                             compose a Physical Estimate with; no claim means no reservation and no \
                              admission",
                             selection.minor
                         ),
@@ -825,8 +825,8 @@ pub fn admit(
                     frozen_binding: authority.frozen_binding,
                 })
                 .map_err(composition_refusal)?;
-            let dt = composed.claim().device_total_bytes();
-            let ht = composed.claim().linear_memory_bytes;
+            let dt = composed.estimate().device_total_bytes();
+            let ht = composed.estimate().linear_memory_bytes;
             let against = ComposedAgainst {
                 profile_digest: authority.profile.digest().0,
                 profile_authority: authority.profile.authenticating_authority().0,
@@ -843,7 +843,7 @@ pub fn admit(
                         FunnelRefusal::typed(
                             4,
                             AbiRefusal::new(
-                                AbiRefusalCode::ClaimNotComposable,
+                                AbiRefusalCode::EstimateNotComposable,
                                 format!(
                                     "this node's capability report could not be digested, so the \
                                      admitted tuple could not state what the claim was authorized \
@@ -909,8 +909,8 @@ pub fn admit(
 /// Map a composition refusal onto the funnel stage and the ratified refusal code that named it.
 ///
 /// The taxonomy already separates these, and the separation is the point: an operator told
-/// `ClaimExceedsPolicy` looks at policy, `PhysicalClaimExceedsLane` at the lane's envelope,
-/// `LaneProfileUnsupported` at the lane's configuration for this backend, and `ClaimNotComposable` at
+/// `ClaimExceedsPolicy` looks at policy, `PhysicalEstimateExceedsLane` at the lane's envelope,
+/// `LaneProfileUnsupported` at the lane's configuration for this backend, and `EstimateNotComposable` at
 /// whether a profile is present and authenticated at all. Collapsing them into one code would put all
 /// four investigations behind the same word.
 fn composition_refusal(refusal: daemon_vhc_resource::AdmissionRefusal) -> FunnelRefusal {
@@ -922,10 +922,10 @@ fn composition_refusal(refusal: daemon_vhc_resource::AdmissionRefusal) -> Funnel
         AdmissionRefusal::ExceedsLane(PlannerError::LaneStatesNoBoundsForClass { .. }) => {
             (4, AbiRefusalCode::LaneProfileUnsupported)
         }
-        AdmissionRefusal::ExceedsLane(_) => (4, AbiRefusalCode::PhysicalClaimExceedsLane),
+        AdmissionRefusal::ExceedsLane(_) => (4, AbiRefusalCode::PhysicalEstimateExceedsLane),
         // No usable claim came out of composition — a missing, incompatible or unusable input.
         AdmissionRefusal::NotComposable(_) | AdmissionRefusal::CapabilityUnusable(_) => {
-            (4, AbiRefusalCode::ClaimNotComposable)
+            (4, AbiRefusalCode::EstimateNotComposable)
         }
         // The machine, the owner's policy, or the allocator the profile describes said no. Stage 5,
         // because these are authorization answers about a claim that is otherwise well-formed.

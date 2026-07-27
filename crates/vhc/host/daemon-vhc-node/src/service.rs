@@ -1207,7 +1207,7 @@ impl VhcService {
     /// contract (decisions D-10):
     ///
     /// - **v2 assess** (`eligibility_from_assess`, the discovery path): the claim funnel's verdict,
-    ///   whose headroom carries `claim_device_bytes` / `claim_host_bytes` (bytes) — the disjoint
+    ///   whose headroom carries `claim_device_bytes` / `admitted_host_bytes` (bytes) — the disjoint
     ///   tier sums the worker's `admit` computed. Charged verbatim onto the device + host tiers,
     ///   so an admitted instance's reservation equals the assess claim totals.
     /// - **probe fallback** (`eligibility_from_hardware`, the no-registry default path): headroom
@@ -1253,7 +1253,7 @@ impl VhcService {
                 .map(|v| u64::try_from(v).unwrap_or(0))
         };
 
-        // The MEMORY reservation derives from the composed claim, and from nothing else.
+        // The MEMORY reservation derives from the composed estimate, and from nothing else.
         //
         // The certification path reports the reservation the governor derived: already
         // scope-correct, with process- and device-scoped terms charged once at their scope rather
@@ -1276,10 +1276,10 @@ impl VhcService {
                         "{}: no composed reservation and no declared device claim for role \
                          `{role}`, so there is nothing to reserve. The owner's cap is not a \
                          substitute for a figure that was supposed to be derived",
-                        AbiRefusalCode::ClaimNotComposable.slug()
+                        AbiRefusalCode::EstimateNotComposable.slug()
                     ))
                 })?;
-                (legacy_device, figure("claim_host_bytes").unwrap_or(0))
+                (legacy_device, figure("admitted_host_bytes").unwrap_or(0))
             }
         };
 
@@ -3220,7 +3220,7 @@ mod arbitration_tests {
     fn eligibility(device: i64, host: i64) -> VhcEligibility {
         let mut headroom = BTreeMap::new();
         headroom.insert("claim_device_bytes".to_string(), device);
-        headroom.insert("claim_host_bytes".to_string(), host);
+        headroom.insert("admitted_host_bytes".to_string(), host);
         VhcEligibility {
             eligible: true,
             reasons: Vec::new(),
@@ -3275,7 +3275,7 @@ mod arbitration_tests {
             .expect_err("no figure means no reservation and no admission");
         let rendered = err.to_string();
         assert!(
-            rendered.contains(AbiRefusalCode::ClaimNotComposable.slug()),
+            rendered.contains(AbiRefusalCode::EstimateNotComposable.slug()),
             "the refusal names the reason: {rendered}"
         );
         assert!(

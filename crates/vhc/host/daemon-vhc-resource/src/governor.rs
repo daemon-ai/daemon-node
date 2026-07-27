@@ -9,7 +9,7 @@
 //! The owner's memory ledger charge and the governor's occupancy reservation are **the same
 //! reservation seen twice**. They must not be taken twice and they must not drift apart. So there is
 //! exactly one [`Reservation`] object, and both consumers obtain their numbers from it through
-//! [`Reservation::bounds`] — the same function, the same arithmetic, the same composed claim. A
+//! [`Reservation::bounds`] — the same function, the same arithmetic, the same composed estimate. A
 //! second derivation is not an optimization, it is the drift.
 //!
 //! ## What the two views are compared on
@@ -23,7 +23,7 @@
 //!
 //! ## Memory is claim-derived; the other ledgers are not
 //!
-//! Only device memory and host RAM derive from the composed claim. Duty cycle, disk, uplink and
+//! Only device memory and host RAM derive from the composed estimate. Duty cycle, disk, uplink and
 //! downlink, and the concurrently-admitted-instance ceiling keep their established sources. What
 //! they share is the prohibition on the owner-cap fallback: an absent input is a typed refusal or an
 //! explicit policy default, never a silent substitution of the owner's own ceiling for a value that
@@ -36,7 +36,7 @@ use daemon_vhc_proto::{blake3_hash, to_canonical_vec, Hash};
 use serde::{Deserialize, Serialize};
 
 use crate::capability::DeviceCapabilityReport;
-use crate::planner::{AggregateClaim, PhysicalClaim, ScopedOccupancy};
+use crate::planner::{AggregateEstimate, PhysicalEstimate, ScopedOccupancy};
 use crate::profile::{AllocationScope, BackendExecutionProfile, EnforcementClass, ProfileError};
 
 /// The reservation arithmetic's identity.
@@ -237,11 +237,11 @@ pub enum GovernorError {
     /// absent composed figure would otherwise make the fallback the *only* path, and the ledger
     /// would charge the owner's own ceiling instead of the workload.
     #[error(
-        "no composed claim is available for {role}, so no reservation exists and the admission is \
+        "no composed estimate is available for {role}, so no reservation exists and the admission is \
          refused: {detail}. The owner's cap is not a substitute for a figure that was supposed to \
          be derived"
     )]
-    ClaimNotComposable {
+    EstimateNotComposable {
         /// The role that cannot be admitted.
         role: String,
         /// Why the claim is unavailable — a missing, incompatible or unauthenticated profile.
@@ -303,7 +303,7 @@ pub enum GovernorError {
     },
 }
 
-/// Derive the single reservation from the composed claims.
+/// Derive the single reservation from the composed estimates.
 ///
 /// Memory only: device memory from the composed role claim and the node/device aggregate, host RAM
 /// from the plan's own linear-memory terms. Never from a guest-declared physical figure, never from
@@ -313,9 +313,9 @@ pub enum GovernorError {
 /// `PerAllocation` terms are collected as a maximum constraint and are **not** added to any total.
 pub fn derive_reservation(
     identity: ReservationIdentity,
-    claim: &PhysicalClaim,
+    claim: &PhysicalEstimate,
     occupancy: &ScopedOccupancy,
-    aggregate: &AggregateClaim,
+    aggregate: &AggregateEstimate,
     profile: &BackendExecutionProfile,
 ) -> Result<Reservation, GovernorError> {
     profile.validate()?;
@@ -539,7 +539,7 @@ pub fn evaluate_occupancy(reservation: &Reservation, observed_bytes: u64) -> Occ
     }
 }
 
-/// The pool sizing a composed claim implies — **computed, not applied**.
+/// The pool sizing a composed estimate implies — **computed, not applied**.
 ///
 /// The default is not neutral. One backend's runtime overrides the pool page size with a fraction of
 /// the **device-local heap** — on a machine whose heap is far larger than the run's budget that
@@ -627,7 +627,7 @@ fn configured_worst_case(pooling: &crate::profile::PoolingBehavior, device_total
     blocks.saturating_mul(block)
 }
 
-/// Admit or refuse a composed claim against what this device was measured to accept.
+/// Admit or refuse a composed estimate against what this device was measured to accept.
 ///
 /// The **check** half of the pool question, which is the half that prevents a bad admission. A claim
 /// whose largest single allocation exceeds the device's measured limit cannot be satisfied by any pool
@@ -642,7 +642,7 @@ fn configured_worst_case(pooling: &crate::profile::PoolingBehavior, device_total
 /// is not a device that passed, and admitting against an absent measurement would admit everything.
 pub fn check_pool_admissible(
     reservation: &Reservation,
-    claim: &PhysicalClaim,
+    claim: &PhysicalEstimate,
     report: &DeviceCapabilityReport,
     profile: &BackendExecutionProfile,
 ) -> Result<PoolAdmission, GovernorError> {
@@ -657,7 +657,7 @@ pub fn check_pool_admissible(
         .saturating_mul(alignment);
     if requested > measured_ceiling {
         return Err(GovernorError::Invalid(format!(
-            "the composed claim needs a {requested}-byte single allocation, above the \
+            "the composed estimate needs a {requested}-byte single allocation, above the \
              {measured_ceiling}-byte limit this device was measured to accept"
         )));
     }
@@ -791,7 +791,7 @@ mod tests {
         compare_views(&reservation, &reservation).expect("one object cannot disagree with itself");
     }
 
-    /// Memory derives from the composed claim: device from the claim and aggregate, host RAM from
+    /// Memory derives from the composed estimate: device from the claim and aggregate, host RAM from
     /// the plan's own linear terms.
     #[test]
     fn memory_derives_from_the_composed_claim_and_never_from_a_cap() {
@@ -817,7 +817,7 @@ mod tests {
     /// reservation, so there is no admission.
     #[test]
     fn an_uncomposable_claim_is_a_typed_refusal_not_a_charge_of_the_owners_ceiling() {
-        let err = GovernorError::ClaimNotComposable {
+        let err = GovernorError::EstimateNotComposable {
             role: "trainer".into(),
             detail: "no authenticated profile for the resolved backend implementation".into(),
         };
@@ -1032,7 +1032,7 @@ mod tests {
         );
     }
 
-    /// Pool sizing comes from the composed claim. A page derived from the device heap can exceed
+    /// Pool sizing comes from the composed estimate. A page derived from the device heap can exceed
     /// the whole budget; a page derived from the claim cannot exceed the reservation.
     #[test]
     fn pool_sizing_derives_from_the_claim_and_never_exceeds_the_reservation() {

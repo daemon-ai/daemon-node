@@ -201,21 +201,21 @@ impl JournalSink for DurableSink {
         // merely wrong. Hashes are computed here from the very bytes being written, so a record cannot
         // carry a digest of something else.
         let digest = |bytes: &[u8]| daemon_vhc_proto::blake3_hash(bytes);
-        let (claim, resource_plan, physical_claim, aggregate_claim, execution_grant) =
+        let (claim, resource_plan, physical_estimate, aggregate_estimate, execution_grant) =
             match resources {
                 RunHeaderResources::Declared(claim) => {
                     (Some(claim.to_vec()), None, None, None, None)
                 }
                 RunHeaderResources::Composed {
                     resource_plan,
-                    physical_claim,
-                    aggregate_claim,
+                    physical_estimate,
+                    aggregate_estimate,
                     execution_grant,
                 } => (
                     None,
                     Some(resource_plan.to_vec()),
-                    Some(physical_claim.to_vec()),
-                    Some(aggregate_claim.to_vec()),
+                    Some(physical_estimate.to_vec()),
+                    Some(aggregate_estimate.to_vec()),
                     Some(execution_grant.to_vec()),
                 ),
             };
@@ -237,10 +237,10 @@ impl JournalSink for DurableSink {
                 device: device.to_vec(),
                 resource_plan_hash: resource_plan.as_deref().map(digest),
                 resource_plan,
-                physical_claim_hash: physical_claim.as_deref().map(digest),
-                physical_claim,
-                aggregate_claim_hash: aggregate_claim.as_deref().map(digest),
-                aggregate_claim,
+                physical_estimate_hash: physical_estimate.as_deref().map(digest),
+                physical_estimate,
+                aggregate_estimate_hash: aggregate_estimate.as_deref().map(digest),
+                aggregate_estimate,
                 execution_grant_hash: execution_grant.as_deref().map(digest),
                 execution_grant,
                 format: u64::from(format_version()),
@@ -506,7 +506,7 @@ mod tests {
     /// actually wrote.
     ///
     /// The two branches are the minor split made durable: a reader of a certification run's journal
-    /// finds the plan, the composed claim, the aggregate and the grant, and finds **no** declared claim
+    /// finds the plan, the composed estimate, the aggregate and the grant, and finds **no** declared claim
     /// to mistake for the figure the run was admitted on. A record carrying both would leave whoever
     /// reconstructs the run to choose, which is exactly what the grammar forbids.
     #[test]
@@ -535,8 +535,8 @@ mod tests {
                 b"g",
                 RunHeaderResources::Composed {
                     resource_plan: b"plan-bytes",
-                    physical_claim: b"claim-bytes",
-                    aggregate_claim: b"aggregate-bytes",
+                    physical_estimate: b"claim-bytes",
+                    aggregate_estimate: b"aggregate-bytes",
                     execution_grant: b"grant-bytes",
                 },
                 b"ch",
@@ -557,13 +557,13 @@ mod tests {
             ),
             (
                 &b"claim-bytes"[..],
-                header.physical_claim.as_deref(),
-                header.physical_claim_hash,
+                header.physical_estimate.as_deref(),
+                header.physical_estimate_hash,
             ),
             (
                 &b"aggregate-bytes"[..],
-                header.aggregate_claim.as_deref(),
-                header.aggregate_claim_hash,
+                header.aggregate_estimate.as_deref(),
+                header.aggregate_estimate_hash,
             ),
             (
                 &b"grant-bytes"[..],
@@ -600,8 +600,8 @@ mod tests {
         assert_eq!(header.claim.as_deref(), Some(&b"declared-claim"[..]));
         assert!(
             header.resource_plan.is_none()
-                && header.physical_claim.is_none()
-                && header.aggregate_claim.is_none()
+                && header.physical_estimate.is_none()
+                && header.aggregate_estimate.is_none()
                 && header.execution_grant.is_none(),
             "a lower-minor run composed nothing, so it records none of the composed members"
         );

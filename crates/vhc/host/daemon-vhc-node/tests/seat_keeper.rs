@@ -402,7 +402,7 @@ impl WorkerControl for RoleDirectedWorker {
             // The verdict carries the composed reservation this role needs, because that is what the
             // ledger charges. It used to carry no figure at all and the join still admitted, on the
             // owner-cap fallback that `d9a32ab8` removed — so an eligibility with nothing to charge is
-            // now a typed `ClaimNotComposable` refusal, which is the correct behaviour and made these
+            // now a typed `EstimateNotComposable` refusal, which is the correct behaviour and made these
             // seat drills fail once the arbitration suite stopped failing first. This suite is about
             // seat arbitration, not resources; it states a modest need so the resource funnel has
             // something real to reserve (arbiter-charge disposition, 2026-07-26).

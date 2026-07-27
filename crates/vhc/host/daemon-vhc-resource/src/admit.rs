@@ -14,7 +14,7 @@
 //!
 //! Every step can refuse, and which step refuses first decides what an operator is told:
 //!
-//! 1. **Compose** the selected configuration into a Physical Claim. A plan that cannot be priced by
+//! 1. **Compose** the selected configuration into a Physical Estimate. A plan that cannot be priced by
 //!    this profile fails here, and it is a composition fault — not a small machine.
 //! 2. **Bound it by the participation lane**, keyed by the backend class the profile prices. A claim
 //!    absurd for the lane is a lane violation. Reported as a capability refusal instead, it would send
@@ -41,8 +41,8 @@ use crate::governor::{
     ReservationIdentity,
 };
 use crate::planner::{
-    aggregate, check_claim_against_lane, compose_selection, minimum_binding, AggregateClaim,
-    LaneClaimBounds, PhysicalClaim, PlannerError, Selection,
+    aggregate, check_estimate_against_lane, compose_selection, minimum_binding, AggregateEstimate,
+    LaneEstimateBounds, PhysicalEstimate, PlannerError, Selection,
 };
 use crate::store::AuthenticatedProfile;
 
@@ -66,7 +66,7 @@ pub struct AdmissionInputs<'a> {
     /// The participation lane this role would run in.
     pub lane: &'a str,
     /// The lane's profile-keyed claim sanity bounds.
-    pub lane_bounds: &'a LaneClaimBounds,
+    pub lane_bounds: &'a LaneEstimateBounds,
     /// How many role instances share this device, this one included.
     pub co_resident_roles: u64,
     /// The reservation identity this admission would hold.
@@ -84,10 +84,10 @@ pub struct AdmissionInputs<'a> {
 /// What admission produced: the claim, what the node reserved, and the grant the guest will consume.
 #[derive(Clone, Debug)]
 pub struct AdmittedComposition {
-    /// The selected configuration, its Execution Grant, and the composed claim.
+    /// The selected configuration, its Execution Grant, and the composed estimate.
     pub selection: Selection,
     /// The node/device aggregate the instance was admitted within.
-    pub aggregate: AggregateClaim,
+    pub aggregate: AggregateEstimate,
     /// The single memory reservation the governor holds and the owner's ledger projects.
     pub reservation: Reservation,
     /// The pool bound that was checked, carried so evidence can state what admission compared.
@@ -95,10 +95,10 @@ pub struct AdmittedComposition {
 }
 
 impl AdmittedComposition {
-    /// The composed role Physical Claim.
+    /// The composed role Physical Estimate.
     #[must_use]
-    pub fn claim(&self) -> &PhysicalClaim {
-        &self.selection.claim
+    pub fn estimate(&self) -> &PhysicalEstimate {
+        &self.selection.estimate
     }
 
     /// The Execution Grant the run instance receives.
@@ -122,7 +122,7 @@ pub enum AdmissionRefusal {
     /// The plan could not be composed against this profile.
     #[error("the logical resource plan could not be composed into a physical claim: {0}")]
     NotComposable(PlannerError),
-    /// The composed claim falls outside the lane's bounds for the priced backend class.
+    /// The composed estimate falls outside the lane's bounds for the priced backend class.
     #[error("{0}")]
     ExceedsLane(PlannerError),
     /// The claim exceeds measured supply, the owner's cap, or the pool they share.
@@ -175,15 +175,20 @@ pub fn admit_composition(
     )
     .map_err(AdmissionRefusal::NotComposable)?;
 
-    // 2 — the lane bounds the composed claim, before any statement about the machine.
-    check_claim_against_lane(&selection.claim, profile, inputs.lane, inputs.lane_bounds)
-        .map_err(AdmissionRefusal::ExceedsLane)?;
+    // 2 — the lane bounds the composed estimate, before any statement about the machine.
+    check_estimate_against_lane(
+        &selection.estimate,
+        profile,
+        inputs.lane,
+        inputs.lane_bounds,
+    )
+    .map_err(AdmissionRefusal::ExceedsLane)?;
 
     // 3 — supply and the owner's cap, independently, with the joint pool comparison where the device
     // and the host draw on one DRAM.
     admit_node_memory_bytes(
-        selection.claim.total_peak_bytes,
-        selection.claim.linear_memory_bytes,
+        selection.estimate.total_peak_bytes,
+        selection.estimate.linear_memory_bytes,
         inputs.report,
         inputs.owner_cap,
     )?;
@@ -195,18 +200,18 @@ pub fn admit_composition(
     // keeps the reservation derivable at admission time, before any other role's admission is known.
     let aggregate = aggregate(&[(
         inputs.reservation_identity.role.clone(),
-        selection.claim.clone(),
+        selection.estimate.clone(),
         selection.occupancy.clone(),
     )])
     .map_err(AdmissionRefusal::Aggregation)?;
     let reservation = derive_reservation(
         inputs.reservation_identity.clone(),
-        &selection.claim,
+        &selection.estimate,
         &selection.occupancy,
         &aggregate,
         profile,
     )?;
-    let pool = check_pool_admissible(&reservation, &selection.claim, inputs.report, profile)?;
+    let pool = check_pool_admissible(&reservation, &selection.estimate, inputs.report, profile)?;
 
     Ok(AdmittedComposition {
         selection,
@@ -225,10 +230,10 @@ pub fn admit_composition(
 pub struct RecordedComposition<'a> {
     /// The canonical Logical Resource Plan bytes, and the hash the header recorded for them.
     pub resource_plan: (&'a [u8], daemon_vhc_proto::Hash),
-    /// The composed role Physical Claim.
-    pub physical_claim: (&'a [u8], daemon_vhc_proto::Hash),
+    /// The composed role Physical Estimate.
+    pub physical_estimate: (&'a [u8], daemon_vhc_proto::Hash),
     /// The node/device aggregate claim.
-    pub aggregate_claim: (&'a [u8], daemon_vhc_proto::Hash),
+    pub aggregate_estimate: (&'a [u8], daemon_vhc_proto::Hash),
     /// The Execution Grant.
     pub execution_grant: (&'a [u8], daemon_vhc_proto::Hash),
 }
@@ -310,8 +315,8 @@ pub fn validate_recorded_composition(
 
     for (member, (bytes, recorded_hash)) in [
         ("resource_plan", recorded.resource_plan),
-        ("physical_claim", recorded.physical_claim),
-        ("aggregate_claim", recorded.aggregate_claim),
+        ("physical_estimate", recorded.physical_estimate),
+        ("aggregate_estimate", recorded.aggregate_estimate),
         ("execution_grant", recorded.execution_grant),
     ] {
         if blake3_hash(bytes) != recorded_hash {
@@ -319,8 +324,9 @@ pub fn validate_recorded_composition(
         }
     }
 
-    let claim: PhysicalClaim = decode_member("physical_claim", recorded.physical_claim.0)?;
-    let aggregate: AggregateClaim = decode_member("aggregate_claim", recorded.aggregate_claim.0)?;
+    let claim: PhysicalEstimate = decode_member("physical_estimate", recorded.physical_estimate.0)?;
+    let aggregate: AggregateEstimate =
+        decode_member("aggregate_estimate", recorded.aggregate_estimate.0)?;
     // The plan and the grant are closed bounded schemas with their own decoders, and those are what a
     // replay must use: a permissive decode would accept bytes the admission path would have refused.
     let grant = ExecutionGrant::decode_canonical(recorded.execution_grant.0).map_err(|e| {
@@ -384,7 +390,7 @@ pub fn validate_recorded_composition(
 /// # Errors
 /// [`RecordedCompositionError::Divergent`] when re-composition disagrees, or the decode/consistency
 /// errors of the underlying members.
-pub fn recompose_recorded_claim(
+pub fn recompose_recorded_estimate(
     recorded: RecordedComposition<'_>,
     profile: &crate::profile::BackendExecutionProfile,
     co_resident_roles: u64,
@@ -395,7 +401,8 @@ pub fn recompose_recorded_claim(
             detail: e.detail().to_string(),
         }
     })?;
-    let recorded_claim: PhysicalClaim = decode_member("physical_claim", recorded.physical_claim.0)?;
+    let recorded_claim: PhysicalEstimate =
+        decode_member("physical_estimate", recorded.physical_estimate.0)?;
     let grant = ExecutionGrant::decode_canonical(recorded.execution_grant.0).map_err(|e| {
         RecordedCompositionError::Undecodable {
             member: "execution_grant",
@@ -434,9 +441,9 @@ pub fn recompose_recorded_claim(
         .map_err(|e| RecordedCompositionError::Inconsistent {
             detail: format!("the recorded plan does not compose against this profile: {e}"),
         })?;
-    if recomposed.claim.total_peak_bytes != recorded_claim.total_peak_bytes {
+    if recomposed.estimate.total_peak_bytes != recorded_claim.total_peak_bytes {
         return Err(RecordedCompositionError::Divergent {
-            recomposed: recomposed.claim.total_peak_bytes,
+            recomposed: recomposed.estimate.total_peak_bytes,
             recorded: recorded_claim.total_peak_bytes,
         });
     }
@@ -493,7 +500,7 @@ mod tests {
         plan: &'a LogicalResourcePlan,
         profile: &'a AuthenticatedProfile<'a>,
         report: &'a DeviceCapabilityReport,
-        bounds: &'a LaneClaimBounds,
+        bounds: &'a LaneEstimateBounds,
     ) -> AdmissionInputs<'a> {
         AdmissionInputs {
             plan,
@@ -513,8 +520,8 @@ mod tests {
         }
     }
 
-    fn generous_bounds() -> LaneClaimBounds {
-        let mut bounds = LaneClaimBounds::default();
+    fn generous_bounds() -> LaneEstimateBounds {
+        let mut bounds = LaneEstimateBounds::default();
         for class in ["vulkan", "metal", "dx12", "cuda", "cpu"] {
             bounds
                 .by_backend_class
@@ -542,7 +549,7 @@ mod tests {
             "the grant names the plan it configures"
         );
         assert_eq!(
-            admitted.claim().execution_grant_hash,
+            admitted.estimate().execution_grant_hash,
             admitted.grant().grant_hash().unwrap(),
             "the claim names the grant it prices"
         );
@@ -569,7 +576,7 @@ mod tests {
         report.measured_max_allocation =
             Maybe::Available(crate::capability::fixtures::measured_ceiling(4096));
 
-        let mut bounds = LaneClaimBounds::default();
+        let mut bounds = LaneEstimateBounds::default();
         bounds.by_backend_class.insert("vulkan".into(), [0, 4096]);
 
         let refusal =
@@ -654,7 +661,7 @@ mod tests {
 
         let plan_bytes = plan.to_canonical_bytes().expect("plan encodes");
         let claim_bytes = admitted
-            .claim()
+            .estimate()
             .to_canonical_bytes()
             .expect("claim encodes");
         let aggregate_bytes = admitted
@@ -679,21 +686,21 @@ mod tests {
         let (ph, ch, ah, gh) = members(&plan_bytes, &claim_bytes, &aggregate_bytes, &grant_bytes);
         let good = RecordedComposition {
             resource_plan: (&plan_bytes, ph),
-            physical_claim: (&claim_bytes, ch),
-            aggregate_claim: (&aggregate_bytes, ah),
+            physical_estimate: (&claim_bytes, ch),
+            aggregate_estimate: (&aggregate_bytes, ah),
             execution_grant: (&grant_bytes, gh),
         };
         validate_recorded_composition(good).expect("what admission wrote validates");
 
         // A digest that does not match its bytes is caught before anything is decoded.
         let wrong_digest = RecordedComposition {
-            physical_claim: (&claim_bytes, blake3_hash(b"not the claim")),
+            physical_estimate: (&claim_bytes, blake3_hash(b"not the claim")),
             ..good
         };
         assert!(matches!(
             validate_recorded_composition(wrong_digest).unwrap_err(),
             RecordedCompositionError::DigestMismatch {
-                member: "physical_claim"
+                member: "physical_estimate"
             }
         ));
 
@@ -717,13 +724,13 @@ mod tests {
         let shrunk = {
             let mut aggregate = admitted.aggregate.clone();
             aggregate.max_individual_allocation_bytes = admitted
-                .claim()
+                .estimate()
                 .max_individual_allocation_bytes
                 .saturating_sub(1);
             aggregate.to_canonical_bytes().expect("encodes")
         };
         let shrunk_aggregate = RecordedComposition {
-            aggregate_claim: (&shrunk, blake3_hash(&shrunk)),
+            aggregate_estimate: (&shrunk, blake3_hash(&shrunk)),
             ..good
         };
         assert!(matches!(
@@ -752,30 +759,30 @@ mod tests {
             .expect("the fixture admits");
 
         let plan_bytes = plan.to_canonical_bytes().unwrap();
-        let claim_bytes = admitted.claim().to_canonical_bytes().unwrap();
+        let claim_bytes = admitted.estimate().to_canonical_bytes().unwrap();
         let aggregate_bytes = admitted.aggregate.to_canonical_bytes().unwrap();
         let grant_bytes = admitted.grant().to_canonical_bytes().unwrap();
         let recorded = RecordedComposition {
             resource_plan: (&plan_bytes, blake3_hash(&plan_bytes)),
-            physical_claim: (&claim_bytes, blake3_hash(&claim_bytes)),
-            aggregate_claim: (&aggregate_bytes, blake3_hash(&aggregate_bytes)),
+            physical_estimate: (&claim_bytes, blake3_hash(&claim_bytes)),
+            aggregate_estimate: (&aggregate_bytes, blake3_hash(&aggregate_bytes)),
             execution_grant: (&grant_bytes, blake3_hash(&grant_bytes)),
         };
 
-        recompose_recorded_claim(recorded, profile.profile(), 1)
+        recompose_recorded_estimate(recorded, profile.profile(), 1)
             .expect("the same plan, grant and profile reproduce the recorded claim");
 
         // A record whose claim was tampered with is a divergence, and it names both figures.
         let tampered = {
-            let mut claim = admitted.claim().clone();
+            let mut claim = admitted.estimate().clone();
             claim.total_peak_bytes = claim.total_peak_bytes.saturating_add(4096);
             claim.to_canonical_bytes().unwrap()
         };
         let divergent = RecordedComposition {
-            physical_claim: (&tampered, blake3_hash(&tampered)),
+            physical_estimate: (&tampered, blake3_hash(&tampered)),
             ..recorded
         };
-        let err = recompose_recorded_claim(divergent, profile.profile(), 1).unwrap_err();
+        let err = recompose_recorded_estimate(divergent, profile.profile(), 1).unwrap_err();
         assert!(
             matches!(err, RecordedCompositionError::Divergent { .. }),
             "got {err}"

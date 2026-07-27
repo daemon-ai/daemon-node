@@ -136,7 +136,8 @@ fn boundary_4_a_capability_report_refuses_zero_readings_and_impossible_ceilings(
     );
     let unmeasured = CapabilityError::Unmeasured {
         quantity: "per-allocation ceiling",
-        detail: "a composed claim's maximum individual allocation cannot be validated against an \
+        detail:
+            "a composed estimate's maximum individual allocation cannot be validated against an \
                  unmeasured limit",
     };
     assert!(
@@ -172,8 +173,8 @@ fn boundary_6_a_recorded_composition_with_a_wrong_digest_is_refused_before_use()
     let wrong = daemon_vhc_proto::blake3_hash(b"different bytes entirely");
     let recorded = RecordedComposition {
         resource_plan: (&bytes, wrong),
-        physical_claim: (&bytes, wrong),
-        aggregate_claim: (&bytes, wrong),
+        physical_estimate: (&bytes, wrong),
+        aggregate_estimate: (&bytes, wrong),
         execution_grant: (&bytes, wrong),
     };
     let err = validate_recorded_composition(recorded)

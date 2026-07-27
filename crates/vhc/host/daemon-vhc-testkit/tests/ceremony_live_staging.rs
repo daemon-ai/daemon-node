@@ -394,7 +394,7 @@ fn drive_live_round(wasm: &[u8], corpus: &CorpusFixture) -> StagedRound {
 
     let admission = admitted(wasm, &cfg_bytes);
     let engine = EngineConfig::real_model(BackendKind::Cpu, None)
-        .with_claimed_memory(admission.claim_host_bytes());
+        .with_claimed_memory(admission.admitted_host_bytes());
     let worker = Worker::new(engine).expect("engine");
 
     let identity = RunIdentity {
@@ -531,7 +531,7 @@ fn drive_live_round(wasm: &[u8], corpus: &CorpusFixture) -> StagedRound {
                  geometry: read the trap detail — the SDK panic hook forwards the guest's own \
                  message and `file:line:col` through `sys@2::log` — and note that an allocation \
                  abort names the byte count it could not get.",
-                admission.claim_host_bytes(),
+                admission.admitted_host_bytes(),
                 ranges.len(),
             );
         }
@@ -558,7 +558,7 @@ fn drive_live_round(wasm: &[u8], corpus: &CorpusFixture) -> StagedRound {
     StagedRound {
         container: container.expect("the round PUTs its committed container"),
         peak,
-        claim_host: admission.claim_host_bytes(),
+        claim_host: admission.admitted_host_bytes(),
         ranges,
         spans,
         wall,
@@ -602,7 +602,7 @@ fn drive_live_refusal(wasm: &[u8], corpus: &CorpusFixture, fault: Fault) -> RunE
 
     let admission = admitted(wasm, &cfg_bytes);
     let engine = EngineConfig::real_model(BackendKind::Cpu, None)
-        .with_claimed_memory(admission.claim_host_bytes());
+        .with_claimed_memory(admission.admitted_host_bytes());
     let worker = Worker::new(engine).expect("engine");
     let identity = RunIdentity {
         run_id: [0x5e; 32],

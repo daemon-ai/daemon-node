@@ -102,7 +102,7 @@ fn honest_claim_admits_and_runs_with_deterministic_claim_bytes() {
         None,
     )
     .expect("honest claim admits");
-    assert_eq!(admission.claim_host_bytes(), 1 << 16);
+    assert_eq!(admission.admitted_host_bytes(), 1 << 16);
     assert_eq!(admission.declared_pressure_order(), vec![0, 1]);
     assert!(!admission.claim_bytes.is_empty());
     assert!(!admission.manifest_bytes.is_empty());
@@ -129,7 +129,7 @@ fn honest_claim_admits_and_runs_with_deterministic_claim_bytes() {
     let mut run_cfg = RunConfig::new(identity(&wasm, 1), [0x61; 32], cfg, Vec::new());
     run_cfg.claim_bytes = admission.claim_bytes.clone();
     run_cfg.manifest_bytes = admission.manifest_bytes.clone();
-    run_cfg.hard_accountable_host_bytes = admission.claim_host_bytes();
+    run_cfg.hard_accountable_host_bytes = admission.admitted_host_bytes();
     let sink = Arc::new(Mutex::new(MemorySink::new()));
     let run = start_run(&w, &wasm, run_cfg, Box::new(sink)).expect("start");
     run.pump
@@ -271,10 +271,10 @@ fn under_claim_traps_attributably_at_the_hard_cap() {
         None,
     )
     .expect("the under-claimer's CLAIM is well-formed and within bounds — it admits");
-    assert_eq!(admission.claim_host_bytes(), 512);
+    assert_eq!(admission.admitted_host_bytes(), 512);
 
     let mut run_cfg = RunConfig::new(identity(&wasm, 2), [0x62; 32], cfg, Vec::new());
-    run_cfg.hard_accountable_host_bytes = admission.claim_host_bytes();
+    run_cfg.hard_accountable_host_bytes = admission.admitted_host_bytes();
     run_cfg.claim_bytes = admission.claim_bytes;
     let sink = Arc::new(Mutex::new(MemorySink::new()));
     let run = start_run(&w, &wasm, run_cfg, Box::new(sink.clone())).expect("start");

@@ -719,10 +719,10 @@ claim figure. Each was fixed as an incident. These rules make the class unrepres
   cannot link it is bound by [DI-3] form 2 instead.
 
 **What this forbids in practice.** Authoring MUST NOT contain a physical figure for a role: the
-authored artifact carries the role's **module-derived** requirements, and the physical claim is
+authored artifact carries the role's **module-derived** requirements, and the Physical Estimate is
 composed at admission from those requirements plus the node's own profile and capability report
 (§9.6). An authoring seat therefore has no constructor for stating a requirement, and no path by
-which an operator's estimate becomes one.
+which an operator's figure becomes one.
 
 ---
 
@@ -1220,7 +1220,7 @@ checkpoint round, and disabling checkpointing isolated the trigger.
   restarts workers between runs; keep it that way.
 
 **Relationship to §9.6 (the residency contract).** [EB-4] and [EB-6] are the device-side siblings of
-two terms in the composed claim: [EB-4]'s checkpoint-staging headroom is [RC-4]'s staging term, and
+two terms in the composed estimate: [EB-4]'s checkpoint-staging headroom is [RC-4]'s staging term, and
 [EB-6]'s never-shrink pool is its retained-pool term. Under §9.6 those terms are supplied by the
 backend's **certified profile** rather than authored into a guest's claim — the quantity is the same
 one, and the change is which authority states it.
@@ -1298,31 +1298,52 @@ re-pins every time a driver moves.
 - **[RC-3]** Peak arithmetic is **persistent floor + the maximal concurrently-live transient set +
   fragmentation headroom**, not a sum over everything declared. The maximal-set form is the
   correction: summing transients over-states a peak no execution reaches.
-- **[RC-4]** `PhysicalClaim = compose(plan, authenticated certified profile)` — **one claim per
-  backend, never a maximum across backends**. Every profile term declares its **allocation scope**
-  (`PerAllocation` / `PerRoleInstance` / `PerProcess` / `PerDevice`), a stable aggregation key and an
-  associative composition rule; unknown sharing takes the conservative non-sharing rule. The Device
-  Capability Report is **measured on the participating node** and is a statement of **supply**, never
-  of demand, and never of instantaneous free memory.
-- **[RC-6]** A divergence between claimed and observed residency MUST name a **root authority and
-  the contributing authorities** among plan, profile, planner-selector, probe and governor. "The
-  memory was wrong" is not an attribution.
+- **[RC-4]** `PhysicalEstimate = compose(plan, authenticated certified profile)` — **one estimate
+  per backend, never a maximum across backends**. Every profile term declares its **allocation
+  scope** (`PerAllocation` / `PerRoleInstance` / `PerProcess` / `PerDevice`), a stable aggregation
+  key and an associative composition rule; unknown sharing takes the conservative non-sharing rule.
+  The Device Capability Report is **measured on the participating node** and is a statement of
+  **supply**, never of demand, and never of instantaneous free memory.
+- **[RC-6]** A divergence between estimated and observed residency MUST name a **root authority and
+  the contributing authorities** among plan, profile, planner, probe and governor. "The memory was
+  wrong" is not an attribution.
 - **[RC-10]** The governor **intercepts and attributes** what it can, **pre-authorizes from the
   profile's derived worst case** what it cannot, and records the two enforcement classes
-  **distinctly** in every claim, conformance record and certification statement. A statement that
+  **distinctly** in every estimate, conformance record and certification statement. A statement that
   reported one property over both would be asserting something about a driver's internals that
   nobody verified.
-- **[RC-11]** The host composes over the plan's choice set, selects under scope policy, and delivers
-  **logical values only** as an immutable **Execution Grant**. A `UniformRun` grant is frozen in the
-  signed role entry and every participant consumes those exact bytes; `PerParticipant` requires the
-  module's stated normalization contract and peer-visible evidence.
-- **[RC-13]** There is **one memory reservation authority**: the composed claim and its node/device
-  aggregates. Non-memory ledgers — duty, disk, bandwidth, instance ceiling — keep their existing
-  grant and policy derivations and are never claim-derived. The owner's cap **authorizes and never
-  pays**: it is not a substitute for a figure that was supposed to be derived.
+- **[RC-11]** The host composes the plan at a fixed binding and delivers **logical values only** as
+  an immutable **Execution Grant**. A `UniformRun` grant is frozen in the signed role entry and
+  every participant consumes those exact bytes and **verifies rather than reselects**;
+  `PerParticipant` requires the module's stated normalization contract and peer-visible evidence.
+  There is no estimate-driven geometry search on the admission path: which binding a grant carries
+  is decided by fit-verdict evidence ([RC-15]), not by ascending the choice set against a
+  composed figure.
+- **[RC-13]** There is **one memory reservation authority**: the composed estimate and its
+  node/device aggregates. Non-memory ledgers — duty, disk, bandwidth, instance ceiling — keep their
+  existing grant and policy derivations and are never estimate-derived. The owner's cap **authorizes
+  and never pays**: it is not a substitute for a figure that was supposed to be derived.
 - **[RC-14]** The profiled hidden-overhead reserve is **visible and counted once**, and a
   ledger-versus-governor comparison is about **reservation identity and bounds**, not occupancy —
   measured usage below a reserved bound is normal and is not a divergence.
+- **[RC-15]** **The composed figure is an estimate; the device is the oracle.** `compose()` output
+  serves exactly two purposes: **cheap sound refusal** (an estimate that already exceeds lane
+  bounds, measured supply or the owner's cap needs no probe) and **sizing the enforced budget** the
+  governor holds the run to. It is not a proof of fit and MUST NOT be refined toward one — no
+  byte-exactness obligation attaches to it, and a divergence between estimate and residency inside
+  the budget is not a defect. The authority that admits a geometry is the **Fit Verdict**: the
+  actual module, on the actual backend, at the granted geometry, under the enforced budget, in the
+  sandbox — recorded content-addressed and **memoized by
+  `(module hash, backend implementation revision, plan, grant, budget)`**. A green verdict admits
+  that exact key; a red verdict is a **contained, typed outcome** whose answer is a smaller
+  geometry from the grant's declared space, not a forensic investigation; an absent verdict means
+  the probe has not run — never that the estimate answers instead. Fleet feasibility for a frozen
+  roster is set membership — every node holds a green verdict — and involves no roster search and
+  no offer/matching protocol. An infeasibility surfaced by estimate or verdict refuses TYPED,
+  naming the binding constraint, its scope, and the refusing authority. The only question this
+  model ever escalates to the owner is a **product** question (a device whose declared space is
+  empty at minimum geometry: in or out); byte, margin and allocator questions are answered by the
+  probe or they are not questions.
 
 **Supply is discovered, never supplied.** A certified platform adapter derives conservative usable
 device supply from the platform's own facts, and there is no parameter through which a human figure
@@ -1332,11 +1353,11 @@ that is the answer, not a prompt. The figure MUST be **stable rather than instan
 platform budget that moves with co-tenant pressure is the governor's input, because a report cited by
 digest cannot be a different report each time it is taken. An **optional owner cap is separate node
 policy, outside the report**, and admission makes **two independent comparisons with two
-attributions** — claim against measured supply, and claim against the cap where one is set. A single
+attributions** — estimate against measured supply, and estimate against the cap where one is set. A single
 `min()` of the two loses which refused, and an operator whose own policy is the binding constraint
 must not be told their hardware is too small.
 
-**Ceilings are measured or absent.** The per-allocation ceiling a claim is validated against MUST be
+**Ceilings are measured or absent.** The per-allocation ceiling an estimate is validated against MUST be
 a **measurement, taken by allocating**, carried with the method that obtained it. Every ceiling a
 platform merely *states* — a framework constant, an advertised buffer limit — describes what an API
 permits rather than what the device honors, and promoting one into a field whose contract says

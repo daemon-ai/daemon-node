@@ -78,7 +78,7 @@ impl WorkerControl for FakeWorker {
         self.calls().assessed_envelopes.push(envelope);
         // A distinctive verdict so a test can tell the §6.5 assess path from the probe fallback — plus
         // the composed reservation the ledger charges. A verdict with no resource figure is a typed
-        // `ClaimNotComposable` refusal now that the owner-cap fallback is gone (`d9a32ab8`; arbiter-charge
+        // `EstimateNotComposable` refusal now that the owner-cap fallback is gone (`d9a32ab8`; arbiter-charge
         // disposition, 2026-07-26), so a drill about the discovery path has to state a need in order to
         // reach the discovery path at all.
         Ok(Eligibility {

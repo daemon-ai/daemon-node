@@ -520,10 +520,10 @@ fn ceremony_geometry_trainer_round_streams_under_the_production_budgets() {
     // measurement-era constant would compare a budget to a footprint.
     let admission = admitted(&wasm, &cfg_bytes);
     let engine = EngineConfig::real_model(BackendKind::Cpu, None)
-        .with_claimed_memory(admission.claim_host_bytes());
+        .with_claimed_memory(admission.admitted_host_bytes());
     assert_eq!(
         engine.max_memory_bytes as u64,
-        admission.claim_host_bytes(),
+        admission.admitted_host_bytes(),
         "the sandbox's memory cap IS the admitted claim (architecture §3.5), not a host constant"
     );
     let worker = Worker::new(engine).expect("engine");
@@ -651,7 +651,7 @@ fn ceremony_geometry_trainer_round_streams_under_the_production_budgets() {
              fleet geometry — a whole-θ export collection, a whole master assembly, a whole moment \
              family at seal, or a whole decoded peer payload; OutOfFuel is the per-slice fuel \
              budget). Peak guest linear memory reached {peak} B.",
-            admission.claim_host_bytes()
+            admission.admitted_host_bytes()
         ),
     }
 
@@ -660,11 +660,11 @@ fn ceremony_geometry_trainer_round_streams_under_the_production_budgets() {
     // trapped"; this says how much was actually resident — and it is what makes the claim honest
     // evidence rather than a number nobody checks.
     assert!(
-        peak <= admission.claim_host_bytes(),
+        peak <= admission.admitted_host_bytes(),
         "measured peak guest linear memory {peak} B exceeds the admitted claim {} B — the module \
          under-claimed at this geometry (the claim is derived in `decl_for_config`; fix the \
          derivation, do not raise the cap)",
-        admission.claim_host_bytes()
+        admission.admitted_host_bytes()
     );
     // The anti-regression tripwire, on the measurement rather than the budget: the residency the
     // enforcement-wiring defect era proved possible at this geometry. A measured peak past this
@@ -746,10 +746,10 @@ fn ceremony_geometry_trainer_round_streams_under_the_production_budgets() {
         CEREMONY_PARAM_COUNT,
         payload.len(),
         PEERS.len(),
-        admission.claim_host_bytes(),
+        admission.admitted_host_bytes(),
         admission.hard_accountable_host_bytes(),
         peak,
-        100.0 * peak as f64 / admission.claim_host_bytes() as f64,
+        100.0 * peak as f64 / admission.admitted_host_bytes() as f64,
         100.0 * peak as f64 / UNRAISED_MEMORY_CAP as f64,
         UNRAISED_MEMORY_CAP,
     );
@@ -796,10 +796,10 @@ fn ceremony_geometry_whole_payload_ingest_cannot_fit_the_admitted_claim() {
     let whole_blob_per_peer = resident_indices + resident_values + container;
 
     assert!(
-        whole_blob_per_peer > admission.claim_host_bytes(),
+        whole_blob_per_peer > admission.admitted_host_bytes(),
         "the red line is not red: one peer's whole-blob residency {whole_blob_per_peer} B fits the \
          admitted claim {} B",
-        admission.claim_host_bytes()
+        admission.admitted_host_bytes()
     );
     // The comfort margin is taken against the MEASURED-residency bar (the streaming gate's
     // constant), not against the composed budget: the budget is conservative by design — it
@@ -821,7 +821,7 @@ fn ceremony_geometry_whole_payload_ingest_cannot_fit_the_admitted_claim() {
         resident_indices,
         resident_values,
         container,
-        admission.claim_host_bytes(),
+        admission.admitted_host_bytes(),
         PEERS.len(),
         window_section_bytes(),
     );
@@ -833,7 +833,7 @@ fn ceremony_geometry_whole_payload_ingest_cannot_fit_the_admitted_claim() {
     // image and the zeroed `ef` window. So the guest must fail to bring its state plane up.
     let starved = 2 * ceremony_state_chunk_size();
     assert!(
-        starved < admission.claim_host_bytes(),
+        starved < admission.admitted_host_bytes(),
         "the starved cap must be below the honest claim to prove anything"
     );
     let engine = EngineConfig::real_model(BackendKind::Cpu, None).with_claimed_memory(starved);
@@ -866,7 +866,7 @@ fn ceremony_geometry_whole_payload_ingest_cannot_fit_the_admitted_claim() {
                  {} B — brought its ceremony-geometry state plane up anyway: the claim-derived cap \
                  is NOT being enforced, which would make the streaming gate's completion assertion \
                  vacuous",
-                admission.claim_host_bytes()
+                admission.admitted_host_bytes()
             );
             eprintln!("ceremony_round[red line]: starved to {starved} B, run ended {end:?}");
         }

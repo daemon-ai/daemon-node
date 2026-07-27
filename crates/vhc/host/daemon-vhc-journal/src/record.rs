@@ -147,22 +147,22 @@ pub struct RunHeader {
     /// blake3 of [`Self::resource_plan`], so a reader can check the bytes it was given.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub resource_plan_hash: Option<Hash>,
-    /// Tag-0 certification member: the composed Physical Claim for this role instance.
+    /// Tag-0 certification member: the composed Physical Estimate for this role instance.
     #[serde(with = "serde_bytes", skip_serializing_if = "Option::is_none", default)]
-    pub physical_claim: Option<Vec<u8>>,
-    /// blake3 of [`Self::physical_claim`].
+    pub physical_estimate: Option<Vec<u8>>,
+    /// blake3 of [`Self::physical_estimate`].
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub physical_claim_hash: Option<Hash>,
+    pub physical_estimate_hash: Option<Hash>,
     /// Tag-0 certification member: the node/device aggregate the instance was admitted within.
     ///
     /// Distinct from the per-instance claim on purpose: a role colocated with another shares device
     /// resources, and the aggregate is what the node actually reserved. A record carrying only the
     /// per-instance figure cannot explain why two colocated roles fit.
     #[serde(with = "serde_bytes", skip_serializing_if = "Option::is_none", default)]
-    pub aggregate_claim: Option<Vec<u8>>,
-    /// blake3 of [`Self::aggregate_claim`].
+    pub aggregate_estimate: Option<Vec<u8>>,
+    /// blake3 of [`Self::aggregate_estimate`].
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub aggregate_claim_hash: Option<Hash>,
+    pub aggregate_estimate_hash: Option<Hash>,
     /// Tag-0 certification member: the Execution Grant this instance ran under.
     #[serde(with = "serde_bytes", skip_serializing_if = "Option::is_none", default)]
     pub execution_grant: Option<Vec<u8>>,
@@ -385,7 +385,7 @@ pub struct SealRec {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Body {
-    /// tag 0. Boxed: the certification variant carries the plan, the composed claim, the aggregate
+    /// tag 0. Boxed: the certification variant carries the plan, the composed estimate, the aggregate
     /// and the grant, which makes this much the largest body — unboxed, every record of every other
     /// tag would be sized for it.
     RunHeader(Box<RunHeader>),
@@ -591,7 +591,7 @@ impl RunHeader {
     /// looking at without first agreeing with the writer about what a minor implies.
     #[must_use]
     pub fn is_certification_variant(&self) -> bool {
-        self.resource_plan.is_some() || self.physical_claim.is_some()
+        self.resource_plan.is_some() || self.physical_estimate.is_some()
     }
 
     /// Check the tag-0 variant grammar: exactly one of the two shapes, never both and never neither.
@@ -615,8 +615,11 @@ impl RunHeader {
             for (name, present) in [
                 ("resource_plan", self.resource_plan.is_some()),
                 ("resource_plan_hash", self.resource_plan_hash.is_some()),
-                ("physical_claim", self.physical_claim.is_some()),
-                ("physical_claim_hash", self.physical_claim_hash.is_some()),
+                ("physical_estimate", self.physical_estimate.is_some()),
+                (
+                    "physical_estimate_hash",
+                    self.physical_estimate_hash.is_some(),
+                ),
             ] {
                 if !present {
                     return Err(format!(
@@ -634,14 +637,14 @@ impl RunHeader {
                     self.resource_plan_hash,
                 ),
                 (
-                    "physical_claim",
-                    self.physical_claim.as_ref(),
-                    self.physical_claim_hash,
+                    "physical_estimate",
+                    self.physical_estimate.as_ref(),
+                    self.physical_estimate_hash,
                 ),
                 (
-                    "aggregate_claim",
-                    self.aggregate_claim.as_ref(),
-                    self.aggregate_claim_hash,
+                    "aggregate_estimate",
+                    self.aggregate_estimate.as_ref(),
+                    self.aggregate_estimate_hash,
                 ),
                 (
                     "execution_grant",
@@ -696,10 +699,10 @@ mod run_header_variant_tests {
             device: Vec::new(),
             resource_plan: None,
             resource_plan_hash: None,
-            physical_claim: None,
-            physical_claim_hash: None,
-            aggregate_claim: None,
-            aggregate_claim_hash: None,
+            physical_estimate: None,
+            physical_estimate_hash: None,
+            aggregate_estimate: None,
+            aggregate_estimate_hash: None,
             execution_grant: None,
             execution_grant_hash: None,
             format: 1,
@@ -713,8 +716,8 @@ mod run_header_variant_tests {
         h.claim = None;
         h.resource_plan_hash = Some(daemon_vhc_proto::hash::blake3_hash(&plan));
         h.resource_plan = Some(plan);
-        h.physical_claim_hash = Some(daemon_vhc_proto::hash::blake3_hash(&claim));
-        h.physical_claim = Some(claim);
+        h.physical_estimate_hash = Some(daemon_vhc_proto::hash::blake3_hash(&claim));
+        h.physical_estimate = Some(claim);
         h
     }
 
@@ -758,10 +761,10 @@ mod run_header_variant_tests {
     #[test]
     fn a_partial_certification_record_is_refused() {
         let mut partial = certification();
-        partial.physical_claim = None;
-        partial.physical_claim_hash = None;
+        partial.physical_estimate = None;
+        partial.physical_estimate_hash = None;
         let err = partial.check_variant().expect_err("a partial record");
-        assert!(err.contains("physical_claim"), "{err}");
+        assert!(err.contains("physical_estimate"), "{err}");
     }
 
     /// A digest that does not name the bytes beside it is refused: a verifier re-deriving from those
@@ -782,8 +785,8 @@ mod run_header_variant_tests {
         let text = format!("{encoded:?}");
         for absent in [
             "resource_plan",
-            "physical_claim",
-            "aggregate_claim",
+            "physical_estimate",
+            "aggregate_estimate",
             "execution_grant",
         ] {
             assert!(

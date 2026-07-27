@@ -118,12 +118,12 @@ fn a_composed_admission_states_the_plan_it_priced_and_what_priced_it() {
     // Every digest agrees with the bytes recorded beside it. A record whose digest does not cover its
     // own bytes is worse than no record: it invites a reader to verify and be reassured.
     assert_eq!(
-        composed.physical_claim_hash,
-        *blake3::hash(&composed.physical_claim).as_bytes()
+        composed.physical_estimate_hash,
+        *blake3::hash(&composed.physical_estimate).as_bytes()
     );
     assert_eq!(
-        composed.aggregate_claim_hash,
-        *blake3::hash(&composed.aggregate_claim).as_bytes()
+        composed.aggregate_estimate_hash,
+        *blake3::hash(&composed.aggregate_estimate).as_bytes()
     );
     assert_eq!(
         composed.execution_grant_hash,
@@ -150,7 +150,7 @@ fn a_composed_admission_states_the_plan_it_priced_and_what_priced_it() {
          what was charged"
     );
     assert!(
-        !composed.physical_claim.is_empty() && !composed.aggregate_claim.is_empty(),
+        !composed.physical_estimate.is_empty() && !composed.aggregate_estimate.is_empty(),
         "a composed statement with no claim bytes records that a composition happened and nothing \
          about what it produced"
     );

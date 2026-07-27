@@ -39,14 +39,14 @@ pub struct RunConfig {
     /// until the A2 admission funnel wires them — recorded as such.
     pub manifest_bytes: Vec<u8>,
     /// Run-header claim bytes (see [`RunConfig::manifest_bytes`]). Empty at the certification minor,
-    /// which records the plan, the composed claims and the grant instead.
+    /// which records the plan, the composed estimates and the grant instead.
     pub claim_bytes: Vec<u8>,
-    /// The composed role Physical Claim's canonical bytes — a certification-minor run-header member.
+    /// The composed role Physical Estimate's canonical bytes — a certification-minor run-header member.
     ///
     /// Empty below the certification minor, where [`RunConfig::claim_bytes`] carries the module's
     /// declared claim instead. The run header records one branch or the other, never both.
-    pub physical_claim_bytes: Vec<u8>,
-    /// The node/device aggregate claim's canonical bytes (see [`RunConfig::physical_claim_bytes`]).
+    pub physical_estimate_bytes: Vec<u8>,
+    /// The node/device aggregate claim's canonical bytes (see [`RunConfig::physical_estimate_bytes`]).
     ///
     /// Distinct from the per-instance claim: a role colocated with another shares device resources, and
     /// the aggregate is what the node actually reserved.
@@ -197,7 +197,7 @@ impl RunConfig {
             grants,
             manifest_bytes: Vec::new(),
             claim_bytes: Vec::new(),
-            physical_claim_bytes: Vec::new(),
+            physical_estimate_bytes: Vec::new(),
             aggregate_claim_bytes: Vec::new(),
             // A directly-constructed run has negotiated nothing, so it must not claim the newest
             // contract. Defaulting to the host's own minor made this field track the constant: when
@@ -253,7 +253,7 @@ pub enum RunError {
     /// Engine/linker/instantiation plumbing failed.
     #[error("v2 sandbox error: {0}")]
     Sandbox(String),
-    /// The run declares the certification minor but carries no composed claim to record.
+    /// The run declares the certification minor but carries no composed estimate to record.
     ///
     /// A host-side refusal before any guest code runs, and deliberately not a silent fallback to the
     /// legacy header: writing the composed branch with empty members would produce a record asserting
@@ -261,11 +261,11 @@ pub enum RunError {
     /// a declared claim the module never declared. Both are worse than not starting.
     ///
     /// Admission already refuses this run — a certification-minor module with no authenticated profile
-    /// gets `ClaimNotComposable` — so reaching here means a caller assembled a run configuration
+    /// gets `EstimateNotComposable` — so reaching here means a caller assembled a run configuration
     /// directly. That is exactly the path the first gate cannot see.
     #[error(
         "CompositionMissing: this run declares major-2 minor {minor}, whose run header records the \
-         composed claim, but `{member}` is empty — so there is nothing to record and the run does \
+         composed estimate, but `{member}` is empty — so there is nothing to record and the run does \
          not start"
     )]
     CompositionMissing {

@@ -259,19 +259,19 @@ pub struct ComposedResource {
     pub planner_version: u32,
     /// The Device Capability Report the claim was authorized against.
     pub capability_report_digest: [u8; 32],
-    /// The canonical bytes of the composed **role** Physical Claim.
-    pub physical_claim: Vec<u8>,
-    /// blake3 of [`Self::physical_claim`].
-    pub physical_claim_hash: [u8; 32],
+    /// The canonical bytes of the composed **role** Physical Estimate.
+    pub physical_estimate: Vec<u8>,
+    /// blake3 of [`Self::physical_estimate`].
+    pub physical_estimate_hash: [u8; 32],
     /// The canonical bytes of the node/device **aggregate** claim atomically reserved for this
     /// incarnation.
     ///
     /// Separate from the role claim because a correctly-shared process-scoped term and a
     /// double-counted per-role one produce the same role total and different aggregates — the
     /// colocation defect the aggregate exists to make visible.
-    pub aggregate_claim: Vec<u8>,
-    /// blake3 of [`Self::aggregate_claim`].
-    pub aggregate_claim_hash: [u8; 32],
+    pub aggregate_estimate: Vec<u8>,
+    /// blake3 of [`Self::aggregate_estimate`].
+    pub aggregate_estimate_hash: [u8; 32],
     /// The governor that took the reservation.
     pub governor_version: u32,
     /// The reservation's node-local monotone sequence. With the tuple's own role, incarnation and
@@ -410,7 +410,7 @@ impl AdmittedResource {
         let grant_bytes = composed.grant().to_canonical_bytes().map_err(|e| {
             daemon_vhc_resource::PlannerError::Invalid(format!("grant encoding: {e}"))
         })?;
-        let claim_bytes = composed.claim().to_canonical_bytes()?;
+        let claim_bytes = composed.estimate().to_canonical_bytes()?;
         let aggregate_bytes = composed.aggregate.to_canonical_bytes()?;
         let reservation_digest = composed.reservation.reservation_digest().map_err(|e| {
             daemon_vhc_resource::PlannerError::Invalid(format!("reservation encoding: {e}"))
@@ -427,10 +427,10 @@ impl AdmittedResource {
             backend_implementation_revision: against.backend_implementation_revision.clone(),
             planner_version: against.planner_version,
             capability_report_digest: against.capability_report_digest,
-            physical_claim_hash: *blake3::hash(&claim_bytes).as_bytes(),
-            physical_claim: claim_bytes,
-            aggregate_claim_hash: *blake3::hash(&aggregate_bytes).as_bytes(),
-            aggregate_claim: aggregate_bytes,
+            physical_estimate_hash: *blake3::hash(&claim_bytes).as_bytes(),
+            physical_estimate: claim_bytes,
+            aggregate_estimate_hash: *blake3::hash(&aggregate_bytes).as_bytes(),
+            aggregate_estimate: aggregate_bytes,
             governor_version: daemon_vhc_resource::GOVERNOR_VERSION,
             reservation_sequence: against.reservation_sequence,
             reservation_digest: reservation_digest.0,
@@ -485,14 +485,14 @@ impl ComposedResource {
             Some("planner_version")
         } else if self.capability_report_digest != rederived.capability_report_digest {
             Some("capability_report_digest")
-        } else if self.physical_claim != rederived.physical_claim {
-            Some("physical_claim")
-        } else if self.physical_claim_hash != rederived.physical_claim_hash {
-            Some("physical_claim_hash")
-        } else if self.aggregate_claim != rederived.aggregate_claim {
-            Some("aggregate_claim")
-        } else if self.aggregate_claim_hash != rederived.aggregate_claim_hash {
-            Some("aggregate_claim_hash")
+        } else if self.physical_estimate != rederived.physical_estimate {
+            Some("physical_estimate")
+        } else if self.physical_estimate_hash != rederived.physical_estimate_hash {
+            Some("physical_estimate_hash")
+        } else if self.aggregate_estimate != rederived.aggregate_estimate {
+            Some("aggregate_estimate")
+        } else if self.aggregate_estimate_hash != rederived.aggregate_estimate_hash {
+            Some("aggregate_estimate_hash")
         } else if self.governor_version != rederived.governor_version {
             Some("governor_version")
         } else if self.reservation_sequence != rederived.reservation_sequence {
@@ -1201,10 +1201,10 @@ mod tests {
             backend_implementation_revision: "0.10.0".into(),
             planner_version: 1,
             capability_report_digest: [0x14; 32],
-            physical_claim: vec![0xB0, 0xB1],
-            physical_claim_hash: [0x15; 32],
-            aggregate_claim: vec![0xC0, 0xC1],
-            aggregate_claim_hash: [0x16; 32],
+            physical_estimate: vec![0xB0, 0xB1],
+            physical_estimate_hash: [0x15; 32],
+            aggregate_estimate: vec![0xC0, 0xC1],
+            aggregate_estimate_hash: [0x16; 32],
             governor_version: 1,
             reservation_sequence: 7,
             reservation_digest: [0x17; 32],
@@ -1250,13 +1250,13 @@ mod tests {
             ("capability_report_digest", |c| {
                 c.capability_report_digest = [0xFF; 32]
             }),
-            ("physical_claim", |c| c.physical_claim = vec![0xFF]),
-            ("physical_claim_hash", |c| {
-                c.physical_claim_hash = [0xFF; 32]
+            ("physical_estimate", |c| c.physical_estimate = vec![0xFF]),
+            ("physical_estimate_hash", |c| {
+                c.physical_estimate_hash = [0xFF; 32]
             }),
-            ("aggregate_claim", |c| c.aggregate_claim = vec![0xFF]),
-            ("aggregate_claim_hash", |c| {
-                c.aggregate_claim_hash = [0xFF; 32]
+            ("aggregate_estimate", |c| c.aggregate_estimate = vec![0xFF]),
+            ("aggregate_estimate_hash", |c| {
+                c.aggregate_estimate_hash = [0xFF; 32]
             }),
             ("governor_version", |c| c.governor_version = 2),
             ("reservation_sequence", |c| c.reservation_sequence = 8),

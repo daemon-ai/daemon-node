@@ -68,7 +68,7 @@ impl WorkerControl for FakeChild {
         }
         if let Some((device, host)) = self.assess_claim {
             headroom.push(("claim_device_bytes".into(), device));
-            headroom.push(("claim_host_bytes".into(), host));
+            headroom.push(("admitted_host_bytes".into(), host));
         }
         if headroom.is_empty() {
             unreachable!("no discovery seam in this test");
@@ -442,7 +442,7 @@ impl RunDiscovery for StubDiscovery {
 }
 
 /// D-10 / D6 point 3: on the assess path a claim-bearing verdict carries `claim_device_bytes` /
-/// `claim_host_bytes`, and `derive_charge` charges them verbatim onto the device + host tiers —
+/// `admitted_host_bytes`, and `derive_charge` charges them verbatim onto the device + host tiers —
 /// so an **admitted instance's arbiter reservation equals the assess claim totals exactly** (with
 /// an uncapped policy, the owner cap does not tighten the claim). This is the acceptance assertion
 /// the retirement plan requires for the both-inputs rewrite.

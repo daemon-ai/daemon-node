@@ -188,7 +188,10 @@ async fn join_live(
         module: resolved.module.clone(),
         // The measured backend selection materialized (no fallback: an unavailable admitted
         // backend refuses the join typed here).
-        engine: backend::engine_for_join(resolved.device_min.as_ref(), binding.claim_host_bytes)?,
+        engine: backend::engine_for_join(
+            resolved.device_min.as_ref(),
+            binding.admitted_host_bytes,
+        )?,
         run: binding.run,
         own_cert: binding.own_cert,
         trusted_bases: binding.trusted_bases,
@@ -679,7 +682,7 @@ async fn main() {
                             // unavailable admitted backend refuses the join typed).
                             let engine = match backend::engine_for_join(
                                 resolved.device_min.as_ref(),
-                                binding.claim_host_bytes,
+                                binding.admitted_host_bytes,
                             ) {
                                 Ok(engine) => engine,
                                 Err(detail) => {

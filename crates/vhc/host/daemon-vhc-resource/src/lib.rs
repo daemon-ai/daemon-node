@@ -44,9 +44,10 @@ pub mod store;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 pub mod trust;
+pub mod verdict;
 
 pub use admit::{
-    admit_composition, recompose_recorded_claim, validate_recorded_composition, AdmissionInputs,
+    admit_composition, recompose_recorded_estimate, validate_recorded_composition, AdmissionInputs,
     AdmissionRefusal, AdmittedComposition, RecordedComposition, RecordedCompositionError,
 };
 pub use capability::{
@@ -68,9 +69,9 @@ pub use governor::{
     RESERVATION_ARITHMETIC_VERSION,
 };
 pub use planner::{
-    aggregate, check_claim_against_lane, compose, compose_selection, select, validate_against,
-    AggregateClaim, DivergenceAuthority, LaneClaimBounds, PhysicalClaim, PlannerError,
-    ScopedOccupancy, ScopedTerm, Selection, SelectionPolicy, PLANNER_VERSION,
+    aggregate, check_estimate_against_lane, compose, compose_selection, AggregateEstimate,
+    DivergenceAuthority, LaneEstimateBounds, PhysicalEstimate, PlannerError, ScopedOccupancy,
+    ScopedTerm, Selection, PLANNER_VERSION,
 };
 pub use profile::{
     AllocationCeilings, AllocationScope, BackendExecutionProfile, CompilationBehavior,
@@ -92,4 +93,7 @@ pub use store::{
 pub use trust::{
     authenticate, AuthenticationRefusal, PolicySide, ProfileAcceptancePolicy, ProfileAuthority,
     ProfileTrustEnvelope, RevisionNumbering, RevisionRange, ValidityPolicy,
+};
+pub use verdict::{
+    FitOutcome, FitProbeKey, FitVerdict, FitVerdictStore, VerdictError, FIT_VERDICT_SCHEMA,
 };

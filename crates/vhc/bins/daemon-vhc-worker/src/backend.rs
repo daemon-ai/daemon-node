@@ -874,7 +874,7 @@ pub(crate) fn measured_backend(
 /// ([`EngineConfig::real_model`]) on the device lanes and under an explicit operator selection
 /// (the defaults are tuned for the tiny reference model; a real geometry's fp32 steps trip the 5 s
 /// epoch watchdog and its fresh-join seed-init expansion trips the default fuel budget) — and the
-/// guest linear-memory cap taken from the **admitted claim** (`claim_host_bytes`, the claim's
+/// guest linear-memory cap taken from the **admitted claim** (`admitted_host_bytes`, the claim's
 /// hard-accountable host tier), so no host constant governs an admitted experiment's memory.
 ///
 /// # Errors
@@ -882,7 +882,7 @@ pub(crate) fn measured_backend(
 /// The typed `BackendUnavailable` reason — the join refuses; there is no fallback.
 pub(crate) fn engine_for_join(
     device_min: Option<&daemon_vhc_proto::DeviceMinimums>,
-    claim_host_bytes: u64,
+    admitted_host_bytes: u64,
 ) -> Result<EngineConfig, String> {
     let sel = measured_backend(device_min)?;
     let backend = kind_for_slug(&sel.slug).ok_or_else(|| {
@@ -902,7 +902,7 @@ pub(crate) fn engine_for_join(
             ..EngineConfig::default()
         }
     };
-    Ok(base.with_claimed_memory(claim_host_bytes))
+    Ok(base.with_claimed_memory(admitted_host_bytes))
 }
 
 /// The engine config for the ASSESSMENT instance (the CPU-cheap admission path: manifest/claim
@@ -1295,7 +1295,7 @@ pub(crate) struct RoleBinding {
     /// experiment declared for this exact config (`decl_for_config` -> `da_claim`), already checked
     /// against the lane's claim bounds and the owner's caps by the funnel. The join engine enforces
     /// it as the sandbox cap, so no host constant governs an admitted run's memory.
-    pub(crate) claim_host_bytes: u64,
+    pub(crate) admitted_host_bytes: u64,
 }
 
 /// Author the role-session binding for a resolved genesis run: re-run the admission funnel over
@@ -1347,7 +1347,7 @@ pub(crate) fn role_binding(
         resolved.device_min.as_ref(),
         envelope_grants.as_ref(),
         // No resource authority is assembled on this path yet, so a certification-minor module is
-        // refused `ClaimNotComposable` here — which is the correct answer today rather than a gap
+        // refused `EstimateNotComposable` here — which is the correct answer today rather than a gap
         // being papered over. Assembling one needs a certified profile to select, and no certified
         // profile artifact exists on any box: profile certification is the measurement wave's
         // deliverable and release signing is fenced. The funnel composes as soon as one is present.
@@ -1429,7 +1429,7 @@ pub(crate) fn role_binding(
     // records. A run that cannot record what it was admitted on is refused rather than started.
     admission
         .apply_composition(&mut run)
-        .map_err(|e| format!("join re-admission: recording the composed claim: {e}"))?;
+        .map_err(|e| format!("join re-admission: recording the composed estimate: {e}"))?;
     admission.apply_quotas(&mut run);
     // Provision the state plane from the genesis state contract (§6.3): the run-pinned
     // `state_chunk_size` the streamed det-lane fold runs under (`None` = no host-side state).
@@ -1458,7 +1458,7 @@ pub(crate) fn role_binding(
         own_cert: cert,
         trusted_bases,
         quotas: admission.quotas.clone(),
-        claim_host_bytes: admission.claim_host_bytes(),
+        admitted_host_bytes: admission.admitted_host_bytes(),
     })
 }
 
@@ -1991,7 +1991,7 @@ fn assess_module(
                         admission.charged_device_bytes() as i64,
                     ),
                     (
-                        "claim_host_bytes".to_string(),
+                        "admitted_host_bytes".to_string(),
                         admission.charged_host_bytes() as i64,
                     ),
                 ],

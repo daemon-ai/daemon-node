@@ -685,18 +685,18 @@ pub enum AbiRefusalCode {
     /// is deterministic and non-retryable for that `(module, plan, grant)` tuple — a retry requires
     /// changed admitted input, not a fresh instance.
     ExecutionGrantRejected,
-    /// The selected composed role Physical Claim breached the participation lane's profile-resolved
+    /// The selected composed role Physical Estimate breached the participation lane's profile-resolved
     /// sanity envelope (checked after composition and grant selection, before capability comparison
     /// and owner authorization).
-    PhysicalClaimExceedsLane,
-    /// The participation lane carries no Physical Claim sanity envelope for the resolved Backend
-    /// Execution Profile, so there is nothing to check the composed claim against.
+    PhysicalEstimateExceedsLane,
+    /// The participation lane carries no Physical Estimate sanity envelope for the resolved Backend
+    /// Execution Profile, so there is nothing to check the composed estimate against.
     LaneProfileUnsupported,
-    /// No composed Physical Claim is available — a missing, incompatible or unauthenticated Backend
+    /// No composed Physical Estimate is available — a missing, incompatible or unauthenticated Backend
     /// Execution Profile — so no reservation exists and the admission is refused.
     ///
     /// The owner's own cap is never substituted for a figure that was supposed to be derived.
-    ClaimNotComposable,
+    EstimateNotComposable,
     /// `switch_module` targets a module without `da_migrate` — always an admission refusal, never a
     /// trap (ABI §1.5, §10.3). Reserved for Phase E; part of the taxonomy now.
     MigrateUnsupported,
@@ -725,9 +725,9 @@ impl AbiRefusalCode {
             Self::LogicalResourcePlanExceedsPolicy => "LogicalResourcePlanExceedsPolicy",
             Self::ResourcePlanInconsistent => "ResourcePlanInconsistent",
             Self::ExecutionGrantRejected => "ExecutionGrantRejected",
-            Self::PhysicalClaimExceedsLane => "PhysicalClaimExceedsLane",
+            Self::PhysicalEstimateExceedsLane => "PhysicalEstimateExceedsLane",
             Self::LaneProfileUnsupported => "LaneProfileUnsupported",
-            Self::ClaimNotComposable => "ClaimNotComposable",
+            Self::EstimateNotComposable => "EstimateNotComposable",
             Self::MigrateUnsupported => "MigrateUnsupported",
             Self::CustomOpUnsupported => "CustomOpUnsupported",
         }
@@ -950,15 +950,15 @@ pub const JOURNAL_TAG_EXECUTION_GRANT: u8 = 18;
 pub const RUN_HEADER_KEY_RESOURCE_PLAN: &str = "resource_plan";
 /// Tag-0 certification member: blake3 of [`RUN_HEADER_KEY_RESOURCE_PLAN`].
 pub const RUN_HEADER_KEY_RESOURCE_PLAN_HASH: &str = "resource_plan_hash";
-/// Tag-0 certification member: the canonical bytes of the **selected role** Physical Claim.
-pub const RUN_HEADER_KEY_PHYSICAL_CLAIM: &str = "physical_claim";
-/// Tag-0 certification member: blake3 of [`RUN_HEADER_KEY_PHYSICAL_CLAIM`].
-pub const RUN_HEADER_KEY_PHYSICAL_CLAIM_HASH: &str = "physical_claim_hash";
+/// Tag-0 certification member: the canonical bytes of the **selected role** Physical Estimate.
+pub const RUN_HEADER_KEY_PHYSICAL_ESTIMATE: &str = "physical_estimate";
+/// Tag-0 certification member: blake3 of [`RUN_HEADER_KEY_PHYSICAL_ESTIMATE`].
+pub const RUN_HEADER_KEY_PHYSICAL_ESTIMATE_HASH: &str = "physical_estimate_hash";
 /// Tag-0 certification member: the canonical bytes of the node/device aggregate claim atomically
 /// reserved for this incarnation at admission.
-pub const RUN_HEADER_KEY_AGGREGATE_CLAIM: &str = "aggregate_claim";
+pub const RUN_HEADER_KEY_AGGREGATE_CLAIM: &str = "aggregate_estimate";
 /// Tag-0 certification member: blake3 of [`RUN_HEADER_KEY_AGGREGATE_CLAIM`].
-pub const RUN_HEADER_KEY_AGGREGATE_CLAIM_HASH: &str = "aggregate_claim_hash";
+pub const RUN_HEADER_KEY_AGGREGATE_CLAIM_HASH: &str = "aggregate_estimate_hash";
 /// Tag-0 certification member: the canonical Execution Grant bytes, recorded **inline**.
 ///
 /// Unlike arbitrary readback, the grant is bounded to 64 KiB, contains only non-secret logical

@@ -336,7 +336,7 @@ fn drive_round(wasm: &[u8], steps: u64) -> RoundOutcome {
     // The cap is the module's OWN admitted claim for this config, through the real funnel.
     let admission = admitted(wasm, &cfg_bytes);
     let engine = EngineConfig::real_model(BackendKind::Cpu, None)
-        .with_claimed_memory(admission.claim_host_bytes());
+        .with_claimed_memory(admission.admitted_host_bytes());
     let worker = Worker::new(engine).expect("engine");
 
     let identity = RunIdentity {
@@ -421,7 +421,7 @@ fn drive_round(wasm: &[u8], steps: u64) -> RoundOutcome {
                  count; an OutOfFuel is the per-slice fuel budget under a REAL training slice — \
                  which was measured on init and on the training-free round walk, and is measured \
                  with the math ON only here",
-                admission.claim_host_bytes()
+                admission.admitted_host_bytes()
             );
         }
         assert!(
@@ -447,7 +447,7 @@ fn drive_round(wasm: &[u8], steps: u64) -> RoundOutcome {
     RoundOutcome {
         container: container.expect("the round PUTs its committed container"),
         peak,
-        claim_host: admission.claim_host_bytes(),
+        claim_host: admission.admitted_host_bytes(),
         max_export_readback: measured.max_export_readback,
         export_readbacks: measured.export_readbacks,
         wall,

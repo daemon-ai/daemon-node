@@ -35,7 +35,7 @@ use daemon_vhc_proto::{blake3_hash, to_canonical_vec, Hash, PeerId};
 use serde::{Deserialize, Serialize};
 
 use crate::governor::{ReservationComponents, ReservationIdentity};
-use crate::planner::{AggregateClaim, PhysicalClaim};
+use crate::planner::{AggregateEstimate, PhysicalEstimate};
 
 /// The number of normative bindings a layer-2 composition evidence record carries.
 ///
@@ -167,10 +167,10 @@ pub struct CompositionEvidenceRecord {
     pub logical_resource_plan_hash: Hash,
     /// The digest of the Execution Grant's **canonical bytes**.
     pub execution_grant_digest: Hash,
-    /// The composed role Physical Claim.
-    pub physical_claim: PhysicalClaim,
+    /// The composed role Physical Estimate.
+    pub physical_estimate: PhysicalEstimate,
     /// The node/device aggregate claim reserved for this incarnation.
-    pub aggregate_claim: AggregateClaim,
+    pub aggregate_estimate: AggregateEstimate,
     /// The planner that composed it.
     pub planner_version: u32,
     /// The governor that reserved it.
@@ -641,8 +641,8 @@ mod tests {
             capability_report_digest: report(BackendClass::Vulkan).report_digest().unwrap(),
             logical_resource_plan_hash: p.plan_hash().unwrap(),
             execution_grant_digest: Hash([8u8; 32]),
-            physical_claim: claim,
-            aggregate_claim: agg,
+            physical_estimate: claim,
+            aggregate_estimate: agg,
             planner_version: PLANNER_VERSION,
             governor_version: GOVERNOR_VERSION,
             supersedes,

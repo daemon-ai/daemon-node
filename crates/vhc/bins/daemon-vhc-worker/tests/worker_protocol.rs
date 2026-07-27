@@ -340,7 +340,7 @@ fn genesis_wire(run_label: &str, config: Value) -> Vec<u8> {
                 ..RoleGrants::default()
             },
             // The superseded device-minimums section stays EMPTY: physical requirements are
-            // members of the composed claim, and an authored minimum beside a composed one is a
+            // members of the composed estimate, and an authored minimum beside a composed one is a
             // second authority over the same question, which authoring refuses.
             device_min: daemon_vhc_proto::DeviceMinimums::default(),
         },
@@ -543,7 +543,7 @@ async fn v1_module_assess_is_refused_abi_unsupported_major() {
 
 /// The envelope seam over the genesis form for a **certification-minor** module: the worker
 /// verifies the real signed genesis, the trainer emits its Logical Resource Plan — and the worker
-/// refuses `ClaimNotComposable`, TYPED and healthy, because no authenticated Backend Execution
+/// refuses `EstimateNotComposable`, TYPED and healthy, because no authenticated Backend Execution
 /// Profile is provisioned on this box to compose a physical estimate with. That refusal is the
 /// correct answer today, not a gap: composing without an authenticated profile would be the exact
 /// substitution the resource model exists to prevent. When node-side profile provisioning lands
@@ -565,7 +565,7 @@ async fn certification_minor_assess_refuses_claim_not_composable_without_a_profi
     assert!(
         elig.reasons
             .iter()
-            .any(|r| r.contains("ClaimNotComposable")),
+            .any(|r| r.contains("EstimateNotComposable")),
         "the refusal carries the stable typed slug: {:?}",
         elig.reasons
     );

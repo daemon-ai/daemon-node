@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! The **composition planner** — `PhysicalClaim = compose(LogicalResourcePlan, BackendExecutionProfile)`
+//! The **composition planner** — `PhysicalEstimate = compose(LogicalResourcePlan, BackendExecutionProfile)`
 //! (`docs/specs/vhc-architecture-spec.md` §9.6 `[RC-4]`, `[RC-10]`; §5.4 `[DI-10]`).
 //!
 //! One implementation, four callers: authoring validation, node admission, sealed-binary
@@ -29,7 +29,7 @@ use daemon_vhc_proto::resource_plan::{Binding, DimensionValue, Domain, LogicalRe
 use daemon_vhc_proto::{ExecutionGrant, GrantValue, Hash, SelectionScope};
 use serde::{Deserialize, Serialize};
 
-use crate::capability::{CapabilityError, DeviceCapabilityReport};
+use crate::capability::CapabilityError;
 use crate::profile::{
     AllocationScope, BackendExecutionProfile, CompositionRule, CostInput, CostInputs, CostTerm,
     EnforcementClass, ProfileError,
@@ -48,7 +48,7 @@ pub const PLANNER_VERSION: u32 = 1;
 /// that reported one enforcement property over both would be making a claim about the driver's
 /// internals that nobody verified.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PhysicalClaim {
+pub struct PhysicalEstimate {
     /// Persistent device residency.
     pub persistent_device_bytes: u64,
     /// The maximal concurrently-live transient set, priced.
@@ -90,15 +90,15 @@ pub struct PhysicalClaim {
     pub execution_grant_hash: Hash,
 }
 
-impl PhysicalClaim {
+impl PhysicalEstimate {
     /// The claim's canonical CBOR bytes — what the admitted tuple and the journal record verbatim.
     pub fn to_canonical_bytes(&self) -> Result<Vec<u8>, PlannerError> {
         daemon_vhc_proto::to_canonical_vec(self)
             .map_err(|e| PlannerError::Invalid(format!("claim encoding: {e}")))
     }
 
-    /// blake3 of the canonical bytes — the `physical_claim_hash`.
-    pub fn claim_digest(&self) -> Result<Hash, PlannerError> {
+    /// blake3 of the canonical bytes — the `physical_estimate_hash`.
+    pub fn estimate_digest(&self) -> Result<Hash, PlannerError> {
         Ok(daemon_vhc_proto::blake3_hash(&self.to_canonical_bytes()?))
     }
 
@@ -143,7 +143,7 @@ pub struct ScopedOccupancy {
 
 /// The node/device aggregate claim over every admitted co-resident role.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AggregateClaim {
+pub struct AggregateEstimate {
     /// The occupancy bytes reserved for this node/device.
     pub occupancy_bytes: u64,
     /// The largest single allocation any co-resident role will require. A **maximum constraint**,
@@ -159,15 +159,15 @@ pub struct AggregateClaim {
     pub planner_version: u32,
 }
 
-impl AggregateClaim {
+impl AggregateEstimate {
     /// The aggregate's canonical CBOR bytes.
     pub fn to_canonical_bytes(&self) -> Result<Vec<u8>, PlannerError> {
         daemon_vhc_proto::to_canonical_vec(self)
             .map_err(|e| PlannerError::Invalid(format!("aggregate encoding: {e}")))
     }
 
-    /// blake3 of the canonical bytes — the `aggregate_claim_hash`.
-    pub fn claim_digest(&self) -> Result<Hash, PlannerError> {
+    /// blake3 of the canonical bytes — the `aggregate_estimate_hash`.
+    pub fn estimate_digest(&self) -> Result<Hash, PlannerError> {
         Ok(daemon_vhc_proto::blake3_hash(&self.to_canonical_bytes()?))
     }
 }
@@ -219,9 +219,9 @@ pub enum PlannerError {
         /// What the machine offers.
         available: u64,
     },
-    /// The composed claim exceeds the machine's per-allocation limit.
+    /// The composed estimate exceeds the machine's per-allocation limit.
     #[error(
-        "the composed claim requires a {required}-byte single allocation, above this device's \
+        "the composed estimate requires a {required}-byte single allocation, above this device's \
          measured {limit}-byte limit"
     )]
     AllocationCeilingExceeded {
@@ -230,12 +230,12 @@ pub enum PlannerError {
         /// The device's measured limit.
         limit: u64,
     },
-    /// The composed Physical Claim falls outside the participation lane's sanity bounds.
+    /// The composed Physical Estimate falls outside the participation lane's sanity bounds.
     #[error(
         "the composed physical claim's {total} device bytes fall outside lane `{lane}`'s bounds \
          [{min}, {max}] for backend class `{backend_class}`"
     )]
-    PhysicalClaimExceedsLane {
+    PhysicalEstimateExceedsLane {
         /// The lane.
         lane: String,
         /// The claim's device total.
@@ -315,7 +315,7 @@ fn add(a: u64, b: u64) -> Result<u64, PlannerError> {
         .ok_or_else(|| PlannerError::Invalid("checked u64 overflow composing a claim".into()))
 }
 
-/// Compose one role's Physical Claim, and the per-term breakdown the aggregate needs.
+/// Compose one role's Physical Estimate, and the per-term breakdown the aggregate needs.
 ///
 /// The claim is a **conservative upper bound for the admitted configuration**, not an average-case
 /// prediction.
@@ -324,7 +324,7 @@ pub fn compose(
     binding: &Binding,
     profile: &BackendExecutionProfile,
     co_resident_roles: u64,
-) -> Result<(PhysicalClaim, ScopedOccupancy), PlannerError> {
+) -> Result<(PhysicalEstimate, ScopedOccupancy), PlannerError> {
     profile.validate()?;
     plan.validate()?;
 
@@ -454,7 +454,7 @@ pub fn compose(
     .try_fold(profiled_and_measured_bytes, add)?;
 
     Ok((
-        PhysicalClaim {
+        PhysicalEstimate {
             persistent_device_bytes,
             transient_peak_bytes,
             workspace_bytes,
@@ -486,8 +486,8 @@ pub fn compose(
 /// summed. Shared terms match by aggregation key, and profiles that give the same key incompatible
 /// scopes or rules are mutually incompatible — admission refuses rather than choosing one.
 pub fn aggregate(
-    roles: &[(String, PhysicalClaim, ScopedOccupancy)],
-) -> Result<AggregateClaim, PlannerError> {
+    roles: &[(String, PhysicalEstimate, ScopedOccupancy)],
+) -> Result<AggregateEstimate, PlannerError> {
     let mut occupancy_bytes = 0u64;
     let mut max_individual_allocation_bytes = 0u64;
     let mut enforceable = 0u64;
@@ -568,7 +568,7 @@ pub fn aggregate(
         }
     }
 
-    Ok(AggregateClaim {
+    Ok(AggregateEstimate {
         occupancy_bytes,
         max_individual_allocation_bytes,
         directly_enforceable_bytes: enforceable,
@@ -594,12 +594,12 @@ pub fn aggregate(
 /// A class with no entry is **not** unbounded. It is a lane that has not been configured for that
 /// backend, and it refuses — see [`PlannerError::LaneStatesNoBoundsForClass`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct LaneClaimBounds {
+pub struct LaneEstimateBounds {
     /// `[min, max]` device bytes per backend class slug.
     pub by_backend_class: std::collections::BTreeMap<String, [u64; 2]>,
 }
 
-impl LaneClaimBounds {
+impl LaneEstimateBounds {
     /// The bounds this lane states for one backend class, if any.
     #[must_use]
     pub fn for_class(&self, class: crate::revision::BackendClass) -> Option<[u64; 2]> {
@@ -607,7 +607,7 @@ impl LaneClaimBounds {
     }
 }
 
-/// Apply a lane's **profile-keyed** sanity bounds to a composed role Physical Claim.
+/// Apply a lane's **profile-keyed** sanity bounds to a composed role Physical Estimate.
 ///
 /// Stage order is load-bearing and is the reason this is its own function: the lane check happens
 /// **after composition and before capability or owner authorization**. A claim that is absurd for the
@@ -619,13 +619,13 @@ impl LaneClaimBounds {
 /// the owner's cap are expressed in.
 ///
 /// # Errors
-/// [`PlannerError::PhysicalClaimExceedsLane`] when the total falls outside the class's bounds, and
+/// [`PlannerError::PhysicalEstimateExceedsLane`] when the total falls outside the class's bounds, and
 /// [`PlannerError::LaneStatesNoBoundsForClass`] when the lane states none for it.
-pub fn check_claim_against_lane(
-    claim: &PhysicalClaim,
+pub fn check_estimate_against_lane(
+    claim: &PhysicalEstimate,
     profile: &BackendExecutionProfile,
     lane: &str,
-    bounds: &LaneClaimBounds,
+    bounds: &LaneEstimateBounds,
 ) -> Result<(), PlannerError> {
     let class = profile.backend_class;
     let Some([min, max]) = bounds.for_class(class) else {
@@ -636,7 +636,7 @@ pub fn check_claim_against_lane(
     };
     let total = claim.total_peak_bytes;
     if total < min || total > max {
-        return Err(PlannerError::PhysicalClaimExceedsLane {
+        return Err(PlannerError::PhysicalEstimateExceedsLane {
             lane: lane.to_string(),
             total,
             min,
@@ -647,69 +647,7 @@ pub fn check_claim_against_lane(
     Ok(())
 }
 
-/// Validate a composed claim against a capability report and, where set, the owner's cap.
-///
-/// Admission evaluates the **composed claim**, not the plan.
-///
-/// The device-memory question is **two independent comparisons**, against host-measured supply and
-/// against the owner's optional cap. They used to be one `min` of a single field that could hold either
-/// a platform measurement or an operator's number depending on a sibling enum — so the two authorities
-/// overwrote each other, and a refusal could not say which had refused. An operator whose own cap is the
-/// binding constraint should not be told their hardware is too small.
-///
-/// The owner's cap only ever *tightens* supply; it can never supply the mandatory hardware figure, which
-/// is measured on this node because this node is the thing that can measure it.
-///
-/// # Errors
-/// [`PlannerError`] when the claim exceeds measured supply, exceeds the owner's cap, exceeds the
-/// per-allocation ceiling, or when this platform has no trustworthy supply derivation at all.
-pub fn validate_against(
-    claim: &PhysicalClaim,
-    report: &DeviceCapabilityReport,
-    owner_cap: Option<crate::capability::OwnerDeviceCap>,
-) -> Result<(), PlannerError> {
-    report.validate()?;
-    // Both comparisons, and the typed refusal is preserved in the message so a reader can tell a
-    // policy refusal from a hardware one — while the shape stays the one callers already match on.
-    //
-    // The claim's host side rides along because on a unified device it is not a separate budget: the
-    // linear-memory cap and the device residency come out of one DRAM pool, so a role that fits each
-    // figure separately can still over-commit the machine. Passing both is what lets the report's
-    // topology decide whether a joint comparison applies, instead of this call site assuming.
-    if let Err(refusal) = crate::capability::admit_node_memory_bytes(
-        claim.total_peak_bytes,
-        claim.linear_memory_bytes,
-        report,
-        owner_cap,
-    ) {
-        return Err(PlannerError::NoAdmissibleConfiguration {
-            required: refusal.claimed_bytes(),
-            available: refusal.binding_limit_bytes(),
-        });
-    }
-    let limit = report.max_allocation_bytes()?;
-    if claim.max_individual_allocation_bytes > limit {
-        return Err(PlannerError::AllocationCeilingExceeded {
-            required: claim.max_individual_allocation_bytes,
-            limit,
-        });
-    }
-    Ok(())
-}
-
-/// How the host chooses among the plan's admissible logical configurations.
-///
-/// Selection policy is **host and owner policy, not guest policy**.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SelectionPolicy {
-    /// Raise each dimension as far as the machine admits, in declaration order.
-    LargestAdmissible,
-    /// Use exactly this configuration, and refuse if it is not admissible. This is what a
-    /// participant does with a frozen uniform grant: verify, do not reselect.
-    Fixed(Binding),
-}
-
-/// The selected configuration and the claim it produces.
+/// The selected configuration and the estimate it produces.
 #[derive(Clone, Debug)]
 pub struct Selection {
     /// The chosen binding.
@@ -717,7 +655,7 @@ pub struct Selection {
     /// The Execution Grant carrying it — logical values only.
     pub grant: ExecutionGrant,
     /// The claim for the chosen configuration, with the grant digest stamped in.
-    pub claim: PhysicalClaim,
+    pub estimate: PhysicalEstimate,
     /// The per-term breakdown for the aggregate.
     pub occupancy: ScopedOccupancy,
 }
@@ -766,13 +704,15 @@ pub(crate) fn minimum_binding(plan: &LogicalResourcePlan) -> Result<Binding, Pla
 
 /// Compose one configuration and the Execution Grant that carries it — **without authorizing it**.
 ///
-/// Separate from [`select`] because the authorization steps have a required order that a function
-/// doing both cannot express: a composed claim is bounded by the participation lane *before* it is
-/// compared against the machine's supply or the owner's cap, so that an absurd claim is refused as a
-/// lane violation rather than reported as a machine that is too small. A caller needing that order —
-/// admission is the one that does — composes here and then authorizes in sequence.
+/// Composition and authorization are separate because the authorization steps have a required order
+/// that a function doing both cannot express: a composed estimate is bounded by the participation
+/// lane *before* it is compared against the machine's supply or the owner's cap, so that an absurd
+/// estimate is refused as a lane violation rather than reported as a machine that is too small. A
+/// caller needing that order — admission is the one that does — composes here and then authorizes in
+/// sequence.
 ///
-/// The grant's digest is stamped into the claim, so the claim names the configuration it prices.
+/// The grant's digest is stamped into the estimate, so the estimate names the configuration it
+/// prices.
 ///
 /// # Errors
 /// [`PlannerError`] when the plan and profile do not compose, or the grant cannot be encoded.
@@ -783,86 +723,15 @@ pub fn compose_selection(
     co_resident_roles: u64,
     scope: SelectionScope,
 ) -> Result<Selection, PlannerError> {
-    let (mut claim, occupancy) = compose(plan, binding, profile, co_resident_roles)?;
+    let (mut estimate, occupancy) = compose(plan, binding, profile, co_resident_roles)?;
     let grant = grant_for(plan, binding, scope)?;
-    claim.execution_grant_hash = grant.grant_hash()?;
+    estimate.execution_grant_hash = grant.grant_hash()?;
     Ok(Selection {
         binding: binding.clone(),
         grant,
-        claim,
+        estimate,
         occupancy,
     })
-}
-
-/// Compose over the plan's bounded choice set, select an admissible configuration under `policy`,
-/// and deliver it as an Execution Grant (`[RC-11]`).
-///
-/// The capability report is **validation supply**; it is not an input to `compose`. That is what
-/// keeps the claim a function of the plan and the profile alone, so the same configuration prices
-/// identically on two machines with the same backend.
-///
-/// [`SelectionPolicy::LargestAdmissible`] performs a deterministic **coordinate-wise ascent**: from
-/// the smallest admissible configuration, each dimension in declaration order is raised as far as
-/// the machine still admits, holding the others fixed. This is not a search for a global optimum,
-/// and it does not claim to be one — selection is host policy, and what the specification requires
-/// of it is that two hosts given the same inputs reach the same answer. An exhaustive search over a
-/// multi-dimensional choice set would be unbounded, and an unbounded search on the admission path
-/// is not a policy anyone can operate.
-pub fn select(
-    plan: &LogicalResourcePlan,
-    profile: &BackendExecutionProfile,
-    report: &DeviceCapabilityReport,
-    owner_cap: Option<crate::capability::OwnerDeviceCap>,
-    co_resident_roles: u64,
-    scope: SelectionScope,
-    policy: &SelectionPolicy,
-) -> Result<Selection, PlannerError> {
-    let finish = |binding: Binding| -> Result<Selection, PlannerError> {
-        compose_selection(plan, &binding, profile, co_resident_roles, scope)
-    };
-
-    match policy {
-        SelectionPolicy::Fixed(binding) => {
-            let selection = finish(binding.clone())?;
-            validate_against(&selection.claim, report, owner_cap)?;
-            Ok(selection)
-        }
-        SelectionPolicy::LargestAdmissible => {
-            let mut binding = minimum_binding(plan)?;
-            // The floor has to be admissible, or nothing is. That refusal is the composed claim,
-            // the profile and the report working as designed — the machine genuinely cannot host
-            // this run — and it names the numbers rather than the machine.
-            let floor = finish(binding.clone())?;
-            validate_against(&floor.claim, report, owner_cap)?;
-
-            for dim in &plan.dimensions {
-                let candidates: Vec<DimensionValue> = match &dim.domain {
-                    Domain::UintRange { lo, hi } => {
-                        // Ascend from the top so the first admissible value found is the largest.
-                        (*lo..=*hi).rev().map(DimensionValue::Uint).collect()
-                    }
-                    Domain::Enum(values) => values
-                        .iter()
-                        .rev()
-                        .cloned()
-                        .map(DimensionValue::Enum)
-                        .collect(),
-                };
-                let held = binding.get(&dim.name).cloned();
-                for candidate in candidates {
-                    binding.insert(dim.name.clone(), candidate);
-                    let trial = finish(binding.clone())?;
-                    if validate_against(&trial.claim, report, owner_cap).is_ok() {
-                        break;
-                    }
-                    if let Some(previous) = &held {
-                        binding.insert(dim.name.clone(), previous.clone());
-                    }
-                }
-            }
-            finish(binding)
-        }
-    }
 }
 
 /// Canonical cross-language conformance vectors for the planner (`[DI-10]` form 2).
@@ -1089,32 +958,18 @@ mod tests {
         assert!(err.to_string().contains("does not support"));
     }
 
+    /// The typed device comparison names WHICH authority refused, so an operator whose own policy
+    /// is the constraint is not told their hardware is too small.
     #[test]
-    fn admission_evaluates_the_composed_claim_against_supply() {
+    fn device_authorization_refusals_are_typed_by_authority() {
         let (claim, _) = compose(&plan(), &binding(4), &profile(BackendClass::Vulkan), 1).unwrap();
         let r = report(BackendClass::Vulkan);
-        validate_against(&claim, &r, None).expect("fits within measured supply");
+        crate::capability::admit_device_bytes(claim.total_peak_bytes, &r, None)
+            .expect("fits within measured supply");
 
-        // An owner cap below the claim refuses, and the refusal says it is a POLICY refusal rather
-        // than a hardware one — the device has the memory; its owner has chosen not to lend it.
-        let err = validate_against(
-            &claim,
-            &r,
-            Some(crate::capability::OwnerDeviceCap { max_bytes: 1024 }),
-        )
-        .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                PlannerError::NoAdmissibleConfiguration {
-                    available: 1024,
-                    ..
-                }
-            ),
-            "the cap is the binding limit: {err}"
-        );
-        // And the typed comparison underneath says WHICH refused, so an operator whose own policy is
-        // the constraint is not told their hardware is too small.
+        // An owner cap below the estimate refuses, and the refusal says it is a POLICY refusal
+        // rather than a hardware one — the device has the memory; its owner has chosen not to
+        // lend it.
         let typed = crate::capability::admit_device_bytes(
             claim.total_peak_bytes,
             &r,
@@ -1148,59 +1003,29 @@ mod tests {
         );
     }
 
+    /// Composition is deterministic for a fixed binding and delivers logical values only.
     #[test]
-    fn a_claim_above_the_devices_measured_allocation_limit_is_refused() {
-        let (mut claim, _) =
-            compose(&plan(), &binding(1), &profile(BackendClass::Vulkan), 1).unwrap();
-        claim.max_individual_allocation_bytes = 8 << 30;
-        let err = validate_against(&claim, &report(BackendClass::Vulkan), None).unwrap_err();
-        assert!(matches!(
-            err,
-            PlannerError::AllocationCeilingExceeded { .. }
-        ));
-    }
-
-    /// Selection raises the configuration as far as the machine admits, deterministically, and
-    /// delivers logical values only.
-    #[test]
-    fn selection_is_deterministic_and_delivers_logical_values_only() {
+    fn composition_is_deterministic_and_delivers_logical_values_only() {
         let p = plan();
         let prof = profile(BackendClass::Vulkan);
-        let r = report(BackendClass::Vulkan);
-        let first = select(
-            &p,
-            &prof,
-            &r,
-            None,
-            1,
-            SelectionScope::UniformRun,
-            &SelectionPolicy::LargestAdmissible,
-        )
-        .unwrap();
-        let second = select(
-            &p,
-            &prof,
-            &r,
-            None,
-            1,
-            SelectionScope::UniformRun,
-            &SelectionPolicy::LargestAdmissible,
-        )
-        .unwrap();
+        let first =
+            compose_selection(&p, &binding(8), &prof, 1, SelectionScope::UniformRun).unwrap();
+        let second =
+            compose_selection(&p, &binding(8), &prof, 1, SelectionScope::UniformRun).unwrap();
         assert_eq!(first.binding, second.binding);
         assert_eq!(first.grant, second.grant);
         assert_eq!(
-            first.binding.get("micro_batch"),
-            Some(&DimensionValue::Uint(8)),
-            "an ample machine takes the largest admissible configuration"
+            first.estimate.estimate_digest().unwrap(),
+            second.estimate.estimate_digest().unwrap(),
+            "the same inputs price identically"
         );
 
-        // The grant carries the selected dimension and nothing else — no backend identity, no
+        // The grant carries the bound dimension and nothing else — no backend identity, no
         // memory figure, no profile content.
         assert_eq!(first.grant.values.len(), 1);
         assert!(first.grant.values.contains_key("micro_batch"));
         assert_eq!(
-            first.claim.execution_grant_hash,
+            first.estimate.execution_grant_hash,
             first.grant.grant_hash().unwrap()
         );
     }
@@ -1214,11 +1039,11 @@ mod tests {
         let claim = compose(&p, &binding(1), &vulkan, 1).unwrap().0;
         let total = claim.total_peak_bytes;
 
-        let mut bounds = LaneClaimBounds::default();
+        let mut bounds = LaneEstimateBounds::default();
         bounds
             .by_backend_class
             .insert("vulkan".to_string(), [0, total]);
-        check_claim_against_lane(&claim, &vulkan, "trainer", &bounds)
+        check_estimate_against_lane(&claim, &vulkan, "trainer", &bounds)
             .expect("a claim at the bound is inside it");
 
         // A hair over the lane's ceiling refuses as a LANE violation, naming the class whose bounds
@@ -1226,10 +1051,10 @@ mod tests {
         bounds
             .by_backend_class
             .insert("vulkan".to_string(), [0, total - 1]);
-        let refusal = check_claim_against_lane(&claim, &vulkan, "trainer", &bounds).unwrap_err();
+        let refusal = check_estimate_against_lane(&claim, &vulkan, "trainer", &bounds).unwrap_err();
         assert!(matches!(
             refusal,
-            PlannerError::PhysicalClaimExceedsLane {
+            PlannerError::PhysicalEstimateExceedsLane {
                 backend_class: "vulkan",
                 ..
             }
@@ -1241,8 +1066,8 @@ mod tests {
             .by_backend_class
             .insert("vulkan".to_string(), [total + 1, total * 2]);
         assert!(matches!(
-            check_claim_against_lane(&claim, &vulkan, "trainer", &bounds).unwrap_err(),
-            PlannerError::PhysicalClaimExceedsLane { .. }
+            check_estimate_against_lane(&claim, &vulkan, "trainer", &bounds).unwrap_err(),
+            PlannerError::PhysicalEstimateExceedsLane { .. }
         ));
     }
 
@@ -1255,12 +1080,12 @@ mod tests {
         let p = plan();
         let metal = profile(BackendClass::Metal);
         let claim = compose(&p, &binding(1), &metal, 1).unwrap().0;
-        let mut bounds = LaneClaimBounds::default();
+        let mut bounds = LaneEstimateBounds::default();
         bounds
             .by_backend_class
             .insert("vulkan".to_string(), [0, u64::MAX]);
 
-        let refusal = check_claim_against_lane(&claim, &metal, "trainer", &bounds).unwrap_err();
+        let refusal = check_estimate_against_lane(&claim, &metal, "trainer", &bounds).unwrap_err();
         assert!(matches!(
             refusal,
             PlannerError::LaneStatesNoBoundsForClass {
@@ -1269,85 +1094,6 @@ mod tests {
             }
         ));
         assert!(refusal.to_string().contains("does not admit"));
-    }
-
-    /// A tighter machine selects a smaller configuration rather than refusing outright.
-    #[test]
-    fn a_tighter_machine_selects_a_smaller_configuration() {
-        let p = plan();
-        let prof = profile(BackendClass::Vulkan);
-        let r = report(BackendClass::Vulkan);
-        let ample = select(
-            &p,
-            &prof,
-            &r,
-            None,
-            1,
-            SelectionScope::UniformRun,
-            &SelectionPolicy::LargestAdmissible,
-        )
-        .unwrap();
-        let floor = compose(&p, &binding(1), &prof, 1).unwrap().0;
-        let tight = select(
-            &p,
-            &prof,
-            &r,
-            Some(crate::capability::OwnerDeviceCap {
-                max_bytes: floor.total_peak_bytes,
-            }),
-            1,
-            SelectionScope::UniformRun,
-            &SelectionPolicy::LargestAdmissible,
-        )
-        .unwrap();
-        let chosen = |selection: &Selection| match selection.binding.get("micro_batch") {
-            Some(DimensionValue::Uint(n)) => *n,
-            other => panic!("expected a numeric selection, got {other:?}"),
-        };
-        assert!(
-            chosen(&tight) < chosen(&ample),
-            "a tighter budget selects a smaller configuration"
-        );
-    }
-
-    /// When even the smallest configuration does not fit, the refusal is the model working as
-    /// designed and it names the numbers.
-    #[test]
-    fn a_machine_that_cannot_host_the_floor_is_refused_with_both_numbers() {
-        let err = select(
-            &plan(),
-            &profile(BackendClass::Vulkan),
-            &report(BackendClass::Vulkan),
-            Some(crate::capability::OwnerDeviceCap { max_bytes: 1024 }),
-            1,
-            SelectionScope::UniformRun,
-            &SelectionPolicy::LargestAdmissible,
-        )
-        .unwrap_err();
-        assert!(matches!(
-            err,
-            PlannerError::NoAdmissibleConfiguration { .. }
-        ));
-        assert!(err.to_string().contains("1024"));
-    }
-
-    /// A participant with a frozen uniform grant verifies it; it does not reselect.
-    #[test]
-    fn a_fixed_selection_verifies_rather_than_reselects() {
-        let selection = select(
-            &plan(),
-            &profile(BackendClass::Vulkan),
-            &report(BackendClass::Vulkan),
-            None,
-            1,
-            SelectionScope::UniformRun,
-            &SelectionPolicy::Fixed(binding(3)),
-        )
-        .unwrap();
-        assert_eq!(
-            selection.binding.get("micro_batch"),
-            Some(&DimensionValue::Uint(3))
-        );
     }
 
     /// A per-allocation term aggregates by maximum; a shared process/device term is charged once,

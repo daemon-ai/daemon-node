@@ -38,7 +38,7 @@
 //! holds any more.
 
 use crate::capability::DeviceCapabilityReport;
-use crate::planner::LaneClaimBounds;
+use crate::planner::LaneEstimateBounds;
 use crate::revision::{BackendClass, BackendImplementationRevision};
 use crate::store::{AuthenticationContext, ProfileStore};
 use crate::trust::ProfileAcceptancePolicy;
@@ -115,14 +115,14 @@ pub fn capability_report_with_supply(
     report
 }
 
-/// Lane bounds wide enough for any composed claim, for a test that is not about lane bounds.
+/// Lane bounds wide enough for any composed estimate, for a test that is not about lane bounds.
 ///
 /// Every backend class is populated on purpose. A class with no entry refuses
 /// `LaneProfileUnsupported` — silence is not permission — so an incomplete map here would surface as a
 /// refusal that looks like a lane-bounds failure in a test about something else.
 #[must_use]
-pub fn generous_lane_bounds() -> LaneClaimBounds {
-    let mut bounds = LaneClaimBounds::default();
+pub fn generous_lane_bounds() -> LaneEstimateBounds {
+    let mut bounds = LaneEstimateBounds::default();
     for class in ["vulkan", "metal", "dx12", "cuda", "cpu"] {
         bounds
             .by_backend_class

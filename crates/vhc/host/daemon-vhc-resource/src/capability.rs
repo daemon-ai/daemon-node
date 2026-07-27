@@ -521,7 +521,7 @@ impl DeviceCapabilityReport {
         Ok(())
     }
 
-    /// The per-allocation ceiling admission may compare a composed claim against.
+    /// The per-allocation ceiling admission may compare a composed estimate against.
     ///
     /// Measured or nothing. The reported figure is not evidence of what the driver enforces, and
     /// substituting it here would re-create the inventory fallback this artifact exists to avoid.
@@ -531,7 +531,7 @@ impl DeviceCapabilityReport {
             .map(|ceiling| ceiling.accepted_bytes)
             .ok_or(CapabilityError::Unmeasured {
                 quantity: "per-allocation ceiling",
-                detail: "a composed claim's maximum individual allocation cannot be validated \
+                detail: "a composed estimate's maximum individual allocation cannot be validated \
                          against an unmeasured limit",
             })
     }
@@ -668,7 +668,7 @@ pub enum DeviceAdmissionRefusal {
     },
     /// The claim exceeds what this node measured as usable supply.
     #[error(
-        "the composed claim needs {claimed_bytes} bytes of device memory, above the \
+        "the composed estimate needs {claimed_bytes} bytes of device memory, above the \
          {supply_bytes} bytes this node measured as usable supply on `{adapter}`"
     )]
     ExceedsSupply {
@@ -681,7 +681,7 @@ pub enum DeviceAdmissionRefusal {
     },
     /// The claim exceeds the owner's cap, though the device has the memory.
     #[error(
-        "the composed claim needs {claimed_bytes} bytes of device memory, above the {cap_bytes} \
+        "the composed estimate needs {claimed_bytes} bytes of device memory, above the {cap_bytes} \
          bytes the owner of this node has chosen to lend; the device itself has {supply_bytes} \
          bytes of usable supply, so this is a policy refusal and not a hardware one"
     )]

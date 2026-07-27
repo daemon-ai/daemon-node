@@ -32,7 +32,7 @@ ord    = uint                        ; per-journal monotone record ordinal
 ; Tag 0 is MINOR-SELECTED, and the legacy `claim` member is replaced rather than repurposed. A
 ; header written under ABI <= 2.4 carries the verbatim `da_claim` result; a header written under
 ; the certification minor (2.5) FORBIDS that member and carries the plan, the selected role
-; Physical Claim, the node/device aggregate claim and the Execution Grant, each as its exact
+; Physical Estimate, the node/device aggregate estimate and the Execution Grant, each as its exact
 ; canonical bytes plus its blake3. An optional tag-0 field would not express this: a reader must be
 ; able to tell which statement the header is making, and "absent" is not a statement.
 run-header-rec = legacy-run-header-rec / certification-run-header-rec
@@ -54,8 +54,8 @@ certification-run-header-rec = [0, ord, {
   "bridge": bool,
   "manifest": bstr, "config": bstr, "grants": bstr,
   "resource_plan": bstr,   "resource_plan_hash": hash32,    ; the canonical Logical Resource Plan
-  "physical_claim": bstr,  "physical_claim_hash": hash32,   ; the SELECTED role claim
-  "aggregate_claim": bstr, "aggregate_claim_hash": hash32,  ; the node/device claim reserved here
+  "physical_estimate": bstr,  "physical_estimate_hash": hash32,   ; the composed role estimate
+  "aggregate_estimate": bstr, "aggregate_estimate_hash": hash32,  ; the node/device estimate reserved here
   "execution_grant": bstr, "execution_grant_hash": hash32,  ; inline: bounded, non-secret, pre-init
   "channels": bstr, "device": bstr,
   "format": uint,

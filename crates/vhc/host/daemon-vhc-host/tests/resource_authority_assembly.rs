@@ -5,7 +5,7 @@
 //!
 //! At the certification minor a module declares no physical figure, so admission composes one from the
 //! plan, an authenticated Backend Execution Profile and this node's capability report; with no
-//! authority to compose against, the run is refused `ClaimNotComposable`. That refusal is the correct
+//! authority to compose against, the run is refused `EstimateNotComposable`. That refusal is the correct
 //! floor, but it left a hole in what was testable: authentication is reachable only through the
 //! resource crate's private machinery, so until now nothing outside that crate could build the
 //! authority the positive path needs — this file is the first place anywhere that does.
@@ -65,11 +65,11 @@ fn the_test_support_feature_assembles_an_authority_that_composes_a_claim() {
     })
     .expect("a plan, an authenticated profile and a measured report compose a claim");
 
-    // A composed claim, not a placeholder: the plan declares a persistent parameter tensor, so a
+    // A composed estimate, not a placeholder: the plan declares a persistent parameter tensor, so a
     // figure of zero would mean the composition silently produced nothing while reporting success.
     assert!(
-        composed.claim().device_total_bytes() > 0,
-        "the composed claim reserves no device memory for a plan that declares a persistent tensor"
+        composed.estimate().device_total_bytes() > 0,
+        "the composed estimate reserves no device memory for a plan that declares a persistent tensor"
     );
     // The grant is what the guest actually receives, and a claim without one is a figure the module
     // can never be told about.
@@ -135,10 +135,10 @@ fn a_frozen_binding_composes_from_outside_the_resource_crate_too() {
     .expect("the unfrozen selection composes");
 
     assert!(
-        composed.claim().device_total_bytes() > minimum.claim().device_total_bytes(),
+        composed.estimate().device_total_bytes() > minimum.estimate().device_total_bytes(),
         "the frozen micro_batch=2 claim ({}) is not larger than the minimum selection's ({}) — the \
          frozen binding was reselected rather than verified",
-        composed.claim().device_total_bytes(),
-        minimum.claim().device_total_bytes()
+        composed.estimate().device_total_bytes(),
+        minimum.estimate().device_total_bytes()
     );
 }
