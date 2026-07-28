@@ -1070,12 +1070,15 @@ pub fn ceremony_execution_with_certification(
         config,
         grants: &[],
         // The run's own policy about where each role may execute — not an inference from what any
-        // particular box turned out to have.
+        // particular box turned out to have. The list names every class the ceremony fleet's
+        // native lanes select (G-1 heterogeneity: RADV Vulkan, Apple Metal, NVIDIA DX12); omitting
+        // one would refuse that seat's native selection by policy, not by evidence.
         allowed_backend_classes: vec![
             "cpu".to_string(),
             "cuda".to_string(),
             "metal".to_string(),
             "vulkan".to_string(),
+            "dx12".to_string(),
         ],
         profile_certification: profile_certification.clone(),
         minima: daemon_vhc_proto::HardwareIndependentMinima::default(),

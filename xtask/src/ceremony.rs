@@ -39,9 +39,10 @@ use daemon_vhc_proto::{
 };
 
 use daemon_vhc_testkit::ceremony::{
-    ceremony_execution, ceremony_expected_state_root, ceremony_genesis, ceremony_profile_chunk,
-    ceremony_round_schedule, ceremony_state_chunk_size, CeremonyGenesisSpec, CeremonyRunTimers,
-    CEREMONY_EXPECTED_ROOT, CEREMONY_PARAM_COUNT, CEREMONY_SEQ_LEN, CEREMONY_TICK_PERIOD_MS,
+    ceremony_execution_with_certification, ceremony_expected_state_root, ceremony_genesis,
+    ceremony_profile_chunk, ceremony_round_schedule, ceremony_state_chunk_size,
+    CeremonyGenesisSpec, CeremonyRunTimers, CEREMONY_EXPECTED_ROOT, CEREMONY_PARAM_COUNT,
+    CEREMONY_SEQ_LEN, CEREMONY_TICK_PERIOD_MS,
 };
 
 /// The parsed `author-ceremony-genesis` inputs (see the [`crate::Cmd`] arm docs for each flag).
@@ -64,6 +65,10 @@ pub struct Args {
     pub trusted_base: Vec<String>,
     pub roster: Vec<String>,
     pub upgrade_authority: Vec<String>,
+    /// Development authorities the run's profile-certification requirements accept (the run side
+    /// of `[PC-12]`'s double opt-in — the owner policy on each box must name the same authority).
+    /// Empty authors the ceremony's default stance: no development authority ever authenticates.
+    pub dev_authority: Vec<String>,
     pub min_peers: u32,
     pub max_peers: u32,
     pub ckpt_cadence: u64,
@@ -202,8 +207,24 @@ pub fn run(args: Args) -> Result<()> {
             path.display()
         );
     }
-    let execution = ceremony_execution(&coordinator_wasm, &trainer_wasm)
-        .map_err(|e| anyhow::anyhow!("derive the ceremony execution requirements: {e}"))?;
+    // The run side of `[PC-12]`'s double opt-in. Stated per authoring invocation because it is a
+    // run-authoring decision: an integration run (C1) names the dev authority its boxes were
+    // provisioned under; an authoring that names none keeps the default release-only stance.
+    let dev_authorities = args
+        .dev_authority
+        .iter()
+        .map(|s| parse_peer("--dev-authority", s))
+        .collect::<Result<Vec<_>>>()?;
+    let profile_certification = daemon_vhc_proto::ProfileCertificationRequirements {
+        accepted_development_authorities: dev_authorities,
+        ..Default::default()
+    };
+    let execution = ceremony_execution_with_certification(
+        &coordinator_wasm,
+        &trainer_wasm,
+        profile_certification,
+    )
+    .map_err(|e| anyhow::anyhow!("derive the ceremony execution requirements: {e}"))?;
 
     let spec = CeremonyGenesisSpec {
         run_label: &args.run_label,

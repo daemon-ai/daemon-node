@@ -277,6 +277,12 @@ enum Cmd {
         /// An upgrade-authority PeerId (64-hex). Repeat; empty authors an immutable run.
         #[arg(long = "upgrade-authority")]
         upgrade_authority: Vec<String>,
+        /// A development authority PeerId (64-hex) the run's profile-certification requirements
+        /// accept (`[PC-12]` double opt-in run side; each box's owner policy must name it too).
+        /// Repeat; empty keeps the release-only default. Integration evidence only — a
+        /// development authority never certifies a ceremony statement.
+        #[arg(long = "dev-authority")]
+        dev_authority: Vec<String>,
         /// Minimum healthy peers to leave WaitingForMembers (the fleet floor; `1` for a smoke).
         #[arg(long, default_value_t = 3)]
         min_peers: u32,
@@ -498,6 +504,7 @@ fn main() -> anyhow::Result<()> {
             trusted_base,
             roster,
             upgrade_authority,
+            dev_authority,
             min_peers,
             max_peers,
             ckpt_cadence,
@@ -519,6 +526,7 @@ fn main() -> anyhow::Result<()> {
             trusted_base,
             roster,
             upgrade_authority,
+            dev_authority,
             min_peers,
             max_peers,
             ckpt_cadence,
