@@ -1936,13 +1936,16 @@ impl VhcService {
             .collect();
         let relay_urls = self.config.iroh.relay_urls();
         // Loopback-only advertisement binds loopback (the single-host topology); anything else
-        // binds the wildcard so every advertised interface is served.
-        let all_loopback = self
-            .config
-            .iroh
-            .advertise_ips
-            .iter()
-            .all(|ip| ip == "127.0.0.1" || ip == "::1");
+        // binds the wildcard so every advertised interface is served. An EMPTY advertise list is
+        // the relay-only posture (a NAT'd node dialable through its home relay, no direct
+        // addresses published) and MUST bind the wildcard too: `all()` on an empty list is
+        // vacuously true, and a loopback-bound socket cannot transmit to any non-loopback peer
+        // or relay (`EINVAL`/`ENETUNREACH` on every send) — observed live on the two-box WAN
+        // rung as a gossip plane that came "up", then failed every outbound dial for the life
+        // of the run.
+        let advertised = &self.config.iroh.advertise_ips;
+        let all_loopback =
+            !advertised.is_empty() && advertised.iter().all(|ip| ip == "127.0.0.1" || ip == "::1");
         let bind_addr = if all_loopback {
             format!("127.0.0.1:{port}")
         } else {
