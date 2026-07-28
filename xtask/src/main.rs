@@ -200,14 +200,18 @@ enum Cmd {
     /// `--base` — the LINT_BASE convention), unioned with staged/unstaged/untracked, map to
     /// workspace crates and expand through the cargo dependency graph to reverse-dependents;
     /// only that cone of the pinned battery runs, with identical per-suite semantics. Non-crate
-    /// inputs map conservatively: `crates/vhc/guests/` selects every guest-linked suite; xtask,
-    /// Cargo.lock, the root Cargo.toml, the flake, `.cargo/`, `vendor/`, and any UNMAPPED path
-    /// fail CLOSED into the full battery — selection can only over-include, never under. The
-    /// acceptance lane runs whenever the cone reaches the product binaries.
+    /// inputs map conservatively: `crates/vhc/guests/` selects every guest-linked suite;
+    /// Cargo.lock cones through the lock's own dependency graph to exactly the crates that
+    /// reach a changed package; xtask, the root Cargo.toml, the flake, `.cargo/`, `vendor/`,
+    /// and any UNMAPPED path fail CLOSED into the full battery — selection can only
+    /// over-include, never under. The acceptance lane runs whenever the cone reaches the
+    /// product binaries.
     ///
-    /// Lanes memoize green runs by workspace fingerprint (`target/vhc-green-ledger/`;
-    /// VHC_GATE_MEMO=0 disables), so re-gating a byte-identical tree — e.g. right after a no-ff
-    /// merge of an already-gated tip — re-verifies nothing and reports "green (memoized)".
+    /// Green runs memoize at TWO grains (`target/vhc-green-ledger/`; VHC_GATE_MEMO=0 disables):
+    /// whole lanes by workspace fingerprint (a byte-identical tree — e.g. right after a no-ff
+    /// merge of a gated tip — re-verifies nothing), and individual suites by their own
+    /// dependency-closure fingerprint, so a fix re-runs its cone and every untouched suite
+    /// reports "green (memoized)" even inside a full-battery escalation.
     ///
     /// The full-tree battery remains `--all` (manual pre-release / post-rebase only —
     /// deliberately wired into NO workflow). `VHC_GATE_PARALLEL=1` (opt-in) overlaps the det and
@@ -721,8 +725,52 @@ fn run_lane_suites(
     schedule: LaneSchedule,
 ) -> anyhow::Result<()> {
     let root = workspace_root();
+
+    // Per-suite memoization (see `SuiteMemo`): key each suite by its own dependency closure, skip
+    // the ones whose closure is byte-identical to their last green run, and record fresh greens
+    // per suite — so a red lane still banks every suite that passed before it. Index construction
+    // failing only disables the memo (`None` keys): every suite then runs.
+    let memo = if memoization_disabled() {
+        None
+    } else {
+        match SuiteMemo::compute(&root) {
+            Ok(memo) => Some(memo),
+            Err(e) => {
+                println!("{lane}: per-suite memo unavailable ({e:#}) — every suite runs");
+                None
+            }
+        }
+    };
+    let keyed: Vec<(&str, &[&str], Option<String>)> = suites
+        .iter()
+        .map(|&(label, args)| {
+            let key = memo
+                .as_ref()
+                .and_then(|m| m.suite_key(&[suite_package(args)], label, args));
+            (label, args, key)
+        })
+        .collect();
+    let memoized = keyed
+        .iter()
+        .filter(|(l, _, k)| suite_memo_green(&root, l, k))
+        .count();
+    if memoized > 0 {
+        println!(
+            "\n== {lane}: {memoized} of {} suite(s) green (memoized — closure identical to the \
+             last green run; VHC_GATE_MEMO=0 forces re-runs) ==",
+            keyed.len()
+        );
+    }
+    let to_run: Vec<(&str, &[&str], Option<String>)> = keyed
+        .into_iter()
+        .filter(|(label, _, key)| !suite_memo_green(&root, label, key))
+        .collect();
+    if to_run.is_empty() {
+        return Ok(());
+    }
+
     if schedule.groups <= 1 && schedule.test_threads.is_none() {
-        for (label, args) in suites {
+        for (label, args, key) in &to_run {
             println!("\n== {lane}: {label} ==");
             let started = std::time::Instant::now();
             let status = Command::new("cargo")
@@ -732,6 +780,7 @@ fn run_lane_suites(
                 .status()
                 .map_err(|e| anyhow::anyhow!("running cargo test {args:?}: {e}"))?;
             anyhow::ensure!(status.success(), "{lane} suite failed: {label}");
+            suite_record_green(&root, label, key);
             println!("== {lane}: {label} — green in {:.0?} ==", started.elapsed());
         }
         return Ok(());
@@ -739,12 +788,13 @@ fn run_lane_suites(
 
     // Group by package, preserving pinned intra-group order; schedule bigger groups first so the
     // longest sequential chain (e.g. the det lane's 12 daemon-vhc-host entries) starts earliest.
-    let mut groups: Vec<(&str, Vec<SuiteEntry<'_>>)> = Vec::new();
-    for &(label, args) in suites {
+    type KeyedEntry<'a> = (&'a str, &'a [&'a str], Option<String>);
+    let mut groups: Vec<(&str, Vec<KeyedEntry<'_>>)> = Vec::new();
+    for (label, args, key) in to_run {
         let pkg = suite_package(args);
         match groups.iter_mut().find(|(p, _)| *p == pkg) {
-            Some((_, entries)) => entries.push((label, args)),
-            None => groups.push((pkg, vec![(label, args)])),
+            Some((_, entries)) => entries.push((label, args, key)),
+            None => groups.push((pkg, vec![(label, args, key)])),
         }
     }
     groups.sort_by_key(|(_, entries)| std::cmp::Reverse(entries.len()));
@@ -761,13 +811,13 @@ fn run_lane_suites(
                 let Some((_, entries)) = groups.get(g) else {
                     return;
                 };
-                for &(label, args) in entries {
+                for (label, args, key) in entries {
                     if stop.load(Ordering::SeqCst) {
                         return;
                     }
                     let started = std::time::Instant::now();
                     let mut cmd = Command::new("cargo");
-                    cmd.current_dir(&root).arg("test").args(args);
+                    cmd.current_dir(&root).arg("test").args(*args);
                     if let Some(threads) = schedule.test_threads {
                         cmd.args(["--", &format!("--test-threads={threads}")]);
                     }
@@ -786,7 +836,11 @@ fn run_lane_suites(
                             );
                             print!("{}", String::from_utf8_lossy(&out.stdout));
                             eprint!("{}", String::from_utf8_lossy(&out.stderr));
-                            if !out.status.success() {
+                            if out.status.success() {
+                                // Bank this suite's green immediately: a later red elsewhere
+                                // in the lane must not re-buy it.
+                                suite_record_green(&root, label, key);
+                            } else {
                                 failures
                                     .lock()
                                     .expect("failures lock")
@@ -1553,6 +1607,29 @@ fn tempfile_dir(label: &str) -> anyhow::Result<PathBuf> {
 fn vhc_acceptance() -> anyhow::Result<()> {
     let root = workspace_root();
     run_lane_memoized(&root, "vhc-acceptance", &[], || {
+        // Closure-keyed memo under the whole-workspace one: the lane's outcome is a function of
+        // the suite crate + the PRODUCT binaries the harness spawns (not cargo deps of the suite,
+        // so they are named here) + the guest bytes — a change outside that closure (a doc, an
+        // unrelated crate) must not re-buy the ~30 min lane.
+        const ACCEPTANCE_CLOSURE: &[&str] =
+            &["daemon-vhc-acceptance", "daemon", "daemon-vhc-worker"];
+        const ACCEPTANCE_LABEL: &str = "vhc-acceptance (multi-process product gates)";
+        let memo = if memoization_disabled() {
+            None
+        } else {
+            SuiteMemo::compute(&root).ok()
+        };
+        let key = memo
+            .as_ref()
+            .and_then(|m| m.suite_key(ACCEPTANCE_CLOSURE, ACCEPTANCE_LABEL, ACCEPTANCE_BUILD_ARGS));
+        if suite_memo_green(&root, ACCEPTANCE_LABEL, &key) {
+            println!(
+                "\n== vhc-acceptance: green (memoized — product closure identical to the last \
+                 green run; VHC_GATE_MEMO=0 forces a re-run) =="
+            );
+            return Ok(());
+        }
+
         build_guests()?;
 
         let bin_dir = acceptance_release_bins(&root)?;
@@ -1570,6 +1647,7 @@ fn vhc_acceptance() -> anyhow::Result<()> {
             status.success(),
             "vhc-acceptance: a multi-process gate failed"
         );
+        suite_record_green(&root, ACCEPTANCE_LABEL, &key);
         println!("\nvhc-acceptance: all multi-process gates green");
         Ok(())
     })
@@ -1850,6 +1928,378 @@ fn run_lane_memoized(
     Ok(())
 }
 
+/// Per-suite memoization: the inputs that can feed ONE suite's outcome, indexed once per lane run.
+///
+/// The whole-workspace lane memo (`run_lane_memoized`) answers "is this tree byte-identical to the
+/// lane's last green run" — a valid fast path, but a hammer: any change anywhere invalidates every
+/// suite, so a one-line fix re-buys the entire battery. This index answers the per-suite question
+/// instead. A suite's outcome is a function of exactly: its package's dependency closure (workspace
+/// crate sources + the resolved external packages), the guest bytes for guest-linked suites, the
+/// toolchain and codegen env, and the invocation args. Nothing else in the tree can reach it, so the
+/// key hashes exactly that closure and a fix re-runs its cone while the rest of a lane stays
+/// memoized green — including inside a full-battery escalation.
+///
+/// Sound over-selection, never under:
+/// - the closure walks the `Cargo.lock` dependency graph, which pins the FEATURE-SUPERSET of every
+///   package's dependencies (optional deps included), so feature unification cannot smuggle in an
+///   unhashed input;
+/// - the runner's own sources (`xtask/`) and the root manifest (the workspace dependency + lint
+///   tables) ride every key, so a gate change re-proves everything once — deliberately;
+/// - workspace crate content is the git index blob ids plus a working-tree overlay of every
+///   modified/untracked/deleted path, the same evidence base as the whole-workspace fingerprint;
+/// - anything the index cannot prove (a git failure, an unparseable lock, a quoted path) fails the
+///   construction and the caller runs every suite unconditionally.
+struct SuiteMemo {
+    /// Aggregated lock entry per package NAME (identity material + dependency names). Aggregating
+    /// by name over-selects when one name resolves at several versions — sound.
+    lock: std::collections::BTreeMap<String, LockPackage>,
+    /// Workspace member name -> repo-relative crate dir (trailing `/`).
+    member_dirs: std::collections::BTreeMap<String, String>,
+    /// Tracked content: sorted repo-relative path -> `mode blob-sha` from the git index.
+    index: Vec<(String, String)>,
+    /// Working-tree overlay: sorted path -> blake3 of current bytes (`<absent>` for deletions).
+    dirty: Vec<(String, String)>,
+    /// The fragment present in every key: root manifest, the runner's own sources, toolchain, env.
+    globals: String,
+    /// Content hash of the guests workspace — a RUNTIME input to the guest-linked suites.
+    guests: String,
+}
+
+/// One `Cargo.lock` package name's aggregated identity + dependency edges.
+struct LockPackage {
+    /// Sorted `version/source/checksum` identity lines of every same-named entry.
+    meta: String,
+    /// Bare dependency names (a `"name version"` ref keeps only the name — aggregation by name).
+    deps: std::collections::BTreeSet<String>,
+}
+
+/// Parse a `Cargo.lock` into per-name aggregated entries. Line-based over the lock's stable
+/// `[[package]]` format; anything unexpected is an error (callers fail closed).
+fn parse_cargo_lock(text: &str) -> anyhow::Result<std::collections::BTreeMap<String, LockPackage>> {
+    let mut packages: std::collections::BTreeMap<String, LockPackage> =
+        std::collections::BTreeMap::new();
+    // Accumulator for the block being read.
+    let mut name: Option<String> = None;
+    let mut meta: Vec<String> = Vec::new();
+    let mut deps: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut in_deps = false;
+    let quoted = |line: &str, key: &str| -> Option<String> {
+        line.strip_prefix(key)?
+            .strip_prefix(" = \"")?
+            .strip_suffix('"')
+            .map(str::to_string)
+    };
+    let mut flush = |name: &mut Option<String>,
+                     meta: &mut Vec<String>,
+                     deps: &mut std::collections::BTreeSet<String>| {
+        if let Some(n) = name.take() {
+            meta.sort();
+            let entry = packages.entry(n).or_insert_with(|| LockPackage {
+                meta: String::new(),
+                deps: std::collections::BTreeSet::new(),
+            });
+            entry.meta.push_str(&meta.join("\n"));
+            entry.meta.push('\n');
+            entry.deps.append(deps);
+        }
+        meta.clear();
+        deps.clear();
+    };
+    for raw in text.lines() {
+        let line = raw.trim_end();
+        if line == "[[package]]" {
+            flush(&mut name, &mut meta, &mut deps);
+            in_deps = false;
+            continue;
+        }
+        if in_deps {
+            if line.trim() == "]" {
+                in_deps = false;
+            } else {
+                // ` "name"` or ` "name version"` (+ trailing comma) — the name is the first token.
+                let inner = line
+                    .trim()
+                    .trim_end_matches(',')
+                    .strip_prefix('"')
+                    .and_then(|s| s.strip_suffix('"'))
+                    .ok_or_else(|| anyhow::anyhow!("unparseable lock dependency line: {line}"))?;
+                let dep = inner.split_whitespace().next().unwrap_or(inner);
+                deps.insert(dep.to_string());
+            }
+            continue;
+        }
+        if let Some(n) = quoted(line, "name") {
+            anyhow::ensure!(name.is_none(), "lock package block with two names");
+            name = Some(n);
+        } else if line.starts_with("version")
+            || line.starts_with("source")
+            || line.starts_with("checksum")
+        {
+            meta.push(line.to_string());
+        } else if line == "dependencies = [" {
+            in_deps = true;
+        }
+        // Everything else (`[metadata]`, blank lines, the version header) is identity-neutral.
+    }
+    flush(&mut name, &mut meta, &mut deps);
+    anyhow::ensure!(!packages.is_empty(), "no [[package]] entries parsed");
+    Ok(packages)
+}
+
+/// The package names whose lock identity differs between two parsed locks (added, removed, or
+/// re-pinned). These are the only packages a `Cargo.lock` change can act through.
+fn lock_changed_names(
+    old: &std::collections::BTreeMap<String, LockPackage>,
+    new: &std::collections::BTreeMap<String, LockPackage>,
+) -> std::collections::BTreeSet<String> {
+    let mut changed = std::collections::BTreeSet::new();
+    for (name, entry) in new {
+        match old.get(name) {
+            Some(prev) if prev.meta == entry.meta => {}
+            _ => {
+                changed.insert(name.clone());
+            }
+        }
+    }
+    for name in old.keys() {
+        if !new.contains_key(name) {
+            changed.insert(name.clone());
+        }
+    }
+    changed
+}
+
+impl SuiteMemo {
+    /// Build the index from the working tree. Any input that cannot be proven is an error — the
+    /// caller then runs without per-suite memoization (a redundant run, never a stale skip).
+    fn compute(root: &Path) -> anyhow::Result<SuiteMemo> {
+        let git = |args: &[&str]| -> anyhow::Result<String> {
+            let out = Command::new("git")
+                .current_dir(root)
+                .args(args)
+                .output()
+                .map_err(|e| anyhow::anyhow!("git {args:?}: {e}"))?;
+            anyhow::ensure!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        };
+
+        // Tracked content: the index's blob ids. Stage != 0 means an unresolved merge — refuse.
+        let mut index = Vec::new();
+        for line in git(&["ls-files", "-s"])?.lines() {
+            let (meta, path) = line
+                .split_once('\t')
+                .ok_or_else(|| anyhow::anyhow!("unparseable ls-files line: {line}"))?;
+            let mut fields = meta.split_whitespace();
+            let (mode, sha, stage) = (
+                fields.next().unwrap_or_default(),
+                fields.next().unwrap_or_default(),
+                fields.next().unwrap_or_default(),
+            );
+            anyhow::ensure!(stage == "0", "unmerged index entry: {path}");
+            anyhow::ensure!(!path.starts_with('"'), "path needs git unquoting: {path}");
+            index.push((path.to_string(), format!("{mode} {sha}")));
+        }
+        index.sort();
+
+        // Working-tree overlay: every divergence from the index, hashed as it is on disk.
+        let mut dirty = Vec::new();
+        for line in git(&["status", "--porcelain=v1", "-uall", "--no-renames"])?.lines() {
+            let Some(path) = line.get(3..) else { continue };
+            anyhow::ensure!(
+                !path.starts_with('"'),
+                "dirty path needs git unquoting: {path}"
+            );
+            let digest = match std::fs::read(root.join(path)) {
+                Ok(bytes) => blake3::hash(&bytes).to_hex().to_string(),
+                Err(_) => "<absent>".to_string(),
+            };
+            dirty.push((path.to_string(), digest));
+        }
+        dirty.sort();
+
+        let lock_text = std::fs::read_to_string(root.join("Cargo.lock"))
+            .map_err(|e| anyhow::anyhow!("read Cargo.lock: {e}"))?;
+        let lock = parse_cargo_lock(&lock_text)?;
+
+        let member_dirs: std::collections::BTreeMap<String, String> = workspace_members(root)?
+            .into_iter()
+            .map(|(name, dir, _)| (name, dir))
+            .collect();
+
+        let hash_prefix = |index: &[(String, String)], dirty: &[(String, String)], prefix: &str| {
+            let mut h = blake3::Hasher::new();
+            for (path, id) in range_of(index, prefix) {
+                h.update(path.as_bytes());
+                h.update(b"=");
+                h.update(id.as_bytes());
+                h.update(b";");
+            }
+            for (path, id) in range_of(dirty, prefix) {
+                h.update(b"dirty:");
+                h.update(path.as_bytes());
+                h.update(b"=");
+                h.update(id.as_bytes());
+                h.update(b";");
+            }
+            h.finalize().to_hex().to_string()
+        };
+
+        // The every-key fragment: toolchain, codegen env, the workspace manifest (dependency
+        // versions + lint tables feed every crate's build), and the runner's own sources (the
+        // gate's semantics; a gate change deliberately re-proves the world once).
+        let rustc = Command::new("rustc")
+            .arg("-vV")
+            .output()
+            .map_err(|e| anyhow::anyhow!("rustc -vV: {e}"))?;
+        anyhow::ensure!(rustc.status.success(), "rustc -vV failed");
+        let mut globals = blake3::Hasher::new();
+        globals.update(&rustc.stdout);
+        for var in [
+            "RUSTFLAGS",
+            "CARGO_ENCODED_RUSTFLAGS",
+            "CARGO_BUILD_RUSTFLAGS",
+            "DAEMON_BUILD_ID",
+        ] {
+            globals.update(var.as_bytes());
+            globals.update(b"=");
+            globals.update(std::env::var(var).unwrap_or_default().as_bytes());
+            globals.update(b";");
+        }
+        globals.update(hash_prefix(&index, &dirty, "Cargo.toml").as_bytes());
+        globals.update(hash_prefix(&index, &dirty, "xtask/").as_bytes());
+
+        let guests = hash_prefix(&index, &dirty, "crates/vhc/guests/");
+
+        Ok(SuiteMemo {
+            lock,
+            member_dirs,
+            index,
+            dirty,
+            globals: globals.finalize().to_hex().to_string(),
+            guests,
+        })
+    }
+
+    /// The names reachable from `packages` through the lock graph (the packages themselves
+    /// included). Errors when a package is not in the lock — the caller runs unconditionally.
+    fn closure(&self, packages: &[&str]) -> anyhow::Result<std::collections::BTreeSet<String>> {
+        let mut reached = std::collections::BTreeSet::new();
+        let mut frontier: Vec<String> = Vec::new();
+        for pkg in packages {
+            anyhow::ensure!(
+                self.lock.contains_key(*pkg),
+                "package {pkg} is not in Cargo.lock"
+            );
+            if reached.insert((*pkg).to_string()) {
+                frontier.push((*pkg).to_string());
+            }
+        }
+        while let Some(name) = frontier.pop() {
+            // Dep names absent from the lock (platform-filtered externals of externals) carry no
+            // identity of their own beyond the parent's meta — skip, don't fail.
+            let Some(entry) = self.lock.get(&name) else {
+                continue;
+            };
+            for dep in &entry.deps {
+                if reached.insert(dep.clone()) {
+                    frontier.push(dep.clone());
+                }
+            }
+        }
+        Ok(reached)
+    }
+
+    /// The memo key for one suite: the closure of `packages`, split into workspace crates (hashed
+    /// by source content) and externals (hashed by lock identity), plus the every-key globals,
+    /// the guest bytes for guest-linked suites, and the invocation identity. `None` = this suite
+    /// cannot be keyed (unknown package) — run it.
+    fn suite_key(&self, packages: &[&str], label: &str, args: &[&str]) -> Option<String> {
+        let closure = self.closure(packages).ok()?;
+        let mut h = blake3::Hasher::new();
+        h.update(b"globals=");
+        h.update(self.globals.as_bytes());
+        for name in &closure {
+            match self.member_dirs.get(name) {
+                Some(dir) => {
+                    h.update(b"crate:");
+                    h.update(name.as_bytes());
+                    h.update(b"=");
+                    for (path, id) in range_of(&self.index, dir) {
+                        h.update(path.as_bytes());
+                        h.update(b"=");
+                        h.update(id.as_bytes());
+                        h.update(b";");
+                    }
+                    for (path, id) in range_of(&self.dirty, dir) {
+                        h.update(b"dirty:");
+                        h.update(path.as_bytes());
+                        h.update(b"=");
+                        h.update(id.as_bytes());
+                        h.update(b";");
+                    }
+                }
+                None => {
+                    h.update(b"extern:");
+                    h.update(name.as_bytes());
+                    h.update(b"=");
+                    h.update(
+                        self.lock
+                            .get(name)
+                            .map(|e| e.meta.as_str())
+                            .unwrap_or("")
+                            .as_bytes(),
+                    );
+                }
+            }
+            h.update(b"\n");
+        }
+        if packages.iter().any(|p| GUEST_LINKED_PACKAGES.contains(p)) {
+            h.update(b"guests=");
+            h.update(self.guests.as_bytes());
+        }
+        h.update(b"suite=");
+        h.update(label.as_bytes());
+        h.update(b" ");
+        h.update(args.join(" ").as_bytes());
+        Some(h.finalize().to_hex().to_string())
+    }
+}
+
+/// The contiguous slice of a path-sorted list whose paths start with `prefix`.
+fn range_of<'a>(sorted: &'a [(String, String)], prefix: &str) -> &'a [(String, String)] {
+    let start = sorted.partition_point(|(p, _)| p.as_str() < prefix);
+    let end = start + sorted[start..].partition_point(|(p, _)| p.starts_with(prefix));
+    &sorted[start..end]
+}
+
+/// The per-suite ledger file: `suite-<label hash>` beside the lane files, first line the key,
+/// second the human-readable label (never parsed back).
+fn suite_ledger_path(root: &Path, label: &str) -> PathBuf {
+    let id = blake3::hash(label.as_bytes()).to_hex();
+    lane_ledger_path(root, &format!("suite-{}", &id[..16]))
+}
+
+/// Does the per-suite ledger record a green run of `label` for exactly this key?
+fn suite_memo_green(root: &Path, label: &str, key: &Option<String>) -> bool {
+    let Some(key) = key else { return false };
+    std::fs::read_to_string(suite_ledger_path(root, label))
+        .is_ok_and(|s| s.lines().next() == Some(key.as_str()))
+}
+
+/// Record a green run of `label` (best-effort — a write failure only costs a future re-run).
+fn suite_record_green(root: &Path, label: &str, key: &Option<String>) {
+    let Some(key) = key else { return };
+    let path = suite_ledger_path(root, label);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, format!("{key}\n{label}\n"));
+}
+
 /// Keep the newest `keep` cache entries (by directory mtime — bumped on every hit), delete the
 /// rest. Best-effort: pruning failures never fail the lane.
 fn prune_acceptance_cache(cache_root: &Path, keep: usize) {
@@ -2020,10 +2470,12 @@ const GUEST_LINKED_PACKAGES: &[&str] = &[
 const FULL_GATE_PREFIXES: &[&str] = &["xtask/", ".cargo/", "vendor/"];
 
 /// Root files with the same "no crate cone bounds this" property (the root `Cargo.toml` carries
-/// the workspace dependency + lint tables; the flake pins the devShell toolchain).
+/// the workspace dependency + lint tables; the flake pins the devShell toolchain). `Cargo.lock`
+/// is deliberately NOT here: the lock names exactly which packages changed, and the lock's own
+/// dependency graph bounds their blast radius — see `lock_cone_seeds` (a one-line re-pin used to
+/// buy the full battery on every gate invocation until its commit was behind the base).
 const FULL_GATE_FILES: &[&str] = &[
     "Cargo.toml",
-    "Cargo.lock",
     "flake.nix",
     "flake.lock",
     "rust-toolchain.toml",
@@ -2056,6 +2508,9 @@ enum GateInput {
     Guests,
     /// Maps to a workspace crate — seeds the reverse-dependency cone.
     Crate(String),
+    /// The workspace lock — seeds the crates whose lock-graph closure reaches a changed package
+    /// (`lock_cone_seeds`; unparseable or gate-reaching deltas escalate).
+    Lock,
     /// A global input (or an unmapped path — fail CLOSED) — escalates to the full battery.
     FullGate(String),
 }
@@ -2066,6 +2521,9 @@ enum GateInput {
 fn classify_gate_input(path: &str, crate_dirs: &[(String, String)]) -> GateInput {
     if path.starts_with("crates/vhc/guests/") {
         return GateInput::Guests;
+    }
+    if path == "Cargo.lock" {
+        return GateInput::Lock;
     }
     if FULL_GATE_PREFIXES.iter().any(|p| path.starts_with(p)) || FULL_GATE_FILES.contains(&path) {
         return GateInput::FullGate(format!("global input changed: {path}"));
@@ -2170,6 +2628,70 @@ fn workspace_members(root: &Path) -> anyhow::Result<Vec<(String, String, Vec<Str
     Ok(members)
 }
 
+/// Map a `Cargo.lock` delta to the workspace crates it can act through: parse the lock at the
+/// merge-base and in the working tree, take the packages whose pinned identity changed, and walk
+/// the lock's REVERSE dependency graph from them up to workspace member names. The lock pins the
+/// feature-superset of every package's dependencies, so this walk over-selects, never under.
+///
+/// An unparseable lock at either end is an error — the caller fails closed into the full
+/// battery. The gate's own dependencies need no special case here: `cargo run -p xtask` rebuilds
+/// the gate FROM the changed lock before any selection happens (a breaking re-pin fails loudly),
+/// and the gate's semantics live in `xtask/` sources, which still escalate.
+fn lock_cone_seeds(
+    root: &Path,
+    base: &str,
+    members: &[(String, String, Vec<String>)],
+) -> anyhow::Result<std::collections::BTreeSet<String>> {
+    let git = |args: &[&str]| -> anyhow::Result<String> {
+        let out = Command::new("git")
+            .current_dir(root)
+            .args(args)
+            .output()
+            .map_err(|e| anyhow::anyhow!("git {args:?}: {e}"))?;
+        anyhow::ensure!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    let merge_base = git(&["merge-base", "HEAD", base])?.trim().to_string();
+    let old = parse_cargo_lock(&git(&["show", &format!("{merge_base}:Cargo.lock")])?)?;
+    let new_text = std::fs::read_to_string(root.join("Cargo.lock"))
+        .map_err(|e| anyhow::anyhow!("read Cargo.lock: {e}"))?;
+    let new = parse_cargo_lock(&new_text)?;
+    let changed = lock_changed_names(&old, &new);
+
+    // Reverse edges over the UNION of both locks (a removed package's dependents still felt it).
+    let mut dependents: std::collections::BTreeMap<&str, Vec<&str>> =
+        std::collections::BTreeMap::new();
+    for lock in [&old, &new] {
+        for (name, entry) in lock {
+            for dep in &entry.deps {
+                dependents
+                    .entry(dep.as_str())
+                    .or_default()
+                    .push(name.as_str());
+            }
+        }
+    }
+    let mut reached: std::collections::BTreeSet<String> = changed;
+    let mut frontier: Vec<String> = reached.iter().cloned().collect();
+    while let Some(name) = frontier.pop() {
+        for dependent in dependents.get(name.as_str()).into_iter().flatten() {
+            if reached.insert((*dependent).to_string()) {
+                frontier.push((*dependent).to_string());
+            }
+        }
+    }
+    Ok(members
+        .iter()
+        .map(|(name, _, _)| name)
+        .filter(|name| reached.contains(*name))
+        .cloned()
+        .collect())
+}
+
 /// Expand seed crates through the REVERSE dependency graph (workspace members only, every
 /// dependency kind): everything whose build or tests can observe a seed changes with it.
 fn reverse_dependents(
@@ -2226,16 +2748,45 @@ fn vhc_gate_diff(base: Option<String>, dry_run: bool) -> anyhow::Result<()> {
 
     let mut seeds: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut guests_changed = false;
+    let mut lock_changed = false;
     let mut ignored = 0usize;
     for path in &changed {
         match classify_gate_input(path, &crate_dirs) {
             GateInput::Ignored => ignored += 1,
             GateInput::Guests => guests_changed = true,
+            GateInput::Lock => lock_changed = true,
             GateInput::Crate(name) => {
                 seeds.insert(name);
             }
             GateInput::FullGate(reason) => {
                 println!("vhc-production-gate: {reason}");
+                if dry_run {
+                    println!("(dry run) would run the full battery");
+                    return Ok(());
+                }
+                return vhc_production_gate_all();
+            }
+        }
+    }
+    if lock_changed {
+        match lock_cone_seeds(&root, &base, &members) {
+            Ok(lock_seeds) => {
+                println!(
+                    "vhc-production-gate: Cargo.lock delta cones to {} workspace crate(s){}",
+                    lock_seeds.len(),
+                    if lock_seeds.is_empty() {
+                        " (no workspace crate reaches a changed package)"
+                    } else {
+                        ""
+                    }
+                );
+                seeds.extend(lock_seeds);
+            }
+            Err(e) => {
+                println!(
+                    "vhc-production-gate: Cargo.lock delta cannot be cone-mapped ({e:#}) — \
+                     failing closed into the full battery"
+                );
                 if dry_run {
                     println!("(dry run) would run the full battery");
                     return Ok(());
@@ -5465,4 +6016,166 @@ fn vhc_codename_scan() -> anyhow::Result<()> {
         FORBIDDEN.len()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod suite_memo_tests {
+    use super::*;
+
+    const OLD_LOCK: &str = r#"version = 4
+
+[[package]]
+name = "app"
+version = "0.1.0"
+dependencies = [
+ "lib",
+]
+
+[[package]]
+name = "ext"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aaaa"
+
+[[package]]
+name = "lib"
+version = "0.1.0"
+dependencies = [
+ "ext",
+]
+
+[[package]]
+name = "other"
+version = "0.1.0"
+"#;
+
+    fn new_lock() -> String {
+        OLD_LOCK.replace("aaaa", "bbbb")
+    }
+
+    #[test]
+    fn the_lock_parser_reads_names_identity_and_edges() {
+        let lock = parse_cargo_lock(OLD_LOCK).expect("parse");
+        assert_eq!(
+            lock.keys().cloned().collect::<Vec<_>>(),
+            ["app", "ext", "lib", "other"]
+        );
+        assert_eq!(
+            lock["app"].deps.iter().cloned().collect::<Vec<_>>(),
+            ["lib"]
+        );
+        assert_eq!(
+            lock["lib"].deps.iter().cloned().collect::<Vec<_>>(),
+            ["ext"]
+        );
+        assert!(lock["ext"].deps.is_empty());
+        assert!(lock["ext"].meta.contains("checksum = \"aaaa\""));
+    }
+
+    #[test]
+    fn a_repinned_package_is_the_only_changed_name() {
+        let old = parse_cargo_lock(OLD_LOCK).expect("parse old");
+        let new = parse_cargo_lock(&new_lock()).expect("parse new");
+        assert_eq!(
+            lock_changed_names(&old, &new)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            ["ext"]
+        );
+        assert!(lock_changed_names(&old, &old).is_empty());
+    }
+
+    fn memo_over(lock_text: &str, index: Vec<(String, String)>) -> SuiteMemo {
+        SuiteMemo {
+            lock: parse_cargo_lock(lock_text).expect("parse"),
+            member_dirs: [
+                ("app".to_string(), "crates/app/".to_string()),
+                ("lib".to_string(), "crates/lib/".to_string()),
+                ("other".to_string(), "crates/other/".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            index,
+            dirty: Vec::new(),
+            globals: "globals".to_string(),
+            guests: "guests".to_string(),
+        }
+    }
+
+    #[test]
+    fn a_suite_key_moves_with_its_closure_and_ignores_the_rest() {
+        let entry = |path: &str, id: &str| (path.to_string(), id.to_string());
+        let base = memo_over(
+            OLD_LOCK,
+            vec![
+                entry("crates/app/src/main.rs", "100644 a1"),
+                entry("crates/lib/src/lib.rs", "100644 b1"),
+                entry("crates/other/src/lib.rs", "100644 c1"),
+            ],
+        );
+        let key = |memo: &SuiteMemo| memo.suite_key(&["app"], "app suite", &["-p", "app"]);
+        let baseline = key(&base).expect("key");
+
+        // A dependency crate's content moves the key.
+        let lib_changed = memo_over(
+            OLD_LOCK,
+            vec![
+                entry("crates/app/src/main.rs", "100644 a1"),
+                entry("crates/lib/src/lib.rs", "100644 b2"),
+                entry("crates/other/src/lib.rs", "100644 c1"),
+            ],
+        );
+        assert_ne!(key(&lib_changed).expect("key"), baseline);
+
+        // An external re-pin inside the closure moves the key.
+        let ext_repinned = memo_over(
+            &new_lock(),
+            vec![
+                entry("crates/app/src/main.rs", "100644 a1"),
+                entry("crates/lib/src/lib.rs", "100644 b1"),
+                entry("crates/other/src/lib.rs", "100644 c1"),
+            ],
+        );
+        assert_ne!(key(&ext_repinned).expect("key"), baseline);
+
+        // A crate OUTSIDE the closure does not.
+        let other_changed = memo_over(
+            OLD_LOCK,
+            vec![
+                entry("crates/app/src/main.rs", "100644 a1"),
+                entry("crates/lib/src/lib.rs", "100644 b1"),
+                entry("crates/other/src/lib.rs", "100644 c2"),
+            ],
+        );
+        assert_eq!(key(&other_changed).expect("key"), baseline);
+
+        // An unknown package cannot be keyed — the suite must run.
+        assert!(base.suite_key(&["ghost"], "ghost", &[]).is_none());
+    }
+
+    #[test]
+    fn range_of_selects_exactly_the_prefixed_paths() {
+        let sorted: Vec<(String, String)> = [
+            ("Cargo.toml", "t"),
+            ("crates/app/src/main.rs", "a"),
+            ("crates/lib/src/lib.rs", "b"),
+            ("xtask/src/main.rs", "x"),
+        ]
+        .into_iter()
+        .map(|(p, i)| (p.to_string(), i.to_string()))
+        .collect();
+        let paths = |prefix: &str| {
+            range_of(&sorted, prefix)
+                .iter()
+                .map(|(p, _)| p.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(paths("crates/app/"), ["crates/app/src/main.rs"]);
+        assert_eq!(paths("Cargo.toml"), ["Cargo.toml"]);
+        assert_eq!(paths("crates/ghost/"), Vec::<&str>::new());
+        assert_eq!(
+            paths("crates/"),
+            ["crates/app/src/main.rs", "crates/lib/src/lib.rs"]
+        );
+    }
 }
