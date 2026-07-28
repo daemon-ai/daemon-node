@@ -560,5 +560,18 @@ panic = "unwind"
 # the crates.io 0.10.0 release except for that one fix (see `vendor/cubecl-cuda/PATCH.md`); it is a
 # single-crate patch, so every sibling `cubecl-*` crate stays at the crates.io 0.10.0 source.
 # Lock-affecting only for the `cuda` lane; the default gate never compiles it.
+#
+# --- vendored patch: cubek-matmul selector shared-memory clamp (backend-lane audit D3) ------------
+# `cubek-matmul` 0.2.0 (pulled transitively by `burn`'s cubecl backends) selects matmul stage
+# configs without ever consulting the adapter's `hardware.max_shared_memory_size`; the launch-side
+# validator then refuses the kernel (40,960 B selected vs Apple's 32,768 B limit — upstream
+# tracel-ai/burn#4530/#4851, unfixed in 0.2.0). Autotune is deliberately OFF here (determinism
+# posture), so there is no candidate fallback and the refusal is a mid-round ComputeFault. The
+# vendored copy under `vendor/cubek-matmul` is byte-identical to the crates.io 0.2.0 release except
+# for a deterministic per-adapter clamp in the two blueprint selectors (see
+# `vendor/cubek-matmul/PATCH.md`); single-crate patch, every sibling `cubek-*` crate stays at the
+# crates.io source. Host-side compute only: the guests workspace resolves the crate in its lock but
+# never compiles it to wasm (no cubecl backend is enabled there).
 [patch.crates-io]
 cubecl-cuda = { path = "vendor/cubecl-cuda" }
+cubek-matmul = { path = "vendor/cubek-matmul" }

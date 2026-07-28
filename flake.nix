@@ -243,7 +243,28 @@
           NIX_SSL_CERT_FILE = caBundle;
         };
 
-        cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+        # crane's deps-only builds compile against a "dummy" source tree in which every local path
+        # crate is stubbed to an empty lib. Right for workspace members; wrong for the
+        # `[patch.crates-io]` crates under `vendor/`: those are dependency-graph SOURCES whose API
+        # sibling registry crates compile against during the deps-only build (cubek-convolution
+        # resolves cubek-matmul's `Routine` trait, so a stub explodes into E0220/E0432 across every
+        # dependent — the fleet windows lane found it first because it is the first crane lane whose
+        # feature set compiles the burn/cubek stack). Restore the real vendored sources into the
+        # dummy tree and hand it to `buildDepsOnly` as `dummySrc` (dropping `src`, which it would
+        # ignore with a warning). The vendored patches are tiny and effectively frozen, so keying
+        # the deps cache on their real bytes is correct, not wasteful.
+        vendorDummySrc = craneLib.mkDummySrc {
+          inherit src;
+          extraDummyScript = ''
+            rm -rf "$out/vendor"
+            cp -r --no-preserve=mode,ownership ${src}/vendor "$out/vendor"
+          '';
+        };
+        buildDepsOnlyWithVendor =
+          cl: args:
+          cl.buildDepsOnly ((builtins.removeAttrs args [ "src" ]) // { dummySrc = vendorDummySrc; });
+
+        cargoArtifacts = buildDepsOnlyWithVendor craneLib commonArgs;
 
         buildWorkspacePackage =
           packageName:
@@ -328,7 +349,7 @@
             // {
               pname = "daemon-browser";
               version = baseVersion;
-              cargoArtifacts = craneLib.buildDepsOnly (
+              cargoArtifacts = buildDepsOnlyWithVendor craneLib (
                 commonArgs
                 // browserExtra
                 // {
@@ -363,7 +384,7 @@
               # scratch. Building deps-only with the SAME features moves them into a cached layer
               # keyed on Cargo.lock/toolchain/pin — "compile once per arch until the hash changes"
               # (the Windows llama lane's `daemonInferLlamaWindowsDeps` is the same pattern).
-              cargoArtifacts = craneLib.buildDepsOnly (
+              cargoArtifacts = buildDepsOnlyWithVendor craneLib (
                 commonArgs
                 // {
                   pname = "daemon-infer-${name}-deps";
@@ -428,7 +449,7 @@
             pname = "daemon-infer-mistralrs-metal";
             # Features-matched deps artifact (see `buildEngineWorker`): keeps the mistral.rs/candle
             # tree in a cached layer instead of recompiling it on every workspace source edit.
-            cargoArtifacts = craneLib.buildDepsOnly (
+            cargoArtifacts = buildDepsOnlyWithVendor craneLib (
               commonArgs
               // {
                 pname = "daemon-infer-mistralrs-metal-deps";
@@ -458,7 +479,7 @@
             pname = "daemon-infer-vulkan";
             # Features-matched deps artifact (see `buildEngineWorker`): moves the from-source
             # Vulkan llama.cpp cmake build into a cached layer instead of recompiling it per edit.
-            cargoArtifacts = craneLib.buildDepsOnly (
+            cargoArtifacts = buildDepsOnlyWithVendor craneLib (
               commonArgs
               // {
                 pname = "daemon-infer-vulkan-deps";
@@ -534,7 +555,7 @@
 
         # Dependency-only artifacts for the two shipped bins. Scoped with `-p` so the unix-only
         # dev-deps (the `nix` signal crate) and test-only trees never compile for windows.
-        windowsCargoArtifacts = craneLibWindows.buildDepsOnly (
+        windowsCargoArtifacts = buildDepsOnlyWithVendor craneLibWindows (
           windowsCommonArgs
           // {
             pname = "daemon-workspace-windows";
@@ -777,7 +798,7 @@
             windowsBindgenClangArgs + " -I${llamaCppWindowsPrebuiltDir}/include";
         };
 
-        daemonInferLlamaWindowsDeps = craneLibWindows.buildDepsOnly (
+        daemonInferLlamaWindowsDeps = buildDepsOnlyWithVendor craneLibWindows (
           windowsLlamaEngineArgs
           // {
             pname = "daemon-infer-llama-windows-deps";
@@ -851,7 +872,7 @@
 
         # mistral.rs on windows is CPU-only (candle has no vulkan backend). Its only new native dep
         # is `onig_sys` (C, covered by TARGET_CC + the bindgen clang args). No prebuilt env.
-        daemonInferMistralrsWindowsDeps = craneLibWindows.buildDepsOnly (
+        daemonInferMistralrsWindowsDeps = buildDepsOnlyWithVendor craneLibWindows (
           windowsEngineCommonArgs
           // {
             pname = "daemon-infer-mistralrs-windows-deps";
@@ -886,7 +907,7 @@
         # daemon-telemetry/toolchain blocker (substrate crate), NOT the probe. The probe bin links +
         # runs the identical `autotune` probe, so it is the honest validation artifact this wave.
         # swarm-ledger-p2-c2 flake edit #2 (ADDITIVE lane output; Merge-2 review).
-        daemonTrainProbeWindowsDeps = craneLibWindows.buildDepsOnly (
+        daemonTrainProbeWindowsDeps = buildDepsOnlyWithVendor craneLibWindows (
           windowsCommonArgs
           // {
             pname = "daemon-vhc-probe-windows-deps";
@@ -928,7 +949,7 @@
         # aws-lc-sys (rustls' provider, pulled by `vhc-net`'s wss:// TLS) already cross-builds
         # here via `windowsCommonArgs` (nasm + TARGET_CC), exactly like daemon-host's TLS stack.
         # Integration-owner flake edit (frozen-file rule), recorded in swarm-p3-ledger Merge-2.
-        daemonTrainWorkerWindowsDeps = craneLibWindows.buildDepsOnly (
+        daemonTrainWorkerWindowsDeps = buildDepsOnlyWithVendor craneLibWindows (
           windowsCommonArgs
           // {
             pname = "daemon-vhc-worker-windows-deps";
@@ -963,7 +984,7 @@
             # Features-matched deps artifact (see `buildEngineWorker`): `hyperon` is a big non-default
             # git dep absent from the default-feature `cargoArtifacts`, so without this it recompiles
             # on every workspace source edit. Deps-only with `--features hyperon` caches it.
-            cargoArtifacts = craneLib.buildDepsOnly (
+            cargoArtifacts = buildDepsOnlyWithVendor craneLib (
               commonArgs
               // {
                 pname = "daemon-metta-deps";
