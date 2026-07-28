@@ -215,7 +215,13 @@ fn admit_for_probe(
     let profile = parts.select().map_err(|refusal| {
         format!("fit probe: the provisioned profile did not authenticate: {refusal}")
     })?;
-    let authority = parts.authority(&profile);
+    let mut authority = parts.authority(&profile);
+    // The probe's whole reason to exist: a conservative estimate above supply is UNPROVEN, not
+    // disproven, and the box's own drive is the proof either way. Under this posture only the
+    // plan's exactly-stated persistent floor refuses without device time; the conservative total
+    // is what the verdict will answer for. (A join keeps refusing on the total until [RC-15]'s
+    // verdict wiring hands it a green verdict to defer to.)
+    authority.posture = daemon_vhc_resource::AdmissionPosture::FitProbe;
     let admission = admit(
         &admission_worker,
         module,

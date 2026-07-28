@@ -50,7 +50,32 @@ use crate::store::AuthenticatedProfile;
 ///
 /// A struct rather than a parameter list because the members are a set: an admission that had some of
 /// them would not be a cheaper admission, it would be an unauthorized one.
+/// What this admission licenses — a join, or a fit probe.
+///
+/// The doctrine's split ([RC-15]): the composed figure is a **conservative estimate**, and a
+/// conservative figure above supply is *unproven*, not disproven. A join refuses on it, because a
+/// join charges a ledger and nothing has yet proved the role fits. The fit probe exists to
+/// produce that proof, so it must be able to run exactly where the join cannot yet — refusing the
+/// probe on the conservative total would leave the estimate as the admission authority it was
+/// demoted from. Under `FitProbe` the machine comparison uses the plan's **exactly-stated
+/// persistent floor** instead (the optimistic bound: if even the persistent set cannot reside, no
+/// probe outcome can change that, and refusing without device time is sound). Everything else —
+/// lane bounds, per-allocation ceilings, pool configuration, owner caps — is posture-neutral.
+///
+/// A `FitProbe` admission is consumed by the worker's probe mode only; it never charges a ledger
+/// and never joins a run.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AdmissionPosture {
+    /// Production: the conservative total must fit, because nothing else has proven it does.
+    #[default]
+    Join,
+    /// The probe: the device is the oracle; only the persistent floor refuses without running.
+    FitProbe,
+}
+
 pub struct AdmissionInputs<'a> {
+    /// What this admission licenses. See [`AdmissionPosture`].
+    pub posture: AdmissionPosture,
     /// The module's Logical Resource Plan, as its assessment emitted it.
     pub plan: &'a LogicalResourcePlan,
     /// The **authenticated** certified profile for this node's backend implementation.
@@ -186,8 +211,16 @@ pub fn admit_composition(
 
     // 3 — supply and the owner's cap, independently, with the joint pool comparison where the device
     // and the host draw on one DRAM.
+    //
+    // WHICH device figure faces the machine is the posture's whole difference (see
+    // [`AdmissionPosture`]): a join authorizes the conservative total, the probe authorizes the
+    // exactly-stated persistent floor and lets the device answer for the rest.
+    let device_figure = match inputs.posture {
+        AdmissionPosture::Join => selection.estimate.total_peak_bytes,
+        AdmissionPosture::FitProbe => selection.estimate.persistent_device_bytes,
+    };
     admit_node_memory_bytes(
-        selection.estimate.total_peak_bytes,
+        device_figure,
         selection.estimate.linear_memory_bytes,
         inputs.report,
         inputs.owner_cap,
@@ -503,6 +536,7 @@ mod tests {
         bounds: &'a LaneEstimateBounds,
     ) -> AdmissionInputs<'a> {
         AdmissionInputs {
+            posture: AdmissionPosture::Join,
             plan,
             profile,
             report,
@@ -555,6 +589,64 @@ mod tests {
         );
         assert_eq!(admitted.reservation.identity.role, "trainer");
         assert!(admitted.pool.configured_worst_case_bytes() > 0);
+    }
+
+    /// The posture split, exactly as ratified ([RC-15]): a conservative total above supply is
+    /// UNPROVEN — a join refuses on it, the probe runs past it — while a persistent floor above
+    /// supply is disproven for both, because no probe outcome can shrink what must reside.
+    #[test]
+    fn the_probe_posture_authorizes_the_floor_and_the_join_the_total() {
+        let plan = plan();
+        let (store, running) = stocked();
+        let policy = trust_fixtures::policy_for(&store);
+        let profile = authenticate(&store, &running, &policy);
+        let report = report_with_measured_ceiling();
+        let bounds = generous_bounds();
+
+        // The fixture's own composed figures, so the supply pivots sit where the semantics live
+        // rather than at magic constants.
+        let admitted = admit_composition(&inputs(&plan, &profile, &report, &bounds))
+            .expect("the generous fixture admits");
+        let floor = admitted.estimate().persistent_device_bytes;
+        let total = admitted.estimate().total_peak_bytes;
+        assert!(floor < total, "the fixture prices transients above zero");
+        // The report must stay self-consistent while the supply shrinks: a measured ceiling above
+        // the supply invalidates the report a step earlier, which would pass this test for the
+        // wrong reason. The ceiling only needs to cover the estimate's own largest allocation.
+        let ceiling = admitted.pool.largest_single_allocation_bytes;
+        assert!(
+            ceiling <= (floor + total) / 2,
+            "the fixture's largest allocation fits under the squeezed supply"
+        );
+
+        // Supply between the floor and the conservative total: unproven territory.
+        let mut squeezed = report_with_measured_ceiling();
+        squeezed.measured_max_allocation =
+            Maybe::Available(crate::capability::fixtures::measured_ceiling(ceiling));
+        squeezed.device_supply = Maybe::Available(crate::capability::fixtures::derived_supply(
+            (floor + total) / 2,
+        ));
+        let join = admit_composition(&inputs(&plan, &profile, &squeezed, &bounds))
+            .expect_err("a join refuses what nothing has proven fits");
+        assert_eq!(join.stage(), "device-authorization");
+        let mut probe_inputs = inputs(&plan, &profile, &squeezed, &bounds);
+        probe_inputs.posture = AdmissionPosture::FitProbe;
+        admit_composition(&probe_inputs)
+            .expect("the probe runs where the join cannot yet — that is what it is for");
+
+        // Supply below the persistent floor: disproven, for both postures, without device time.
+        let mut starved = report_with_measured_ceiling();
+        starved.measured_max_allocation = Maybe::Available(
+            crate::capability::fixtures::measured_ceiling(ceiling.min(floor.saturating_sub(1))),
+        );
+        starved.device_supply = Maybe::Available(crate::capability::fixtures::derived_supply(
+            floor.saturating_sub(1),
+        ));
+        let mut starved_probe = inputs(&plan, &profile, &starved, &bounds);
+        starved_probe.posture = AdmissionPosture::FitProbe;
+        let refusal = admit_composition(&starved_probe)
+            .expect_err("even the probe refuses a floor that cannot reside");
+        assert_eq!(refusal.stage(), "device-authorization");
     }
 
     /// The lane refuses before the machine is consulted, so the operator is told which authority said no.

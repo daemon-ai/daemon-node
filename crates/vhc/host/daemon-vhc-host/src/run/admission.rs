@@ -243,6 +243,11 @@ pub struct ResourceAuthority<'a> {
     pub reservation_identity: daemon_vhc_resource::ReservationIdentity,
     /// The frozen configuration a uniform-run participant must verify rather than reselect.
     pub frozen_binding: Option<&'a daemon_vhc_proto::resource_plan::Binding>,
+    /// What this admission licenses — a join (the default) or a fit probe, which authorizes the
+    /// estimate's persistent floor instead of its conservative total against the machine (the
+    /// probe exists to answer what the conservative figure cannot). See
+    /// [`daemon_vhc_resource::AdmissionPosture`].
+    pub posture: daemon_vhc_resource::AdmissionPosture,
 }
 
 /// The **owned** assembly a [`ResourceAuthority`] is borrowed from.
@@ -314,6 +319,8 @@ impl ResourceAuthorityParts {
             co_resident_roles: self.co_resident_roles,
             reservation_identity: self.reservation_identity.clone(),
             frozen_binding: self.frozen_binding.as_ref(),
+            // Production assembly licenses joins; the probe flips this field itself.
+            posture: daemon_vhc_resource::AdmissionPosture::default(),
         }
     }
 }
@@ -896,6 +903,7 @@ pub fn admit(
                     co_resident_roles: authority.co_resident_roles,
                     reservation_identity: authority.reservation_identity.clone(),
                     frozen_binding: authority.frozen_binding,
+                    posture: authority.posture,
                 })
                 .map_err(composition_refusal)?;
             let dt = composed.estimate().device_total_bytes();

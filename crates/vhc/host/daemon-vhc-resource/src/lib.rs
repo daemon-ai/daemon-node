@@ -50,7 +50,8 @@ pub mod verdict;
 
 pub use admit::{
     admit_composition, recompose_recorded_estimate, validate_recorded_composition, AdmissionInputs,
-    AdmissionRefusal, AdmittedComposition, RecordedComposition, RecordedCompositionError,
+    AdmissionPosture, AdmissionRefusal, AdmittedComposition, RecordedComposition,
+    RecordedCompositionError,
 };
 pub use capability::{
     admit_device_bytes, admit_node_memory_bytes, derive_device_supply, revision_record_digest,

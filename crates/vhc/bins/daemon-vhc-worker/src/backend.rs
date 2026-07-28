@@ -2390,7 +2390,26 @@ fn operating_system(family: daemon_vhc_resource::OsFamily) -> daemon_vhc_resourc
         read_first_line(&["uname", "-r"]),
     );
 
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    // On Windows the registry's CurrentVersion key is the platform's own statement of what is
+    // installed: CurrentBuildNumber + UBR is the build that moves when the OS (and with it the
+    // in-box graphics stack) moves. This is the documented OS-build fallback signal — the wgpu
+    // framework exposes no comparable driver revision on DX12 (`driver_info` is empty there and
+    // `driver` is a value whose meaning differs per backend), and a Windows record without an OS
+    // build carries NO comparable signal at all, which authenticates nothing (typed refusal).
+    #[cfg(target_os = "windows")]
+    let (version, build) = (
+        windows_registry_version_field("DisplayVersion"),
+        match (
+            windows_registry_version_field("CurrentBuildNumber"),
+            windows_registry_version_field("UBR"),
+        ) {
+            (Some(major), Some(ubr)) => Some(format!("{major}.{ubr}")),
+            (Some(major), None) => Some(major),
+            _ => None,
+        },
+    );
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     let (version, build) = (None, None);
 
     OperatingSystem {
@@ -2422,6 +2441,39 @@ fn read_first_line(argv: &[&str]) -> Option<String> {
     let text = String::from_utf8_lossy(&output.stdout);
     let line = text.lines().next()?.trim();
     (!line.is_empty()).then(|| line.to_string())
+}
+
+/// One value of `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion`, read through `reg query` —
+/// the same spawned-command pattern as `uname`/`sw_vers` on the other platforms. The output's
+/// value line ends `<name>  REG_SZ|REG_DWORD  <data>`; the data is the last token. REG_DWORD
+/// values (UBR) print as `0x<hex>` and are decoded to decimal so a build reads `20348.4294`,
+/// not `20348.0x10c6`.
+#[cfg(target_os = "windows")]
+fn windows_registry_version_field(name: &str) -> Option<String> {
+    let output = std::process::Command::new("reg")
+        .args([
+            "query",
+            r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion",
+            "/v",
+            name,
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let data = text
+        .lines()
+        .find(|l| l.trim_start().starts_with(name))?
+        .split_whitespace()
+        .last()?
+        .to_string();
+    let decoded = data
+        .strip_prefix("0x")
+        .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+        .map_or(data, |n| n.to_string());
+    (!decoded.is_empty()).then_some(decoded)
 }
 
 /// One field of `/etc/os-release`, unquoted.

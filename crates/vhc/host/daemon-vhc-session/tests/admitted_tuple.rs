@@ -38,6 +38,7 @@ fn composed_admission() -> (AdmittedComposition, ComposedAgainst, Vec<u8>) {
     let plan = test_support::trivial_plan();
 
     let composition = daemon_vhc_resource::admit_composition(&AdmissionInputs {
+        posture: daemon_vhc_resource::AdmissionPosture::Join,
         plan: &plan,
         profile: &profile,
         report: &report,

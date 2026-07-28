@@ -71,6 +71,10 @@ cpu = ["daemon-vhc-host/cpu"]
 burn-ndarray = ["daemon-vhc-host/burn-ndarray"]
 # burn with the wgpu backend (Vulkan/RADV at runtime) — the G2 GPU lane. Opt-in only.
 wgpu = ["daemon-vhc-host/wgpu"]
+# The Vulkan-adapter SPIR-V compile lane (see daemon-vhc-host's feature of the same name).
+# Linux and the Windows cross lane build this; a Metal box builds plain `wgpu` (burn/vulkan
+# needs the Vulkan SDK at build time on macOS).
+wgpu-spirv = ["wgpu", "daemon-vhc-host/wgpu-spirv"]
 # burn with the CUDA backend (driver-API + NVRTC JIT at runtime) — the discrete-NVIDIA lane.
 # Opt-in only.
 cuda = ["daemon-vhc-host/cuda"]

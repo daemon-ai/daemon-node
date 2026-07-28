@@ -336,6 +336,7 @@ fn admitted(wasm: &[u8], cfg_bytes: &[u8]) -> Admission {
     let report = test_support::capability_report(BackendClass::Cpu);
     let lane_bounds = test_support::generous_lane_bounds();
     let authority = ResourceAuthority {
+        posture: daemon_vhc_resource::AdmissionPosture::Join,
         profile: &profile,
         report: &report,
         lane_bounds: &lane_bounds,

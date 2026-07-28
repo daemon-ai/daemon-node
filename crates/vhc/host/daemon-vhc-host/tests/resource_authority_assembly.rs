@@ -39,6 +39,7 @@ fn the_test_support_feature_assembles_an_authority_that_composes_a_claim() {
     let plan = test_support::trivial_plan();
 
     let authority = ResourceAuthority {
+        posture: daemon_vhc_resource::AdmissionPosture::Join,
         profile: &profile,
         report: &report,
         lane_bounds: &lane_bounds,
@@ -53,6 +54,7 @@ fn the_test_support_feature_assembles_an_authority_that_composes_a_claim() {
     };
 
     let composed = daemon_vhc_resource::admit_composition(&AdmissionInputs {
+        posture: daemon_vhc_resource::AdmissionPosture::Join,
         plan: &plan,
         profile: authority.profile,
         report: authority.report,
@@ -96,6 +98,7 @@ fn a_frozen_binding_composes_from_outside_the_resource_crate_too() {
     let frozen = test_support::trivial_binding(2);
 
     let composed = daemon_vhc_resource::admit_composition(&AdmissionInputs {
+        posture: daemon_vhc_resource::AdmissionPosture::Join,
         plan: &plan,
         profile: &profile,
         report: &report,
@@ -117,6 +120,7 @@ fn a_frozen_binding_composes_from_outside_the_resource_crate_too() {
     // select on its own is 1, so a claim equal to the minimum's would mean the freeze was ignored —
     // which is the failure mode that surfaces far away, as a digest mismatch at another participant.
     let minimum = daemon_vhc_resource::admit_composition(&AdmissionInputs {
+        posture: daemon_vhc_resource::AdmissionPosture::Join,
         plan: &plan,
         profile: &profile,
         report: &report,

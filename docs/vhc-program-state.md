@@ -166,18 +166,28 @@ None of these blocks C0 or C1.
   reachability (§8.1). Freeze/C2: not reached.
 - Program archive: frozen and locked read-only 2026-07-27.
 
-## 8. Next actions (in order)
+## 8. Fleet roster and next actions
 
-1. **[HUMAN] Restore fleet reachability.** The relay box (`intelligent-city-fades-fin-03`,
-   31.22.104.86) times out on ssh, and the Mac / Windows seats are not in the build host's ssh
-   config. C1's physical run needs one reachable second box; C2 needs all of them.
-2. Run C1 on two boxes: provision each box with `vhc-provision-dev-profile`, start the relay
-   per the runbook §4.2, point both nodes' `[vhc.iroh]` at it with WAN `advertise_ips`, drive
-   over `ssh → daemon-cli`; fix what it surfaces. The transport/churn semantics are already
-   gate-proven; this run is about real WAN, real hardware heterogeneity.
-3. Fit probes on the two remote boxes at ceremony geometry (this box is green; the runner is
-   one command per box once reachable: `vhc-provision-dev-profile` then `vhc-fit-probe`).
-4. Freeze; memoized preflight; run C2; evidence closure; human-signed master merge.
+The roster is status this file MUST carry (an earlier revision dropped it into the archive and
+a session then declared reachable boxes unreachable — access facts live here, verified by ssh):
+
+| Box | Access | Hardware | Role | Backend |
+|---|---|---|---|---|
+| Strix Halo (build host) | local | AMD Strix Halo, 128 GiB UMA, RADV | trainer + coordinator seat + operator seat | wgpu/Vulkan |
+| M4 Mac | `ssh m1@62.210.193.129` | Apple M4, 32 GiB unified (memory floor) | trainer | wgpu/Metal |
+| Windows 5090 | `ssh usergpu356@37.230.134.194` (cmd.exe; build via sealed Nix cross-build, never on-box) | RTX 5090 32 GiB, Server 2022 | trainer | wgpu/DX12 |
+| M1 mini | `ssh m1@51.159.120.241` | Apple M1, 8 GiB | iroh relay only | — |
+
+All four answer ssh (verified 2026-07-28). Next actions (in order):
+
+1. Fit probes on the M4 (Metal) and Windows 5090 (DX12) at ceremony geometry:
+   `vhc-provision-dev-profile` then `vhc-fit-probe` per box (on-box for the Mac; authored
+   here + driven over ssh for Windows).
+2. Run C1 on two boxes: start the relay per the runbook §4.2, point both nodes' `[vhc.iroh]`
+   at it with WAN `advertise_ips`, drive over `ssh → daemon-cli`; fix what it surfaces. The
+   transport/churn semantics are already gate-proven; this run is about real WAN and real
+   hardware heterogeneity.
+3. Freeze; memoized preflight; run C2; evidence closure; human-signed master merge.
 
 ## 9. Agent contract
 

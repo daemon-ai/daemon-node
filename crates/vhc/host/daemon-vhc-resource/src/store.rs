@@ -80,10 +80,18 @@ pub enum SelectionRefusal {
         held: usize,
     },
     /// Candidates existed and every one was refused, with the reason for each.
+    ///
+    /// The reasons are IN the message: a refusal that states only its count sends the operator of
+    /// a remote box home with nothing — the one holding this error is often not the one holding a
+    /// debugger.
     #[error(
         "every candidate profile for the {class} backend was refused ({} considered); this is a \
-         refusal to run, not a fallback",
-        refusals.len()
+         refusal to run, not a fallback:{}",
+        refusals.len(),
+        refusals
+            .iter()
+            .map(|(digest, refusal)| format!("\n  - profile {digest:?}: {refusal}"))
+            .collect::<String>()
     )]
     AllCandidatesRefused {
         /// The class asked for.

@@ -121,9 +121,16 @@ enum Cmd {
     /// satisfies integration evidence (C0/C1) and can never certify a ceremony — that fence lives
     /// in the authentication result's authority class, not in this command's intentions.
     VhcProvisionDevProfile {
-        /// The box's `daemon-vhc-worker` binary — the very file the node will spawn.
-        #[arg(long)]
-        worker_bin: PathBuf,
+        /// The box's `daemon-vhc-worker` binary — the very file the node will spawn. Required
+        /// unless `--revision-record` supplies the export directly (a REMOTE box's record: the
+        /// binary cannot run here, but its self-hashed record travels).
+        #[arg(long, required_unless_present = "revision_record")]
+        worker_bin: Option<PathBuf>,
+        /// A pre-exported `revision-<class>.cbor` (the worker's `DAEMON_TRAIN_REVISION_OUT`
+        /// mode, run ON the box that will join). Mutually exclusive with `--worker-bin`; the
+        /// record still truthfully names the remote binary — it hashed itself.
+        #[arg(long, conflicts_with = "worker_bin")]
+        revision_record: Option<PathBuf>,
         /// The output profile directory (what the node's `DAEMON_VHC_PROFILE_DIR` names).
         #[arg(long)]
         out: PathBuf,
@@ -150,22 +157,32 @@ enum Cmd {
     /// (`DAEMON_TRAIN_BACKEND`, `DAEMON_VHC_LANE_GPU_OPTIONAL`); the provisioned profile home is
     /// `--profile-dir` (see `vhc-provision-dev-profile`).
     VhcFitProbe {
-        /// The box's `daemon-vhc-worker` binary — the very file the node will spawn.
+        /// The box's `daemon-vhc-worker` binary — the very file the node will spawn. Required
+        /// unless `--author-only` / `--report-only` split the flow for a remote box (the probe
+        /// directory is opaque platform-independent bytes: author here, drive the box's own
+        /// worker over ssh with `DAEMON_TRAIN_FIT_PROBE`, report here from the returned dir).
+        #[arg(long, required_unless_present_any = ["author_only", "report_only"])]
+        worker_bin: Option<PathBuf>,
+        /// Author the probe directory and stop (no drive, no verdict). The remote box drives it.
+        #[arg(long, conflicts_with = "report_only")]
+        author_only: bool,
+        /// Read + report the verdict already recorded in `--out` (a remote drive's result).
         #[arg(long)]
-        worker_bin: PathBuf,
+        report_only: bool,
         /// The trainer module wasm (the built `tiny_llama.wasm`).
-        #[arg(long)]
-        trainer_wasm: PathBuf,
+        #[arg(long, required_unless_present = "report_only")]
+        trainer_wasm: Option<PathBuf>,
         /// The coordinator module wasm (`coordinator_quorum.wasm`) — requirement authoring runs
         /// every role of the run the probe stands in for.
+        #[arg(long, required_unless_present = "report_only")]
+        coordinator_wasm: Option<PathBuf>,
+        /// The provisioned profile directory (`DAEMON_VHC_PROFILE_DIR`). Unused by
+        /// `--author-only`/`--report-only` (the remote drive names its own).
         #[arg(long)]
-        coordinator_wasm: PathBuf,
-        /// The provisioned profile directory (`DAEMON_VHC_PROFILE_DIR`).
-        #[arg(long)]
-        profile_dir: PathBuf,
+        profile_dir: Option<PathBuf>,
         /// The development authority PeerId (64-hex) the run's requirements accept.
-        #[arg(long)]
-        authority: String,
+        #[arg(long, required_unless_present = "report_only")]
+        authority: Option<String>,
         /// The probe directory to author (created; the verdict lands here).
         #[arg(long)]
         out: PathBuf,
@@ -428,27 +445,38 @@ fn main() -> anyhow::Result<()> {
         Cmd::VhcAcceptance => vhc_acceptance(),
         Cmd::VhcProvisionDevProfile {
             worker_bin,
+            revision_record,
             out,
             authority,
             class,
-        } => vhc_provision_dev_profile(&worker_bin, &out, &authority, &class),
+        } => vhc_provision_dev_profile(
+            worker_bin.as_deref(),
+            revision_record.as_deref(),
+            &out,
+            &authority,
+            &class,
+        ),
         Cmd::VhcFitProbe {
             worker_bin,
+            author_only,
+            report_only,
             trainer_wasm,
             coordinator_wasm,
             profile_dir,
             authority,
             out,
             deadline_s,
-        } => vhc_fit_probe(
-            &worker_bin,
-            &trainer_wasm,
-            &coordinator_wasm,
-            &profile_dir,
-            &authority,
-            &out,
+        } => vhc_fit_probe(&FitProbeArgs {
+            worker_bin,
+            author_only,
+            report_only,
+            trainer_wasm,
+            coordinator_wasm,
+            profile_dir,
+            authority,
+            out,
             deadline_s,
-        ),
+        }),
         Cmd::VhcProductionGate {
             all,
             base,
@@ -1289,7 +1317,8 @@ const VHC_T2_SUITES: &[SuiteEntry<'static>] = &[
 /// for a real box (see the `Cmd` doc for the trust posture; the double opt-in fence lives in the
 /// authentication path, not here).
 fn vhc_provision_dev_profile(
-    worker_bin: &Path,
+    worker_bin: Option<&Path>,
+    revision_record: Option<&Path>,
     out: &Path,
     authority: &str,
     class: &str,
@@ -1301,24 +1330,37 @@ fn vhc_provision_dev_profile(
     // The revision record comes from the worker binary itself (its export mode), never from a
     // hand-written figure: the record's sealed-binary identity is the binary hashing itself, and a
     // profile priced for any other record would refuse to authenticate against the running worker.
-    let export = tempfile_dir("vhc-revision-export")?;
-    let status = Command::new(worker_bin)
-        .env("DAEMON_TRAIN_REVISION_OUT", &export)
-        .status()
-        .with_context(|| format!("run {} in revision-export mode", worker_bin.display()))?;
-    anyhow::ensure!(status.success(), "worker revision export failed: {status}");
-
-    let record_path = export.join(format!("revision-{class}.cbor"));
-    let bytes = std::fs::read(&record_path).with_context(|| {
-        format!(
-            "the worker exported no `{class}` lane record ({}) — the class must be one the \
-             binary's backend inventory actually offers",
-            record_path.display()
-        )
-    })?;
+    // A REMOTE box's binary cannot run here, but its self-hashed record travels — `--revision-record`
+    // consumes an export produced ON that box (`DAEMON_TRAIN_REVISION_OUT`), same provenance rule.
+    let bytes = if let Some(record_path) = revision_record {
+        std::fs::read(record_path)
+            .with_context(|| format!("read the revision record {}", record_path.display()))?
+    } else {
+        let worker_bin = worker_bin.expect("clap: --worker-bin required without --revision-record");
+        let export = tempfile_dir("vhc-revision-export")?;
+        let status = Command::new(worker_bin)
+            .env("DAEMON_TRAIN_REVISION_OUT", &export)
+            .status()
+            .with_context(|| format!("run {} in revision-export mode", worker_bin.display()))?;
+        anyhow::ensure!(status.success(), "worker revision export failed: {status}");
+        let record_path = export.join(format!("revision-{class}.cbor"));
+        let bytes = std::fs::read(&record_path).with_context(|| {
+            format!(
+                "the worker exported no `{class}` lane record ({}) — the class must be one the \
+                 binary's backend inventory actually offers",
+                record_path.display()
+            )
+        })?;
+        std::fs::remove_dir_all(&export).ok();
+        bytes
+    };
     let record: daemon_vhc_resource::BackendImplementationRevision =
         daemon_vhc_proto::from_canonical_slice(&bytes).context("decode the revision record")?;
-    std::fs::remove_dir_all(&export).ok();
+    anyhow::ensure!(
+        record.backend_class.slug() == class,
+        "the record's class `{}` does not match --class `{class}`",
+        record.backend_class.slug()
+    );
 
     let set =
         daemon_vhc_resource::test_support::development_provisioned_profiles(&record, authority);
@@ -1347,75 +1389,113 @@ fn vhc_provision_dev_profile(
     Ok(())
 }
 
-/// One fit probe on this box, at the frozen ceremony geometry (see the `Cmd::VhcFitProbe` docs).
-#[allow(clippy::too_many_arguments)] // a CLI surface, one arg per flag
-fn vhc_fit_probe(
-    worker_bin: &Path,
-    trainer_wasm: &Path,
-    coordinator_wasm: &Path,
-    profile_dir: &Path,
-    authority: &str,
-    out: &Path,
+/// The `vhc-fit-probe` CLI surface, one field per flag (see the `Cmd::VhcFitProbe` docs).
+struct FitProbeArgs {
+    worker_bin: Option<PathBuf>,
+    author_only: bool,
+    report_only: bool,
+    trainer_wasm: Option<PathBuf>,
+    coordinator_wasm: Option<PathBuf>,
+    profile_dir: Option<PathBuf>,
+    authority: Option<String>,
+    out: PathBuf,
     deadline_s: u64,
-) -> anyhow::Result<()> {
+}
+
+/// One fit probe on this box, at the frozen ceremony geometry (see the `Cmd::VhcFitProbe` docs).
+/// `--author-only` / `--report-only` split the author → drive → report flow around a REMOTE
+/// box's drive: the probe directory is opaque platform-independent bytes, so authoring and
+/// reporting live here while only the worker runs on the box that answers.
+fn vhc_fit_probe(args: &FitProbeArgs) -> anyhow::Result<()> {
     use anyhow::Context;
     use daemon_vhc_testkit::ceremony::{
         ceremony_execution_with_certification, ceremony_trainer_config_harness,
     };
 
-    let authority = ceremony::parse_peer("--authority", authority)?;
-    let trainer = std::fs::read(trainer_wasm)
-        .with_context(|| format!("read trainer module {}", trainer_wasm.display()))?;
-    let coordinator = std::fs::read(coordinator_wasm)
-        .with_context(|| format!("read coordinator module {}", coordinator_wasm.display()))?;
+    let out = args.out.as_path();
+    if !args.report_only {
+        let authority = ceremony::parse_peer(
+            "--authority",
+            args.authority.as_deref().expect("clap: authority required"),
+        )?;
+        let trainer_wasm = args
+            .trainer_wasm
+            .as_deref()
+            .expect("clap: trainer required");
+        let coordinator_wasm = args
+            .coordinator_wasm
+            .as_deref()
+            .expect("clap: coordinator required");
+        let trainer = std::fs::read(trainer_wasm)
+            .with_context(|| format!("read trainer module {}", trainer_wasm.display()))?;
+        let coordinator = std::fs::read(coordinator_wasm)
+            .with_context(|| format!("read coordinator module {}", coordinator_wasm.display()))?;
 
-    // The run's execution requirements, derived through the ONE authoring seam the ceremony
-    // genesis uses — same frozen harness-form config, same domain-minimum grant — naming the
-    // development authority (double opt-in with the provisioned owner policy).
-    let certification = daemon_vhc_proto::ProfileCertificationRequirements {
-        accepted_development_authorities: vec![authority],
-        ..Default::default()
-    };
-    let requirements = ceremony_execution_with_certification(&coordinator, &trainer, certification)
+        // The run's execution requirements, derived through the ONE authoring seam the ceremony
+        // genesis uses — same frozen harness-form config, same domain-minimum grant — naming the
+        // development authority (double opt-in with the provisioned owner policy).
+        let certification = daemon_vhc_proto::ProfileCertificationRequirements {
+            accepted_development_authorities: vec![authority],
+            ..Default::default()
+        };
+        let requirements =
+            ceremony_execution_with_certification(&coordinator, &trainer, certification)
+                .map_err(anyhow::Error::msg)
+                .context("derive the run's execution requirements")?
+                .for_role("trainer")
+                .context("the authored requirements carry the trainer role")?;
+
+        // The frozen ceremony-geometry trainer config, harness form: the probe drives host
+        // staging, so the roster is a stand-in member that never enters the plan (the
+        // authoring's own rule).
+        let config = daemon_vhc_proto::to_canonical_vec(&ceremony_trainer_config_harness(&[
+            daemon_vhc_testkit::fit_probe::probe_peer(),
+        ]))
+        .context("encode the probe config")?;
+
+        std::fs::create_dir_all(out)
+            .with_context(|| format!("create the probe directory {}", out.display()))?;
+        daemon_vhc_testkit::fit_probe::write_trainer_probe_dir(
+            out,
+            &trainer,
+            &config,
+            &requirements,
+            args.deadline_s,
+        )
         .map_err(anyhow::Error::msg)
-        .context("derive the run's execution requirements")?
-        .for_role("trainer")
-        .context("the authored requirements carry the trainer role")?;
-
-    // The frozen ceremony-geometry trainer config, harness form: the probe drives host staging,
-    // so the roster is a stand-in member that never enters the plan (the authoring's own rule).
-    let config = daemon_vhc_proto::to_canonical_vec(&ceremony_trainer_config_harness(&[
-        daemon_vhc_testkit::fit_probe::probe_peer(),
-    ]))
-    .context("encode the probe config")?;
-
-    std::fs::create_dir_all(out)
-        .with_context(|| format!("create the probe directory {}", out.display()))?;
-    daemon_vhc_testkit::fit_probe::write_trainer_probe_dir(
-        out,
-        &trainer,
-        &config,
-        &requirements,
-        deadline_s,
-    )
-    .map_err(anyhow::Error::msg)
-    .context("author the probe directory")?;
-
-    println!(
-        "== vhc-fit-probe: driving {} over {} ==",
-        worker_bin.display(),
-        out.display()
-    );
-    let status = Command::new(worker_bin)
-        .env("DAEMON_TRAIN_FIT_PROBE", out)
-        .env(daemon_vhc_resource::PROFILE_DIR_ENV, profile_dir)
-        .status()
-        .with_context(|| format!("run {} in fit-probe mode", worker_bin.display()))?;
-    anyhow::ensure!(
-        status.success(),
-        "the probe produced no verdict: {status} (an absent verdict is never an answer — see \
-         the worker's stderr above)"
-    );
+        .context("author the probe directory")?;
+    }
+    if args.author_only {
+        println!(
+            "== vhc-fit-probe: authored {} — ship it to the box, drive its own worker with \
+             DAEMON_TRAIN_FIT_PROBE=<dir> (+ DAEMON_VHC_PROFILE_DIR, lane env), then \
+             `vhc-fit-probe --report-only --out <returned dir>` ==",
+            out.display()
+        );
+        return Ok(());
+    }
+    if !args.report_only {
+        let worker_bin = args.worker_bin.as_deref().expect("clap: worker required");
+        let profile_dir = args
+            .profile_dir
+            .as_deref()
+            .context("--profile-dir is required to drive the probe locally")?;
+        println!(
+            "== vhc-fit-probe: driving {} over {} ==",
+            worker_bin.display(),
+            out.display()
+        );
+        let status = Command::new(worker_bin)
+            .env("DAEMON_TRAIN_FIT_PROBE", out)
+            .env(daemon_vhc_resource::PROFILE_DIR_ENV, profile_dir)
+            .status()
+            .with_context(|| format!("run {} in fit-probe mode", worker_bin.display()))?;
+        anyhow::ensure!(
+            status.success(),
+            "the probe produced no verdict: {status} (an absent verdict is never an answer — \
+             see the worker's stderr above)"
+        );
+    }
 
     // Surface the recorded verdict (the worker printed its own summary; this re-reads the file
     // so what is reported is what a store would look up).

@@ -1327,9 +1327,15 @@ re-pins every time a driver moves.
   ledger-versus-governor comparison is about **reservation identity and bounds**, not occupancy —
   measured usage below a reserved bound is normal and is not a divergence.
 - **[RC-15]** **The composed figure is an estimate; the device is the oracle.** `compose()` output
-  serves exactly two purposes: **cheap sound refusal** (an estimate that already exceeds lane
-  bounds, measured supply or the owner's cap needs no probe) and **sizing the enforced budget** the
-  governor holds the run to. It is not a proof of fit and MUST NOT be refined toward one — no
+  serves exactly two purposes: **cheap sound refusal** and **sizing the enforced budget** the
+  governor holds the run to. Sound refusal keys on the bound that makes it sound: the estimate's
+  **exactly-stated persistent floor** above measured supply refuses without a probe under every
+  posture (no probe outcome can shrink what must reside), while a **conservative total** above
+  supply is *unproven*, not disproven — a **join** refuses on it (nothing has yet proved the role
+  fits, until verdict-store wiring hands the join a green verdict to defer to), but the **fit
+  probe MUST be admitted past it**, because the probe is the instrument that answers exactly this
+  question and an estimate that can veto its own audit is an authority again. Lane bounds,
+  measured per-allocation ceilings, pool configuration and the owner's cap are posture-neutral. It is not a proof of fit and MUST NOT be refined toward one — no
   byte-exactness obligation attaches to it, and a divergence between estimate and residency inside
   the budget is not a defect. The authority that admits a geometry is the **Fit Verdict**: the
   actual module, on the actual backend, at the granted geometry, under the enforced budget, in the
