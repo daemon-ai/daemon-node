@@ -25,7 +25,7 @@
 //   2. the round plan — the guest's own `interval_for`/`slice_interval` over the window a
 //      `RoundOpen` names — coalesced into one `data@2` fetch per COVERING CHUNK;
 //   3. the CHUNK-COLLIDING shape the ceremony corpus actually has: one chunk hash per 2 MiB shard
-//      and 512 sequences inside it, so all 30 of a single-peer round's sequences resolve to the
+//      and 2048 sequences inside it, so all 30 of a single-peer round's sequences resolve to the
 //      SAME covering chunk of the SAME shard — the case a manifest with many small chunks would
 //      never produce, and the case that decides whether the round transfers that chunk once or
 //      thirty times;
@@ -36,28 +36,29 @@
 //
 // Assertion 4 is BYTES ON THE ARTIFACT PLANE. Every sequence of a single-peer round lands in one
 // covering chunk, so a plan made micro-batch by micro-batch asks for that chunk thirty times: the
-// host verifies and transfers 62,914,560 B to deliver 122,880 B of tokens, and the fleet measured
-// exactly that. The plan is made for the whole round now, so the chunk crosses the plane ONCE.
+// host verifies and transfers 62,914,560 B to deliver one round's worth of tokens (the fleet
+// measured exactly that, 122,880 B at the then-frozen 2048-token sequence; 30,720 B at 512).
+// The plan is made for the whole round now, so the chunk crosses the plane ONCE.
 // What is left is granularity, not duplication, and the assertion names both numbers so neither
 // can drift silently.
 //
 // Assertion 5 is the MEASURED peak guest linear memory against the module's OWN admitted claim,
 // with a real training step running at the frozen `(seq_len, vocab)`. That is the assertion the
 // fleet failed. The forward pass built two guest-resident, geometry-scaled images in linear memory
-// — the `s × s` causal mask and a `rows × vocab` one-hot target matrix (256 MiB at the frozen
-// values, against a whole-module claim of ~57 MiB) — so the guest's allocator hit the sandbox's
+// — the `s × s` causal mask and a `rows × vocab` one-hot target matrix (256 MiB at the 2048-token
+// geometry the fleet then ran, against a whole-module claim of ~57 MiB) — so the guest's allocator hit the sandbox's
 // memory cap and Rust aborted into a wasm `unreachable`. Every prior gate ran at 64 tokens, where
 // the same two images are 16 KiB and 8 MiB and fit comfortably. The mask is built on device now
 // and the one-hot is gone entirely — the loss reads each row's target log-probability by index.
 //
 // The bound: the parameter layout is reduced (`ceremony_trainer_config_live_staging` owns the
-// argument) because 30 real steps over 786_507_264 parameters at 2048 tokens is ~290 TFLOP. The
+// argument) because 30 real steps over 786_507_264 parameters at 512 tokens is ~72 TFLOP. The
 // frozen `seq_len` and `vocab` — the two dimensions BOTH guest-resident images are functions of —
 // are the fleet's, and the staging path is parameter-independent code. `ceremony_training_step`
 // gates the complementary axis (the frozen parameter count at a shortened sequence).
 //
-// Cost: one round, minutes, single, CPU. Host RAM: the `[2047, 32768]` activation tensors are
-// DEVICE-side (host burn-ndarray here) and several are live across the backward pass — a few GiB.
+// Cost: one round, minutes, single, CPU. Host RAM: the `[511, 32768]` activation tensors are
+// DEVICE-side (host burn-ndarray here) and several are live across the backward pass.
 
 // Dev/test harness: the guest builder shells `cargo` for the guests workspace.
 #![allow(clippy::disallowed_methods)]
@@ -88,7 +89,7 @@ use daemon_vhc_testkit::ceremony::{
 /// The sole trainer identity: `peer` and `roster[0]`, so the round's whole window is this peer's.
 const PEER: [u8; 32] = [0x5c; 32];
 
-/// The ceremony corpus's chunk size: 2 MiB, which at the frozen 2048-token u16 sequence is 512
+/// The ceremony corpus's chunk size: 2 MiB, which at the frozen 512-token u16 sequence is 2048
 /// whole sequences per chunk — and, since the ceremony shards ARE 2 MiB, exactly one chunk hash
 /// per shard. This is the number that makes every sequence of a single-peer round collide on one
 /// covering chunk.
@@ -120,7 +121,7 @@ const ROUND_DEADLINE: Duration = Duration::from_secs(2700);
 
 /// A synthetic corpus in the CEREMONY manifest shape: `CORPUS_SHARDS` shards of exactly
 /// `CORPUS_CHUNK_SIZE` bytes each, u16 little-endian tokens, the frozen `seq_len` — so each shard
-/// carries one chunk hash and 512 whole sequences.
+/// carries one chunk hash and 2048 whole sequences.
 struct CorpusFixture {
     manifest_bytes: Vec<u8>,
     manifest_hash: Hash,
@@ -427,7 +428,7 @@ fn drive_live_round(wasm: &[u8], corpus: &CorpusFixture) -> StagedRound {
     let pump = run.pump.clone();
 
     // Round 0's window: the fleet's shape — `steps_per_round × micro_batch` sequences for the sole
-    // roster peer, so the guest plans 30 inner steps of one 2048-token sequence each.
+    // roster peer, so the guest plans 30 inner steps of one 512-token sequence each.
     let window = u64::from(CEREMONY_STEPS_PER_ROUND) * u64::from(CEREMONY_MICRO_BATCH);
     let open = to_canonical_vec(&VhcMessage::RoundOpen(RoundOpen {
         round: 0,
@@ -739,7 +740,7 @@ fn corpus_state_chunk_size() -> u64 {
 /// runs it explicitly (`xtask vhc-ci-t2`). Like `ceremony_training_step`, its inner loop is real
 /// host fp32 arithmetic, which the unoptimized test profile runs an order of magnitude slower.
 #[test]
-#[ignore = "release-only: thirty real optimizer steps at the frozen 2048-token sequence; \
+#[ignore = "release-only: thirty real optimizer steps at the frozen 512-token sequence; \
             `xtask vhc-ci-t2` runs it with --release --ignored"]
 fn the_trainer_feeds_itself_from_the_pinned_corpus_and_trains_the_round_it_plans() {
     let wasm = daemon_vhc_guest_build::guest_wasm("tiny_llama");
@@ -808,7 +809,7 @@ fn the_trainer_feeds_itself_from_the_pinned_corpus_and_trains_the_round_it_plans
     );
     assert_eq!(
         (served / useful, served % useful),
-        (17, 8_192),
+        (68, 8_192),
         "the residual amplification is GRANULARITY, not duplication: one {CORPUS_CHUNK_SIZE} B \
          chunk for {useful} B of tokens. The duplication figure this replaces was {}x ({} B). \
          A change here is a corpus-manifest chunk-size decision, not a fetch-plan regression",

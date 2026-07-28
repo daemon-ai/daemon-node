@@ -20,7 +20,7 @@
 // What it drives, and what it deliberately does not. The round is opened with `steps_per_round = 0`
 // (`ceremony_trainer_config_round_walk`): the barrier still opens, commits, fences and exports, so
 // every STATE walk runs at full ceremony size, but the 30-step inner loop — hours of ndarray CPU at
-// seq 2048 over 24 layers — does not. The trainer goldens own the training math (bit-exact, toy
+// the frozen sequence over 24 layers — does not. The trainer goldens own the training math (bit-exact, toy
 // geometry); this owns the geometry. The compression profile is the FROZEN one (`topk = 64`), so
 // the committed payload is the fleet's real ~54 MB container and its ingest is the real one: the
 // gate ingests a THREE-peer record whose entries are real-size containers, range-read a fold window

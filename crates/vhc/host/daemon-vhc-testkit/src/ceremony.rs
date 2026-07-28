@@ -78,8 +78,20 @@ pub const CEREMONY_HEAD_DIM: u32 = 64;
 /// tokenizer's id space (the in-guest `token % vocab` clamp is the identity for well-formed
 /// corpora, the established discipline).
 pub const CEREMONY_VOCAB: u32 = 32_768;
-/// Sequence length.
-pub const CEREMONY_SEQ_LEN: u32 = 2_048;
+/// Sequence length — the run-geometry knob the 2026-07-28 shrink turned (2048 → 512), sized so
+/// the composed per-device estimate fits the fleet's smallest seat. The MODEL is untouched: the
+/// full replica still trains every one of the 786,507,264 parameters, so the persistent floor
+/// (θ + both AdamW moments, 12 B/param ≈ 9.44 GB) is unchanged; only the step transient moved.
+///
+/// The demand arithmetic (the composition prices the step transient TWICE — once live, once as
+/// the profile's retained-pool reservation — under 21/20 headroom plus a 128 MiB reserve):
+/// the transient is the θ-sized gradients (≈ 3.15 GB) plus activations `2308·s² + 1,890,316·s`
+/// over span `s = seq_len − 1`. At 2048 that composed to 45,182,790,853 B — fitting neither
+/// 32 GiB seat (M4 usable supply 26,800,553,984 B; the 5090 OOM'd for real). At 512:
+/// transient ≈ 4.71 GB, estimate ≈ (9.44 + 2×4.71 + ~0.09 fixed) GB × 21/20 + 128 MiB
+/// ≈ 20.0 GB — under the M4 floor with real margin. 1024 was rejected (≈ 25.9 GB, ~3% margin);
+/// non-powers-of-two are refused by the corpus format (a 2 MiB shard must hold whole sequences).
+pub const CEREMONY_SEQ_LEN: u32 = 512;
 /// SwiGLU hidden = `ffn_mult · d_model` (= 4608).
 pub const CEREMONY_FFN_MULT: u32 = 3;
 
@@ -390,8 +402,8 @@ pub fn ceremony_trainer_config_harness(roster: &[PeerId]) -> Value {
 /// geometry on a CPU lane in minutes.
 ///
 /// - `steps_per_round = 0` — the round opens, commits, fences and exports WITHOUT the training
-///   math. A single 30-step inner loop at seq 2048 over this 24-layer decoder is hours of ndarray
-///   CPU; the round path's residency class is a property of the state walks (which windows are
+///   math. A single 30-step inner loop at the frozen sequence over this 24-layer decoder is hours
+///   of ndarray CPU; the round path's residency class is a property of the state walks (which windows are
 ///   read back, folded, emitted and applied), not of the gradients that produced θ. The trainer
 ///   goldens own the training math (bit-exact at a toy geometry); this owns the geometry.
 ///
@@ -434,8 +446,8 @@ pub fn ceremony_trainer_config_round_walk(roster: &[PeerId]) -> Value {
 /// # The bound, and why it still covers the seam
 ///
 /// `seq_len` is the ONE deviation, and it is the only knob that buys the difference: a step's
-/// arithmetic is `O(parameters × tokens)`, so the frozen 2048-token sequence makes a single CPU
-/// step ~9.7 TFLOP — hours per round, which is not a gate. `steps_per_round` and the sequence are
+/// arithmetic is `O(parameters × tokens)`, so the frozen 512-token sequence makes a single CPU
+/// step ~2.4 TFLOP — hours per round, which is not a gate. `steps_per_round` and the sequence are
 /// the caller's, and the recommended bound is a short sequence with more than one step.
 ///
 /// What shortening the sequence does NOT change is exactly what this lane is for. The parameter
@@ -581,14 +593,14 @@ pub fn staging_gate_state_contract() -> StateContract {
 ///
 /// The `live` section itself, `seq_len`, `vocab`, `steps_per_round`, `micro_batch`,
 /// `stall_rounds_max`, and the compression profile's shape — so the round plans the fleet's 30
-/// single-sequence inner steps over the fleet's 2048-token sequences against a real chunk-addressed
+/// single-sequence inner steps over the fleet's 512-token sequences against a real chunk-addressed
 /// manifest, and the forward pass sees the frozen `(seq_len, vocab)` activation geometry.
 ///
 /// # The bound
 ///
 /// `d_model`/`n_layers`/`n_heads`/`head_dim`/`ffn_mult` are reduced
 /// ([`STAGING_GATE_D_MODEL`] and friends), because a 30-step round over 786_507_264 parameters at
-/// 2048 tokens is ~290 TFLOP — not a gate on any CPU. What that does NOT touch is what this lane
+/// 512 tokens is ~72 TFLOP — not a gate on any CPU. What that does NOT touch is what this lane
 /// is for: the staging path is parameter-independent, and the forward pass's own guest-resident
 /// working set is a function of `(seq_len, vocab)` — the target rows and the `rows × vocab` logit
 /// plane they index into — both of which are the frozen values here. `ceremony_training_step` covers the

@@ -5,11 +5,12 @@ appended — at every program boundary, and it is status, not normative text. No
 in the tracked specs (§2). If this file contradicts a chat log, a memory, or an archived
 document, this file wins; if it contradicts a tracked spec, the spec wins.
 
-Last rewritten: 2026-07-27 (fit-probe machinery landed as gates and run for real: the build
-box holds a GREEN ceremony-geometry FitVerdict on its Vulkan lane; two device-lane defects the
-probe surfaced are fixed — WGSL bool-storage refusal (SPIR-V compile lane) and the epoch
-watchdog epoch-killing a live device slice (liveness extension, ABI §5.6); remote-box probes
-blocked on the same reachability as C1).
+Last rewritten: 2026-07-28 (ceremony run geometry reduced to fit the fleet:
+`CEREMONY_SEQ_LEN` 2048 → 512, model untouched — the frozen 2048-token geometry composed a
+45,182,790,853 B per-device estimate that fit neither 32 GiB seat, proven by real device
+failures after the native-lane compile defects were fixed on hardware; at 512 the composed
+estimate is 20,041,849,456 B, under the M4 floor's 26,800,553,984 B usable supply with 25 %
+margin, and this box re-probed GREEN at the new geometry).
 
 ## 1. What we are building, and the next milestone
 
@@ -144,10 +145,21 @@ None of these blocks C0 or C1.
   vocabulary; authoring lives in `daemon-vhc-testkit::fit_probe` / `xtask vhc-fit-probe`), and
   records a content-addressed FitVerdict keyed by (module, backend revision, plan, grant,
   budget). Gate: `tests/fit_probe.rs` in the worker crate (CPU lane, green).
-- **This box holds a GREEN ceremony-geometry verdict on its Vulkan lane** (Radeon 8060S/RADV):
-  round 0 committed, measured peak 43.3 MB guest linear memory under the 142.2 MB budget.
-  Evidence: `~/experiments/ceremony-artifacts/fit-probe-20260728-platform-vulkan-spirv/`
-  (the RED predecessors and their logs are retained there — they are the defect evidence).
+- **Ceremony run geometry reduced to fit the fleet** (endorsed 2026-07-28): `CEREMONY_SEQ_LEN`
+  2048 → 512 in the frozen ceremony module (`daemon-vhc-testkit::ceremony`, the single source);
+  model, parameter count, init seed, and the pinned `expected_root` are all unchanged (the
+  full replica still trains every parameter — the persistent θ+AdamW floor stays 9.44 GB).
+  The composition prices the step transient twice (live + retained pool) under 21/20 headroom
+  + a 128 MiB reserve: at 2048 the transient was 16.69 GB and the estimate 45,182,790,853 B —
+  RED on both 32 GiB seats for real (5090 Vulkan OOM, M4 unified-memory grind); at 512 it is
+  4,714,647,800 B and the estimate 20,041,849,456 B, under the M4's 26,800,553,984 B usable
+  supply with 25 % margin. Powers of two only: a 2 MiB corpus shard holds whole sequences.
+- **This box holds a GREEN verdict at the REDUCED geometry on its Vulkan lane**
+  (Radeon 8060S/RADV, wgpu-spirv): round 0 committed (30 real steps) in 155 s, measured peak
+  43,319,296 B guest linear memory under the 141,757,180 B composed budget. Evidence:
+  `~/experiments/ceremony-artifacts/fit-probe-20260728-platform-vulkan-geometry512/`. The
+  frozen-geometry predecessor evidence stays in `…-platform-vulkan-spirv/` (GREEN on this box)
+  and the RED seats' dirs — they are the capacity evidence the shrink answers.
 - Two real device-lane defects the probe surfaced, both fixed and gate-proven:
   1. cubecl's WGSL lane emits `var<storage> array<bool>` buffers (cmp/mask kernels), which WGSL
      forbids as host-shareable — every such kernel was refused on RADV (`ComputeFault`). Fixed
@@ -180,9 +192,10 @@ a session then declared reachable boxes unreachable — access facts live here, 
 
 All four answer ssh (verified 2026-07-28). Next actions (in order):
 
-1. Fit probes on the M4 (Metal) and Windows 5090 (DX12) at ceremony geometry:
-   `vhc-provision-dev-profile` then `vhc-fit-probe` per box (on-box for the Mac; authored
-   here + driven over ssh for Windows).
+1. Fit probes on the M4 (Metal) and Windows 5090 (DX12) at the REDUCED ceremony geometry
+   (seq 512): `vhc-provision-dev-profile` then `vhc-fit-probe` per box (on-box for the Mac;
+   authored here + driven over ssh for Windows). Native lanes (wgpu/Metal, wgpu/DX12) — the
+   compile layer is already proven on hardware at tip `23880e4c`.
 2. Run C1 on two boxes: start the relay per the runbook §4.2, point both nodes' `[vhc.iroh]`
    at it with WAN `advertise_ips`, drive over `ssh → daemon-cli`; fix what it surfaces. The
    transport/churn semantics are already gate-proven; this run is about real WAN and real

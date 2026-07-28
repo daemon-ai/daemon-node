@@ -21,7 +21,7 @@
 //
 // The bound, and why it still covers the seam. `seq_len` is shortened (see
 // `ceremony_trainer_config_training_step`, which owns the argument): a step's arithmetic is
-// O(parameters × tokens), so the frozen 2048-token sequence is ~9.7 TFLOP per step on a CPU lane —
+// O(parameters × tokens), so the frozen 512-token sequence is ~2.4 TFLOP per step on a CPU lane —
 // hours, not a gate. Everything the seam is ABOUT is O(parameters) and unaffected: the parameter
 // layout, the gradient buffers, the AdamW moments, the per-parameter device traffic, the profile's
 // `topk = 64` selection over 512_049 compression rows, and the export/commit walks all run at full

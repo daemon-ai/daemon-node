@@ -371,7 +371,8 @@ host and archived in the ledger (public half only).
 ### 4.5 Corpus (before the smokes)
 
 Tokenize the ratified corpus (TinyStories under the TinyLlama SentencePiece tokenizer) with
-`tokenize-corpus`, at `--seq-len 2048 --token-width u16`. Resolve + record the exact dataset +
+`tokenize-corpus`, at `--seq-len 512 --token-width u16` (the frozen `CEREMONY_SEQ_LEN`). Resolve +
+record the exact dataset +
 tokenizer revision SHAs at this step (placeholders are forbidden past here). Record the
 `corpus-manifest.cbor` blake3 — it is a genesis input, and the smokes consume the same corpus so
 calibration reflects real data-plane behavior.
