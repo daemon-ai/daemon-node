@@ -63,6 +63,20 @@ pub(crate) struct SliceState {
     pub(crate) log_calls_this_phase: u64,
     /// Accepted `sys@2::log` bytes in the current exempt phase (`[LX-6]`).
     pub(crate) log_bytes_this_phase: u64,
+    /// Monotonic count of import entries — the guest's **liveness signal** for the epoch watchdog.
+    ///
+    /// Every host-import entry increments it (in [`Host::enter`], the one seam every import
+    /// passes). The run store's epoch-deadline callback compares it against
+    /// [`Self::import_calls_at_epoch_check`]: a guest that has made host calls since the last
+    /// expiry is WORKING (device compute happens inside imports and its wall belongs to the
+    /// device, not to a wedge), so the deadline extends; a guest that spun a full epoch budget in
+    /// pure wasm without one import is wedged and traps `BudgetEpoch`. The deterministic budgets
+    /// (fuel, ops) are untouched — this only stops the WALL watchdog from killing a long
+    /// device-lane slice that is demonstrably alive (the same principle as the `next_event`
+    /// park re-arm, §5.6: never epoch-kill a guest for time it did not burn).
+    pub(crate) import_calls: u64,
+    /// The [`Self::import_calls`] value the epoch-deadline callback last observed.
+    pub(crate) import_calls_at_epoch_check: u64,
 }
 
 impl SliceState {
@@ -161,6 +175,10 @@ impl Host {
     /// The §6.6 temporal-legality gate + §4.1/§6.4 mandatory-retry enforcement, shared by every
     /// import. `is_next_event`/`is_read_back` let the two blocking imports pass their own retry.
     pub(crate) fn enter(&mut self, import: &'static str) -> Result<(), Trap> {
+        // Liveness for the epoch watchdog (see [`SliceState::import_calls`]): counted BEFORE any
+        // legality verdict — an import that is about to trap still proves the guest is executing,
+        // and the trap it earns is the answer, not an epoch kill racing it.
+        self.slice.import_calls = self.slice.import_calls.wrapping_add(1);
         if self.slice.stopped {
             return Err(Trap::new(
                 TrapCode::PhaseViolation,

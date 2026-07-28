@@ -44,6 +44,10 @@ daemon-vhc-det = { workspace = true }
 # dependency-direction exception (xtask vhc_dep_check): host/* -> sdk/* narrows to a
 # contracts-crate move if the shared coordinator/authority types ever relocate.
 daemon-vhc-sdk-consensus = { workspace = true }
+# The fit-probe directory contract (`daemon_vhc_resource::probe`): the authoring half of the
+# probe seam writes the drive spec the worker's probe mode consumes. host/* -> host/* (allowed);
+# default features only — the `test-support` fixture feature stays dev-only (re-stated below).
+daemon-vhc-resource = { workspace = true }
 blake3 = { workspace = true }
 ciborium = { workspace = true }
 # Typed harness errors (the D2 coordinator configuration seat's matrix refusals).

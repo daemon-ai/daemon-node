@@ -5,10 +5,11 @@ appended — at every program boundary, and it is status, not normative text. No
 in the tracked specs (§2). If this file contradicts a chat log, a memory, or an archived
 document, this file wins; if it contradicts a tracked spec, the spec wins.
 
-Last rewritten: 2026-07-27 (C1 transport delta landed as a gate: relay-carried mesh + churn in
-the acceptance lane; gapped-restore divergence fixed — `StaleRestore` outcome + coordinator
-replay-forward; operator provisioning command shipped; physical two-box run blocked on box
-reachability).
+Last rewritten: 2026-07-27 (fit-probe machinery landed as gates and run for real: the build
+box holds a GREEN ceremony-geometry FitVerdict on its Vulkan lane; two device-lane defects the
+probe surfaced are fixed — WGSL bool-storage refusal (SPIR-V compile lane) and the epoch
+watchdog epoch-killing a live device slice (liveness extension, ABI §5.6); remote-box probes
+blocked on the same reachability as C1).
 
 ## 1. What we are building, and the next milestone
 
@@ -136,8 +137,33 @@ None of these blocks C0 or C1.
   only nonzero outcome that is, because a retry restores a fresher checkpoint), and the
   coordinator's join admission re-publishes its retained ring of committed records ascending
   (replay-forward), so a rejoiner inside the retention window folds the gap instead of ending.
+- Fit probes (`[RC-15]`): the runner exists end to end and has produced its first real verdict.
+  The worker's `DAEMON_TRAIN_FIT_PROBE` mode drives the actual module on the actual measured
+  backend at the granted geometry under the enforced budget, consuming only pre-authored opaque
+  inputs (`daemon-vhc-resource::probe` directory contract — the worker binary links no round
+  vocabulary; authoring lives in `daemon-vhc-testkit::fit_probe` / `xtask vhc-fit-probe`), and
+  records a content-addressed FitVerdict keyed by (module, backend revision, plan, grant,
+  budget). Gate: `tests/fit_probe.rs` in the worker crate (CPU lane, green).
+- **This box holds a GREEN ceremony-geometry verdict on its Vulkan lane** (Radeon 8060S/RADV):
+  round 0 committed, measured peak 43.3 MB guest linear memory under the 142.2 MB budget.
+  Evidence: `~/experiments/ceremony-artifacts/fit-probe-20260728-platform-vulkan-spirv/`
+  (the RED predecessors and their logs are retained there — they are the defect evidence).
+- Two real device-lane defects the probe surfaced, both fixed and gate-proven:
+  1. cubecl's WGSL lane emits `var<storage> array<bool>` buffers (cmp/mask kernels), which WGSL
+     forbids as host-shareable — every such kernel was refused on RADV (`ComputeFault`). Fixed
+     by compiling the Vulkan adapter's kernels to SPIR-V (`burn/vulkan` beside `burn/wgpu` in
+     the host's `wgpu` feature).
+  2. The epoch watchdog epoch-killed a LIVE device slice: a ceremony-geometry round is one
+     slice whose wall grows with granted geometry (this box: ~690 s of device compute), so no
+     per-slice wall constant separates working from wedged. The deadline now extends on expiry
+     iff the guest entered a host import since the last expiry (host contact is the liveness
+     proof; device wall lives inside imports), and interrupts only a full budget with zero
+     import entries — pure-wasm spins still die within two budgets, fuel/op budgets untouched
+     (ABI §5.6 amended). Also: wasmtime reports the epoch trap as `interrupt`, which the
+     classifier misfiled as `BadModule`; now `BudgetEpoch`.
 - C0: green and pinned. C1: software delta green; two-box run blocked on hardware (§8.1).
-  Fit probes: not run. Freeze/C2: not reached.
+  Fit probes: green on this box's ceremony lane; M4/Windows probes blocked on the same
+  reachability (§8.1). Freeze/C2: not reached.
 - Program archive: frozen and locked read-only 2026-07-27.
 
 ## 8. Next actions (in order)
@@ -149,8 +175,8 @@ None of these blocks C0 or C1.
    per the runbook §4.2, point both nodes' `[vhc.iroh]` at it with WAN `advertise_ips`, drive
    over `ssh → daemon-cli`; fix what it surfaces. The transport/churn semantics are already
    gate-proven; this run is about real WAN, real hardware heterogeneity.
-3. Fit probes on all three boxes at ceremony geometry (one fixed retention policy); the probe
-   runner records content-addressed verdicts (`[RC-15]`).
+3. Fit probes on the two remote boxes at ceremony geometry (this box is green; the runner is
+   one command per box once reachable: `vhc-provision-dev-profile` then `vhc-fit-probe`).
 4. Freeze; memoized preflight; run C2; evidence closure; human-signed master merge.
 
 ## 9. Agent contract

@@ -1185,11 +1185,19 @@ The epoch deadline (wasmtime epoch interruption, the `EpochThread` ticking `incr
 - The epoch deadline arms when a slice starts (a `Delivered` return hands control to the guest) and
   disarms while the guest is **parked inside** `next_event` or `read_back` (a parked guest is not
   spinning; it must not be killed for waiting on the host).
-- If the guest burns wall-clock past the deadline **within a slice** (not parked), the epoch fires
-  and the slice traps `BudgetEpoch` — the v1 per-call watchdog, scoped to the slice. The same
-  mechanism enforces the quiesce deadline (`QuiesceDeadlineExceeded`, §4.4) and forced throttle
-  teardown (§11.3); epoch interruption is the **only** sanctioned way to interrupt a running guest,
-  because it is cross-thread-safe and surfaces the trap **on the guest thread** (§11.3).
+- On expiry the deadline **extends by one budget** if the guest has entered at least one host
+  import since the previous expiry, and fires only after a full budget with **zero** import
+  entries. Host contact is the liveness proof the watchdog actually needs: a device-lane slice
+  spends its wall inside compute imports and that wall grows with the granted geometry (a
+  ceremony-geometry round is one slice), so no per-slice wall constant can separate "working" from
+  "wedged" — import traffic can. A pure-compute spin still traps `BudgetEpoch` within at most two
+  budgets; a guest that spins while calling imports is ended deterministically by the per-slice
+  fuel and op budgets, which never extend.
+- If the epoch fires (a budget with no import entries, not parked), the slice traps
+  `BudgetEpoch` — the v1 per-call watchdog, scoped to the slice. The quiesce deadline is enforced
+  separately, import-side (`QuiesceDeadlineExceeded` inside `next_event`, §4.4/§11.3); epoch
+  interruption remains the **only** sanctioned way to interrupt a running guest, because it is
+  cross-thread-safe and surfaces the trap **on the guest thread** (§11.3).
 - The epoch watchdog is orthogonal to fuel: fuel bounds *instructions* (deterministic), epoch
   bounds *wall-clock* (non-deterministic). **Replay rule (resolution of OQ-8, normative):** an
   epoch-class trap is recorded as a terminal fault at a recorded journal ordinal (§8.3 tag 9);

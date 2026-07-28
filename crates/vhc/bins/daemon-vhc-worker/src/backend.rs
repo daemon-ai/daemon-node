@@ -2505,7 +2505,7 @@ fn sealed_binary_identity() -> daemon_vhc_resource::SealedBinaryIdentity {
 /// the intended outcome: a device whose usable supply cannot be derived is not admissible, and the one
 /// thing that must not happen is a substitute figure — a per-buffer ceiling or a physical-RAM total —
 /// standing in for the measurement, because then the refusal arrives at an allocation instead.
-fn admission_device_profile(
+pub(crate) fn admission_device_profile(
     hw: &Hardware,
     dl: &DeviceLimits,
 ) -> daemon_vhc_host::run::DeviceProfile {

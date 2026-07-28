@@ -105,6 +105,10 @@ harness = [
 # The shared guest-workspace builder every wasm-backed test suite in this crate goes through
 # (reproducibility remap env + cross-process build lock live there, once). Test-only.
 daemon-vhc-guest-build = { workspace = true }
+# tests/fit_probe.rs: the probe-input authoring seam (`daemon_vhc_testkit::fit_probe`) — the
+# orchestrator half of the probe directory contract, which owns the round vocabulary the worker
+# binary must not link. Test-only edge (production probes are authored by `xtask vhc-fit-probe`).
+daemon-vhc-testkit = { workspace = true }
 # Test-only, `test-support`: the join suite provisions a `[PC-12]` development-authority profile
 # set (the fixture constructors that can MINT a profile ride dev edges only — `vhc-dep-check`
 # refuses them anywhere else) so the plan-emitting trainer composes and admits.

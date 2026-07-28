@@ -36,6 +36,10 @@
 //! A trapping module surfaces as a classified terminal outcome — the worker is never harmed.
 
 mod backend;
+// The fit-probe mode (`[RC-15]`): the device answers "does it fit?" and the answer is a
+// content-addressed FitVerdict. Lives in this binary because the verdict names this binary's
+// sealed revision identity; consumes only pre-authored opaque inputs (no round vocabulary).
+mod fit_probe;
 // The in-process self-driven join: it decodes the SDK round schemas and drives the run's
 // coordinator module in-process, so it is HARNESS machinery — the production worker routes
 // opaque signed frames only and carries no round vocabulary (dep-check-enforced; the
@@ -378,6 +382,21 @@ async fn main() {
                 capability.class,
                 path.display()
             );
+        }
+        return;
+    }
+
+    // Fit-probe mode (`[RC-15]`): run the actual module on this box's actual measured backend at
+    // the actual granted geometry under the actual enforced budget, and record what the device
+    // said as a content-addressed FitVerdict. The env names a probe directory pre-authored by the
+    // orchestrator (`xtask vhc-fit-probe`); like the other operator modes it runs on a bare box
+    // with no CBOR framing. A RED verdict exits 0 (evidence, not an outage); a probe that could
+    // not produce a verdict exits 1.
+    if let Some(dir) = std::env::var_os(fit_probe::FIT_PROBE_ENV) {
+        let dir = std::path::PathBuf::from(dir);
+        if let Err(e) = fit_probe::run_fit_probe(&dir) {
+            eprintln!("daemon-vhc-worker: fit probe FAILED: {e}");
+            std::process::exit(1);
         }
         return;
     }

@@ -598,6 +598,8 @@ fn signed_frame_carries_the_full_scope_tuple_and_verifies() {
             slices_delivered: 0,
             log_calls_this_phase: 0,
             log_bytes_this_phase: 0,
+            import_calls: 0,
+            import_calls_at_epoch_check: 0,
             pending_device: None,
         },
         fuel_per_slice: 0,
@@ -689,6 +691,8 @@ fn quiescent_slice() -> SliceState {
         slices_delivered: 0,
         log_calls_this_phase: 0,
         log_bytes_this_phase: 0,
+        import_calls: 0,
+        import_calls_at_epoch_check: 0,
         pending_device: None,
     }
 }

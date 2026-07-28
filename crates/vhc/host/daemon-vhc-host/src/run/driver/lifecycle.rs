@@ -315,6 +315,8 @@ pub fn start_run_migrating(
                     slices_delivered: 0,
                     log_calls_this_phase: 0,
                     log_bytes_this_phase: 0,
+                    import_calls: 0,
+                    import_calls_at_epoch_check: 0,
                     pending_device: None,
                 },
                 fuel_per_slice: engine_cfg.fuel_per_call,
@@ -345,6 +347,23 @@ pub fn start_run_migrating(
                 .set_fuel(engine_cfg.fuel_per_call)
                 .map_err(|e| RunError::Sandbox(e.to_string()))?;
             store.set_epoch_deadline(epoch_ticks);
+            // The epoch watchdog is a WEDGE detector, not a wall bound on legitimate work: a
+            // device-lane slice spends its wall inside host compute imports (a ceremony-geometry
+            // round is ONE slice, and its device time grows with the granted geometry — no
+            // constant survives that), while a wedged guest spins in pure wasm making no import
+            // calls at all. So on expiry the deadline EXTENDS while the guest's import-entry
+            // count is advancing ([`SliceState::import_calls`], §5.6's never-kill-for-waiting
+            // principle) and interrupts only a full budget with zero host contact — pure-wasm
+            // wedges still die within two budgets, and the deterministic fuel/op budgets are
+            // untouched.
+            store.epoch_deadline_callback(move |mut cx| {
+                let d = cx.data_mut();
+                if d.slice.import_calls == d.slice.import_calls_at_epoch_check {
+                    return Ok(wasmtime::UpdateDeadline::Interrupt);
+                }
+                d.slice.import_calls_at_epoch_check = d.slice.import_calls;
+                Ok(wasmtime::UpdateDeadline::Continue(epoch_ticks))
+            });
 
             let instance = linker
                 .instantiate(&mut store, &module)
@@ -736,7 +755,11 @@ fn classify_trap(store: &mut Store<Host>, e: wasmtime::Error) -> Trap {
     let low = msg.to_lowercase();
     let code = if low.contains("fuel") {
         TrapCode::BudgetFuel
-    } else if low.contains("epoch") {
+    } else if low.contains("epoch") || low.contains("interrupt") {
+        // wasmtime reports an epoch-deadline expiry as `wasm trap: interrupt` (the epoch trap
+        // variant IS `Trap::Interrupt`); nothing else arms interruption on this engine, so an
+        // interrupt is the epoch watchdog — without this arm it fell through to `BadModule`,
+        // filing a wall-clock budget exhaustion as a malformed module.
         TrapCode::BudgetEpoch
     } else if low.contains("unreachable") {
         TrapCode::GuestPanic

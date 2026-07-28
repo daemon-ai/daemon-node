@@ -147,7 +147,16 @@ cpu = []
 # safe alias for the CI gate).
 burn-ndarray = ["burn/ndarray"]
 # burn with the wgpu backend (cubecl + wgpu 29; targets Vulkan/RADV) — the G2 GPU lane. Opt-in only.
-wgpu = ["burn/wgpu", "dep:cubecl-runtime", "dep:ash"]
+#
+# `burn/vulkan` (= burn-wgpu/vulkan -> cubecl-wgpu/spirv) additionally compiles kernels to
+# SPIR-V PASSTHROUGH on Vulkan adapters instead of WGSL-through-naga. Added because the first
+# ceremony-geometry fit probe on a RADV lane recorded a RED verdict whose containment was a
+# WGSL validation refusal — cubecl emits `var<storage> array<bool>` buffers for `cmp`/
+# `mask_fill` kernels and `bool` is not host-shareable in WGSL, so EVERY such kernel is refused
+# by naga before the device ever sees it. The SPIR-V path has no such host-shareability rule.
+# Non-Vulkan adapters (Metal, DX12) keep the WGSL path; this only changes which compiler serves
+# a Vulkan adapter. Lane-owned edit by the standing dep rule (cubecl-spirv rides the lock).
+wgpu = ["burn/wgpu", "burn/vulkan", "dep:cubecl-runtime", "dep:ash"]
 # (A2 worker-bin split): the `vhc-net` feature (the A3 live coordinator attach) moved to
 # `crates/vhc/bins/daemon-vhc-worker` with the bin — it gated only worker-binary plumbing
 # (`live.rs`); the host lib has no vhc-net code.

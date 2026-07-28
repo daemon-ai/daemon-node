@@ -134,6 +134,46 @@ enum Cmd {
         #[arg(long, default_value = "cpu")]
         class: String,
     },
+    /// Run one **fit probe** on this box (`[RC-15]`: the estimate refuses cheaply and sizes the
+    /// budget; the DEVICE decides): author the probe directory (the frozen ceremony-geometry
+    /// trainer config, the run's execution requirements naming a development authority, the
+    /// round-0 drive inputs as opaque bytes), spawn the box's own worker binary in its
+    /// `DAEMON_TRAIN_FIT_PROBE` mode — the verdict names that binary's sealed revision identity,
+    /// so no other process may host the probe — and report the recorded content-addressed
+    /// FitVerdict.
+    ///
+    /// A RED verdict is evidence, not a failure: the command surfaces `Contained` with its trap
+    /// slug and still exits 0. Only a probe that produced no verdict (estimate refused,
+    /// un-provisioned box, wedged drive) fails.
+    ///
+    /// Lane selection rides the environment exactly as a node spawn would set it
+    /// (`DAEMON_TRAIN_BACKEND`, `DAEMON_VHC_LANE_GPU_OPTIONAL`); the provisioned profile home is
+    /// `--profile-dir` (see `vhc-provision-dev-profile`).
+    VhcFitProbe {
+        /// The box's `daemon-vhc-worker` binary — the very file the node will spawn.
+        #[arg(long)]
+        worker_bin: PathBuf,
+        /// The trainer module wasm (the built `tiny_llama.wasm`).
+        #[arg(long)]
+        trainer_wasm: PathBuf,
+        /// The coordinator module wasm (`coordinator_quorum.wasm`) — requirement authoring runs
+        /// every role of the run the probe stands in for.
+        #[arg(long)]
+        coordinator_wasm: PathBuf,
+        /// The provisioned profile directory (`DAEMON_VHC_PROFILE_DIR`).
+        #[arg(long)]
+        profile_dir: PathBuf,
+        /// The development authority PeerId (64-hex) the run's requirements accept.
+        #[arg(long)]
+        authority: String,
+        /// The probe directory to author (created; the verdict lands here).
+        #[arg(long)]
+        out: PathBuf,
+        /// Whole-drive wall-clock deadline, seconds (a ceremony-geometry CPU init alone is
+        /// ~100 s; a full 30-step round on a slow lane is much more).
+        #[arg(long, default_value_t = 3_600)]
+        deadline_s: u64,
+    },
     /// The merge gate (D-P10): the tier-1 det aggregate (which folds `vhc-ci-node`), the tier-2
     /// whole-run suites, and the multi-process acceptance suite.
     ///
@@ -392,6 +432,23 @@ fn main() -> anyhow::Result<()> {
             authority,
             class,
         } => vhc_provision_dev_profile(&worker_bin, &out, &authority, &class),
+        Cmd::VhcFitProbe {
+            worker_bin,
+            trainer_wasm,
+            coordinator_wasm,
+            profile_dir,
+            authority,
+            out,
+            deadline_s,
+        } => vhc_fit_probe(
+            &worker_bin,
+            &trainer_wasm,
+            &coordinator_wasm,
+            &profile_dir,
+            &authority,
+            &out,
+            deadline_s,
+        ),
         Cmd::VhcProductionGate {
             all,
             base,
@@ -1286,6 +1343,121 @@ fn vhc_provision_dev_profile(
     println!(
         "  point the node's DAEMON_VHC_PROFILE_DIR at {}",
         out.display()
+    );
+    Ok(())
+}
+
+/// One fit probe on this box, at the frozen ceremony geometry (see the `Cmd::VhcFitProbe` docs).
+#[allow(clippy::too_many_arguments)] // a CLI surface, one arg per flag
+fn vhc_fit_probe(
+    worker_bin: &Path,
+    trainer_wasm: &Path,
+    coordinator_wasm: &Path,
+    profile_dir: &Path,
+    authority: &str,
+    out: &Path,
+    deadline_s: u64,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+    use daemon_vhc_testkit::ceremony::{
+        ceremony_execution_with_certification, ceremony_trainer_config_harness,
+    };
+
+    let authority = ceremony::parse_peer("--authority", authority)?;
+    let trainer = std::fs::read(trainer_wasm)
+        .with_context(|| format!("read trainer module {}", trainer_wasm.display()))?;
+    let coordinator = std::fs::read(coordinator_wasm)
+        .with_context(|| format!("read coordinator module {}", coordinator_wasm.display()))?;
+
+    // The run's execution requirements, derived through the ONE authoring seam the ceremony
+    // genesis uses — same frozen harness-form config, same domain-minimum grant — naming the
+    // development authority (double opt-in with the provisioned owner policy).
+    let certification = daemon_vhc_proto::ProfileCertificationRequirements {
+        accepted_development_authorities: vec![authority],
+        ..Default::default()
+    };
+    let requirements = ceremony_execution_with_certification(&coordinator, &trainer, certification)
+        .map_err(anyhow::Error::msg)
+        .context("derive the run's execution requirements")?
+        .for_role("trainer")
+        .context("the authored requirements carry the trainer role")?;
+
+    // The frozen ceremony-geometry trainer config, harness form: the probe drives host staging,
+    // so the roster is a stand-in member that never enters the plan (the authoring's own rule).
+    let config = daemon_vhc_proto::to_canonical_vec(&ceremony_trainer_config_harness(&[
+        daemon_vhc_testkit::fit_probe::probe_peer(),
+    ]))
+    .context("encode the probe config")?;
+
+    std::fs::create_dir_all(out)
+        .with_context(|| format!("create the probe directory {}", out.display()))?;
+    daemon_vhc_testkit::fit_probe::write_trainer_probe_dir(
+        out,
+        &trainer,
+        &config,
+        &requirements,
+        deadline_s,
+    )
+    .map_err(anyhow::Error::msg)
+    .context("author the probe directory")?;
+
+    println!(
+        "== vhc-fit-probe: driving {} over {} ==",
+        worker_bin.display(),
+        out.display()
+    );
+    let status = Command::new(worker_bin)
+        .env("DAEMON_TRAIN_FIT_PROBE", out)
+        .env(daemon_vhc_resource::PROFILE_DIR_ENV, profile_dir)
+        .status()
+        .with_context(|| format!("run {} in fit-probe mode", worker_bin.display()))?;
+    anyhow::ensure!(
+        status.success(),
+        "the probe produced no verdict: {status} (an absent verdict is never an answer — see \
+         the worker's stderr above)"
+    );
+
+    // Surface the recorded verdict (the worker printed its own summary; this re-reads the file
+    // so what is reported is what a store would look up).
+    let verdict_file = std::fs::read_dir(out)
+        .with_context(|| format!("read {}", out.display()))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(daemon_vhc_resource::probe::VERDICT_FILE_PREFIX))
+        })
+        .context("the probe exited green but recorded no verdict file")?;
+    let verdict: daemon_vhc_resource::FitVerdict = daemon_vhc_proto::from_canonical_slice(
+        &std::fs::read(&verdict_file).context("read the verdict")?,
+    )
+    .context("decode the verdict")?;
+    println!(
+        "fit-verdict {} at {}",
+        if verdict.is_green() { "GREEN" } else { "RED" },
+        verdict_file.display()
+    );
+    match &verdict.outcome {
+        daemon_vhc_resource::FitOutcome::Fits {
+            measured_peak_bytes,
+        } => println!(
+            "  fits: measured peak {measured_peak_bytes} B under budget {} B",
+            verdict.key.budget_bytes
+        ),
+        daemon_vhc_resource::FitOutcome::Contained { trap_slug } => println!(
+            "  contained: {trap_slug} (evidence about this geometry on this box — the grant's \
+             declared space selects a smaller geometry, or the owner decides the device's \
+             membership; never a byte escalation)"
+        ),
+    }
+    println!(
+        "  key digest {} (module {}, revision {}, plan {}, grant {}, budget {} B)",
+        blake3::Hash::from(verdict.key.digest().map_err(anyhow::Error::msg)?.0).to_hex(),
+        blake3::Hash::from(verdict.key.module_hash.0).to_hex(),
+        blake3::Hash::from(verdict.key.backend_revision_digest.0).to_hex(),
+        blake3::Hash::from(verdict.key.plan_hash.0).to_hex(),
+        blake3::Hash::from(verdict.key.grant_hash.0).to_hex(),
+        verdict.key.budget_bytes,
     );
     Ok(())
 }

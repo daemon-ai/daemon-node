@@ -29,6 +29,7 @@
 pub mod ceremony;
 pub mod coordinator;
 pub mod coordinator_config;
+pub mod fit_probe;
 pub mod genesis_run;
 pub mod live_genesis;
 pub mod run;
