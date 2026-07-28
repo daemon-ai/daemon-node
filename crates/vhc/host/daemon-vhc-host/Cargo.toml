@@ -156,11 +156,17 @@ wgpu = ["burn/wgpu", "dep:cubecl-runtime", "dep:ash"]
 # host-shareable in WGSL, so EVERY such kernel is refused by naga before the device ever sees
 # it. The SPIR-V path has no such host-shareability rule.
 #
-# SEPARATE from `wgpu` because `burn/vulkan` requires the Vulkan SDK at BUILD time on macOS —
-# a Metal box builds plain `wgpu` (its adapters compile through MSL and never hit the WGSL
-# refusal this lane bypasses). Vulkan-capable builds (Linux, the Windows cross lane) enable
-# this. Lane-owned edit by the standing dep rule (cubecl-spirv rides the lock).
+# SEPARATE from `wgpu` because `burn/vulkan` requires the Vulkan SDK at BUILD time on macOS.
+# Vulkan-capable builds (Linux, the Windows cross lane) enable this. Lane-owned edit by the
+# standing dep rule (cubecl-spirv rides the lock).
 wgpu-spirv = ["wgpu", "burn/vulkan"]
+# The MSL passthrough lane for Metal adapters (`burn/metal` = burn-wgpu/metal ->
+# cubecl/wgpu-msl), the exact Metal analogue of `wgpu-spirv`: naga's WGSL FRONTEND validation
+# runs on every wgpu backend (WGSL -> MSL included), so a Metal adapter on the plain `wgpu`
+# feature refuses the same bool-storage kernels the RADV lane did — the M4's first
+# ceremony-geometry fit probe recorded exactly that, as a typed RED verdict. macOS builds
+# enable this.
+wgpu-msl = ["wgpu", "burn/metal"]
 # (A2 worker-bin split): the `vhc-net` feature (the A3 live coordinator attach) moved to
 # `crates/vhc/bins/daemon-vhc-worker` with the bin — it gated only worker-binary plumbing
 # (`live.rs`); the host lib has no vhc-net code.

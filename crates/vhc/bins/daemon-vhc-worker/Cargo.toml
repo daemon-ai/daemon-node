@@ -75,6 +75,9 @@ wgpu = ["daemon-vhc-host/wgpu"]
 # Linux and the Windows cross lane build this; a Metal box builds plain `wgpu` (burn/vulkan
 # needs the Vulkan SDK at build time on macOS).
 wgpu-spirv = ["wgpu", "daemon-vhc-host/wgpu-spirv"]
+# The Metal analogue (MSL passthrough; see daemon-vhc-host's feature of the same name).
+# macOS builds enable this.
+wgpu-msl = ["wgpu", "daemon-vhc-host/wgpu-msl"]
 # burn with the CUDA backend (driver-API + NVRTC JIT at runtime) — the discrete-NVIDIA lane.
 # Opt-in only.
 cuda = ["daemon-vhc-host/cuda"]
