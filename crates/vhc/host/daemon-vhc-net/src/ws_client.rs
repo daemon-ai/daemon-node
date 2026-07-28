@@ -400,10 +400,28 @@ async fn serve(
 }
 
 /// Dedupe an inbound frame and fan it out to every live subscriber (one delivery — NET-6).
+///
+/// A frame is recorded as seen only when it was actually DELIVERED to someone. The plane connects
+/// before the session subscribes (provider bring-up continues after `connect`), so an inbound
+/// frame can arrive while `subscribers` is empty; recording it then would burn its content id on
+/// a delivery to nobody, and every later byte-identical copy — precisely the §12.3 anti-entropy
+/// re-sends, which exist to heal this ordering — would be dropped as a duplicate forever.
+/// Observed live on the two-box WAN rung: a rejoined peer refused every frame as
+/// `UncertifiedSender` for the life of the run while the announcer faithfully re-sent its
+/// certificate every cadence tick.
 fn deliver(shared: &Arc<Mutex<Shared>>, payload: Vec<u8>) {
     let mut sh = shared.lock().expect("ws shared lock");
-    if sh.dedupe.observe(&payload) {
-        sh.subscribers.retain(|tx| tx.send(payload.clone()).is_ok());
+    if sh.dedupe.contains(&payload) {
+        return;
+    }
+    let mut delivered = false;
+    sh.subscribers.retain(|tx| {
+        let ok = tx.send(payload.clone()).is_ok();
+        delivered |= ok;
+        ok
+    });
+    if delivered {
+        sh.dedupe.observe(&payload);
     }
 }
 
