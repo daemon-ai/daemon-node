@@ -61,17 +61,6 @@ const HELD_FRAMES_MAX: usize = 256;
 /// The session's internal tick (pending-frame retries, guest-end polling, gap aging).
 const TICK: Duration = Duration::from_millis(50);
 
-/// The §12.3 certificate re-announce cadence (anti-entropy).
-///
-/// The attach-time announce is one-shot on a broadcast plane with no replay: a peer whose planes
-/// come up AFTER the announce (the staggered-join WAN case) would otherwise never hold this
-/// incarnation's certificate and would refuse every frame it sends for the life of the run —
-/// the WS reconnect re-announce only heals the announcer's own reconnects, not a listener's late
-/// arrival. Re-publishing on a slow cadence makes distribution eventually consistent regardless
-/// of join order; ingestion is idempotent ([`crate::attach::CertCheck::ingest_certificate`]), so
-/// the steady-state cost is one small record per role-instance per period.
-const CERT_REANNOUNCE: Duration = Duration::from_secs(60);
-
 /// The transport + provider bindings a role session services capabilities against. All three are
 /// OPAQUE seams: signed frames in/out, content-addressed bytes up/down — no schema, no
 /// coordinates, no credentials cross this surface.
@@ -452,8 +441,10 @@ async fn run_role(
 
     // §12.3 distribution: announce this incarnation's certificate on the control plane so peers
     // can verify our frames without an out-of-band exchange. Best-effort by design (supersession
-    // is the safety floor); a WS plane additionally re-announces on every reconnect via the
-    // resubscribe registration made at provider construction.
+    // is the safety floor); a WS plane additionally re-announces on every reconnect AND on a slow
+    // anti-entropy cadence via the resubscribe registration made at provider construction (a peer
+    // whose planes come up after this one-shot announce converges on the next cadence tick —
+    // re-publishing here would be suppressed by the plane's own content-hash dedupe).
     if let Ok(bytes) = own_cert_record.to_bytes() {
         let _ = providers.control.publish(&bytes).await;
     }
@@ -488,7 +479,6 @@ async fn run_role(
     let mut paused = false;
     let mut ticker = tokio::time::interval(TICK);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut last_cert_announce = tokio::time::Instant::now();
     let mut leave_requested: Option<LeaveMode> = None;
     let mut transport_fault: Option<String> = None;
 
@@ -600,15 +590,6 @@ async fn run_role(
                 if let Some(stale) = retry_held(&mut current.attach, &mut held, own_sender) {
                     transport_fault = Some(stale);
                     break 'session;
-                }
-                // §12.3 anti-entropy: re-announce this incarnation's certificate on a slow
-                // cadence so a peer that attached after the one-shot announce still converges
-                // (see [`CERT_REANNOUNCE`]). Best-effort like the original announce.
-                if last_cert_announce.elapsed() >= CERT_REANNOUNCE {
-                    last_cert_announce = tokio::time::Instant::now();
-                    if let Ok(bytes) = own_cert_record.to_bytes() {
-                        let _ = providers.control.publish(&bytes).await;
-                    }
                 }
                 if current.run.is_finished() {
                     break 'session;

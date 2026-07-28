@@ -326,6 +326,20 @@ async fn conn_loop(
     }
 }
 
+/// The §12.3 anti-entropy cadence: how often a LIVE connection re-sends its resubscribe frames.
+///
+/// A resubscribe frame (the peer's certificate announcement, its signed Join) is one-shot on a
+/// broadcast plane with no replay: a peer whose socket connects AFTER the send never sees it, and
+/// the reconnect re-send only heals THIS side's drops, not a listener's late arrival. Observed
+/// live on the two-box WAN rung as a staggered join whose second box refused every frame from the
+/// first's trainer for the life of the run (no certificate ever arrived). Re-sending on a slow
+/// cadence makes distribution eventually consistent regardless of join order. This deliberately
+/// rides `write.send` — the same dedupe-free path the reconnect re-send uses — because
+/// `publish`'s content-hash dedupe (NET-6) exists precisely to suppress byte-identical re-sends;
+/// receivers dedupe per subscription, so a peer that already holds the record drops the copy and
+/// a late one finally converges.
+const RESUBSCRIBE_REANNOUNCE: Duration = Duration::from_secs(60);
+
 /// Serve one connected socket: resend resubscribe frames, then pump outbound publishes up and
 /// inbound frames down until the socket drops or the plane is closed.
 async fn serve(
@@ -345,8 +359,22 @@ async fn serve(
         }
     }
 
+    let mut reannounce = tokio::time::interval(RESUBSCRIBE_REANNOUNCE);
+    reannounce.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    reannounce.tick().await; // consume the immediate first tick — this connect just re-sent above
+
     loop {
         tokio::select! {
+            _ = reannounce.tick() => {
+                // §12.3 anti-entropy (see [`RESUBSCRIBE_REANNOUNCE`]): a late-subscribing peer
+                // converges on the next cadence tick instead of never.
+                let frames = resubscribe.lock().expect("ws resubscribe lock").clone();
+                for frame in frames {
+                    if write.send(Message::binary(frame)).await.is_err() {
+                        return ServeOutcome::Disconnected;
+                    }
+                }
+            }
             outbound = outbound_rx.recv() => match outbound {
                 Some(bytes) => {
                     if write.send(Message::binary(bytes)).await.is_err() {
