@@ -219,17 +219,20 @@ fn tensors(g: &Geometry) -> Vec<TensorDecl> {
     ));
 
     out.extend([
-        // The input and target position ids the forward pass indexes with.
+        // The input and target position ids the forward pass indexes with. i32 on purpose: every
+        // index space this module addresses fits i32, and i64 kernels are a capability a stock
+        // DX12 lane does not have (SHADER_INT64 is DXC-only there) — declaring i32 is what lets
+        // the plan admit on every lane the module actually runs on (backend-lane audit D2).
         tensor(
             "step_input_ids",
             vec![g.rows()],
-            Dtype::I64,
+            Dtype::I32,
             Lifetime::Transient(LIVE_STEP.to_string()),
         ),
         tensor(
             "step_target_ids",
             vec![g.rows()],
-            Dtype::I64,
+            Dtype::I32,
             Lifetime::Transient(LIVE_STEP.to_string()),
         ),
         // The additive causal mask: one plane, shared across blocks and heads, built on device.

@@ -154,9 +154,10 @@ impl RunnerChannel for RecChannel {
     type Bridge = NoBridge;
     type Client = RecClient;
     type FloatElem = f32;
-    type IntElem = i64;
-    // Mirrors the guest SDK channel (`daemon-vhc-sdk-compute`): bool rides the wire as u32
-    // storage — WGSL forbids native bool in the storage address space (cubecl#1274).
+    // Mirrors the guest SDK channel (`daemon-vhc-sdk-compute`): i32 indices (i64 kernels are
+    // DXC-only on DX12) and u32 bool storage — WGSL forbids native bool in the storage address
+    // space (cubecl#1274).
+    type IntElem = i32;
     type BoolElem = u32;
 
     fn name(_device: &NdArrayDevice) -> String {
@@ -311,17 +312,21 @@ fn record_mask_journal() -> (Vec<ComputeStep>, Vec<u8>) {
 }
 
 #[test]
-fn the_mask_path_rides_the_wire_without_native_bool_storage() {
-    // The D1 regression net (backend-lane audit 2026-07-28): the guest channel's `BoolElem` chose
-    // native bool, so the comparison/mask kernels carried `DType::Bool(Native)` across the
-    // `compute@2` wire and every WGSL host lane (DX12, Metal) refused `var<storage> array<bool>`
-    // at shader validation (WGSL: bool is not host-shareable; cubecl#1274). The channel now pins
-    // u32 bool storage; this walks every dtype the mask path actually puts on the wire.
+fn the_mask_path_rides_the_wire_without_native_bool_or_i64() {
+    // The D1+D2 regression net (backend-lane audit 2026-07-28). D1: the guest channel's
+    // `BoolElem` chose native bool, so the comparison/mask kernels carried `DType::Bool(Native)`
+    // across the `compute@2` wire and every WGSL host lane (DX12, Metal) refused
+    // `var<storage> array<bool>` at shader validation (WGSL: bool is not host-shareable;
+    // cubecl#1274). D2: `IntElem` chose i64, a kernel dtype a stock DX12 lane cannot compile
+    // (SHADER_INT64 is DXC-only under wgpu; the default FXC lane refuses). The channel now pins
+    // u32 bool storage and i32 indices; this walks every dtype the mask/index path actually puts
+    // on the wire.
     use burn_backend::BoolStore;
 
     let (journal, export_ir) = record_mask_journal();
 
     let mut bool_seen = false;
+    let mut int_seen = false;
     let mut check = |dtype: DType, what: &str| {
         if let DType::Bool(store) = dtype {
             bool_seen = true;
@@ -329,6 +334,14 @@ fn the_mask_path_rides_the_wire_without_native_bool_storage() {
                 !matches!(store, BoolStore::Native),
                 "{what} carries native-bool storage, which WGSL host lanes refuse \
                  (bool is not host-shareable in the storage address space)"
+            );
+        }
+        if dtype.is_int() {
+            int_seen = true;
+            assert!(
+                !matches!(dtype, DType::I64),
+                "{what} carries i64, which a stock (FXC) DX12 lane cannot compile \
+                 (SHADER_INT64 is DXC-only)"
             );
         }
     };
@@ -348,8 +361,9 @@ fn the_mask_path_rides_the_wire_without_native_bool_storage() {
         }
     }
     assert!(
-        bool_seen,
-        "the mask workload must put a bool tensor on the wire, or this test guards nothing"
+        bool_seen && int_seen,
+        "the mask workload must put a bool and an int tensor on the wire, or this test guards \
+         nothing (bool_seen: {bool_seen}, int_seen: {int_seen})"
     );
 
     // And the u32-bool journal still executes on the production runner: the gathered values are

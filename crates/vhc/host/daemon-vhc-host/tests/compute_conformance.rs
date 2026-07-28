@@ -172,9 +172,10 @@ impl RunnerChannel for ConformanceChannel {
     type Bridge = NoBridge;
     type Client = AbiClient;
     type FloatElem = f32;
-    type IntElem = i64;
-    // Mirrors the guest SDK channel (`daemon-vhc-sdk-compute`): bool rides the wire as u32
-    // storage — WGSL forbids native bool in the storage address space (cubecl#1274).
+    // Mirrors the guest SDK channel (`daemon-vhc-sdk-compute`): i32 indices (i64 kernels are
+    // DXC-only on DX12) and u32 bool storage — WGSL forbids native bool in the storage address
+    // space (cubecl#1274).
+    type IntElem = i32;
     type BoolElem = u32;
 
     fn name(_device: &NdArrayDevice) -> String {

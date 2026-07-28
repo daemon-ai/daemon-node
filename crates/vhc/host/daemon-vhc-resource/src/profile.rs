@@ -853,6 +853,28 @@ pub mod fixtures {
         }
     }
 
+    /// The dtype spellings a profile of `class` may truthfully claim.
+    ///
+    /// Derived from what the lane's compute stack actually registers, per class, never a platform
+    /// constant (backend-lane audit 2026-07-28, D2/D4): f32, (u32-stored) bool and i32 are
+    /// universal; **i64 is gated exactly as cubecl gates it — on `SHADER_INT64`**, which Vulkan,
+    /// Metal (MSL 2.3+), CUDA and the CPU lanes expose but a stock DX12 lane does not (wgpu
+    /// compiles DX12 shaders with FXC by default; `SHADER_INT64` is DXC-only). A dx12-class
+    /// profile claiming i64 turned what should have been a typed admission refusal into a
+    /// mid-round ComputeFault — and this is the authoring seam the dev-minted profiles
+    /// (`test_support::development_provisioned_profiles`, `xtask vhc-provision-dev-profile`)
+    /// state their coverage through.
+    pub fn supported_dtypes(class: BackendClass) -> BTreeSet<String> {
+        let mut dtypes: BTreeSet<String> = ["f32", "bool1", "i32"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        if !matches!(class, BackendClass::Dx12) {
+            dtypes.insert("i64".to_string());
+        }
+        dtypes
+    }
+
     /// A small but complete and valid profile.
     pub fn profile(class: BackendClass) -> BackendExecutionProfile {
         BackendExecutionProfile {
@@ -876,9 +898,7 @@ pub mod fixtures {
             .into_iter()
             .map(str::to_string)
             .collect(),
-            supported_dtypes: ["f32".to_string(), "bool1".to_string(), "i64".to_string()]
-                .into_iter()
-                .collect(),
+            supported_dtypes: supported_dtypes(class),
             allocation_alignment_bytes: 256,
             allocation_ceilings: AllocationCeilings {
                 reported_bytes: 2 << 30,
@@ -1151,6 +1171,52 @@ mod tests {
         let bad_dtypes = ["f8".to_string()].into_iter().collect();
         assert!(p.supports(&ok_families, &bad_dtypes).is_err());
         assert!(p.supports(&ok_families, &dtypes).is_ok());
+    }
+
+    /// The fixture's dtype coverage is truthful per backend class (audit D2/D4): a dx12-class
+    /// profile does NOT claim i64 — wgpu compiles DX12 shaders with FXC by default and
+    /// `SHADER_INT64` is DXC-only — so a plan declaring i64 refuses TYPED at admission on that
+    /// lane instead of burning rounds into a mid-round ComputeFault. The lanes that actually
+    /// expose the feature keep the claim, and the module's own index dtype (i32) admits
+    /// everywhere.
+    #[test]
+    fn dtype_coverage_is_truthful_per_backend_class() {
+        use super::fixtures::supported_dtypes;
+
+        let families: BTreeSet<String> = ["gemm".to_string()].into_iter().collect();
+        let i64_plan: BTreeSet<String> =
+            ["f32".to_string(), "i64".to_string()].into_iter().collect();
+        let i32_plan: BTreeSet<String> =
+            ["f32".to_string(), "i32".to_string()].into_iter().collect();
+
+        let dx12 = profile(BackendClass::Dx12);
+        assert!(
+            dx12.supports(&families, &i64_plan)
+                .unwrap_err()
+                .to_string()
+                .contains("i64"),
+            "a dx12-class profile claiming i64 would disarm the admission gate"
+        );
+        assert!(dx12.supports(&families, &i32_plan).is_ok());
+
+        for class in [
+            BackendClass::Vulkan,
+            BackendClass::Metal,
+            BackendClass::Cuda,
+            BackendClass::Cpu,
+        ] {
+            let p = profile(class);
+            assert!(
+                p.supports(&families, &i64_plan).is_ok(),
+                "{} exposes SHADER_INT64 (or is not shader-bound) and keeps the i64 claim",
+                class.slug()
+            );
+            assert!(p.supports(&families, &i32_plan).is_ok());
+        }
+
+        // The statement itself is per class, not a constant copied across classes.
+        assert!(supported_dtypes(BackendClass::Vulkan).contains("i64"));
+        assert!(!supported_dtypes(BackendClass::Dx12).contains("i64"));
     }
 
     /// Formulas are exact rationals, never floats, so two hosts composing the same plan and

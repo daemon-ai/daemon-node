@@ -167,7 +167,13 @@ impl RunnerChannel for ComputeChannel {
     type Bridge = NoBridge;
     type Client = ComputeClient;
     type FloatElem = f32;
-    type IntElem = i64;
+    // Index tensors ride the wire as i32, not i64: DX12 exposes SHADER_INT64 only under the DXC
+    // compiler (wgpu 29 docs; SM ≥ 6.0 + Int64ShaderOps), and wgpu's default FXC lane cannot, so
+    // an i64 kernel is refused on a stock DX12 box. Every index space a module addresses fits
+    // i32 by construction — the largest ceremony per-tensor numel is 50,331,648 < 2³¹ — and an
+    // index dtype changes no f32 value, so the trajectory is bit-identical (backend-lane audit
+    // 2026-07-28, D2).
+    type IntElem = i32;
     // Bool tensors ride the `burn-ir` wire as u32 storage, never native bool: WGSL forbids `bool`
     // in the `storage` address space (not host-shareable), so a `DType::Bool(Native)` in the IR
     // makes every WGSL host lane (DX12, Metal) refuse the cmp/mask kernels at shader validation

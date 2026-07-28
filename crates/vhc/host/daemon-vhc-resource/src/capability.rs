@@ -795,9 +795,9 @@ pub mod fixtures {
             .into_iter()
             .map(str::to_string)
             .collect(),
-            supported_dtypes: ["f32".to_string(), "bool1".to_string(), "i64".to_string()]
-                .into_iter()
-                .collect(),
+            // Kept in step with the fixture profile's per-class coverage (i64 is SHADER_INT64-
+            // gated, which a stock DX12 lane lacks — see `profile::fixtures::supported_dtypes`).
+            supported_dtypes: crate::profile::fixtures::supported_dtypes(class),
             link: LinkCapacity {
                 uplink_bps: Maybe::Available(500_000_000),
                 downlink_bps: Maybe::Available(1_000_000_000),

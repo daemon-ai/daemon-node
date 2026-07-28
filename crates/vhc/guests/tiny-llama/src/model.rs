@@ -414,7 +414,7 @@ impl<B: AutodiffBackend> TinyLlamaModel<B> {
     /// forward loss *scalar*'s summation order (`rows` terms instead of `rows × vocab` terms, the
     /// extra ones being exact zeros); the scalar is consumed only as `backward()`'s root, which is
     /// seeded independently of its value.
-    fn target_logprobs(&self, logsm: Tensor<B, 2>, tgt: Vec<i64>, rows: usize) -> Tensor<B, 2> {
+    fn target_logprobs(&self, logsm: Tensor<B, 2>, tgt: Vec<i32>, rows: usize) -> Tensor<B, 2> {
         let targets = Tensor::<B, 1, Int>::from_data(TensorData::new(tgt, [rows]), &self.device)
             .reshape([rows, 1]);
         logsm.gather(1, targets)
@@ -438,8 +438,11 @@ impl<B: AutodiffBackend> TinyLlamaModel<B> {
         let mut tgt = Vec::with_capacity(rows);
         for bi in 0..b {
             for si in 0..s {
-                inp.push(i64::from(tokens[bi * seq + si]));
-                tgt.push(i64::from(tokens[bi * seq + si + 1]));
+                // Token ids are vocabulary indices (< 2¹⁵ at any admitted geometry), so i32 is
+                // lossless — and it is the module's index dtype: i64 kernels don't exist on a
+                // stock DX12 lane (SHADER_INT64 is DXC-only there; backend-lane audit D2).
+                inp.push(tokens[bi * seq + si] as i32);
+                tgt.push(tokens[bi * seq + si + 1] as i32);
             }
         }
 

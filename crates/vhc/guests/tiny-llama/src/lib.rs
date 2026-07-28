@@ -633,7 +633,7 @@ impl GuestModule for TinyLlama {
         // The training step's guest-resident working set, in two named terms because they live on
         // two different scales:
         //
-        //   * per MICRO-BATCH — the input and target id rows the forward pass builds (`i64` each),
+        //   * per MICRO-BATCH — the input and target id rows the forward pass builds (`i32` each),
         //     alive only for the step that consumes them;
         //   * per ROUND — a live round plans and stages the whole round's window before it trains
         //     the first step, so the fetched corpus bytes (one `token_width`-wide element per
@@ -649,7 +649,7 @@ impl GuestModule for TinyLlama {
         // the guest.
         let tokens_mb = u64::from(cfg.model.seq_len) * u64::from(cfg.micro_batch);
         let tokens_round = tokens_mb * u64::from(cfg.steps_per_round.max(1));
-        let step_peak = tokens_mb * (8 + 8) + tokens_round * (4 + 4);
+        let step_peak = tokens_mb * (4 + 4) + tokens_round * (4 + 4);
         decl.host_state_bytes =
             MODULE_BASELINE_BYTES + init_peak + update_peak + ingest_peak + bookkeeping + step_peak;
         // The outgoing container: one section pair per window, staged host-side.
