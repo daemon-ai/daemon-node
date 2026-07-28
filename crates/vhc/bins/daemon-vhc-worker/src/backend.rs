@@ -2597,6 +2597,7 @@ fn windows_probed_device(
     dl: &daemon_vhc_host::probe::DeviceLimits,
     raw: Option<&daemon_vhc_host::probe::DxgiAdapterMemory>,
     adapter_name: Option<String>,
+    class: daemon_vhc_resource::BackendClass,
     fallback_ram_bytes: u64,
 ) -> ProbedDevice {
     let mib = |mb: u64| mb << 20;
@@ -2627,7 +2628,7 @@ fn windows_probed_device(
             platform_budget_bytes: None,
             advertised_device_heap_bytes: None,
         },
-        class: daemon_vhc_resource::BackendClass::Dx12,
+        class,
         adapter_name: adapter_name.unwrap_or_else(|| UNNAMED_DX12_ADAPTER.to_string()),
     }
 }
@@ -2705,6 +2706,33 @@ fn probed_adapter_name() -> Option<String> {
     }
 }
 
+/// The backend class of the adapter the live graphics probe actually brought up, where it
+/// brought one up.
+///
+/// The class a capability report states must be the class of the LANE the worker runs, not a
+/// platform constant: on Windows the selected graphics API is a bring-up choice
+/// (`DAEMON_TRAIN_GRAPHICS_API`, platform default Dx12), and the DXGI supply facts describe the
+/// physical adapter whichever API drives it — a report that said `dx12` while the lane runs
+/// Vulkan would refuse to match the very profile minted for this box's running record.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn probed_adapter_class() -> Option<daemon_vhc_resource::BackendClass> {
+    #[cfg(feature = "wgpu")]
+    {
+        daemon_vhc_host::probe::probe_wgpu().and_then(|p| {
+            match p.backend.to_ascii_lowercase().as_str() {
+                "vulkan" => Some(daemon_vhc_resource::BackendClass::Vulkan),
+                "dx12" => Some(daemon_vhc_resource::BackendClass::Dx12),
+                "metal" => Some(daemon_vhc_resource::BackendClass::Metal),
+                _ => None,
+            }
+        })
+    }
+    #[cfg(not(feature = "wgpu"))]
+    {
+        None
+    }
+}
+
 /// Gather the platform facts a device-supply derivation reads, or `None` on a box with no device lane.
 ///
 /// `None` is not a failure: a CPU-only participant has no device supply to state, and a report about a
@@ -2729,6 +2757,10 @@ fn probed_device() -> Option<ProbedDevice> {
                 &dl,
                 daemon_vhc_host::probe::probe_windows_adapter_memory().as_ref(),
                 probed_adapter_name(),
+                // The class of the lane actually brought up (Vulkan under a directed
+                // `DAEMON_TRAIN_GRAPHICS_API`), defaulting to the platform's Dx12. The DXGI
+                // facts are about the physical adapter either way.
+                probed_adapter_class().unwrap_or(daemon_vhc_resource::BackendClass::Dx12),
                 ram_bytes,
             ));
         }
@@ -3445,7 +3477,13 @@ mod platform_arm_tests {
             budget_non_local: 0,
         };
 
-        let probed = windows_probed_device(&dl, Some(&raw), Some("Radeon 8060S".into()), 0);
+        let probed = windows_probed_device(
+            &dl,
+            Some(&raw),
+            Some("Radeon 8060S".into()),
+            BackendClass::Dx12,
+            0,
+        );
         assert_eq!(probed.class, BackendClass::Dx12);
         assert_eq!(probed.facts.platform, SupplyPlatform::Windows);
         assert_eq!(
@@ -3467,6 +3505,7 @@ mod platform_arm_tests {
             },
             Some(&DxgiAdapterMemory { uma: false, ..raw }),
             None,
+            BackendClass::Dx12,
             0,
         );
         assert_eq!(discrete.facts.shared_pool_bytes, 0);
@@ -3477,7 +3516,7 @@ mod platform_arm_tests {
         );
 
         // Without the raw scalars the mapper's own figure is all there is.
-        let no_raw = windows_probed_device(&dl, None, None, 0);
+        let no_raw = windows_probed_device(&dl, None, None, BackendClass::Dx12, 0);
         assert_eq!(no_raw.facts.shared_pool_bytes, 12_000 * MIB);
     }
 
@@ -3547,7 +3586,7 @@ mod platform_arm_tests {
             unified: true,
         };
         assert_eq!(
-            windows_probed_device(&dl, None, None, 64 * 1024 * MIB)
+            windows_probed_device(&dl, None, None, BackendClass::Dx12, 64 * 1024 * MIB)
                 .facts
                 .host_ram_bytes,
             64 * 1024 * MIB
