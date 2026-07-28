@@ -36,6 +36,62 @@ pub struct PlaneTilingBlueprintOptions {
     pub partition_buffering: Option<PartitionBuffering>,
     /// Enables the tiny selector when the [matmul problem](MatmulProblem) is flagged as tiny.
     pub tiny_selection_enabled: bool,
+    /// [daemon patch — see PATCH.md] The `(lhs, rhs)` stage counts the calling routine's global
+    /// family declares (`NumStages`; e.g. (2, 2) for double buffering, (1, 2) for ordered
+    /// double buffering). `None` means the single-stage families' (1, 1). The shared-memory
+    /// clamp accounts the FULL declared budget, so it must know how many copies of each input
+    /// stage the compiled kernel will declare.
+    pub num_stages: Option<(u32, u32)>,
+}
+
+/// [daemon patch — see PATCH.md] Walk a plane selection's `(stage_m, partition_n, partition_k)`
+/// down until the FULL declared shared-memory budget fits the adapter. The budget mirrors what
+/// `plane_partitioned/setup.rs` + the stage types make the compiled kernel declare (the D3-v2
+/// lesson: bounding the lhs+rhs input stages alone still let a unit kernel declare 40,960 B
+/// against a 32,768 B device — the writer stage was unaccounted):
+///
+///  - lhs input stage (`StridedStageMemory`), × the family's lhs stage count (`NumStages`);
+///  - rhs input stage, × the family's rhs stage count;
+///  - the writer stage (`PartitionedStage`, `write/stage.rs`): tiles-per-partition forced to
+///    (1, 1) and this path pins the tiling scheme's stage n to 1, so
+///    `tile_m · tile_n · stage_m` accumulator-stage elements.
+///
+/// Not accounted (documented residual, the validator keeps the last, typed word): an acc INPUT
+/// stage (only fused C-input matmuls declare one) and the per-stage alignment rounding.
+/// Deterministic per adapter: the walk depends only on the device-property limit. If a single
+/// tile pair still exceeds the limit, the launch validator keeps the last word.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn clamp_plane_stage_to_shared_memory(
+    (tile_m, tile_n, tile_k): (u32, u32, u32),
+    rows_per_plane: usize,
+    (mut stage_size_m, mut partition_shape_n, mut partition_shape_k): (usize, usize, u32),
+    (lhs_stage_size, rhs_stage_size, out_stage_size): (usize, usize, usize),
+    (lhs_stages, rhs_stages): (u32, u32),
+    max_shared: usize,
+) -> (usize, usize, u32) {
+    let stage_bytes = |stage_m: usize, part_n: usize, part_k: u32| -> usize {
+        let elems_m = tile_m as usize * rows_per_plane * stage_m;
+        let elems_n = tile_n as usize * part_n;
+        let elems_k = tile_k as usize * part_k as usize;
+        let lhs = elems_m * elems_k * lhs_stage_size * lhs_stages as usize;
+        let rhs = elems_k * elems_n * rhs_stage_size * rhs_stages as usize;
+        let writer = (tile_m * tile_n) as usize * stage_m * out_stage_size;
+        lhs + rhs + writer
+    };
+    while stage_bytes(stage_size_m, partition_shape_n, partition_shape_k) > max_shared {
+        if stage_size_m > 1 {
+            stage_size_m /= 2;
+        } else if partition_shape_n > 1 {
+            partition_shape_n /= 2;
+        } else if partition_shape_k > 1 {
+            partition_shape_k /= 2;
+        } else {
+            // A single tile pair already exceeds the device limit; leave the refusal to the
+            // launch validator, which reports it as a typed resource error.
+            break;
+        }
+    }
+    (stage_size_m, partition_shape_n, partition_shape_k)
 }
 
 pub fn infer_blueprint_plane<R: Runtime>(
@@ -145,31 +201,28 @@ pub fn infer_blueprint_plane<R: Runtime>(
     }
 
     // [daemon patch — see PATCH.md] Clamp the selection to the adapter's shared-memory budget.
-    // The launch validator refuses a stage set exceeding `hardware.max_shared_memory_size`
-    // (e.g. 40,960 B selected vs Apple's 32,768 B limit — tracel-ai/burn#4530, #4851), but only
-    // the gemv setup ever consulted the limit at selection time; with autotune off there is no
-    // fallback and the refusal is fatal. Walk the stage shape down until the lhs+rhs stages fit:
-    // deterministic per adapter, since it depends only on the device-property limit.
+    // The launch validator refuses a compiled kernel whose DECLARED shared memory exceeds
+    // `hardware.max_shared_memory_size` (e.g. 40,960 B declared vs a 32,768 B limit —
+    // tracel-ai/burn#4530, #4851), but only the gemv setup ever consulted the limit at
+    // selection time; with autotune off there is no fallback and the refusal is fatal. Walk
+    // the stage shape down until the full declared budget — the lhs/rhs input stages × their
+    // family's `NumStages`, plus the `PartitionedStage` writer (tiles-per-partition forced to
+    // (1, 1): `tile_m · tile_n · stage_m` accumulator-stage elements on this path, whose stage
+    // n is pinned to 1) — fits: deterministic per adapter, since it depends only on the
+    // device-property limit.
     let max_shared = client.properties().hardware.max_shared_memory_size;
-    let stage_bytes = |stage_m: usize, part_n: usize, part_k: u32| -> usize {
-        let elems_m = tile_size.m() as usize * rows_per_plane * stage_m;
-        let elems_n = tile_size.n() as usize * part_n;
-        let elems_k = tile_size.k() as usize * part_k as usize;
-        elems_m * elems_k * dtypes.lhs_stage.size() + elems_k * elems_n * dtypes.rhs_stage.size()
-    };
-    while stage_bytes(stage_size_m, partition_shape_n, partition_shape_k) > max_shared {
-        if stage_size_m > 1 {
-            stage_size_m /= 2;
-        } else if partition_shape_n > 1 {
-            partition_shape_n /= 2;
-        } else if partition_shape_k > 1 {
-            partition_shape_k /= 2;
-        } else {
-            // A single tile pair already exceeds the device limit; leave the refusal to the
-            // launch validator, which reports it as a typed resource error.
-            break;
-        }
-    }
+    let (stage_size_m, partition_shape_n, partition_shape_k) = clamp_plane_stage_to_shared_memory(
+        (tile_size.m(), tile_size.n(), tile_size.k()),
+        rows_per_plane,
+        (stage_size_m, partition_shape_n, partition_shape_k),
+        (
+            dtypes.lhs_stage.size(),
+            dtypes.rhs_stage.size(),
+            dtypes.acc_stage.size(),
+        ),
+        options.num_stages.unwrap_or((1, 1)),
+        max_shared,
+    );
 
     let tiles_per_partition = PartitionSize::new(
         rows_per_plane as u32,
@@ -398,4 +451,59 @@ fn selection_tiny<R: Runtime>(
         .partition_buffering(PartitionBuffering::Single)
         .hypercube_blueprint(hypercube)
         .build()
+}
+
+// [daemon patch — see PATCH.md]
+#[cfg(test)]
+mod daemon_patch_tests {
+    use super::clamp_plane_stage_to_shared_memory;
+
+    /// A CMMA-shaped selection (16×16×16 tiles, 4 m-partitions staged, k spanning the plane)
+    /// whose full declared budget exceeds a 32,768 B device: the walk halves the m stage until
+    /// the lhs + rhs stages AND the writer fit, deterministically.
+    #[test]
+    fn an_oversized_plane_selection_clamps_to_the_device_limit() {
+        // stage_m 4, part_n 4, part_k 2 at f32: lhs = 16·1·4 × 16·2 × 4 B = 8,192 B;
+        // rhs = 32 × 64 × 4 B = 8,192 B; writer = 256 × 4 × 4 B = 4,096 B → 20,480 B: fits.
+        assert_eq!(
+            clamp_plane_stage_to_shared_memory(
+                (16, 16, 16),
+                1,
+                (4, 4, 2),
+                (4, 4, 4),
+                (1, 1),
+                32_768
+            ),
+            (4, 4, 2)
+        );
+        // The same shape double-buffered ((2, 2) stages) declares 36,864 B: one m halving.
+        assert_eq!(
+            clamp_plane_stage_to_shared_memory(
+                (16, 16, 16),
+                1,
+                (4, 4, 2),
+                (4, 4, 4),
+                (2, 2),
+                32_768
+            ),
+            (2, 4, 2)
+        );
+    }
+
+    /// The walk floors at (1, 1, 1) on a pathological budget and leaves the refusal to the
+    /// launch validator.
+    #[test]
+    fn the_plane_walk_stops_at_a_single_tile_pair() {
+        assert_eq!(
+            clamp_plane_stage_to_shared_memory(
+                (16, 16, 16),
+                1,
+                (4, 4, 2),
+                (4, 4, 4),
+                (1, 1),
+                1
+            ),
+            (1, 1, 1)
+        );
+    }
 }

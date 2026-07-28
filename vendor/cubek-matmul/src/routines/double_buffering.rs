@@ -123,6 +123,10 @@ macro_rules! double_buffering_impl {
                                 minimum_stage_count: 8,
                             },
                             swizzled: tile_matmul.should_swizzle(&device_settings.client),
+                            // [daemon patch — see PATCH.md] this family declares 2 stages per
+                            // input (`num_stages() == (2, 2)`); the shared-memory clamp
+                            // accounts the full declared budget.
+                            num_stages: Some((2, 2)),
                             ..Default::default()
                         },
                     )?,

@@ -129,6 +129,10 @@ where
                         minimum_stage_count: 8,
                     },
                     swizzled: tile_matmul.should_swizzle(&device_settings.client),
+                    // [daemon patch — see PATCH.md] this family declares 2 stages per input
+                    // (`num_stages() == (2, 2)`); the shared-memory clamp accounts the full
+                    // declared budget.
+                    num_stages: Some((2, 2)),
                     ..Default::default()
                 },
             )?,
@@ -227,6 +231,9 @@ fn infer_blueprint_specialized<R: Runtime>(
                 partition_buffering: Some(PartitionBuffering::Single),
                 multi_row_strategy: MultiRowStrategy::Always(2),
                 partition_k: Some(2),
+                // [daemon patch — see PATCH.md] the specialized family declares 2 stages per
+                // input (`num_stages() == (2, 2)`).
+                num_stages: Some((2, 2)),
                 ..Default::default()
             },
         );

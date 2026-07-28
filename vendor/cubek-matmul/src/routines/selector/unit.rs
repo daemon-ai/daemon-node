@@ -58,25 +58,44 @@ pub struct UnitTilingBlueprintOptions {
     pub swizzle: bool,
 }
 
-/// [daemon patch — see PATCH.md] Walk a unit stage's `(stage_m, stage_n)` down until the lhs +
-/// rhs stages fit the adapter's shared-memory budget. The launch validator refuses a stage set
-/// exceeding `hardware.max_shared_memory_size` (e.g. 40,960 B selected vs Apple's 32,768 B limit
-/// — tracel-ai/burn#4530, #4851), but no selector consulted the limit (only the gemv setup does);
-/// with autotune off there is no fallback and the refusal is fatal. Deterministic per adapter:
-/// the walk depends only on the device-property limit. Halves the larger contributor first; if a
-/// single tile pair still exceeds the limit, the launch validator keeps the last word.
+/// [daemon patch — see PATCH.md] Walk a unit stage's `(stage_m, stage_n)` down until the FULL
+/// declared shared-memory budget fits the adapter. The launch validator refuses a compiled
+/// kernel whose declared shared memory exceeds `hardware.max_shared_memory_size`
+/// (e.g. 40,960 B declared vs a 32,768 B limit — tracel-ai/burn#4530, #4851), but no selector
+/// consulted the limit (only the gemv setup does); with autotune off there is no fallback and
+/// the refusal is fatal.
+///
+/// The budget mirrors what `expand_config` + the stage types actually make the kernel declare
+/// (the D3-v2 lesson: bounding the lhs+rhs input stages alone still let a kernel declare
+/// 40,960 B against a 32,768 B device — the writer stage was unaccounted):
+///
+///  - lhs input stage (`StridedStageMemory` from `lhs_smem_config`), × its stage count
+///    (`NumStages`: 2 on the double-buffered global families);
+///  - rhs input stage, likewise;
+///  - the writer stage (`PartitionedStage` from `out_smem_config`): tiles-per-partition forced
+///    to (1, 1), so `tile_m · tile_n · stage_m · stage_n` accumulator-stage elements.
+///
+/// Not accounted (documented residual, the validator keeps the last, typed word): an acc INPUT
+/// stage (only fused C-input matmuls declare one — burn's plain `A @ B` never does) and the
+/// per-stage alignment rounding (≤ the swizzle atom, orders of magnitude under the limit).
+/// Deterministic per adapter: the walk depends only on the device-property limit. Halves the
+/// larger contributor first; if a single tile pair still exceeds the limit, the launch
+/// validator keeps the last word.
 pub(crate) fn clamp_stage_to_shared_memory(
     t: (u32, u32, u32),
     p: (u32, u32, u32),
     (mut stage_m, mut stage_n): (u32, u32),
-    (lhs_stage_size, rhs_stage_size): (usize, usize),
+    (lhs_stage_size, rhs_stage_size, out_stage_size): (usize, usize, usize),
+    num_stages: usize,
     max_shared: usize,
 ) -> (u32, u32) {
     let stage_bytes = |sm: u32, sn: u32| -> usize {
         let elems_m = (t.0 * p.0 * sm) as usize;
         let elems_n = (t.1 * p.1 * sn) as usize;
         let elems_k = (t.2 * p.2) as usize;
-        elems_m * elems_k * lhs_stage_size + elems_k * elems_n * rhs_stage_size
+        let inputs = elems_m * elems_k * lhs_stage_size + elems_k * elems_n * rhs_stage_size;
+        let writer = (t.0 * t.1 * sm * sn) as usize * out_stage_size;
+        inputs * num_stages + writer
     };
     while stage_bytes(stage_m, stage_n) > max_shared {
         if stage_m > 1 && stage_m >= stage_n {
@@ -271,6 +290,7 @@ fn general_unit_selector(
         options.stage,
         options.swizzle,
         max_shared,
+        double_buffering,
         problem,
         dtypes,
         vector_sizes,
@@ -282,7 +302,7 @@ fn general_unit_selector(
 fn matvec_unit_selector(
     problem: &MatmulProblem,
     plane_dim: u32,
-    _double_buffering: bool,
+    double_buffering: bool,
     tile_size: u32,
     num_sms: Option<u32>,
     max_shared: usize,
@@ -309,6 +329,7 @@ fn matvec_unit_selector(
         StageScaling::Disabled,
         options.swizzle,
         max_shared,
+        double_buffering,
         problem,
         dtypes,
         vector_sizes,
@@ -320,7 +341,7 @@ fn matvec_unit_selector(
 fn vecmat_unit_selector(
     problem: &MatmulProblem,
     plane_dim: u32,
-    _double_buffering: bool,
+    double_buffering: bool,
     tile_size: u32,
     num_sms: Option<u32>,
     max_shared: usize,
@@ -344,6 +365,7 @@ fn vecmat_unit_selector(
         StageScaling::Disabled,
         options.swizzle,
         max_shared,
+        double_buffering,
         problem,
         dtypes,
         vector_sizes,
@@ -355,7 +377,7 @@ fn vecmat_unit_selector(
 fn scalarvec_unit_selector(
     problem: &MatmulProblem,
     plane_dim: u32,
-    _double_buffering: bool,
+    double_buffering: bool,
     tile_size: u32,
     num_sms: Option<u32>,
     max_shared: usize,
@@ -385,6 +407,7 @@ fn scalarvec_unit_selector(
         StageScaling::Disabled,
         options.swizzle,
         max_shared,
+        double_buffering,
         problem,
         dtypes,
         vector_sizes,
@@ -396,7 +419,7 @@ fn scalarvec_unit_selector(
 fn vecscalar_unit_selector(
     problem: &MatmulProblem,
     plane_dim: u32,
-    _double_buffering: bool,
+    double_buffering: bool,
     tile_size: u32,
     num_sms: Option<u32>,
     max_shared: usize,
@@ -420,6 +443,7 @@ fn vecscalar_unit_selector(
         StageScaling::Disabled,
         options.swizzle,
         max_shared,
+        double_buffering,
         problem,
         dtypes,
         vector_sizes,
@@ -431,7 +455,7 @@ fn vecscalar_unit_selector(
 fn inner_product_unit_selector(
     problem: &MatmulProblem,
     plane_dim: u32,
-    _double_buffering: bool,
+    double_buffering: bool,
     tile_size: u32,
     num_sms: Option<u32>,
     max_shared: usize,
@@ -458,6 +482,7 @@ fn inner_product_unit_selector(
         StageScaling::Disabled,
         options.swizzle,
         max_shared,
+        double_buffering,
         problem,
         dtypes,
         vector_sizes,
@@ -469,7 +494,7 @@ fn inner_product_unit_selector(
 fn outer_product_unit_selector(
     problem: &MatmulProblem,
     plane_dim: u32,
-    _double_buffering: bool,
+    double_buffering: bool,
     tile_size: u32,
     num_sms: Option<u32>,
     max_shared: usize,
@@ -490,6 +515,7 @@ fn outer_product_unit_selector(
         StageScaling::Disabled,
         options.swizzle,
         max_shared,
+        double_buffering,
         problem,
         dtypes,
         vector_sizes,
@@ -501,7 +527,7 @@ fn outer_product_unit_selector(
 fn scalar_product_unit_selector(
     problem: &MatmulProblem,
     plane_dim: u32,
-    _double_buffering: bool,
+    double_buffering: bool,
     _tile_size: u32,
     num_sms: Option<u32>,
     max_shared: usize,
@@ -525,6 +551,7 @@ fn scalar_product_unit_selector(
         StageScaling::Disabled,
         options.swizzle,
         max_shared,
+        double_buffering,
         problem,
         dtypes,
         vector_sizes,
@@ -563,6 +590,9 @@ fn selection(
     stage_scaling: StageScaling,
     swizzle: bool,
     max_shared: usize,
+    // [daemon patch — see PATCH.md] the routine's global family declares this many stages per
+    // input (DoubleUnit: 2); the clamp accounts the full declared budget.
+    double_buffering: bool,
     problem: &MatmulProblem,
     dtypes: &MatmulElems,
     vector_sizes: &MatmulVectorSizes,
@@ -580,13 +610,19 @@ fn selection(
     };
 
     // [daemon patch — see PATCH.md] Clamp the selection to the adapter's shared-memory budget
-    // (tracel-ai/burn#4530, #4851): the launch validator would otherwise refuse the stage set,
-    // and with autotune off there is no fallback.
+    // (tracel-ai/burn#4530, #4851): the launch validator would otherwise refuse the compiled
+    // kernel, and with autotune off there is no fallback. `double_buffering` names the global
+    // family the routine expands into (`NumStages`: DoubleUnit declares 2 stages per input).
     let (stage_size_m, stage_size_n) = clamp_stage_to_shared_memory(
         t,
         p,
         (stage_size_m, stage_size_n),
-        (dtypes.lhs_stage.size(), dtypes.rhs_stage.size()),
+        (
+            dtypes.lhs_stage.size(),
+            dtypes.rhs_stage.size(),
+            dtypes.acc_stage.size(),
+        ),
+        if double_buffering { 2 } else { 1 },
         max_shared,
     );
 
@@ -681,25 +717,73 @@ fn scale_partition(setting: PartitionScaling, axis: usize, max_exp: u32, div_exp
 mod daemon_patch_tests {
     use super::clamp_stage_to_shared_memory;
 
-    /// The recorded Apple failure shape (tracel-ai/burn#4530): tile (4,4,4), partitions (4,2,4),
-    /// stage (32,16) at f32 stages selects 32,768 B (lhs) + 8,192 B (rhs) = 40,960 B against the
-    /// 32,768 B device limit. One halving of the m stage fits it.
+    /// The full declared budget of a unit stage set, mirroring the clamp's own accounting —
+    /// asserted against the instrumented figures so the formula and the compiled kernels can't
+    /// drift silently.
+    fn declared_bytes(
+        t: (u32, u32, u32),
+        p: (u32, u32, u32),
+        (sm, sn): (u32, u32),
+        (lhs, rhs, out): (usize, usize, usize),
+        num_stages: usize,
+    ) -> usize {
+        let elems_m = (t.0 * p.0 * sm) as usize;
+        let elems_n = (t.1 * p.1 * sn) as usize;
+        let elems_k = (t.2 * p.2) as usize;
+        (elems_m * elems_k * lhs + elems_k * elems_n * rhs) * num_stages
+            + (t.0 * t.1 * sm * sn) as usize * out
+    }
+
+    /// The recorded D3-v2 failure decomposition (tracel-ai/burn#4530; the RTX 5090/DX12 and
+    /// Apple M4 fit probes, and the local RADV instrumented replay): tile (4,4,4), partitions
+    /// (4,2,4), stage (16,16), f32 everywhere, single-stage. The lhs + rhs input stages alone
+    /// are 24,576 B — UNDER the 32,768 B limit, which is exactly why the input-only clamp
+    /// passed it — but the compiled kernel also declares the 16,384 B `PartitionedStage`
+    /// writer, for the observed 40,960 B total. The full-budget walk halves the m stage once
+    /// and the declared budget fits.
+    #[test]
+    fn the_recorded_d3v2_overrun_clamps_to_the_device_limit() {
+        let (t, p, stage, sizes) = ((4, 4, 4), (4, 2, 4), (16, 16), (4, 4, 4));
+        // The evidence figures, reproduced by the accounting itself.
+        assert_eq!(declared_bytes(t, p, stage, sizes, 1), 40_960);
+        let clamped = clamp_stage_to_shared_memory(t, p, stage, sizes, 1, 32_768);
+        assert_eq!(clamped, (8, 16));
+        assert!(declared_bytes(t, p, clamped, sizes, 1) <= 32_768);
+    }
+
+    /// The pre-D3-v2 Apple shape (stage (32,16)): under the full accounting it now walks two
+    /// halvings deep (73,728 B declared → 24,576 B), still deterministically.
     #[test]
     fn the_apple_overrun_clamps_to_the_device_limit() {
+        let (t, p, sizes) = ((4, 4, 4), (4, 2, 4), (4, 4, 4));
+        let clamped = clamp_stage_to_shared_memory(t, p, (32, 16), sizes, 1, 32_768);
+        assert_eq!(clamped, (8, 16));
+        assert!(declared_bytes(t, p, clamped, sizes, 1) <= 32_768);
+    }
+
+    /// The recorded decomposition under a 65,536 B limit (the green RADV lane, where the
+    /// instrumented replay compiled and RAN this very kernel at 40,960 B): untouched — the
+    /// clamp changes nothing on adapters where the declared budget already fits, so green
+    /// lanes keep selecting the identical config.
+    #[test]
+    fn a_fitting_selection_is_untouched() {
         assert_eq!(
-            clamp_stage_to_shared_memory((4, 4, 4), (4, 2, 4), (32, 16), (4, 4), 32_768),
+            clamp_stage_to_shared_memory((4, 4, 4), (4, 2, 4), (16, 16), (4, 4, 4), 1, 65_536),
             (16, 16)
         );
     }
 
-    /// The same selection under a 65,536 B limit (the green RADV lane) is untouched: the clamp
-    /// changes nothing on adapters where the stage already fits.
+    /// Double buffering doubles the input stages (NumStages (2,2)) and the clamp accounts it:
+    /// the same decomposition that fits single-staged at 32,768 B must walk further when the
+    /// global family declares two stages per input.
     #[test]
-    fn a_fitting_selection_is_untouched() {
-        assert_eq!(
-            clamp_stage_to_shared_memory((4, 4, 4), (4, 2, 4), (32, 16), (4, 4), 65_536),
-            (32, 16)
-        );
+    fn double_buffering_is_accounted() {
+        let (t, p, sizes) = ((4, 4, 4), (4, 2, 4), (4, 4, 4));
+        let single = clamp_stage_to_shared_memory(t, p, (16, 16), sizes, 1, 32_768);
+        let double = clamp_stage_to_shared_memory(t, p, (16, 16), sizes, 2, 32_768);
+        assert_eq!(single, (8, 16));
+        assert_eq!(double, (8, 8));
+        assert!(declared_bytes(t, p, double, sizes, 2) <= 32_768);
     }
 
     /// A pathological budget cannot loop forever: the walk floors at (1, 1) and leaves the final
@@ -707,7 +791,7 @@ mod daemon_patch_tests {
     #[test]
     fn the_walk_stops_at_a_single_tile_pair() {
         assert_eq!(
-            clamp_stage_to_shared_memory((4, 4, 4), (4, 2, 4), (32, 16), (4, 4), 1),
+            clamp_stage_to_shared_memory((4, 4, 4), (4, 2, 4), (32, 16), (4, 4, 4), 1, 1),
             (1, 1)
         );
     }

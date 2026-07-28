@@ -123,6 +123,10 @@ where
                             minimum_stage_count: 8,
                         }),
                     swizzled: tile_matmul.should_swizzle(&device_settings.client),
+                    // [daemon patch — see PATCH.md] this family declares 1 lhs / 2 rhs stages
+                    // (`num_stages() == (1, 2)`); the shared-memory clamp accounts the full
+                    // declared budget.
+                    num_stages: Some((1, 2)),
                     ..Default::default()
                 },
             )?,
