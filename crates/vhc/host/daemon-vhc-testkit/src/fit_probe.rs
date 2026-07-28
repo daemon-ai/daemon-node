@@ -50,6 +50,10 @@ struct TrainerGeometry {
 /// # Errors
 /// A human-readable failure when the config does not carry the trainer's geometry members or the
 /// directory cannot be written.
+// Plain local-fs writes to the **orchestrator-chosen** probe directory (gate/dev authoring — the
+// caller derives it under its own scratch root); never an attacker-influenced path, so
+// `ContainedRoot` containment adds nothing here. Same posture as the session harness observer.
+#[allow(clippy::disallowed_methods)]
 pub fn write_trainer_probe_dir(
     dir: &Path,
     module: &[u8],
