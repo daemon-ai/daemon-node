@@ -183,9 +183,14 @@ pub fn authorize_incumbent(
 ) -> Result<AuthorizedSeat, SeatLeaseError> {
     lease.authorize(trusted_bases, now_ms, skew_ms)?;
     // Supersession floor / explicit revocation: a stale claimant is dead once a higher fencing
-    // token (incarnation) exists, regardless of the registry.
+    // token (incarnation) exists, regardless of the registry. The floor is per base-identity
+    // ladder — the lease's own certifying base judges it (never a roster sibling's ladder).
     revocations
-        .judge(&lease.body.cert_scope(), &lease.body.claimant)
+        .judge(
+            &lease.body.cert_scope(),
+            &lease.body.claimant,
+            &lease.certificate.base_identity,
+        )
         .map_err(|_| SeatLeaseError::Expired {
             // A superseded/revoked lease is not authoritative; reuse the typed refusal surface
             // (the ledger's own error is folded to the seat vocabulary here).

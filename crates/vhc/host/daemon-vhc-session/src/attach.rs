@@ -176,17 +176,20 @@ impl CertCheck {
     /// revoked/superseded.
     fn judge(&self, scope: &CertScope, sender: &PeerId) -> Result<(), CertError> {
         let mut last = CertError::NoCertifiedChain;
-        let mut certified = false;
+        // The certifying base is retained for the revocation judgement: supersession ladders are
+        // per base identity, so the sender is judged against the ladder of the identity that
+        // certified it — never a roster sibling's.
+        let mut certified: Option<PeerId> = None;
         for base in &self.trusted_bases {
             match verify_certified_sender(scope, sender, base, &self.certs) {
                 Ok(()) => {
-                    certified = true;
+                    certified = Some(*base);
                     break;
                 }
                 Err(e) => last = e,
             }
         }
-        if !certified {
+        let Some(certifying_base) = certified else {
             // Diagnostic: which certs are present and how their scopes compare to the frame's.
             // A live session that refuses a peer frame without saying why is undebuggable.
             if tracing::enabled!(tracing::Level::DEBUG) {
@@ -222,8 +225,8 @@ impl CertCheck {
                 );
             }
             return Err(last);
-        }
-        self.revocations.judge(scope, sender)
+        };
+        self.revocations.judge(scope, sender, &certifying_base)
     }
 }
 

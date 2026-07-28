@@ -162,12 +162,20 @@ impl RunKeyRevocation {
     }
 }
 
-/// One `(run, role)` slot key of the ledger.
-type SlotKey = (Hash, String);
+/// One `(run, role, base identity)` slot key of the ledger.
+///
+/// The base identity is LOAD-BEARING: a role names a duty, not a seat. A run whose roster
+/// carries two trainers has two independent `(role = "trainer")` incarnation ladders — one per
+/// base identity — and each base may only supersede (or revoke) its OWN keys. A `(run, role)`
+/// key conflated them: the peer with the higher incarnation (a box that had churned more) set
+/// the floor for the whole role and every sibling's live key was refused as revoked. Observed
+/// live on the two-box WAN rung as a `CertRevoked` refusal stream against the slower-churning
+/// trainer.
+type SlotKey = (Hash, String, PeerId);
 
 /// A receiver's revocation state for a run: explicitly revoked keys (from ingested signed
 /// records, replay-protected) plus the **supersession floor** — the highest incarnation each
-/// `(run, role)` slot has been observed certified at. Explicit revocation is best-effort
+/// `(run, role, base)` slot has been observed certified at. Explicit revocation is best-effort
 /// delivery; the floor is the safety guarantee that holds under partition.
 #[derive(Debug, Default)]
 pub struct RevocationLedger {
@@ -200,7 +208,11 @@ impl RevocationLedger {
         if record.base_identity != *trusted_base {
             return Err(RevocationError::UntrustedBase);
         }
-        let slot = (record.body.run_id, record.body.role.clone());
+        let slot = (
+            record.body.run_id,
+            record.body.role.clone(),
+            record.base_identity,
+        );
         if let Some(&last) = self.last_sequence.get(&slot) {
             if record.body.sequence <= last {
                 return Err(RevocationError::StaleSequence {
@@ -220,21 +232,36 @@ impl RevocationLedger {
     }
 
     /// Observe a certified incarnation for a slot (called when a certificate is accepted into a
-    /// store): the supersession floor advances to the highest incarnation seen — implicit
-    /// revocation of every lower incarnation, enforced even when no explicit record arrives.
-    pub fn observe_certified_incarnation(&mut self, run_id: Hash, role: &str, instance: u64) {
-        let slot = (run_id, role.to_string());
+    /// store): the base's supersession floor advances to the highest incarnation seen — implicit
+    /// revocation of every lower incarnation OF THAT BASE, enforced even when no explicit record
+    /// arrives. `base` is the certifying base identity: supersession is per identity ladder,
+    /// never across roster siblings sharing the role (see [`SlotKey`]).
+    pub fn observe_certified_incarnation(
+        &mut self,
+        run_id: Hash,
+        role: &str,
+        base: PeerId,
+        instance: u64,
+    ) {
+        let slot = (run_id, role.to_string(), base);
         let floor = self.incarnation_floor.entry(slot).or_insert(instance);
         *floor = (*floor).max(instance);
     }
 
     /// Judge a certified sender against the ledger: refused typed if the key was explicitly
-    /// revoked for its `(run, role, instance)`, or if its incarnation is below the slot's
-    /// supersession floor (a higher incarnation wins, with or without an explicit record).
+    /// revoked for its `(run, role, instance)`, or if its incarnation is below ITS OWN base's
+    /// supersession floor (a higher incarnation of the same identity wins, with or without an
+    /// explicit record). `base` is the base identity whose certificate authenticated the sender
+    /// — a sibling's ladder never judges this sender (see [`SlotKey`]).
     ///
     /// # Errors
     /// [`CertError::Revoked`] when the sender's key is dead by either rule.
-    pub fn judge(&self, scope: &CertScope, sender: &PeerId) -> Result<(), CertError> {
+    pub fn judge(
+        &self,
+        scope: &CertScope,
+        sender: &PeerId,
+        base: &PeerId,
+    ) -> Result<(), CertError> {
         if self
             .revoked
             .contains(&(scope.run_id, scope.role.clone(), scope.instance, *sender))
@@ -243,7 +270,7 @@ impl RevocationLedger {
         }
         if let Some(&floor) = self
             .incarnation_floor
-            .get(&(scope.run_id, scope.role.clone()))
+            .get(&(scope.run_id, scope.role.clone(), *base))
         {
             if scope.instance < floor {
                 return Err(CertError::Revoked);
@@ -252,12 +279,14 @@ impl RevocationLedger {
         Ok(())
     }
 
-    /// Observe every certificate in a store (their scopes advance the supersession floor).
+    /// Observe every certificate in a store (their scopes advance their base's supersession
+    /// floor).
     pub fn observe_certificates(&mut self, certs: &[RunKeyCertificate]) {
         for cert in certs {
             self.observe_certified_incarnation(
                 cert.body.scope.run_id,
                 &cert.body.scope.role,
+                cert.base_identity,
                 cert.body.scope.instance,
             );
         }
@@ -321,11 +350,14 @@ mod tests {
         let mut ledger = RevocationLedger::new();
 
         // Before ingestion the key is live.
-        assert!(ledger.judge(&scope(3), &victim).is_ok());
+        assert!(ledger.judge(&scope(3), &victim, &base_id).is_ok());
 
         let rec = RunKeyRevocation::issue(&base, run(1), "trainer", 3, victim, 1).unwrap();
         ledger.ingest(&rec, &base_id).unwrap();
-        assert_eq!(ledger.judge(&scope(3), &victim), Err(CertError::Revoked));
+        assert_eq!(
+            ledger.judge(&scope(3), &victim, &base_id),
+            Err(CertError::Revoked)
+        );
 
         // Replay of the same record (same sequence) is refused typed — no state change.
         assert_eq!(
@@ -357,21 +389,48 @@ mod tests {
             Err(RevocationError::UntrustedBase)
         );
         // The refused record changed nothing: the key is still live.
-        assert!(ledger.judge(&scope(3), &victim).is_ok());
+        assert!(ledger.judge(&scope(3), &victim, &trusted).is_ok());
     }
 
     #[test]
     fn supersession_fences_lower_incarnations_without_an_explicit_record() {
         // Under partition a peer may never see the explicit revocation — observing the HIGHER
         // incarnation's certificate is enough: the floor advances and the old key is refused.
+        let base_id = peer_id(&key(1));
         let old_key = peer_id(&key(2));
         let mut ledger = RevocationLedger::new();
-        ledger.observe_certified_incarnation(run(1), "trainer", 4);
-        assert_eq!(ledger.judge(&scope(3), &old_key), Err(CertError::Revoked));
+        ledger.observe_certified_incarnation(run(1), "trainer", base_id, 4);
+        assert_eq!(
+            ledger.judge(&scope(3), &old_key, &base_id),
+            Err(CertError::Revoked)
+        );
         // The current incarnation stays live.
-        assert!(ledger.judge(&scope(4), &peer_id(&key(3))).is_ok());
+        assert!(ledger.judge(&scope(4), &peer_id(&key(3)), &base_id).is_ok());
         // The floor never rolls back.
-        ledger.observe_certified_incarnation(run(1), "trainer", 2);
-        assert_eq!(ledger.judge(&scope(3), &old_key), Err(CertError::Revoked));
+        ledger.observe_certified_incarnation(run(1), "trainer", base_id, 2);
+        assert_eq!(
+            ledger.judge(&scope(3), &old_key, &base_id),
+            Err(CertError::Revoked)
+        );
+    }
+
+    #[test]
+    fn a_siblings_ladder_never_supersedes_this_base() {
+        // Two roster seats share the role "trainer" but are DIFFERENT base identities: one
+        // seat churning to a high incarnation must not fence the other's live low incarnation.
+        // (The regression: a (run, role)-keyed floor let the churnier trainer revoke its
+        // sibling — observed live as a CertRevoked stream on the two-box WAN rung.)
+        let churny = peer_id(&key(1));
+        let steady = peer_id(&key(2));
+        let steady_key = peer_id(&key(3));
+        let mut ledger = RevocationLedger::new();
+        ledger.observe_certified_incarnation(run(1), "trainer", churny, 7);
+        // The steady sibling at incarnation 1 stays live — its own ladder has no higher rung.
+        assert!(ledger.judge(&scope(1), &steady_key, &steady).is_ok());
+        // The churny base's own old rungs are fenced as before.
+        assert_eq!(
+            ledger.judge(&scope(1), &steady_key, &churny),
+            Err(CertError::Revoked)
+        );
     }
 }
