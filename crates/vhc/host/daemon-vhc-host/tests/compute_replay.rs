@@ -155,7 +155,9 @@ impl RunnerChannel for RecChannel {
     type Client = RecClient;
     type FloatElem = f32;
     type IntElem = i64;
-    type BoolElem = bool;
+    // Mirrors the guest SDK channel (`daemon-vhc-sdk-compute`): bool rides the wire as u32
+    // storage — WGSL forbids native bool in the storage address space (cubecl#1274).
+    type BoolElem = u32;
 
     fn name(_device: &NdArrayDevice) -> String {
         "compute@2-recording".to_string()
@@ -281,6 +283,79 @@ fn compute_replay_degenerate_ndarray_is_bit_exact() {
             "replay must reconstruct the native gradient bit-exactly"
         );
     }
+}
+
+/// Record the trainer's mask/compare path — `arange` → `greater` → `mask_fill` → `gather`, the
+/// exact shape `tiny-llama`'s `causal_mask` + `target_logprobs` submit — and return the journal
+/// plus the gathered tensor's export `TensorIr`.
+fn record_mask_journal() -> (Vec<ComputeStep>, Vec<u8>) {
+    use burn::tensor::Int;
+
+    rec_reset();
+    let dev = NdArrayDevice::Cpu;
+    let s = 4usize;
+    // The causal mask, built on device from one arange row (guest `model.rs::causal_mask`).
+    let pos = Tensor::<RecBackend, 1, Int>::arange(0..s as i64, &dev);
+    let cols = pos.clone().reshape([1, s]).expand([s, s]);
+    let rows = pos.reshape([s, 1]).expand([s, s]);
+    let mask = Tensor::<RecBackend, 2>::zeros([s, s], &dev).mask_fill(cols.greater(rows), -1.0e30);
+    // The loss's indexed selection (guest `model.rs::target_logprobs`): a gather over
+    // guest-authored ids.
+    let ids =
+        Tensor::<RecBackend, 1, Int>::from_data(TensorData::new(vec![2i64, 0, 3, 1], [s]), &dev)
+            .reshape([s, 1]);
+    let picked = mask.gather(1, ids);
+    let ir: TensorIr = picked.into_primitive().tensor().into_ir();
+    let export = ser(&ir);
+    (rec_take(), export)
+}
+
+#[test]
+fn the_mask_path_rides_the_wire_without_native_bool_storage() {
+    // The D1 regression net (backend-lane audit 2026-07-28): the guest channel's `BoolElem` chose
+    // native bool, so the comparison/mask kernels carried `DType::Bool(Native)` across the
+    // `compute@2` wire and every WGSL host lane (DX12, Metal) refused `var<storage> array<bool>`
+    // at shader validation (WGSL: bool is not host-shareable; cubecl#1274). The channel now pins
+    // u32 bool storage; this walks every dtype the mask path actually puts on the wire.
+    use burn_backend::BoolStore;
+
+    let (journal, export_ir) = record_mask_journal();
+
+    let mut bool_seen = false;
+    let mut check = |dtype: DType, what: &str| {
+        if let DType::Bool(store) = dtype {
+            bool_seen = true;
+            assert!(
+                !matches!(store, BoolStore::Native),
+                "{what} carries native-bool storage, which WGSL host lanes refuse \
+                 (bool is not host-shareable in the storage address space)"
+            );
+        }
+    };
+    for step in &journal {
+        match step {
+            ComputeStep::Import { data, .. } => {
+                let data: BackendTensorData =
+                    ciborium::from_reader(&data[..]).expect("imported TensorData decodes");
+                check(data.dtype, "an imported tensor");
+            }
+            ComputeStep::Op(op) => {
+                let op: OperationIr = ciborium::from_reader(&op[..]).expect("op-blob decodes");
+                for node in op.nodes() {
+                    check(node.dtype, "an op tensor");
+                }
+            }
+        }
+    }
+    assert!(
+        bool_seen,
+        "the mask workload must put a bool tensor on the wire, or this test guards nothing"
+    );
+
+    // And the u32-bool journal still executes on the production runner: the gathered values are
+    // the mask's, bit-exact (row i, col j: 0.0 on/below the diagonal, -1.0e30 above).
+    let vals = replay_on::<HostReal>(&journal, &export_ir, NdArrayDevice::Cpu);
+    assert_eq!(vals, vec![-1.0e30, 0.0, -1.0e30, 0.0]);
 }
 
 /// The wgpu cross-backend tier — hardware-gated (the same convention as `parity`'s wgpu tier:

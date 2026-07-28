@@ -168,7 +168,13 @@ impl RunnerChannel for ComputeChannel {
     type Client = ComputeClient;
     type FloatElem = f32;
     type IntElem = i64;
-    type BoolElem = bool;
+    // Bool tensors ride the `burn-ir` wire as u32 storage, never native bool: WGSL forbids `bool`
+    // in the `storage` address space (not host-shareable), so a `DType::Bool(Native)` in the IR
+    // makes every WGSL host lane (DX12, Metal) refuse the cmp/mask kernels at shader validation
+    // (tracel-ai/cubecl#1274 — codegen will not paper over it; burn's own wgpu aliases use
+    // u32/u8). u32 is legal on every wgpu lane and matches burn's `Wgpu` alias. The values are
+    // 0/1 either way — no arithmetic changes.
+    type BoolElem = u32;
 
     fn name(_device: &ComputeDevice) -> String {
         "compute@2(HostBackend)".to_string()

@@ -1324,7 +1324,9 @@ mod gpu {
         type Client = RecClient;
         type FloatElem = f32;
         type IntElem = i64;
-        type BoolElem = bool;
+        // Mirrors the guest SDK channel (`daemon-vhc-sdk-compute`): bool rides the wire as u32
+        // storage — WGSL forbids native bool in the storage address space (cubecl#1274).
+        type BoolElem = u32;
 
         fn name(_device: &NdArrayDevice) -> String {
             "compute@2-recording".to_string()
