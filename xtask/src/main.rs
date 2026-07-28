@@ -2046,8 +2046,11 @@ fn parse_cargo_lock(text: &str) -> anyhow::Result<std::collections::BTreeMap<Str
     Ok(packages)
 }
 
-/// The package names whose lock identity differs between two parsed locks (added, removed, or
-/// re-pinned). These are the only packages a `Cargo.lock` change can act through.
+/// The package names whose lock entry differs between two parsed locks: added, removed,
+/// re-pinned, or with changed dependency EDGES (an edge-only delta is always driven by a
+/// manifest change that seeds the cone anyway, but flagging the parent here removes the
+/// reliance on that coupling). These are the only packages a `Cargo.lock` change can act
+/// through.
 fn lock_changed_names(
     old: &std::collections::BTreeMap<String, LockPackage>,
     new: &std::collections::BTreeMap<String, LockPackage>,
@@ -2055,7 +2058,7 @@ fn lock_changed_names(
     let mut changed = std::collections::BTreeSet::new();
     for (name, entry) in new {
         match old.get(name) {
-            Some(prev) if prev.meta == entry.meta => {}
+            Some(prev) if prev.meta == entry.meta && prev.deps == entry.deps => {}
             _ => {
                 changed.insert(name.clone());
             }
@@ -6083,6 +6086,23 @@ version = "0.1.0"
             ["ext"]
         );
         assert!(lock_changed_names(&old, &old).is_empty());
+    }
+
+    #[test]
+    fn an_edge_only_delta_flags_the_parent_package() {
+        let old = parse_cargo_lock(OLD_LOCK).expect("parse old");
+        // `other` gains a dependency edge on `ext` — no pin changes anywhere.
+        let edged = OLD_LOCK.replace(
+            "name = \"other\"\nversion = \"0.1.0\"\n",
+            "name = \"other\"\nversion = \"0.1.0\"\ndependencies = [\n \"ext\",\n]\n",
+        );
+        let new = parse_cargo_lock(&edged).expect("parse edged");
+        assert_eq!(
+            lock_changed_names(&old, &new)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            ["other"]
+        );
     }
 
     fn memo_over(lock_text: &str, index: Vec<(String, String)>) -> SuiteMemo {
