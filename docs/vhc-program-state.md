@@ -154,12 +154,26 @@ None of these blocks C0 or C1.
   RED on both 32 GiB seats for real (5090 Vulkan OOM, M4 unified-memory grind); at 512 it is
   4,714,647,800 B and the estimate 20,041,849,456 B, under the M4's 26,800,553,984 B usable
   supply with 25 % margin. Powers of two only: a 2 MiB corpus shard holds whole sequences.
-- **This box holds a GREEN verdict at the REDUCED geometry on its Vulkan lane**
-  (Radeon 8060S/RADV, wgpu-spirv): round 0 committed (30 real steps) in 155 s, measured peak
-  43,319,296 B guest linear memory under the 141,757,180 B composed budget. Evidence:
-  `~/experiments/ceremony-artifacts/fit-probe-20260728-platform-vulkan-geometry512/`. The
-  frozen-geometry predecessor evidence stays in `…-platform-vulkan-spirv/` (GREEN on this box)
-  and the RED seats' dirs — they are the capacity evidence the shrink answers.
+- **ALL THREE SEATS HOLD GREEN VERDICTS AT THE REDUCED GEOMETRY, ON THEIR NATIVE LANES**
+  (2026-07-28 ~17:45). One module (`9ab98f90…`), one plan (`47898e5b…`), one grant
+  (`741671c4…`), one budget (141,757,180 B); each verdict keyed by the seat's own backend
+  revision. Measured peak guest linear memory is bit-identical on all three: 43,319,296 B.
+  - Strix Halo, Vulkan+SPIR-V (RADV): round 0 (30 real steps) committed in 155 s; key
+    `0764ec9d…`; `~/experiments/ceremony-artifacts/fit-probe-20260728-platform-vulkan-geometry512/`.
+  - Windows 5090, **native wgpu/DX12**: committed at +266 s; key `1f3827c3…`;
+    `…-windows-dx12-geometry512/`.
+  - M4 Mac, **native wgpu/Metal (WGSL→naga→MSL)**: committed at +261 s; key `cdf2a823…`;
+    `…-m4-metal-geometry512/`.
+  The frozen-geometry predecessor evidence stays in `…-platform-vulkan-spirv/` (GREEN) and
+  the RED seats' dirs — the capacity evidence the shrink answers.
+- **Native-lane compile defects: all three fixed and hardware-proven** (ceremony requirement —
+  Vulkan passthrough is a production fallback, not the ceremony answer). D1 bool-storage
+  (`BoolElem = u32` in the compute SDK), D2 i64-on-DX12 (`IntElem = i32` + the DX12 profile
+  no longer claims i64 — refusal typed at admission), D3 threadgroup-memory overrun (vendored
+  `cubek-matmul` clamp budgets the full declared shared memory incl. the partitioned writer;
+  selector tests pin it). Proof: thirty clean slices of native DX12 training at the old
+  geometry (capacity-only failure: DXGI device removal during buffer creation), zero refusals
+  in the native-Metal log — then the reduced-geometry GREENs above.
 - Two real device-lane defects the probe surfaced, both fixed and gate-proven:
   1. cubecl's WGSL lane emits `var<storage> array<bool>` buffers (cmp/mask kernels), which WGSL
      forbids as host-shareable — every such kernel was refused on RADV (`ComputeFault`). Fixed
@@ -173,9 +187,9 @@ None of these blocks C0 or C1.
      import entries — pure-wasm spins still die within two budgets, fuel/op budgets untouched
      (ABI §5.6 amended). Also: wasmtime reports the epoch trap as `interrupt`, which the
      classifier misfiled as `BadModule`; now `BudgetEpoch`.
-- C0: green and pinned. C1: software delta green; two-box run blocked on hardware (§8.1).
-  Fit probes: green on this box's ceremony lane; M4/Windows probes blocked on the same
-  reachability (§8.1). Freeze/C2: not reached.
+- C0: green and pinned. C1: software delta green; the physical two-box WAN run is the next
+  action (§8.1). Fit probes: GREEN on all three seats, native lanes, reduced geometry.
+  Freeze/C2: not reached — the only rung left.
 - Program archive: frozen and locked read-only 2026-07-27.
 
 ## 8. Fleet roster and next actions
@@ -192,10 +206,8 @@ a session then declared reachable boxes unreachable — access facts live here, 
 
 All four answer ssh (verified 2026-07-28). Next actions (in order):
 
-1. Fit probes on the M4 (Metal) and Windows 5090 (DX12) at the REDUCED ceremony geometry
-   (seq 512): `vhc-provision-dev-profile` then `vhc-fit-probe` per box (on-box for the Mac;
-   authored here + driven over ssh for Windows). Native lanes (wgpu/Metal, wgpu/DX12) — the
-   compile layer is already proven on hardware at tip `23880e4c`.
+1. ~~Fit probes on the M4 and 5090 at the reduced geometry~~ DONE — all three seats GREEN
+   on their native lanes (§7).
 2. Run C1 on two boxes: start the relay per the runbook §4.2, point both nodes' `[vhc.iroh]`
    at it with WAN `advertise_ips`, drive over `ssh → daemon-cli`; fix what it surfaces. The
    transport/churn semantics are already gate-proven; this run is about real WAN and real
