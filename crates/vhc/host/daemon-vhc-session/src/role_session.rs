@@ -1475,10 +1475,16 @@ async fn service_op(
                 }
                 OpOutcome::PutDone
             }
-            Err(e) => OpOutcome::Failed {
-                code: daemon_vhc_abi::COMP_ERR_STORE_REFUSED,
-                detail: format!("payload put: {e}"),
-            },
+            Err(e) => {
+                // Voiced HOST-SIDE too: the failure detail otherwise rides only the completion
+                // into the guest, and a fail-loud guest surfaces just its panic site — the
+                // transport cause would be unrecoverable from the node log.
+                tracing::warn!(error = %e, "payload put failed; failing the module op");
+                OpOutcome::Failed {
+                    code: daemon_vhc_abi::COMP_ERR_STORE_REFUSED,
+                    detail: format!("payload put: {e}"),
+                }
+            }
         },
         OpRequest::PayloadGet { hash } => {
             match providers
@@ -1487,10 +1493,13 @@ async fn service_op(
                 .await
             {
                 Ok(bytes) => OpOutcome::GetDone { bytes },
-                Err(e) => OpOutcome::Failed {
-                    code: daemon_vhc_abi::COMP_ERR_STORE_REFUSED,
-                    detail: format!("payload get: {e}"),
-                },
+                Err(e) => {
+                    tracing::warn!(error = %e, "payload get failed; failing the module op");
+                    OpOutcome::Failed {
+                        code: daemon_vhc_abi::COMP_ERR_STORE_REFUSED,
+                        detail: format!("payload get: {e}"),
+                    }
+                }
             }
         }
         OpRequest::ArtifactFetch { hash, .. } => {

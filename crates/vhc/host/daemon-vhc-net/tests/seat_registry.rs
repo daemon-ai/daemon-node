@@ -359,11 +359,23 @@ async fn a_fenced_stale_claimant_is_refused_by_registry_and_peers() {
     ledger.observe_certificates(std::slice::from_ref(&l1.certificate));
     let stale_scope = l0.body.cert_scope();
     assert!(
-        ledger.judge(&stale_scope, &l0.body.claimant).is_err(),
+        ledger
+            .judge(
+                &stale_scope,
+                &l0.body.claimant,
+                &l0.certificate.base_identity
+            )
+            .is_err(),
         "the superseded incarnation is below the supersession floor"
     );
     let live_scope = l1.body.cert_scope();
-    assert!(ledger.judge(&live_scope, &l1.body.claimant).is_ok());
+    assert!(ledger
+        .judge(
+            &live_scope,
+            &l1.body.claimant,
+            &l1.certificate.base_identity
+        )
+        .is_ok());
     // The new lease itself authorizes; the fenced one still carries a chain-valid cert — the
     // floor, not the chain, is what kills it (supersession is the safety floor).
     assert!(l1.authorize(&trusted, 40_000, DEFAULT_SEAT_SKEW_MS).is_ok());

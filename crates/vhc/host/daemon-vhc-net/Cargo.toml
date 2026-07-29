@@ -35,11 +35,11 @@ ciborium = { workspace = true }
 iroh = { workspace = true, optional = true }
 iroh-gossip = { workspace = true, optional = true }
 iroh-relay = { workspace = true, optional = true }
-# Mesh-formation observability on the iroh plane (NeighborUp/Down markers — the multi-process
-# G3 gate's black-box sufficiency signal that the second transport actually formed QUIC
-# connections). OPTIONAL — pulled in only with the `iroh` feature; iroh itself already links
-# tracing, so this adds no new tree to that build.
-tracing = { workspace = true, optional = true }
+# Mesh-formation observability on the iroh plane (NeighborUp/Down markers) plus the payload
+# plane's put-retry voice (`r2_store`, always compiled): a WAN put failure the module treats as
+# fatal must be visible host-side. Non-optional — the crate's every consumer already links
+# tracing, so this adds no new tree to any build.
+tracing = { workspace = true }
 # `StreamExt::next` over the `iroh_gossip` `GossipReceiver` event stream (B2) + the `ws` client's
 # `WebSocketStream` split/sink/stream (A1). OPTIONAL — pulled in only with the `iroh` or `ws`
 # feature; the default (no-iroh, no-ws) build never compiles it.
@@ -79,7 +79,7 @@ daemon-vhc-sdk-consensus = { workspace = true }
 # behind this feature; `iroh`/`iroh-gossip`/`futures` are referenced there. The self-hosted relay is
 # an external runtime binary (`iroh-relay --dev`, devShell), so the `iroh-relay` crate itself stays
 # unreferenced (kept declared for a future in-process-relay path; machete-ignored below).
-iroh = ["dep:iroh", "dep:iroh-gossip", "dep:iroh-relay", "dep:futures", "dep:tracing"]
+iroh = ["dep:iroh", "dep:iroh-gossip", "dep:iroh-relay", "dep:futures"]
 # The node WS coordinator client (A1, spec §11.2) as a `ControlPlane`: connect to the
 # RunCoordinatorDO `GET {base}/runs/:id/ws` surface over `wss://`, canonical-CBOR `SignedMessage`
 # frames, reconnect+backoff+resubscribe, and dual-plane (WS + iroh gossip) dedupe via `Deduper`.

@@ -127,6 +127,35 @@ impl<P: PresignClient> R2Store<P> {
         self.presign.presign(&self.run, &req).await
     }
 
+    /// One attempt of a content-addressed put: presign (fresh each attempt) + presigned `PUT`.
+    async fn put_content_once(&self, hash: &ContentHash, bytes: &[u8]) -> Result<(), VhcNetError> {
+        let req = PresignRequest::artifact(PresignOp::Put, content_rel(hash));
+        let resp = self.presign.presign(&self.run, &req).await?;
+        let egress_resp = if resp.headers.is_empty() {
+            self.egress
+                .put(&resp.url, bytes.to_vec(), Redirects::None)
+                .await
+                .map_err(transport)?
+        } else {
+            let mut ereq = EgressRequest::put(&resp.url, bytes.to_vec());
+            for (name, value) in &resp.headers {
+                ereq = ereq.header(name, value);
+            }
+            self.egress
+                .execute(ereq, Redirects::None)
+                .await
+                .map_err(transport)?
+        };
+        let status = egress_resp.status();
+        if !status.is_success() {
+            return Err(VhcNetError::Transport(format!(
+                "presigned content PUT {} returned {status}",
+                resp.url
+            )));
+        }
+        Ok(())
+    }
+
     /// Issue a presigned `GET`, returning `Some(bytes)` on 2xx, `None` on a 404/403 miss, or a hard
     /// transport error otherwise. Signed headers (if any) are replayed verbatim.
     async fn get_object(&self, resp: &PresignResponse) -> Result<Option<Vec<u8>>, VhcNetError> {
@@ -235,31 +264,31 @@ fn content_rel(hash: &ContentHash) -> String {
 impl<P: PresignClient> crate::transport::ContentStore for R2Store<P> {
     async fn put_content(&self, bytes: &[u8]) -> Result<ContentHash, VhcNetError> {
         let hash = blake3_hash(bytes);
-        let req = PresignRequest::artifact(PresignOp::Put, content_rel(&hash));
-        let resp = self.presign.presign(&self.run, &req).await?;
-        let egress_resp = if resp.headers.is_empty() {
-            self.egress
-                .put(&resp.url, bytes.to_vec(), Redirects::None)
-                .await
-                .map_err(transport)?
-        } else {
-            let mut ereq = EgressRequest::put(&resp.url, bytes.to_vec());
-            for (name, value) in &resp.headers {
-                ereq = ereq.header(name, value);
+        // A content-addressed put is idempotent by construction, and this is the WAN payload
+        // plane: a transient egress fault (reset upload, gateway 5xx) must not surface as a hard
+        // completion failure — a trainer treats a failed commit put as fatal (fail loud) and one
+        // dropped multi-hundred-MB upload would kill an otherwise healthy round. Bounded retries
+        // with a fresh presign per attempt (the previous URL may have aged out during a slow
+        // upload); a non-transient refusal (a 4xx status) still fails fast and loud.
+        let mut last: Option<VhcNetError> = None;
+        for attempt in 0..PUT_ATTEMPTS {
+            if attempt > 0 {
+                let backoff = PUT_BACKOFF_BASE * 2u32.pow(attempt - 1);
+                tracing::warn!(
+                    hash = %hash.to_hex(),
+                    attempt,
+                    error = %last.as_ref().map_or_else(String::new, ToString::to_string),
+                    "content put failed transiently; retrying after {backoff:?}"
+                );
+                tokio::time::sleep(backoff).await;
             }
-            self.egress
-                .execute(ereq, Redirects::None)
-                .await
-                .map_err(transport)?
-        };
-        let status = egress_resp.status();
-        if !status.is_success() {
-            return Err(VhcNetError::Transport(format!(
-                "presigned content PUT {} returned {status}",
-                resp.url
-            )));
+            match self.put_content_once(&hash, bytes).await {
+                Ok(()) => return Ok(hash),
+                Err(e) if is_transient(&e) => last = Some(e),
+                Err(e) => return Err(e),
+            }
         }
-        Ok(hash)
+        Err(last.expect("at least one attempt ran"))
     }
 
     async fn get_content(&self, hash: &ContentHash) -> Result<Vec<u8>, VhcNetError> {
@@ -276,6 +305,22 @@ impl<P: PresignClient> crate::transport::ContentStore for R2Store<P> {
         // keyed bytes verbatim — a plain-hash gate here would wrongly reject every chunk-addressed
         // range fetch (the store is untrusted by construction; the pump is the arbiter).
         Ok(bytes)
+    }
+}
+
+/// How many times a content put is attempted before its transport fault becomes the caller's.
+const PUT_ATTEMPTS: u32 = 4;
+
+/// The first retry backoff; doubles per attempt (2 s, 4 s, 8 s).
+const PUT_BACKOFF_BASE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Whether a put fault is worth retrying: transport-class faults (egress errors, gateway 5xx)
+/// are; a 4xx in the status text is an authoritative refusal (bad signature, missing object
+/// prefix, over-size) that retrying cannot change.
+fn is_transient(e: &VhcNetError) -> bool {
+    match e {
+        VhcNetError::Transport(msg) => !msg.contains("returned 4"),
+        _ => false,
     }
 }
 
