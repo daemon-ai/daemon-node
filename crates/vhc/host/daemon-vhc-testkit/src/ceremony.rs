@@ -995,9 +995,13 @@ fn ceremony_coordinator_config(spec: &CeremonyGenesisSpec<'_>) -> Result<Value, 
         },
         tick_period_ms: CEREMONY_TICK_PERIOD_MS,
         stop: StopCondition::Rounds(spec.timers.stop_rounds),
-        // The fleet coordinator does NOT availability-verify commitments against the content
-        // plane (the guest default): an owner decision, not an authoring one.
-        verify_availability: false,
+        // The fleet coordinator availability-verifies each commitment against the content plane
+        // (coordinator-as-storage-client, §6.4 I6): its host-verified `payload_get` mints the
+        // StorageReceipt that is the round's availability evidence. This is the only evidence
+        // path the fleet actually has — no shipped trainer module witnesses (`Attestation` is
+        // engine vocabulary only), so with this false every round finalizes on the witness
+        // timeout with an empty committed set and the roster bleeds out through k-absences.
+        verify_availability: true,
     })
 }
 
