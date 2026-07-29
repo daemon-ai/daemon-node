@@ -26,8 +26,19 @@ use daemon_vhc_proto::{
     MAX_ROSTER_ENTRIES,
 };
 
-/// One roster slot per `(run label, endpoint id)` key — the registry's storage granularity.
-type SlotKey = (String, IrohId);
+/// One roster slot per `(run label, endpoint id, role)` key — the registry's storage
+/// granularity.
+///
+/// The ROLE is load-bearing: a node's single iroh endpoint is shared by its co-located role
+/// instances (a coordinator and its co-trainer), and each role's record carries the freshness of
+/// its OWN incarnation ladder. An endpoint-only slot compared those ladders against each other:
+/// whichever sibling had churned higher owned the slot, and the other's publish was refused
+/// `RejectedStale` forever — observed live on the two-box WAN rung as a node that could never
+/// rejoin its own run after a restart (the coordinator's low ladder against the trainer's high
+/// stored record). Readers already group records by `(role, base identity)`
+/// ([`RosterRecord::group_key`]); one slot per role is that same projection, and the normative
+/// fold is untouched — freshness now only ever compares within one ladder.
+type SlotKey = (String, IrohId, String);
 
 /// The in-memory roster registry fixture. Interior mutability so one instance can back
 /// concurrent publishers and an HTTP responder simultaneously.
@@ -45,12 +56,16 @@ impl FakeRosterRegistry {
 
     /// Publish (upsert) a roster record for `run` (the `PUT {base}/runs/:id/roster` semantics):
     /// the fold's monotonic freshness upsert against the slot keyed by the record's
-    /// `endpoint_id`, plus the per-run entry cap for a NEW entry key.
+    /// `(endpoint_id, role)`, plus the per-run entry cap for a NEW entry key.
     pub fn publish(&self, run: &str, record: &RosterRecord) -> RosterMutationResponse {
         let mut slots = self.slots.lock().expect("roster slots mutex");
-        let key = (run.to_string(), record.body.endpoint_id);
+        let key = (
+            run.to_string(),
+            record.body.endpoint_id,
+            record.body.role.clone(),
+        );
         if !slots.contains_key(&key) {
-            let run_entries = slots.keys().filter(|(r, _)| r == run).count();
+            let run_entries = slots.keys().filter(|(r, _, _)| r == run).count();
             if run_entries >= MAX_ROSTER_ENTRIES {
                 return RosterMutationResponse {
                     decision: RosterDecision::RejectedStructural {
@@ -76,7 +91,7 @@ impl FakeRosterRegistry {
         RosterSnapshot {
             entries: slots
                 .iter()
-                .filter(|((r, _), _)| r == run)
+                .filter(|((r, _, _), _)| r == run)
                 .filter_map(|(_, slot)| slot.record.clone())
                 .collect(),
         }
