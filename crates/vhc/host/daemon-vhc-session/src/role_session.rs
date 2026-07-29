@@ -1446,6 +1446,7 @@ async fn service_op(
                     // idempotent, so family chunks unchanged since a prior slot upload NOTHING
                     // (skip-on-present) — the amortized remote cost is the changed chunks + the
                     // small document, not the whole family every slot.
+                    let mut chunks_durable = true;
                     if let Ok(capture) = decode_snapshot_doc(&bytes) {
                         let mut referenced: Vec<[u8; 32]> = Vec::new();
                         for section in &capture.sections {
@@ -1454,8 +1455,23 @@ async fn service_op(
                             {
                                 referenced.push(fref.fold.0);
                                 if let Some(chunks) = pump.sealed_fold_chunks(&fref.fold.0) {
-                                    for (_h, chunk) in &chunks {
-                                        let _ = providers.artifacts.put_content(chunk).await;
+                                    for (h, chunk) in &chunks {
+                                        if let Err(e) = providers.artifacts.put_content(chunk).await
+                                        {
+                                            // A checkpoint whose chunks are not durable is
+                                            // POISON: announcing it hands every restoring peer
+                                            // a pointer to a miss it treats as fatal (observed
+                                            // live — both trainers died at the restore fetch).
+                                            // The document put succeeded, but the pointer is
+                                            // only announced when every referenced chunk is.
+                                            tracing::warn!(
+                                                chunk = %h.to_hex(),
+                                                error = %e,
+                                                "live checkpoint chunk put failed; \
+                                                 withholding the checkpoint announcement"
+                                            );
+                                            chunks_durable = false;
+                                        }
                                     }
                                 }
                             }
@@ -1464,14 +1480,16 @@ async fn service_op(
                         // C6); a superseded checkpoint's folds re-enter ordinary retention.
                         pump.repin_checkpoint(&referenced);
                     }
-                    let hash = hash.to_hex();
-                    let _ = events.send(Event::CheckpointPublished {
-                        round,
-                        hash: hash.clone(),
-                        location: format!("payload/{hash}"),
-                        generation,
-                        kind: "live".into(),
-                    });
+                    if chunks_durable {
+                        let hash = hash.to_hex();
+                        let _ = events.send(Event::CheckpointPublished {
+                            round,
+                            hash: hash.clone(),
+                            location: format!("payload/{hash}"),
+                            generation,
+                            kind: "live".into(),
+                        });
+                    }
                 }
                 OpOutcome::PutDone
             }
