@@ -515,18 +515,36 @@ impl VhcService {
             Some(me) => {
                 tokio::spawn(async move {
                     let mut terminated = false;
+                    // Whether THIS instance's session has spoken (any generation-matching
+                    // RunPhase). Before that, the child holds no session: a typed worker error
+                    // (e.g. an assess/join refusal) is the join transaction FAILING, and the
+                    // session's own terminal event will never come — the pump synthesizes it.
+                    // After it, errors are informational; termination arrives as RunTerminated.
+                    let mut sessioned = false;
                     while let Some(ev) = rx.recv().await {
-                        if let (
-                            Some((run, generation)),
-                            protocol::Event::RunTerminated {
-                                run_id,
-                                generation: gen,
-                                ..
-                            },
-                        ) = (&instance, &ev)
-                        {
-                            if run_id == run && gen == generation {
-                                terminated = true;
+                        if let Some((run, generation)) = &instance {
+                            match &ev {
+                                protocol::Event::RunPhase {
+                                    run_id,
+                                    generation: gen,
+                                    ..
+                                } if run_id == run && gen == generation => {
+                                    sessioned = true;
+                                }
+                                protocol::Event::RunTerminated {
+                                    run_id,
+                                    generation: gen,
+                                    ..
+                                } if run_id == run && gen == generation => {
+                                    terminated = true;
+                                }
+                                protocol::Event::Error { detail, .. } if !sessioned => {
+                                    let _ = me.handle_worker_event(&ev);
+                                    let _ = me.handle_pre_session_refusal(run, *generation, detail);
+                                    terminated = true;
+                                    break;
+                                }
+                                _ => {}
                             }
                         }
                         // Best-effort fan-out: a persist error never stalls the pump (mirrors the
@@ -556,17 +574,20 @@ impl VhcService {
     }
 
     /// Start the service: **no-op when disabled** (the worker is never spawned). When enabled,
-    /// re-issue `JoinRun` for every persisted active join-intent — durable-intent re-convergence, so
-    /// a restart rejoins without app involvement (§10.3). Returns the number of runs re-joined.
+    /// re-converge every persisted active join-intent through the ONE join transaction
+    /// ([`Self::reconverge`]) — durable-intent re-convergence, so a restart rejoins without app
+    /// involvement (§10.3). Returns the number of runs whose transaction was re-dispatched.
     ///
-    /// Re-convergence is also the arbiter's restart reconciliation for this supervision model:
-    /// the children died with the node (stdio cut), so the fresh ledger is re-charged exactly by
-    /// re-admitting each persisted intent (decisions D6 point 7 — the ledger converges to the
-    /// genuinely-running set). A persisted intent the (possibly shrunk) owner budget no longer
-    /// fits is surfaced LOUD as a persisted `VhcEvent::Error` and skipped — one refused run
-    /// never blocks the rest of re-convergence. The persisted incarnation is retained (a process
-    /// restart retains the logical instance id, decisions D1); only a genuinely new
-    /// role-instance mints a new one.
+    /// A restart is always the REPLACE entry mode: the children died with the node (stdio cut),
+    /// so no execution has sequence continuity to resume — each intent re-runs assess on a fresh
+    /// child and mints a fresh never-reused incarnation, exactly like a mid-run reconvergence.
+    /// (The retained-incarnation restart was the ghost-instance defect: `JoinRun` without a
+    /// prior `AssessRun` is a typed worker refusal the old path never observed, while it marked
+    /// the row running regardless.) Re-convergence is also the arbiter's restart reconciliation:
+    /// the fresh ledger is re-charged exactly by re-admitting each intent (decisions D6 point 7).
+    /// A persisted intent that no longer converges (owner budget shrunk, authorship failed) is
+    /// surfaced LOUD as a persisted `VhcEvent::Error` and skipped — one refused run never blocks
+    /// the rest.
     pub async fn start(&self) -> Result<usize, VhcError> {
         if !self.config.enabled {
             return Ok(0);
@@ -579,150 +600,26 @@ impl VhcService {
         let intents = self.store.active_intents()?;
         let mut rejoined = 0;
         for run in &intents {
-            let worker = self.instance_worker();
-            let id = RoleInstanceId {
-                run_id: run
-                    .run_id_hash
-                    .unwrap_or_else(|| *blake3::hash(run.run_id.as_bytes()).as_bytes()),
-                epoch: run.epoch,
-                role: if run.role.is_empty() {
-                    "trainer".to_string()
-                } else {
-                    run.role.clone()
-                },
-                instance: if run.instance > 0 {
-                    run.instance
-                } else {
-                    self.store.mint_incarnation()?
-                },
-            };
-            let charge = self.derive_charge(&run.eligibility, &run.policy, &id.role)?;
-            let priority = self.store.run_priority(&run.run_id)?;
-            if let Err(refusal) = self.admit_placed(&id, charge, priority) {
-                if self.worker_factory.is_some() {
-                    worker.shutdown().await;
-                }
-                let mut emitted = Vec::new();
-                let _ = self.emit(
-                    VhcEvent::Error {
-                        run_id: run.run_id.clone(),
-                        class: "owner_arbitration".to_string(),
-                        detail: format!("re-convergence refused: {refusal}"),
-                    },
-                    &mut emitted,
-                );
-                continue;
-            }
-            if run.instance == 0 {
-                self.store
-                    .set_execution_identity(&run.run_id, id.epoch, &id.role, id.instance)?;
-            }
-            // Re-author identity + credentials for the retained incarnation (D-P8): the node
-            // re-resolves + REFRESHES the per-run cert + credentials on every reconvergence (the
-            // keystore recovers the same key within the incarnation; the certificate + credential
-            // record are re-issued). The persisted admitted tuple carries the incarnation to run.
-            let persisted_tuple = run
-                .admitted_tuple
-                .as_deref()
-                .and_then(|b| protocol::decode::<protocol::AdmittedTuple>(b).ok());
-            let restore = self.resolve_restore(&run.run_id, &run.role).await;
-            let seat = self.resolve_seat_bootstrap(&run.run_id).await;
-            let (delivery_tuple, credentials, credentials_ref) = match self
-                .author_join(
-                    &run.run_id,
-                    &run.coordinator,
-                    &id,
-                    persisted_tuple,
-                    restore,
-                    seat,
-                )
-                .await
-            {
-                Ok(v) => v,
+            match self.reconverge(run).await {
+                Ok(()) => rejoined += 1,
                 Err(e) => {
-                    // One intent that cannot re-author never blocks the rest of re-convergence
-                    // (the contract in this method's doc): release, surface LOUD, move on. A box
-                    // carrying a superseded run's intent (a re-used ceremony box) must still
-                    // rejoin the run it is actually here for — and must not keep that intent's
-                    // ledger reservation while it fails.
-                    self.arbiter.release(&id);
-                    if self.worker_factory.is_some() {
-                        worker.shutdown().await;
-                    }
+                    // An owner-arbitration refusal keeps its typed class (the budget shrank
+                    // under a persisted intent — an owner-visible condition, not a fault).
+                    let class = match &e {
+                        VhcError::Resources(_) => "owner_arbitration",
+                        _ => "reconvergence",
+                    };
                     let mut emitted = Vec::new();
                     let _ = self.emit(
                         VhcEvent::Error {
                             run_id: run.run_id.clone(),
-                            class: "reconvergence".to_string(),
-                            detail: format!("re-convergence authorship failed: {e}"),
+                            class: class.to_string(),
+                            detail: format!("restart re-convergence failed: {e}"),
                         },
                         &mut emitted,
                     );
-                    continue;
-                }
-            };
-            // The credentials-record reference is deterministic per `(role, incarnation)`, so a
-            // refresh reuses the persisted ref; only the tuple bytes (incarnation stamped) are
-            // re-persisted here.
-            let _ = &credentials_ref;
-            if let Some(tuple) = &delivery_tuple {
-                if let Ok(bytes) = protocol::encode(tuple) {
-                    let _ = self.store.set_admitted_tuple(&run.run_id, &bytes);
                 }
             }
-            // Re-issue via the streaming path + pump so a re-converged run resumes reporting
-            // live round progression into vhc.db (durable-intent re-convergence, §10.3).
-            let rx = match worker
-                .join_streaming(
-                    run.run_id.clone(),
-                    run.coordinator.clone(),
-                    credentials,
-                    to_join_policy(&run.policy),
-                    delivery_tuple,
-                )
-                .await
-            {
-                Ok(rx) => rx,
-                Err(e) => {
-                    // No child came up — surrender the reservation (nothing to observe tear down)
-                    // and keep re-converging the remaining intents (same contract as above).
-                    self.arbiter.release(&id);
-                    if self.worker_factory.is_some() {
-                        worker.shutdown().await;
-                    }
-                    let mut emitted = Vec::new();
-                    let _ = self.emit(
-                        VhcEvent::Error {
-                            run_id: run.run_id.clone(),
-                            class: "reconvergence".to_string(),
-                            detail: format!("re-convergence join failed: {e}"),
-                        },
-                        &mut emitted,
-                    );
-                    continue;
-                }
-            };
-            let generation = id.instance;
-            self.instances.lock().unwrap().insert(
-                run.run_id.clone(),
-                InstanceEntry {
-                    generation: id.instance,
-                    id,
-                    worker,
-                },
-            );
-            self.spawn_pump(Some((run.run_id.clone(), generation)), rx);
-            self.store.mark_running(&run.run_id)?;
-            // Defect D: reconverge the co-located trainer sibling for a seat/coordinator run when
-            // `coordinator_trains` is set (best-effort — a restart re-seats then re-trains).
-            if self.config.coordinator_trains
-                && !run.role.is_empty()
-                && run.role == self.config.seat_role
-            {
-                self.spawn_co_located_trainer(&run.run_id, &run.policy)
-                    .await;
-            }
-            rejoined += 1;
         }
         if rejoined > 0 {
             self.emit_changed(None);
@@ -927,11 +824,15 @@ impl VhcService {
         Ok(reconverged)
     }
 
-    /// Reconverge one recoverable intent as a NEW incarnation. Mid-run reconvergence never
-    /// retains the failed incarnation: the predecessor may still be surrendering devices, and a
-    /// fresh never-reused incarnation guarantees the generation strictly advances (its stale
-    /// events stay gated) and its ledger key cannot collide. Credentials and the per-run
-    /// certificate are re-authored fresh for the new incarnation (D-P8 — never replayed).
+    /// The ONE join transaction for every non-owner-initiated entry (restart, retry, resume
+    /// recovery): `assess (fresh child) → reserve → author identity/planes → JoinRun →
+    /// supervised Starting → observed readiness promotes Running`. Reconvergence is always the
+    /// REPLACE entry mode — it never retains the failed incarnation: the predecessor may still
+    /// be surrendering devices, and a fresh never-reused incarnation guarantees the generation
+    /// strictly advances (its stale events stay gated) and its ledger key cannot collide.
+    /// Credentials and the per-run certificate are re-authored fresh for the new incarnation
+    /// (D-P8 — never replayed). The row is marked `starting`, never `running` — readiness is an
+    /// observation the event pump makes from the session's own `RunPhase "running"`.
     async fn reconverge(&self, run: &PersistedRun) -> Result<(), VhcError> {
         let worker = self.instance_worker();
         let id = RoleInstanceId {
@@ -1043,7 +944,21 @@ impl VhcService {
             },
         );
         self.spawn_pump(Some((run.run_id.clone(), generation)), rx);
-        self.store.mark_running(&run.run_id)?;
+        // Supervised Starting — never Running: the readiness promotion is event-driven
+        // (`handle_worker_event`'s `RunPhase "running"` arm), so a worker that refuses the join
+        // pre-session (typed error, no phase) leaves no false-running ghost and keeps its retry
+        // schedule.
+        self.store.mark_starting(&run.run_id)?;
+        // A seat-holding trainer+coordinator intent re-converges its co-located trainer sibling
+        // too (defect D): a reconverged seat without its trainer never meets its own membership
+        // floor. Best-effort, same as the original join.
+        if self.config.coordinator_trains
+            && !run.role.is_empty()
+            && run.role == self.config.seat_role
+        {
+            self.spawn_co_located_trainer(&run.run_id, &run.policy)
+                .await;
+        }
         self.emit_changed(Some(run.run_id.clone()));
         Ok(())
     }
@@ -1387,11 +1302,26 @@ impl VhcService {
             run_id,
             phase,
             round,
+            generation,
             ..
         } = ev
         {
             *self.current_run.lock().unwrap() = Some(run_id.clone());
             self.store.set_phase(run_id, phase, *round)?;
+            // The readiness promotion (Starting → Running): the session's OWN "running" phase is
+            // the observation — a dispatched `JoinRun` proves nothing (the ghost-instance
+            // defect). Only the PRIMARY instance's readiness promotes the row: the co-located
+            // trainer sibling shares the run id but not the row's lifecycle.
+            if phase == "running" {
+                let primary = {
+                    let instances = self.instances.lock().unwrap();
+                    instances.get(run_id).map(|e| e.generation)
+                };
+                if primary == Some(*generation) {
+                    self.store.mark_running(run_id)?;
+                    self.emit_changed(Some(run_id.clone()));
+                }
+            }
         }
         let run_id = self.event_run_id(ev);
         let Some(run_id) = run_id else {
@@ -1550,8 +1480,13 @@ impl VhcService {
         if !entry_live {
             match &row {
                 // Duplicate delivery: the instance already transitioned (no live entry, the
-                // observed state is settled) — nothing left to release or record.
-                Some(r) if r.run_state != RunState::Running && r.pending_run_state.is_none() => {
+                // observed state is settled) — nothing left to release or record. `Starting` is
+                // NOT settled: a terminal for an in-flight transaction still transitions it.
+                Some(r)
+                    if r.run_state != RunState::Running
+                        && r.run_state != RunState::Starting
+                        && r.pending_run_state.is_none() =>
+                {
                     return Ok(Vec::new());
                 }
                 Some(_) => {}
@@ -1657,13 +1592,7 @@ impl VhcService {
     /// lost. If that instance is still the run's CURRENT one, it transitions `failed_retryable`
     /// (process absence is the teardown observation); a reaped/replaced instance is left alone.
     pub fn handle_stream_closed(&self, run_id: &str, generation: u64) -> Result<(), VhcError> {
-        let current = {
-            let instances = self.instances.lock().unwrap();
-            instances
-                .get(run_id)
-                .is_some_and(|e| e.id.instance == generation)
-        };
-        if !current {
+        if !self.instance_current(run_id, generation) {
             return Ok(());
         }
         self.handle_run_terminated(
@@ -1674,6 +1603,50 @@ impl VhcService {
             },
         )?;
         Ok(())
+    }
+
+    /// The pre-session refusal observation: the worker child answered the join transaction with
+    /// a typed error BEFORE its session ever spoke (no generation-matching `RunPhase`), so the
+    /// session's own terminal event will never arrive — the transaction failed. Synthesizes the
+    /// retryable terminal for the (still `Starting`) instance: reservation released, entry
+    /// removed, retry scheduled — no ghost survives a refused `JoinRun`.
+    fn handle_pre_session_refusal(
+        &self,
+        run_id: &str,
+        generation: u64,
+        detail: &str,
+    ) -> Result<(), VhcError> {
+        if !self.instance_current(run_id, generation) {
+            return Ok(());
+        }
+        self.handle_run_terminated(
+            run_id,
+            generation,
+            &protocol::TerminalOutcome::FailedRetryable {
+                reason: format!("pre-session worker refusal: {detail}"),
+            },
+        )?;
+        Ok(())
+    }
+
+    /// Whether `generation` is still a CURRENT supervised instance for `run_id` — the primary
+    /// entry or the co-located trainer sibling (whose teardown `handle_run_terminated` routes to
+    /// its own reservation). A reaped/replaced generation is settled: nothing to transition.
+    fn instance_current(&self, run_id: &str, generation: u64) -> bool {
+        let primary = {
+            let instances = self.instances.lock().unwrap();
+            instances
+                .get(run_id)
+                .is_some_and(|e| e.id.instance == generation)
+        };
+        if primary {
+            return true;
+        }
+        self.co_trainers
+            .lock()
+            .unwrap()
+            .get(run_id)
+            .is_some_and(|e| e.generation == generation)
     }
 
     /// The generation the node currently expects for `run_id`'s events: the live instance's
@@ -2610,16 +2583,18 @@ impl VhcApi for VhcService {
                     .store
                     .get_run(&run_id)
                     .map_err(|e| VhcError::from(e).to_api())?;
-                // Identity retention is gated on BOTH axes: a standing joined intent whose
-                // observed instance is resumable (running / failed_retryable) retains its
-                // incarnation; a terminal or left instance never does — an explicit owner
-                // rejoin of a completed/failed/left run mints a fresh incarnation (its
-                // predecessor's identity, keys, and journal stream are settled).
-                let (epoch, role, persisted_instance, run_hash) = persisted
+                // A resumable persisted row contributes its epoch/role/run-hash (the intent's
+                // execution CONTEXT) but never its incarnation: with no live instance there is
+                // no sequence continuity to resume, so a rejoin is always the REPLACE entry
+                // mode — a fresh never-reused incarnation whose stale predecessor stays gated.
+                // (Retention re-published the dead instance's incarnation and freshness pair,
+                // which the registry's monotonic roster fold rightly refused — the run-g
+                // poisoned-slot livelock.)
+                let (epoch, role, run_hash) = persisted
                     .as_ref()
                     .filter(|r| r.desired_state == DesiredState::Joined && r.run_state.resumable())
-                    .map_or((0, String::new(), 0, None), |r| {
-                        (r.epoch, r.role.clone(), r.instance, r.run_id_hash)
+                    .map_or((0, String::new(), None), |r| {
+                        (r.epoch, r.role.clone(), r.run_id_hash)
                     });
                 let id = RoleInstanceId {
                     // The cryptographic RunId when backfilled; a v1-era run keys its node-local
@@ -2637,12 +2612,10 @@ impl VhcApi for VhcService {
                     },
                     // The seat-won join runs at the LEASE incarnation ([SEAT-1]: the fencing
                     // token IS the incarnation — the CAS mints identity, never the counter).
-                    // Otherwise: a restart-re-join retains the logical incarnation; a genuinely
-                    // new role-instance mints a never-reused one (decisions D1).
+                    // Every other join is a new execution: a never-reused counter mint
+                    // (decisions D1). No path re-publishes a dead instance's incarnation.
                     instance: if let Some(inc) = seat_incarnation {
                         inc
-                    } else if persisted_instance > 0 {
-                        persisted_instance
                     } else {
                         self.store
                             .mint_incarnation()

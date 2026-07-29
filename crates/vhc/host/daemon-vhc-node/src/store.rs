@@ -64,7 +64,13 @@ impl DesiredState {
 /// `joined` intent (e.g. a shutdown drain) reconverges on restart.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RunState {
-    /// A live (or presumed-live) role instance.
+    /// A join transaction is in flight: the reservation is held and the worker supervised, but
+    /// session readiness (`RunPhase "running"`) has not been observed. A `Starting` instance is
+    /// attributable (errors and stream closure land on it) but never *published* as running —
+    /// the promotion is event-driven, not command-write-driven.
+    Starting,
+    /// A live role instance: session readiness was OBSERVED (never inferred from a dispatched
+    /// command).
     Running,
     /// The module signaled run end. Terminal: never restarted.
     Completed,
@@ -83,6 +89,7 @@ impl RunState {
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
+            RunState::Starting => "starting",
             RunState::Running => "running",
             RunState::Completed => "completed",
             RunState::FailedRetryable => "failed_retryable",
@@ -92,6 +99,7 @@ impl RunState {
     }
     fn from_str(s: &str) -> Self {
         match s {
+            "starting" => RunState::Starting,
             "completed" => RunState::Completed,
             "failed_retryable" => RunState::FailedRetryable,
             "failed_terminal" => RunState::FailedTerminal,
@@ -101,10 +109,14 @@ impl RunState {
     }
 
     /// Whether a fresh join for this run may RETAIN the persisted incarnation (a live or
-    /// recoverable instance) — terminal states always mint a new one.
+    /// recoverable instance) — terminal states always mint a new one. A `Starting` row (the node
+    /// died mid-transaction) is recoverable: the restart reconverges the intent.
     #[must_use]
     pub fn resumable(self) -> bool {
-        matches!(self, RunState::Running | RunState::FailedRetryable)
+        matches!(
+            self,
+            RunState::Starting | RunState::Running | RunState::FailedRetryable
+        )
     }
 }
 
@@ -406,7 +418,9 @@ impl VhcStore {
         let policy_json = serde_json::to_string(policy)?;
         let elig_json = serde_json::to_string(eligibility)?;
         let conn = self.lock();
-        // An owner join (re)arms the lifecycle: intent joined, the observed state live, and the
+        // An owner join (re)arms the lifecycle: intent joined, the observed state STARTING —
+        // never 'running', which is an observation the worker's session readiness event makes
+        // ([`Self::mark_running`]), not a fact a dispatched command establishes — and the
         // retry/terminal bookkeeping of any previous incarnation cleared (an explicit join is the
         // owner action that reopens a terminal row — with a freshly-minted incarnation).
         conn.execute(
@@ -414,7 +428,7 @@ impl VhcStore {
                 (run_id, coordinator, policy_json, desired_state, credentials_ref,
                  eligibility_json, last_phase, last_round, updated_ms, run_state,
                  running_since_ms)
-             VALUES (?1, ?2, ?3, 'joined', ?4, ?5, '', 0, ?6, 'running', ?6)
+             VALUES (?1, ?2, ?3, 'joined', ?4, ?5, '', 0, ?6, 'starting', ?6)
              ON CONFLICT(run_id) DO UPDATE SET
                 coordinator       = excluded.coordinator,
                 policy_json       = excluded.policy_json,
@@ -422,7 +436,7 @@ impl VhcStore {
                 credentials_ref   = excluded.credentials_ref,
                 eligibility_json  = excluded.eligibility_json,
                 updated_ms        = excluded.updated_ms,
-                run_state         = 'running',
+                run_state         = 'starting',
                 pending_run_state = NULL,
                 retry_count       = 0,
                 next_retry_ms     = NULL,
@@ -607,8 +621,24 @@ impl VhcStore {
         Ok(n)
     }
 
+    /// Mark a run's join transaction in flight: observed state `starting`, any release marker
+    /// cleared. The retry schedule survives — a `Starting` instance has proven nothing yet, and
+    /// the readiness promotion ([`Self::mark_running`], driven by the worker's session event)
+    /// is what clears it. The live-instance map guards against a competing reconvergence in the
+    /// window, not this row.
+    pub fn mark_starting(&self, run_id: &str) -> Result<(), StoreError> {
+        self.lock().execute(
+            "UPDATE vhc_runs SET run_state = 'starting', pending_run_state = NULL, \
+             updated_ms = ?2 WHERE run_id = ?1",
+            params![run_id, now_ms()],
+        )?;
+        Ok(())
+    }
+
     /// Mark a run's instance live: observed state `running`, `running_since` stamped, any release
-    /// marker cleared. The retry budget is NOT cleared here — that is the uptime reset's job
+    /// marker cleared. Driven ONLY by an observed worker readiness event (`RunPhase "running"`) —
+    /// never by a dispatched command; a `JoinRun` written to stdio proves nothing. The retry
+    /// budget is NOT cleared here — that is the uptime reset's job
     /// ([`Self::reset_recovered_retries`]), so a crash-looping instance cannot launder its budget
     /// by merely restarting.
     pub fn mark_running(&self, run_id: &str) -> Result<(), StoreError> {
@@ -1154,9 +1184,11 @@ mod tests {
         assert_eq!(store.counter("owner_policy_rev").unwrap(), 0);
     }
 
-    /// M5: the two-axis lifecycle columns default a fresh join to a live `running` observation,
-    /// the release protocol (begin → commit) transitions the observed axis exactly once, and the
-    /// startup repair finishes a marker whose commit never landed (the crash window).
+    /// M5: the two-axis lifecycle columns default a fresh join to an in-flight `starting`
+    /// observation (readiness is OBSERVED via `mark_running`, never assumed from the dispatched
+    /// command), the release protocol (begin → commit) transitions the observed axis exactly
+    /// once, and the startup repair finishes a marker whose commit never landed (the crash
+    /// window).
     #[test]
     fn m5_release_protocol_begin_commit_and_crash_repair() {
         let store = VhcStore::open_in_memory().unwrap();
@@ -1170,8 +1202,13 @@ mod tests {
             )
             .unwrap();
         let run = store.get_run("run-L").unwrap().unwrap();
-        assert_eq!(run.run_state, RunState::Running);
+        assert_eq!(run.run_state, RunState::Starting);
         assert_eq!(run.pending_run_state, None);
+
+        // The readiness promotion: only the observed session event makes the row `running`.
+        store.mark_running("run-L").unwrap();
+        let run = store.get_run("run-L").unwrap().unwrap();
+        assert_eq!(run.run_state, RunState::Running);
         assert!(run.running_since_ms.is_some());
 
         // begin → the marker + reason are durable while the observed state is still `running`.

@@ -160,6 +160,21 @@ fn terminated(run: &str, generation: u64, outcome: TerminalOutcome) -> protocol:
     }
 }
 
+/// Drive the readiness observation for the run's CURRENT instance — the scripted stand-in for
+/// the session's own `RunPhase "running"`. A join leaves the row `starting`; only this observed
+/// event promotes it to `running` (readiness is never assumed from a dispatched command).
+fn observe_ready(svc: &VhcService, run: &str) {
+    let generation = svc.store().get_run(run).unwrap().unwrap().instance;
+    svc.handle_worker_event(&protocol::Event::RunPhase {
+        run_id: run.to_string(),
+        phase: "running".into(),
+        epoch: 0,
+        round: 0,
+        generation,
+    })
+    .unwrap();
+}
+
 /// Poll the store until `pred` holds (bounded) — the pump/tick paths are asynchronous.
 async fn wait_for(svc: &VhcService, run: &str, pred: impl Fn(RunState) -> bool) {
     for _ in 0..200 {
@@ -259,6 +274,7 @@ async fn stale_generation_events_are_discarded() {
     svc.vhc_join("run-g".into(), policy(), "op".into())
         .await
         .unwrap();
+    observe_ready(&svc, "run-g");
     let generation = svc.store().get_run("run-g").unwrap().unwrap().instance;
     let stale = generation + 100;
 
@@ -333,9 +349,13 @@ async fn retry_budget_reconverges_then_escalates_on_exhaustion() {
     assert!(row.next_retry_ms.is_some(), "a reconvergence is scheduled");
     assert_eq!(svc.arbiter().instances(), 0, "the failed instance released");
 
-    // The tick fires the due reconvergence: a NEW incarnation joins (generation advances).
+    // The tick fires the due reconvergence: a NEW incarnation joins (generation advances). The
+    // fresh transaction is `starting` until its session's readiness event is observed.
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     assert_eq!(svc.reconcile_tick().await.unwrap(), 1);
+    let row = svc.store().get_run("run-r").unwrap().unwrap();
+    assert_eq!(row.run_state, RunState::Starting);
+    observe_ready(&svc, "run-r");
     let row = svc.store().get_run("run-r").unwrap().unwrap();
     assert_eq!(row.run_state, RunState::Running);
     let second_gen = row.instance;
@@ -398,10 +418,12 @@ async fn crash_window_repair_finishes_pending_release_on_start() {
     assert!(worker.joins().is_empty());
 }
 
-/// A restart with a standing joined intent and a live (`running`) observation reconverges with
-/// the RETAINED incarnation — a node restart is not churn (no live predecessor exists).
+/// A restart with a standing joined intent reconverges as a FRESH incarnation (the REPLACE entry
+/// mode): the children died with the node, so no execution has sequence continuity to resume —
+/// re-publishing the dead instance's incarnation is exactly the stale-roster poisoning class.
+/// The rejoined row is `starting` until its session's readiness event is observed.
 #[tokio::test]
-async fn restart_reconverges_retaining_the_incarnation() {
+async fn restart_reconverges_as_a_fresh_incarnation() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("vhc.db");
     let first_instance;
@@ -418,10 +440,13 @@ async fn restart_reconverges_retaining_the_incarnation() {
     let svc = service_over(VhcStore::open(&path).unwrap(), worker.clone(), 5);
     assert_eq!(svc.start().await.unwrap(), 1);
     let row = svc.store().get_run("run-k").unwrap().unwrap();
-    assert_eq!(
-        row.instance, first_instance,
-        "a process restart retains the logical incarnation"
+    assert!(
+        row.instance > first_instance,
+        "a process restart is the REPLACE mode: a fresh never-reused incarnation"
     );
+    assert_eq!(row.run_state, RunState::Starting);
+    observe_ready(&svc, "run-k");
+    let row = svc.store().get_run("run-k").unwrap().unwrap();
     assert_eq!(row.run_state, RunState::Running);
     assert_eq!(worker.joins(), vec!["run-k"]);
 }
@@ -446,9 +471,13 @@ async fn stream_closure_classifies_recoverable_and_reconverges() {
     let row = svc.store().get_run("run-s").unwrap().unwrap();
     assert_eq!(row.retry_count, 1);
 
-    // The reconciliation tick reconverges under the durable intent, as a new incarnation.
+    // The reconciliation tick reconverges under the durable intent, as a new incarnation; the
+    // fresh transaction is `starting` until its readiness event is observed.
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     assert_eq!(svc.reconcile_tick().await.unwrap(), 1);
+    let row = svc.store().get_run("run-s").unwrap().unwrap();
+    assert_eq!(row.run_state, RunState::Starting);
+    observe_ready(&svc, "run-s");
     let row = svc.store().get_run("run-s").unwrap().unwrap();
     assert_eq!(row.run_state, RunState::Running);
     assert!(row.instance > first_gen);
@@ -488,10 +517,14 @@ async fn pause_survives_restart_and_resume_reconverges() {
     assert_eq!(svc.start().await.unwrap(), 0, "paused is not reconverged");
     assert!(worker.joins().is_empty());
 
-    // Resume (no live instance after the restart): reconverges fresh under the intent.
+    // Resume (no live instance after the restart): reconverges fresh under the intent, then
+    // the observed readiness event makes it live.
     svc.vhc_resume("run-p".into(), "op-r".into()).await.unwrap();
     assert_eq!(worker.joins(), vec!["run-p"]);
     assert_eq!(svc.arbiter().instances(), 1);
+    let row = svc.store().get_run("run-p").unwrap().unwrap();
+    assert_eq!(row.run_state, RunState::Starting);
+    observe_ready(&svc, "run-p");
     let row = svc.store().get_run("run-p").unwrap().unwrap();
     assert_eq!(row.run_state, RunState::Running);
     let summary = &svc.vhc_run_list().await.unwrap()[0];
