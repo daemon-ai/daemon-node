@@ -183,20 +183,30 @@ pub fn authorize_incumbent(
 ) -> Result<AuthorizedSeat, SeatLeaseError> {
     lease.authorize(trusted_bases, now_ms, skew_ms)?;
     // Supersession floor / explicit revocation: a stale claimant is dead once a higher fencing
-    // token (incarnation) exists, regardless of the registry. The floor is per base-identity
-    // ladder — the lease's own certifying base judges it (never a roster sibling's ladder).
+    // token (incarnation) exists, regardless of the registry. Explicit revocations and the
+    // claimant's OWN ladder are the per-base judgment; the seat additionally consults the
+    // CROSS-BASE role floor — the seat is one slot per role by construction, so its
+    // fencing-token lineage spans claimants (a takeover by a DIFFERENT base still supersedes
+    // the old incumbent, which the per-base frame-sender ladder deliberately does not).
+    let scope = lease.body.cert_scope();
+    let expired = |_| SeatLeaseError::Expired {
+        // A superseded/revoked lease is not authoritative; reuse the typed refusal surface
+        // (the ledger's own error is folded to the seat vocabulary here).
+        expires_at_ms: lease.body.expires_at_ms,
+        now_ms,
+    };
     revocations
         .judge(
-            &lease.body.cert_scope(),
+            &scope,
             &lease.body.claimant,
             &lease.certificate.base_identity,
         )
-        .map_err(|_| SeatLeaseError::Expired {
-            // A superseded/revoked lease is not authoritative; reuse the typed refusal surface
-            // (the ledger's own error is folded to the seat vocabulary here).
-            expires_at_ms: lease.body.expires_at_ms,
-            now_ms,
-        })?;
+        .map_err(expired)?;
+    if let Some(floor) = revocations.role_floor(&scope.run_id, &scope.role) {
+        if scope.instance < floor {
+            return Err(expired(daemon_vhc_proto::CertError::Revoked));
+        }
+    }
     Ok(AuthorizedSeat {
         endpoint: lease.body.endpoint.clone(),
         claimant: lease.body.claimant,

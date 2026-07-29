@@ -1424,16 +1424,36 @@ impl VhcService {
         // + detached (a pointer is advisory; the joiner hash-verifies regardless, so an unknown
         // size is 0).
         if let protocol::Event::CheckpointPublished {
-            round, hash, kind, ..
+            round,
+            hash,
+            kind,
+            generation,
+            ..
         } = ev
         {
             if let Some(discovery) = &self.discovery {
-                let role = self
-                    .store
-                    .get_run(&run_id)?
-                    .map(|r| r.role)
-                    .filter(|r| !r.is_empty())
-                    .unwrap_or_else(|| "trainer".to_string());
+                // The pointer's role is the EMITTING INSTANCE's role, not the run row's. On a
+                // seat-holding node the run row reads "coordinator" while the co-located trainer
+                // sibling publishes the (much larger) trainer checkpoints; attributing those to
+                // the coordinator slot poisons every coordinator restore — observed live as
+                // `MigrateIncompatible` on every coordinator rejoin (the quorum guest correctly
+                // refusing a TinyLlama trainer document). The event's generation names the
+                // emitter: the co-trainer's generation ⇒ "trainer", else the run row's role.
+                let co_gen = self
+                    .co_trainers
+                    .lock()
+                    .unwrap()
+                    .get(&run_id)
+                    .map(|e| e.generation);
+                let role = if co_gen == Some(*generation) {
+                    "trainer".to_string()
+                } else {
+                    self.store
+                        .get_run(&run_id)?
+                        .map(|r| r.role)
+                        .filter(|r| !r.is_empty())
+                        .unwrap_or_else(|| "trainer".to_string())
+                };
                 let discovery = discovery.clone();
                 let (run, round, hash, kind) = (run_id.clone(), *round, hash.clone(), kind.clone());
                 tokio::spawn(async move {
@@ -1878,6 +1898,9 @@ impl VhcService {
         // cannot be published/verified refuses the join typed (retryable via reconciliation),
         // never a silently-degraded WS-only run.
         let iroh = self.resolve_iroh_plane(&keystore, &identity).await?;
+        let mut seat = seat;
+        self.extend_roster_certs(run_label, &mut seat.peer_certs)
+            .await;
         let authored = crate::credentials::author_join(
             &keystore,
             &identity,
@@ -2120,6 +2143,54 @@ impl VhcService {
             },
             _ => crate::credentials::SeatBootstrap::default(),
         }
+    }
+
+    /// The §12.3 pull half — seed a joining instance's judge with every VERIFIED roster
+    /// certificate. The on-plane certificate announcement is a one-shot a later subscriber never
+    /// sees, and the seat-lease bootstrap covers the coordinator's cert only: a trainer that
+    /// joined BEFORE this instance attached has no push path left (its WS reannounce heals only a
+    /// shared live WS hop, and gossip carries no re-announcements) — observed live on the two-box
+    /// WAN rung as a coordinator refusing every peer frame `UncertifiedSender` forever. Every
+    /// roster record already carries its publisher's certificate; each record is authorized here
+    /// (signature + chain to a genesis-trusted base) before its certificate is handed to
+    /// credential authorship — `CertCheck` still gates every frame, so this only ever ADDS
+    /// verifiable bootstrap trust. Best-effort by design (the push half still runs): a roster
+    /// fetch failure degrades to the pre-seeded certs, it never refuses the join.
+    async fn extend_roster_certs(
+        &self,
+        run_label: &str,
+        certs: &mut Vec<daemon_vhc_proto::RunKeyCertificate>,
+    ) {
+        let Some(discovery) = &self.discovery else {
+            return;
+        };
+        let trusted = match self.genesis_trusted_bases(run_label).await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(run = run_label, error = %e, "roster cert seeding: no trust set");
+                return;
+            }
+        };
+        let records = match discovery.fetch_roster(run_label).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(run = run_label, error = %e, "roster cert seeding: fetch failed");
+                return;
+            }
+        };
+        let mut seeded = 0usize;
+        for record in records {
+            if record.authorize(trusted.bases()).is_ok() && !certs.contains(&record.certificate) {
+                certs.push(record.certificate.clone());
+                seeded += 1;
+            }
+        }
+        tracing::info!(
+            run = run_label,
+            seeded,
+            total = certs.len(),
+            "roster cert seeding: judge bootstrap trust extended from the verified roster"
+        );
     }
 
     /// Consume one committed run-level module-upgrade record and drive the live switch through

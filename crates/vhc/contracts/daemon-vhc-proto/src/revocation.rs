@@ -279,6 +279,21 @@ impl RevocationLedger {
         Ok(())
     }
 
+    /// The highest certified incarnation observed for `(run, role)` ACROSS ALL base identities
+    /// — the single-slot fencing floor. Frame-sender supersession is per base ladder
+    /// ([`SlotKey`]: roster siblings sharing a role run parallel ladders that never judge each
+    /// other), but a SEAT is one slot per role by construction: its fencing-token lineage spans
+    /// claimants, so a seat judgment consults the cross-base maximum — a stale claimant is dead
+    /// once ANY successor holds a higher token, whichever base certified it.
+    #[must_use]
+    pub fn role_floor(&self, run_id: &Hash, role: &str) -> Option<u64> {
+        self.incarnation_floor
+            .iter()
+            .filter(|((r, ro, _), _)| r == run_id && ro == role)
+            .map(|(_, floor)| *floor)
+            .max()
+    }
+
     /// Observe every certificate in a store (their scopes advance their base's supersession
     /// floor).
     pub fn observe_certificates(&mut self, certs: &[RunKeyCertificate]) {
