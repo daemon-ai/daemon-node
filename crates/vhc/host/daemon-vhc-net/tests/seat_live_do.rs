@@ -69,7 +69,7 @@ fn body(
         role: ROLE.to_string(),
         epoch: 0,
         incarnation,
-        fencing_token: incarnation,
+        leadership_term: incarnation,
         claimant,
         module_hash: Hash([0xCC; 32]),
         endpoint: ControlEndpoint {
@@ -110,7 +110,9 @@ async fn live_seat_lifecycle_against_the_deployed_registry() {
         .expect("read seat")
         .expect("the seeded run exists (seed it with the cloud seed script)");
     let bid = match &state {
-        SeatState::Unclaimed { last_fencing_token } => last_fencing_token.map_or(0, |f| f + 1),
+        SeatState::Unclaimed {
+            last_leadership_term,
+        } => last_leadership_term.map_or(0, |f| f + 1),
         SeatState::Leased(held) => {
             // A previous run's lease may still be live for up to TTL + skew: wait it out.
             let deadline = held.body.expires_at_ms.saturating_add(DEFAULT_SEAT_SKEW_MS) + 2_000;
@@ -123,7 +125,7 @@ async fn live_seat_lifecycle_against_the_deployed_registry() {
                 eprintln!("waiting {wait} ms for the previous holder's lease to expire");
                 tokio::time::sleep(Duration::from_millis(wait)).await;
             }
-            held.body.fencing_token + 1
+            held.body.leadership_term + 1
         }
     };
 
@@ -133,7 +135,8 @@ async fn live_seat_lifecycle_against_the_deployed_registry() {
     let run_key = test_key("seat-live/run-key");
     let claimant = peer_id(&run_key);
 
-    // -- claim at the bid (incarnation == fencing token) --------------------------------------
+    // -- claim at the bid (this smoke reuses the bid as the execution incarnation; the
+    //    identity-scope semantics live in the proto fold vectors) ----------------------------
     let b0 = body(run_id, bid, claimant, now_ms(), &ws_url);
     let cert = RunKeyCertificate::issue(&base_key, b0.cert_scope(), claimant).expect("cert");
     let lease = SeatLease::claim(&run_key, cert.clone(), b0).expect("author lease");
@@ -160,7 +163,7 @@ async fn live_seat_lifecycle_against_the_deployed_registry() {
         other => panic!("expected the stored lease: {other:?}"),
     }
 
-    // -- heartbeat/renew: a re-signed body under the same identity + token --------------------
+    // -- heartbeat/renew: a re-signed body under the same identity + term ---------------------
     let mut renewed_body = lease.body.clone();
     renewed_body.issued_at_ms = now_ms();
     renewed_body.expires_at_ms = renewed_body.issued_at_ms + TTL_MS;
@@ -199,7 +202,7 @@ async fn live_seat_lifecycle_against_the_deployed_registry() {
             run_id,
             role: ROLE.to_string(),
             incarnation: bid,
-            fencing_token: bid,
+            leadership_term: bid,
             claimant,
         },
     )
@@ -214,14 +217,16 @@ async fn live_seat_lifecycle_against_the_deployed_registry() {
         .expect("read")
         .expect("run")
     {
-        SeatState::Unclaimed { last_fencing_token } => {
+        SeatState::Unclaimed {
+            last_leadership_term,
+        } => {
             assert_eq!(
-                last_fencing_token,
+                last_leadership_term,
                 Some(bid),
-                "the floor survives the release (tokens never reset)"
+                "the floor survives the release (terms never reset)"
             );
         }
         other => panic!("expected the tombstoned slot: {other:?}"),
     }
-    eprintln!("live seat lifecycle green at bid token {bid} against {base_url}");
+    eprintln!("live seat lifecycle green at bid term {bid} against {base_url}");
 }

@@ -10,6 +10,9 @@ fn main() {
     let path = std::env::args()
         .nth(1)
         .expect("usage: genesisdump <envelope.cbor>");
+    // An operator diagnostic over an operator-named wire file: no containment boundary applies
+    // (the disallowed-methods rule guards the engine's contained-exec roots, not dump tools).
+    #[allow(clippy::disallowed_methods)]
     let bytes = std::fs::read(&path).expect("read envelope");
     let signed: daemon_vhc_proto::SignedEnvelope =
         from_canonical_slice(&bytes).expect("decode SignedEnvelope");

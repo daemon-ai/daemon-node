@@ -28,12 +28,14 @@
 //! (certificate floors included).
 
 use daemon_vhc_proto::{
-    from_canonical_slice, to_canonical_vec, RunKeyCertificate, RunKeyRevocation, VhcProtoError,
+    from_canonical_slice, to_canonical_vec, RunKeyCertificate, RunKeyRevocation, SeatLease,
+    VhcProtoError,
 };
 use serde::{Deserialize, Serialize};
 
-/// One §12.3 record on the control plane: a certificate or a revocation, externally tagged by
-/// kind. Additive: a future record kind is a new map key, refused typed by old receivers.
+/// One §12.3 record on the control plane: a certificate, a revocation, or a seat grant,
+/// externally tagged by kind. Additive: a future record kind is a new map key, refused typed by
+/// old receivers.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DistributionRecord {
     /// A run-key certificate (`{ body, base_identity, sig }`, domain `daemon-vhc/cert/2`).
@@ -42,6 +44,14 @@ pub enum DistributionRecord {
     /// A run-key revocation (`{ body, base_identity, sig }`, domain `daemon-vhc/revocation/2`).
     #[serde(rename = "revocation")]
     Revocation(RunKeyRevocation),
+    /// A full signed seat lease (domain `daemon-vhc/seat-lease/2.0.0`) — the coordinator's
+    /// **grant distribution** ([SEAT-1] v2): announced at attach beside the certificate,
+    /// re-carried by the same WS resubscribe anti-entropy, refreshed on takeover. A receiver
+    /// feeds it into its leadership-term floor only after the observation-grade acceptance
+    /// ([`SeatLease::verify_grant`] + the revocation judgment) — never structurally.
+    /// (Boxed: a lease is ~2x a certificate, and records live mostly in transit.)
+    #[serde(rename = "seat_grant")]
+    SeatGrant(Box<SeatLease>),
 }
 
 impl DistributionRecord {

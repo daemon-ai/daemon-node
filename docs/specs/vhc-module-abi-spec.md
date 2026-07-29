@@ -2297,8 +2297,10 @@ rebuilds the transition chain from that genesis plus its own durable mirror of p
 records, and validate-appends the presented record — domain tag, run binding, strictly-monotone
 gap-free epoch, hash link, stale-old-module, and the authority threshold, any failure a typed
 refusal with the chain untouched. Only then: the pre-switch assessment above, a post-switch
-incarnation minted STRICTLY ABOVE the running one (an out-of-band-minted incumbent — e.g. a
-seat-lease fencing token — can exceed the counter, so the mint takes a floor), identity
+incarnation minted STRICTLY ABOVE the running one (the bounded floor-taking mint; execution
+incarnations come only from the node's durable counter — never from seat terms or registry
+metadata, §12.4 [SEAT-1] — and a held seat is re-claimed by the new execution identity at a
+fresh `term > floor`, never renewed), identity
 provisioning (key + re-issued certificate) BEFORE the command, then `switch_module`. The record
 mirror, the advanced execution identity, and the refreshed admitted tuple persist only on
 activation; a pre-fence refusal leaves every durable fact unchanged, and a post-fence exit that
@@ -2504,20 +2506,24 @@ run-key-revocation = {
 
 A run's coordinator role is claimed through a **signed, fenced seat lease** stored at the
 registry. The registry is **untrusted storage**: it stores the signed object and compare-and-swaps
-on the fencing token, but it never verifies signatures and never judges authority — every peer
+on the leadership term, but it never verifies signatures and never judges authority — every peer
 verifies the lease itself. Leases and releases are separate distribution records with their own
-domain tags (registry-format `daemon-vhc/<domain>/<semver>`): `daemon-vhc/seat-lease/1.0.0` and
-`daemon-vhc/seat-release/1.0.0` — a lease signature is never replayable as a certificate, frame,
-or release, and vice versa.
+domain tags (registry-format `daemon-vhc/<domain>/<semver>`): `daemon-vhc/seat-lease/2.0.0` and
+`daemon-vhc/seat-release/2.0.0` — a lease signature is never replayable as a certificate, frame,
+or release, and vice versa. (The retired scheme-1 tags bound `fencing_token == incarnation`;
+because the canonical body bytes are the signature preimage, scheme 2 is a **new domain
+tag/schema**, never optional fields on the v1 body. v1 objects decode for interpreting archived
+state only — `execution incarnation = incarnation`, `leadership term = fencing_token` — and are
+never authored, re-verified, or accepted on any live path.)
 
 ```cddl
 seat-lease-body = {
-  "domain":                tstr,           ; "daemon-vhc/seat-lease/1.0.0"
+  "domain":                tstr,           ; "daemon-vhc/seat-lease/2.0.0"
   "run_id":                bstr .size 32,  ; the genesis hash (§8.1)
   "role":                  tstr,           ; the claimed envelope role label
   "epoch":                 uint,           ; the epoch this lease is scoped to
-  "incarnation":           uint,           ; §8.1 `instance`, never reused
-  "fencing_token":         uint,           ; == incarnation (SEAT-1)
+  "incarnation":           uint,           ; §8.1 `instance` — EXECUTION identity (SEAT-1)
+  "leadership_term":       uint,           ; run-role-global seat order (SEAT-1); <= i64::MAX
   "claimant":              bstr .size 32,  ; the certified per-run key (== §12.1 `sender`)
   "module_hash":           bstr .size 32,  ; the pinned module the claimant runs
   "endpoint":              control-endpoint,
@@ -2534,38 +2540,60 @@ control-endpoint = {
 }                          ; at least one member MUST be present
 
 seat-release-body = {
-  "domain":        tstr,           ; "daemon-vhc/seat-release/1.0.0"
-  "run_id":        bstr .size 32,
-  "role":          tstr,
-  "incarnation":   uint,
-  "fencing_token": uint,           ; == incarnation (SEAT-1)
-  "claimant":      bstr .size 32,
-}                                  ; distributed as { body, sig } — sig by `claimant` over body
+  "domain":          tstr,           ; "daemon-vhc/seat-release/2.0.0"
+  "run_id":          bstr .size 32,
+  "role":            tstr,
+  "incarnation":     uint,           ; must match the held lease
+  "leadership_term": uint,           ; must match the held lease
+  "claimant":        bstr .size 32,
+}                                    ; distributed as { body, sig } — sig by `claimant` over body
 ```
 
-- **[SEAT-1] Token ≡ incarnation.** The fencing token is bound to the role-instance incarnation:
-  `fencing_token == incarnation`, both carried explicitly, and every verifier asserts the
-  equality. A takeover is therefore a new incarnation, which is exactly what advances the
-  receivers' supersession floor (§12.3 [CERT-4]) — the registry's CAS and the peers' certificate
-  fence advance in step.
-- **[SEAT-2] Registry CAS, structural only.** The registry stores one slot per `(run, role)` with
-  the current lease and the highest token ever stored (the tombstone floor, which persists across
-  release — tokens never reset). It accepts: a first claim at its presented token; a takeover of
-  an expired slot (registry clock, plus a bounded skew grace) at exactly `floor + 1`; the holder's
-  idempotent refresh at the held token or self-supersession at `held + 1`; a renew whose
-  `(run_id, role, incarnation, fencing_token, claimant)` equal the held lease exactly (epoch,
-  module, endpoint, and expiry may change — the epoch-rebind rule, [CERT-3]); and a release whose
-  token and claimant match. Everything else is a typed structural refusal that mutates nothing.
-  The registry MUST validate structure (domain tag, token≡incarnation, expiry window, a dialable
-  endpoint, slot consistency) and MUST NOT verify signatures or judge authority.
-- **[SEAT-3] Peer acceptance.** A peer accepts a seat lease only when: the claimant's signature
-  over the body verifies; the embedded certificate chains to a genesis-trusted base identity
-  (§12.3 [CERT-2]) and covers exactly the lease's scope `(run_id, epoch, role, incarnation,
-  module_hash)` with `run_key == claimant`; the token≡incarnation invariant holds; the lease is
-  unexpired (with the skew grace); and the incarnation is not below the receiver's supersession
-  floor or explicitly revoked (§12.3 [CERT-4]). A stale claimant's records are refused once a
-  higher fencing token exists, **regardless of what the registry says** — wall-clock expiry gates
-  takeover liveness only; fencing is the safety mechanism.
+- **[SEAT-1] Two identities, two order relations.** A lease carries both ordinals explicitly and
+  they are **independent**. `incarnation` is the claimant's *execution identity* (§8.1
+  `instance`): node-local, never reused, minted only by the claimant's durable counter, and
+  meaningful only within one base identity's ladder — it names a sandbox, a per-run key, a
+  journal stream, and a channel sequence namespace. `leadership_term` is the *leadership
+  identity*: the run-role-global monotonic order of seat ownership ACROSS base identities — the
+  only ordinal the registry CAS and the peers' term fence compare. The embedded certificate
+  binds the execution scope (`instance == incarnation`), never the term: certificates certify
+  executions; grants order leadership. Both ordinals live in the shared bounded domain
+  `<= i64::MAX` (SQLite integers and the registry's bigint fold represent and compare them
+  identically); an out-of-domain ordinal is a structural refusal. **Renew = same execution, same
+  term; every new execution key — takeover, same-base restart, or upgrade — obtains a new grant
+  at `term > floor`** (a new incarnation mints a new per-run key, hence a new claimant).
+- **[SEAT-2] Registry CAS, structural only — sparse monotonic terms.** The registry stores one
+  slot per `(run, role)` with the current lease and the highest term ever stored (the tombstone
+  floor, which persists across release — terms never reset). Terms are **sparse**: a claim is
+  accepted at any term *strictly greater* than the floor, never required to be `floor + 1`
+  exactly (leadership terms derive from claimant-local state; dense increments cannot be
+  authored honestly across unrelated boxes). It accepts: a first claim at its presented term; a
+  takeover of an expired slot (registry clock, plus a bounded skew grace) at any `term > floor`;
+  the holder's idempotent refresh at the held term or the holder's own voluntary advance at any
+  greater term; a renew whose identity `(run_id, role, incarnation, leadership_term, claimant)`
+  equals the held lease exactly (epoch, module, endpoint, and expiry may change — the
+  epoch-rebind rule, [CERT-3]); and a release whose term and claimant match. Everything else is
+  a typed structural refusal that mutates nothing. The registry MUST validate structure (domain
+  tag, ordinal bounds, expiry window, a dialable endpoint, slot consistency) and MUST NOT verify
+  signatures or judge authority.
+- **[SEAT-3] Peer acceptance — the verified term floor.** A peer accepts a seat lease only when:
+  the claimant's signature over the body verifies; the embedded certificate chains to a
+  genesis-trusted base identity (§12.3 [CERT-2]) and covers exactly the lease's execution scope
+  `(run_id, epoch, role, incarnation, module_hash)` with `run_key == claimant`; the ordinals are
+  in domain; the lease is unexpired (with the skew grace); the incarnation is not below the
+  receiver's **per-base** supersession floor for the claimant's base and not explicitly revoked
+  (§12.3 [CERT-4]); and the term is not below the receiver's **verified leadership-term floor**
+  for `(run, role)`. That floor advances ONLY from cryptographically verified seat grants —
+  never from a generic coordinator-role certificate (one that never won the seat must not fence
+  the incumbent) and never from naked registry metadata ("accepted" means stored, not
+  authorized). Verified grants ride the join bootstrap and the control-plane re-announce cadence
+  beside the certificates. A stale claimant's records are refused once a higher verified term
+  exists, **regardless of what the registry says** — wall-clock expiry gates takeover liveness
+  only; the term fence is the safety mechanism. Coordinator-frame authorization is therefore the
+  per-base execution floor PLUS the term binding: the sender must be the claimant bound at the
+  highest verified term. A partitioned receiver enforces its highest *observed* term — the
+  architecture §4.4 posture; registry equivocation tolerance is an explicit trust-statement
+  item, not a property this layer claims.
 - **[SEAT-4] Transport surface.** The registry exposes the seat over
   `GET`/`PUT`/`DELETE {base}/runs/:id/seat/:role` and
   `POST {base}/runs/:id/seat/:role/heartbeat`, canonical-CBOR bodies both ways; an accepted
@@ -3071,16 +3099,22 @@ roster-record-body = {
                                    ;   certificate: run-key-certificate, sig: bstr .size 64 }
 ```
 
-- **[ROSTER-1] Registry acceptance is a structural monotonic upsert.** Per `(run, endpoint_id)`
-  slot, a registry accepts a publish whose freshness key `(incarnation, issued_at_ms)` is `>=`
-  the stored record's (lexicographic; equality is the idempotent republish) and refuses below —
+- **[ROSTER-1] Registry acceptance is a structural monotonic upsert.** Per
+  `(run, endpoint_id, role)` slot — the role is part of the slot key: co-located instances of
+  different roles share one endpoint but run **independent incarnation ladders**, so an
+  endpoint-only slot would let one role's higher incarnation fence its neighbour's record — a
+  registry accepts a publish whose freshness key `(incarnation, issued_at_ms)` is `>=` the
+  stored record's (lexicographic; equality is the idempotent republish) and refuses below —
   the stale republish, answered with the stored record as the publisher's re-read. Structural
   checks only: the domain tag, a non-empty role, dialability (at least one direct address or a
-  relay URL), the size caps above, slot `run_id`/`endpoint_id` consistency, and a nonzero issue
-  stamp. The registry MUST NOT verify signatures or judge authority. A per-run entry cap
+  relay URL), the size caps above, slot `run_id`/`endpoint_id`/`role` consistency, and a nonzero
+  issue stamp. The registry MUST NOT verify signatures or judge authority. A per-run entry cap
   (default 64) gates NEW entry keys only. The shared fold vectors
   (`daemon-vhc-proto/tests/fixtures/roster-vectors.json`) pin these semantics; every conforming
-  registry reproduces them bit-for-bit.
+  registry reproduces them bit-for-bit. A publisher refused stale re-enters through its join
+  transaction: it may repair its own execution floor only from a VERIFIED own-base record (its
+  base signed the stored record for this slot) and re-authors from the top; a foreign or
+  unverifiable record occupying its slot is a collision — fail closed, never a floor to adopt.
 - **[ROSTER-2] Peer acceptance.** A peer trusts a fetched record only when: the sender's
   signature over the canonical body verifies; the embedded certificate chains to a
   genesis-trusted base identity (§12.3) and binds exactly the record's
@@ -3513,10 +3547,11 @@ simulated capability providers), never against SDK-native sim — the split the 
   The frame envelope and seq semantics remain final from A2 and are not altered (§12.1, §12.2).
   Broader `Authority`/`Committed<T>` record semantics continue to layer on top.
 - **Coordinator seat lease** — **shipped (node-side contract + registry CAS semantics)**: the
-  Authority-signed fenced lease over a run's coordinator role (§12.4) — token≡incarnation
-  fencing, untrusted-storage registry CAS with the tombstone floor, peer-side verification
-  chaining into §12.3's certificates and supersession. The cloud registry implements the same
-  frozen surface and shared CAS vectors when its coordinator surface next lands.
+  Authority-signed fenced lease over a run's coordinator role (§12.4) — scheme-v2
+  leadership-term fencing (the term is a separate ordinal from the execution incarnation),
+  untrusted-storage registry CAS with the sparse tombstone floor, peer-side verification
+  chaining into §12.3's certificates and supersession plus the verified term floor. The cloud
+  registry implements the same frozen surface and shared CAS vectors.
 - **Record archive** — builds on §8.2's chained segments + §8.6 evidence records. **Phase D**.
 - **Upgrade transaction** — the §10.3 sequence, implemented **Phase E** over the §10.2 scaffolding.
 

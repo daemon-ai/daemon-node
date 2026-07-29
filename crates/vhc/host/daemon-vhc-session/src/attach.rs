@@ -115,6 +115,11 @@ pub struct CertCheck {
     /// Revocation state: explicit signed records + the supersession floor derived from the
     /// certificates observed above.
     revocations: RevocationLedger,
+    /// The leadership-term floors for seat-governed roles ([SEAT-1] v2): fed only by verified
+    /// seat grants ([`CertCheck::ingest_seat_grant`]) — a frame under a governed role from
+    /// anyone but the claimant bound at the highest verified term is refused
+    /// ([`CertError::SeatSuperseded`]), regardless of its certificate.
+    seat_terms: daemon_vhc_proto::SeatTermLedger,
 }
 
 impl CertCheck {
@@ -129,6 +134,7 @@ impl CertCheck {
             trusted_bases,
             certs,
             revocations,
+            seat_terms: daemon_vhc_proto::SeatTermLedger::new(),
         }
     }
 
@@ -154,6 +160,38 @@ impl CertCheck {
     #[must_use]
     pub fn trusts_base(&self, base: &PeerId) -> bool {
         self.trusted_bases.contains(base)
+    }
+
+    /// Ingest a distributed **seat grant** ([SEAT-1] v2 grant distribution): the
+    /// observation-grade acceptance (structure, self-signature, genesis-trusted certificate
+    /// chain over exactly the grant's scope and claimant — expiry deliberately excluded: the
+    /// term floor is monotonic ownership HISTORY, expiry gates takeover liveness) plus the
+    /// per-base revocation judgment, then the term floor advances and the embedded certificate
+    /// joins the store (a grant is also how a late subscriber first learns the incumbent's
+    /// cert). Idempotent; a stale (lower-term) grant is verified but changes no floor.
+    ///
+    /// # Errors
+    /// A human-readable refusal — a refused grant changes no state.
+    pub fn ingest_seat_grant(&mut self, grant: daemon_vhc_proto::SeatLease) -> Result<(), String> {
+        grant
+            .verify_grant(&self.trusted_bases)
+            .map_err(|e| format!("seat grant: {e}"))?;
+        self.revocations
+            .judge(
+                &grant.body.cert_scope(),
+                &grant.body.claimant,
+                &grant.certificate.base_identity,
+            )
+            .map_err(|e| format!("seat grant claimant: {e}"))?;
+        self.ingest_certificate(grant.certificate.clone());
+        self.seat_terms.observe_verified_grant(&grant);
+        Ok(())
+    }
+
+    /// The highest verified leadership term for `(run, role)` (observability / tests).
+    #[must_use]
+    pub fn seat_term_floor(&self, run_id: &daemon_vhc_proto::Hash, role: &str) -> Option<u64> {
+        self.seat_terms.floor(run_id, role)
     }
 
     /// Ingest a signed revocation record: accepted only from a trusted base and only with a
@@ -226,7 +264,16 @@ impl CertCheck {
             }
             return Err(last);
         };
-        self.revocations.judge(scope, sender, &certifying_base)
+        self.revocations.judge(scope, sender, &certifying_base)?;
+        // The cross-base leadership judgment ([SEAT-1] v2): when the frame's role is governed by
+        // an observed verified seat grant, only the claimant bound at the highest verified term
+        // may speak under it — a certified-but-fenced predecessor is refused here. Ungoverned
+        // roles (no grant observed — every trainer role, and the coordinator before the first
+        // grant arrives) pass: certification + the per-base ladders above remain their gate.
+        if self.seat_terms.binds(&scope.run_id, &scope.role, sender) == Some(false) {
+            return Err(CertError::SeatSuperseded);
+        }
+        Ok(())
     }
 }
 
@@ -312,6 +359,9 @@ impl InboundFrames {
             crate::distribution::DistributionRecord::Revocation(record) => certs
                 .ingest_revocation(&record)
                 .map_err(|e| format!("revocation record: {e}")),
+            crate::distribution::DistributionRecord::SeatGrant(grant) => {
+                certs.ingest_seat_grant(*grant)
+            }
         }
     }
 

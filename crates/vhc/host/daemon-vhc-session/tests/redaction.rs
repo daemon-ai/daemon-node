@@ -83,6 +83,7 @@ fn no_secret_crosses_the_command_wire_or_lands_in_a_journal() {
         iroh: None,
         presign_base: Some("http://127.0.0.1:8795/api/v1/vhc".into()),
         peer_certs: Vec::new(),
+        seat_grant: None,
         secret_ref: Some(secret_ref),
         expires_at_ms: 0,
         restore: None,

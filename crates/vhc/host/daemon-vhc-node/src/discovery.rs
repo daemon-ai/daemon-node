@@ -251,6 +251,20 @@ impl RunDiscovery for EgressRunDiscovery {
             .map_err(|e| VhcError::Discovery(e.to_string()))?
         {
             daemon_vhc_net::RosterPublishOutcome::Accepted => Ok(()),
+            // A stale refusal surfaces TYPED with the slot's stored record: the join
+            // transaction judges it (a verified own-base record is own-floor evidence; anything
+            // else fails closed) — never an internal publish retry, and never a string the
+            // caller has to parse.
+            daemon_vhc_net::RosterPublishOutcome::Refused {
+                decision:
+                    daemon_vhc_proto::RosterDecision::RejectedStale {
+                        stored_incarnation, ..
+                    },
+                stored,
+            } => Err(VhcError::RosterStale {
+                stored_incarnation,
+                stored,
+            }),
             daemon_vhc_net::RosterPublishOutcome::Refused { decision, .. } => Err(
                 VhcError::Discovery(format!("roster publish refused: {decision:?}")),
             ),

@@ -87,6 +87,7 @@ fn rig(wasm: &[u8], role: &str, config: Vec<u8>) -> Rig {
         own_cert: certified.cert.clone(),
         trusted_bases: vec![peer_id(&base)],
         peer_certs: vec![certified.cert.clone()],
+        seat_grant: None,
         providers: RoleProviders {
             control: plane.clone(),
             payloads: payloads.clone(),

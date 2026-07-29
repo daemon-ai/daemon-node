@@ -1074,6 +1074,15 @@ pub struct SessionCredentials {
     /// later arrivals ride the control plane as distribution records.
     #[serde(default)]
     pub peer_certs: Vec<daemon_vhc_proto::RunKeyCertificate>,
+    /// The coordinator's full signed **seat grant** known at join ([SEAT-1] v2 grant
+    /// distribution's bootstrap half): the node resolved + AUTHORIZED the stored lease (a
+    /// trainer bootstrapping the incumbent; the winner bootstrapping its own) — the session
+    /// ingests it into its leadership-term floor and re-announces it on-plane beside its
+    /// certificate, so the WS resubscribe anti-entropy re-carries it to late subscribers.
+    /// `None` = no seat observed at join (the floor starts ungoverned; the first on-plane
+    /// grant governs it).
+    #[serde(default)]
+    pub seat_grant: Option<daemon_vhc_proto::SeatLease>,
     /// The keystore reference of the node-authored per-run CREDENTIALS RECORD (WS/presign auth
     /// material) — resolved by the worker against the identity store it already holds by path
     /// reference; token material never rides this body ([CI-9] custody; D-P8 redaction by
@@ -1835,6 +1844,7 @@ mod tests {
             iroh: None,
             presign_base: None,
             peer_certs: Vec::new(),
+            seat_grant: None,
             secret_ref: None,
             expires_at_ms: 0,
             restore: None,
@@ -1886,6 +1896,7 @@ mod tests {
             }),
             presign_base: Some("http://127.0.0.1:8795/api/v1/vhc".into()),
             peer_certs: vec![cert],
+            seat_grant: None,
             secret_ref: Some("coordinator-1.creds".into()),
             expires_at_ms: 1_800_000_000_000,
             restore: Some(CheckpointRestore {

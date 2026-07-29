@@ -203,6 +203,15 @@ pub enum StoreError {
     /// A JSON (de)serialization failure for a stored policy / eligibility / event blob.
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
+    /// A node-owned monotonic counter reached the bounded ordinal ceiling (`i64::MAX`, the
+    /// shared domain across SQLite / the wire / the TS registry) — identity minting on this
+    /// installation is exhausted; typed, never a silent wrap.
+    #[error("counter `{0}` exhausted: the bounded ordinal domain (i64::MAX) is spent")]
+    CounterExhausted(&'static str),
+    /// A presented ordinal (e.g. a floor to mint above) is outside the bounded domain
+    /// (`> i64::MAX`) — refused typed, never truncated into a counter.
+    #[error("ordinal {0} is outside the bounded domain (max {max})", max = i64::MAX)]
+    OrdinalOutOfDomain(u64),
     /// The `RunLabel` ↔ `RunId` cross-check failed: the row already carries a different genesis
     /// hash than the one presented (decisions D1 — a mismatched pair is a stale label or a spoof,
     /// surfaced as a typed refusal, never silently overwritten).
@@ -329,6 +338,21 @@ CREATE TABLE IF NOT EXISTS vhc_upgrade_records (
 );
 ";
 
+/// M7: the node's **highest verified leadership term** per `(run, role)` seat slot ([SEAT-1]
+/// v2 — leadership terms are a separate order relation from execution incarnations, so they get
+/// separate durable state, never the `vhc_counters` execution counter). Fed only by verified
+/// evidence: seat grants this node authored and won, and stored leases that passed the full
+/// peer-side authorization. Monotonic MAX per slot; never advanced by naked registry metadata.
+const M7_SEAT_TERMS: &str = "\
+CREATE TABLE IF NOT EXISTS vhc_seat_terms (
+    run_id   TEXT NOT NULL,
+    role     TEXT NOT NULL,
+    term     INTEGER NOT NULL,
+    claimant BLOB NOT NULL,
+    PRIMARY KEY (run_id, role)
+);
+";
+
 fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
         M::up(SCHEMA),
@@ -337,6 +361,7 @@ fn migrations() -> Migrations<'static> {
         M::up(M4_ADMITTED_TUPLE),
         M::up(M5_RUN_LIFECYCLE),
         M::up(M6_UPGRADE_RECORDS),
+        M::up(M7_SEAT_TERMS),
     ])
 }
 
@@ -883,32 +908,99 @@ impl VhcStore {
 
     /// Mint the next **role-instance incarnation id** — never-reused, node-durable, monotonic
     /// (ABI §8.1; decisions D1). The first minted id is `1` (`0` is the pre-multi-instance
-    /// default in existing rows). Atomic: the increment and the read are one SQL statement.
+    /// default in existing rows). Atomic: the increment and the read are one SQL statement,
+    /// guarded against the bounded-domain ceiling (`i64::MAX`, the shared ordinal domain) —
+    /// exhaustion is a typed error, never a silent wrap.
     pub fn mint_incarnation(&self) -> Result<u64, StoreError> {
         let conn = self.lock();
-        let value: i64 = conn.query_row(
-            "UPDATE vhc_counters SET value = value + 1 WHERE name = 'incarnation' \
-             RETURNING value",
-            [],
-            |row| row.get(0),
-        )?;
+        let value: i64 = conn
+            .query_row(
+                "UPDATE vhc_counters SET value = value + 1 \
+             WHERE name = 'incarnation' AND value < ?1 RETURNING value",
+                params![i64::MAX],
+                |row| row.get(0),
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => StoreError::CounterExhausted("incarnation"),
+                other => StoreError::from(other),
+            })?;
         Ok(value as u64)
     }
 
-    /// Mint the next incarnation id, guaranteed **strictly above `floor`** — the live-upgrade
-    /// minting rule (ABI §8.1/§10.3): the post-switch incarnation must supersede the running
-    /// one, and the running one may exceed the counter when it was minted out-of-band (a seat
-    /// lease's fencing token IS the incarnation). Atomic: the counter is raised to
-    /// `max(counter, floor) + 1` and read in one statement, so the never-reused guarantee holds
-    /// for every later [`mint_incarnation`](Self::mint_incarnation) too.
-    pub fn mint_incarnation_above(&self, floor: u64) -> Result<u64, StoreError> {
+    /// The node's persisted **highest verified leadership term** for a `(run, role)` seat slot,
+    /// with the claimant it bound ([SEAT-1] v2 — a separate order relation from the execution
+    /// counter). `None` until a verified grant was ever observed.
+    pub fn seat_term(
+        &self,
+        run_label: &str,
+        role: &str,
+    ) -> Result<Option<(u64, [u8; 32])>, StoreError> {
         let conn = self.lock();
-        let value: i64 = conn.query_row(
-            "UPDATE vhc_counters SET value = MAX(value, ?1) + 1 WHERE name = 'incarnation' \
-             RETURNING value",
-            params![floor as i64],
-            |row| row.get(0),
+        let row = conn
+            .query_row(
+                "SELECT term, claimant FROM vhc_seat_terms WHERE run_id = ?1 AND role = ?2",
+                params![run_label, role],
+                |row| {
+                    let term: i64 = row.get(0)?;
+                    let claimant: Vec<u8> = row.get(1)?;
+                    Ok((term, claimant))
+                },
+            )
+            .optional()?;
+        Ok(row.and_then(|(term, claimant)| {
+            let claimant: [u8; 32] = claimant.try_into().ok()?;
+            Some((term as u64, claimant))
+        }))
+    }
+
+    /// Observe a **verified** seat grant's leadership term into the persisted floor — monotonic
+    /// MAX per slot (a lower/equal term is a no-op that never regresses the binding). TRUST GATE
+    /// (caller-enforced): only terms from grants this node authored and won, or stored leases
+    /// that passed the full peer-side authorization ([`crate::seat::authorize_incumbent`]) —
+    /// never naked registry metadata.
+    pub fn observe_seat_term(
+        &self,
+        run_label: &str,
+        role: &str,
+        term: u64,
+        claimant: &[u8; 32],
+    ) -> Result<(), StoreError> {
+        let term = i64::try_from(term).map_err(|_| StoreError::OrdinalOutOfDomain(term))?;
+        self.lock().execute(
+            "INSERT INTO vhc_seat_terms (run_id, role, term, claimant) VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT(run_id, role) DO UPDATE \
+             SET term = excluded.term, claimant = excluded.claimant \
+             WHERE excluded.term > vhc_seat_terms.term",
+            params![run_label, role, term, claimant.as_slice()],
         )?;
+        Ok(())
+    }
+
+    /// Mint the next incarnation id, guaranteed **strictly above `floor`** — the live-upgrade /
+    /// floor-repair minting rule (ABI §8.1/§10.3): the successor incarnation must supersede a
+    /// value observed out-of-band (a running instance across a switch; a verified own-base
+    /// roster floor). Atomic: the counter is raised to `max(counter, floor) + 1` and read in
+    /// one statement, so the never-reused guarantee holds for every later
+    /// [`mint_incarnation`](Self::mint_incarnation) too.
+    ///
+    /// `floor` MUST already be inside the bounded ordinal domain (`<= i64::MAX`) — an
+    /// out-of-domain floor is a typed refusal, NEVER truncated into the counter (the audited
+    /// `floor as i64` cast wrapped negative and silently voided the "strictly above" contract);
+    /// a floor at the ceiling exhausts the counter typed.
+    pub fn mint_incarnation_above(&self, floor: u64) -> Result<u64, StoreError> {
+        let floor = i64::try_from(floor).map_err(|_| StoreError::OrdinalOutOfDomain(floor))?;
+        let conn = self.lock();
+        let value: i64 = conn
+            .query_row(
+                "UPDATE vhc_counters SET value = MAX(value, ?1) + 1 \
+             WHERE name = 'incarnation' AND MAX(value, ?1) < ?2 RETURNING value",
+                params![floor, i64::MAX],
+                |row| row.get(0),
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => StoreError::CounterExhausted("incarnation"),
+                other => StoreError::from(other),
+            })?;
         Ok(value as u64)
     }
 
@@ -1147,6 +1239,93 @@ mod tests {
         assert_eq!(store.run_priority("run-X").unwrap(), 100, "default");
         store.set_run_priority("run-X", 7).unwrap();
         assert_eq!(store.run_priority("run-X").unwrap(), 7);
+    }
+
+    /// M7: the ordinal domain is bounded and every edge is TYPED — a poisoned floor can never
+    /// wrap, truncate, or silently void the "strictly above" contract (the audited `floor as
+    /// i64` cast defect class).
+    #[test]
+    fn m7_bounded_ordinal_arithmetic_refuses_poisoned_floors_typed() {
+        let store = VhcStore::open_in_memory().unwrap();
+
+        // The floor-taking mint is strictly above any in-domain floor, and the plain counter
+        // continues above it (never-reused holds across both mint paths).
+        assert_eq!(store.mint_incarnation_above(5).unwrap(), 6);
+        assert_eq!(store.mint_incarnation().unwrap(), 7);
+
+        // An out-of-domain floor (> i64::MAX) is a typed refusal, never a wrap: the counter is
+        // untouched and keeps minting normally.
+        let err = store.mint_incarnation_above(u64::MAX).unwrap_err();
+        assert!(matches!(err, StoreError::OrdinalOutOfDomain(_)), "{err}");
+        let err = store
+            .mint_incarnation_above(i64::MAX as u64 + 1)
+            .unwrap_err();
+        assert!(matches!(err, StoreError::OrdinalOutOfDomain(_)), "{err}");
+        assert_eq!(store.mint_incarnation().unwrap(), 8);
+
+        // A floor AT the ceiling exhausts the counter typed ("+1" would leave the domain);
+        // the counter is untouched by the refused attempt.
+        let err = store.mint_incarnation_above(i64::MAX as u64).unwrap_err();
+        assert!(matches!(err, StoreError::CounterExhausted(_)), "{err}");
+        assert_eq!(store.mint_incarnation().unwrap(), 9);
+    }
+
+    /// M7: the persisted leadership-term floor is monotonic per `(run, role)` slot — a lower or
+    /// equal term never regresses the binding, and slots are independent.
+    #[test]
+    fn m7_seat_term_floor_is_monotonic_and_slot_scoped() {
+        let store = VhcStore::open_in_memory().unwrap();
+        let a = [0xAA_u8; 32];
+        let b = [0xBB_u8; 32];
+
+        assert_eq!(store.seat_term("run-T", "coordinator").unwrap(), None);
+        store
+            .observe_seat_term("run-T", "coordinator", 10, &a)
+            .unwrap();
+        assert_eq!(
+            store.seat_term("run-T", "coordinator").unwrap(),
+            Some((10, a))
+        );
+
+        // A higher verified term advances the floor AND the bound claimant (sparse jump).
+        store
+            .observe_seat_term("run-T", "coordinator", 25, &b)
+            .unwrap();
+        assert_eq!(
+            store.seat_term("run-T", "coordinator").unwrap(),
+            Some((25, b))
+        );
+
+        // A lower or equal term is a no-op — the floor never regresses, the binding holds.
+        store
+            .observe_seat_term("run-T", "coordinator", 10, &a)
+            .unwrap();
+        store
+            .observe_seat_term("run-T", "coordinator", 25, &a)
+            .unwrap();
+        assert_eq!(
+            store.seat_term("run-T", "coordinator").unwrap(),
+            Some((25, b))
+        );
+
+        // An out-of-domain term is a typed refusal, never a truncated row.
+        let err = store
+            .observe_seat_term("run-T", "coordinator", u64::MAX, &a)
+            .unwrap_err();
+        assert!(matches!(err, StoreError::OrdinalOutOfDomain(_)), "{err}");
+
+        // Slots are independent per (run, role).
+        store
+            .observe_seat_term("run-U", "coordinator", 3, &a)
+            .unwrap();
+        assert_eq!(
+            store.seat_term("run-T", "coordinator").unwrap(),
+            Some((25, b))
+        );
+        assert_eq!(
+            store.seat_term("run-U", "coordinator").unwrap(),
+            Some((3, a))
+        );
     }
 
     /// M4: the admitted-tuple column persists beside the join intent, and the two node-owned

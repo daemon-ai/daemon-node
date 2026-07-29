@@ -644,6 +644,108 @@ impl RunDiscovery for CheckpointDiscovery {
     }
 }
 
+/// A discovery seam resolving one run (allowlisted coordinator + envelope) AND serving
+/// checkpoint pointers — the join-time restore-freshness judgment's input surface.
+struct StaleCheckpointDiscovery {
+    trainer_round: u64,
+    coordinator_round: u64,
+}
+
+#[async_trait]
+impl RunDiscovery for StaleCheckpointDiscovery {
+    async fn list_runs(&self) -> Result<Vec<DiscoveredRun>, VhcError> {
+        Ok(Vec::new())
+    }
+    async fn get_run(&self, run_id: &str) -> Result<Option<DiscoveredRun>, VhcError> {
+        Ok(Some(DiscoveredRun {
+            run_id: run_id.to_string(),
+            coordinator: "https://coord.example/api/v1/vhc".into(),
+            envelope_hash: "deadbeef".into(),
+            proto_version: 3,
+        }))
+    }
+    async fn fetch_envelope(&self, _run_id: &str) -> Result<Vec<u8>, VhcError> {
+        Ok(b"frozen-envelope-bytes".to_vec())
+    }
+    async fn fetch_checkpoint(
+        &self,
+        _run_id: &str,
+        role: &str,
+    ) -> Result<Option<daemon_vhc_node::CheckpointPointer>, VhcError> {
+        let round = match role {
+            "trainer" => self.trainer_round,
+            "coordinator" => self.coordinator_round,
+            _ => return Ok(None),
+        };
+        Ok(Some(daemon_vhc_node::CheckpointPointer {
+            role: role.to_string(),
+            kind: "live".into(),
+            round,
+            hash: "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262".into(),
+            size: 1024,
+        }))
+    }
+}
+
+/// **Join-time cadence-vs-ring reachability** (the recovery-honesty check): a trainer whose
+/// freshest restore pointer is more than the retained record horizon behind the run's live
+/// head is refused TYPED at join — before any rehydration — instead of wedging into the
+/// module's post-restore `GapRefused`. A fence within the horizon joins normally.
+#[tokio::test]
+async fn join_refuses_a_checkpoint_too_stale_for_the_retained_horizon() {
+    let config = VhcConfig {
+        coordinator_allowlist: vec!["https://coord.example/api/v1/vhc".into()],
+        ..enabled_config()
+    };
+
+    // Restored fence 1 vs live head 10: 9 rounds behind, horizon 4 — refused typed.
+    let worker = FakeWorker::new();
+    let svc = VhcService::new(VhcServiceParts {
+        config: config.clone(),
+        store: VhcStore::open_in_memory().unwrap(),
+        worker: worker.clone(),
+        feed: None,
+        discovery: Some(Arc::new(StaleCheckpointDiscovery {
+            trainer_round: 1,
+            coordinator_round: 10,
+        })),
+        budget: None,
+        worker_factory: None,
+        identity_dir: None,
+        seat_directory: None,
+    });
+    let err = svc
+        .vhc_join("run-stale".into(), policy(), "op".into())
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("checkpoint too stale"),
+        "typed staleness refusal, got: {err}"
+    );
+    assert!(worker.calls().joins.is_empty(), "no join was issued");
+
+    // Restored fence 8 vs live head 10: within the horizon — the join proceeds.
+    let worker = FakeWorker::new();
+    let svc = VhcService::new(VhcServiceParts {
+        config,
+        store: VhcStore::open_in_memory().unwrap(),
+        worker: worker.clone(),
+        feed: None,
+        discovery: Some(Arc::new(StaleCheckpointDiscovery {
+            trainer_round: 8,
+            coordinator_round: 10,
+        })),
+        budget: None,
+        worker_factory: None,
+        identity_dir: None,
+        seat_directory: None,
+    });
+    svc.vhc_join("run-fresh".into(), policy(), "op".into())
+        .await
+        .expect("a fence within the horizon joins");
+    assert_eq!(worker.calls().joins, vec!["run-fresh".to_string()]);
+}
+
 #[tokio::test]
 async fn checkpoint_pointers_are_role_and_kind_scoped() {
     let d = CheckpointDiscovery::default();

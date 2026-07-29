@@ -62,6 +62,50 @@ pub enum VhcError {
     /// mismatch — the §6.1/§6.5 join-time discovery seam).
     #[error("discovery: {0}")]
     Discovery(String),
+    /// The registry refused this node's roster publish as STALE and returned the slot's stored
+    /// record — surfaced TYPED (never folded into a string) so the join transaction can judge
+    /// it: a record that verifies to this node's OWN base identity for the same
+    /// `(run, role, endpoint)` scope is own-floor evidence (the transaction restarts once above
+    /// it, [`VhcStore::mint_incarnation_above`](crate::store::VhcStore::mint_incarnation_above));
+    /// anything else fails closed. The registry's decision itself is structural retry SIGNAL,
+    /// never trusted state — only the record's own verified signature repairs a counter.
+    #[error("roster publish refused stale (stored incarnation {stored_incarnation})")]
+    RosterStale {
+        /// The registry-reported stored incarnation (diagnostic; the VERIFIED record governs).
+        stored_incarnation: u64,
+        /// The slot's stored record as returned (UNVERIFIED until judged).
+        stored: Option<Box<daemon_vhc_proto::RosterRecord>>,
+    },
+    /// The join transaction observed ITS OWN fresher roster record — verified own-base
+    /// evidence: the stored record's signature verifies, its certificate chains to THIS node's
+    /// base identity, and its `(run, role, endpoint)` scope is this instance's — and repaired
+    /// the local execution counter strictly above it. The transaction restarts authorship from
+    /// the top ONCE with a freshly minted incarnation (a changed incarnation changes the
+    /// reservation key, the admitted tuple, the certificate, and the credentials — it can never
+    /// be an internal publish retry).
+    #[error("own roster floor {floor} observed and repaired; the join transaction restarts")]
+    OwnFloorRepaired {
+        /// The verified floor incarnation the counter was raised above.
+        floor: u64,
+    },
+    /// The role's freshest restore checkpoint is too far behind the run's live head for the
+    /// retained record horizon
+    /// ([`daemon_vhc_proto::RETAINED_RECORD_HORIZON_ROUNDS`]): replay-forward could never
+    /// bridge the gap, so the join is refused TYPED at join time — before rehydration — instead
+    /// of wedging into the module's `GapRefused`/`StaleRestore` after it (the recovery-honesty
+    /// check; the in-module refusal remains the authoritative backstop).
+    #[error(
+        "checkpoint too stale for the retained horizon: restored fence {restored} vs live head \
+         {head} (horizon {horizon} rounds)"
+    )]
+    CheckpointStale {
+        /// The restore fence (the freshest pointer round for the joining role).
+        restored: u64,
+        /// The live-head estimate (the freshest checkpoint round visible for the run).
+        head: u64,
+        /// The retained record horizon (rounds).
+        horizon: u64,
+    },
     /// The owner arbiter refused the join: an aggregate resource ledger is exhausted (decisions
     /// D6 — the admission funnel's last, supreme stage; the owner can always refuse).
     #[error("owner arbitration refused the join: {0}")]
@@ -367,7 +411,7 @@ struct InstanceEntry {
 /// The node-side vhc-training service.
 pub struct VhcService {
     config: VhcConfig,
-    store: VhcStore,
+    store: Arc<VhcStore>,
     worker: Arc<dyn WorkerControl>,
     discovery: Option<Arc<dyn RunDiscovery>>,
     /// The D6 owner arbiter: every join is admitted against the aggregate typed ledgers before
@@ -422,6 +466,9 @@ impl VhcService {
     /// only when `config.enabled`.
     pub fn new(parts: VhcServiceParts) -> Self {
         let (events_tx, _) = broadcast::channel(1024);
+        // The durable store is SHARED with the seat keeper (execution-incarnation counter +
+        // persisted verified leadership-term floors live in one `vhc.db`).
+        let store = Arc::new(parts.store);
         // Coordinator duty is opt-in AND fully wired or absent: the keeper exists only when the
         // owner enabled it and both the seat directory + the identity store are present.
         let seat = match (
@@ -429,15 +476,19 @@ impl VhcService {
             &parts.seat_directory,
             &parts.identity_dir,
         ) {
-            (true, Some(directory), Some(identity_dir)) => Some(
-                crate::seat_keeper::SeatKeeper::new(directory.clone(), identity_dir.clone()),
-            ),
+            (true, Some(directory), Some(identity_dir)) => {
+                Some(crate::seat_keeper::SeatKeeper::new(
+                    directory.clone(),
+                    identity_dir.clone(),
+                    store.clone(),
+                ))
+            }
             _ => None,
         };
         let seat_read = parts.seat_directory.clone();
         Self {
             config: parts.config,
-            store: parts.store,
+            store,
             worker: parts.worker,
             discovery: parts.discovery,
             arbiter: OwnerArbiter::new(parts.budget.unwrap_or_else(OwnerBudget::unbounded)),
@@ -662,10 +713,11 @@ impl VhcService {
                 SeatNote::Claimed {
                     run_label,
                     incarnation,
+                    leadership_term,
                 } => {
                     // A won seat is a state change the app should see (not a warning).
                     self.emit_changed(Some(run_label.clone()));
-                    let _ = (run_label, incarnation);
+                    let _ = (run_label, incarnation, leadership_term);
                     continue;
                 }
                 SeatNote::Renewed { .. } => continue,
@@ -833,7 +885,28 @@ impl VhcService {
     /// Credentials and the per-run certificate are re-authored fresh for the new incarnation
     /// (D-P8 — never replayed). The row is marked `starting`, never `running` — readiness is an
     /// observation the event pump makes from the session's own `RunPhase "running"`.
+    ///
+    /// A verified own-roster-floor repair ([`VhcError::OwnFloorRepaired`], judged inside the
+    /// authorship step) restarts the whole transaction ONCE: the raised counter makes the next
+    /// mint strictly above the observed floor, so the restarted attempt re-reserves, re-authors,
+    /// and re-publishes under a fresh superseding identity. A second stale refusal surfaces
+    /// typed — never a loop.
     async fn reconverge(&self, run: &PersistedRun) -> Result<(), VhcError> {
+        match self.reconverge_attempt(run).await {
+            Err(VhcError::OwnFloorRepaired { floor }) => {
+                tracing::info!(
+                    run_id = run.run_id,
+                    floor,
+                    "reconverge: restarting the join transaction above the repaired floor"
+                );
+                self.reconverge_attempt(run).await
+            }
+            other => other,
+        }
+    }
+
+    /// One attempt of the [`reconverge`](Self::reconverge) transaction body.
+    async fn reconverge_attempt(&self, run: &PersistedRun) -> Result<(), VhcError> {
         let worker = self.instance_worker();
         let id = RoleInstanceId {
             run_id: run
@@ -887,7 +960,16 @@ impl VhcService {
             .admitted_tuple
             .as_deref()
             .and_then(|b| protocol::decode::<protocol::AdmittedTuple>(b).ok());
-        let restore = self.resolve_restore(&run.run_id, &run.role).await;
+        let restore = match self.resolve_restore(&run.run_id, &run.role).await {
+            Ok(r) => r,
+            Err(e) => {
+                self.arbiter.release(&id);
+                if self.worker_factory.is_some() {
+                    worker.shutdown().await;
+                }
+                return Err(e);
+            }
+        };
         let seat = self.resolve_seat_bootstrap(&run.run_id).await;
         let (delivery_tuple, credentials, _credentials_ref) = match self
             .author_join(
@@ -1070,7 +1152,15 @@ impl VhcService {
             worker.shutdown().await;
             return;
         }
-        let restore = self.resolve_restore(run_id, "trainer").await;
+        let restore = match self.resolve_restore(run_id, "trainer").await {
+            Ok(r) => r,
+            Err(e) => {
+                self.arbiter.release(&id);
+                warn_co!(format!("co-located trainer restore refused: {e}"));
+                worker.shutdown().await;
+                return;
+            }
+        };
         let seat = self.resolve_seat_bootstrap(run_id).await;
         let (delivery_tuple, credentials, _credentials_ref) = match self
             .author_join(run_id, &coordinator, &id, assessed_tuple, restore, seat)
@@ -1957,7 +2047,23 @@ impl VhcService {
             u64::try_from(now_ms()).unwrap_or(1).max(1),
         )
         .map_err(|e| VhcError::Internal(format!("author roster record: {e}")))?;
-        discovery.publish_roster(run_label, &record).await?;
+        if let Err(e) = discovery.publish_roster(run_label, &record).await {
+            // A stale refusal is judged HERE, where the identity material lives: verified
+            // own-base evidence repairs the counter and surfaces `OwnFloorRepaired` (the join
+            // transaction restarts once); anything else fails closed typed.
+            return Err(match e {
+                VhcError::RosterStale {
+                    stored_incarnation,
+                    stored,
+                } => self.repair_own_roster_floor(
+                    keystore,
+                    identity,
+                    stored_incarnation,
+                    stored.as_deref(),
+                ),
+                other => other,
+            });
+        }
 
         // 3. Fetch + verify: trust is the genesis-named base set, never the registry.
         let trusted = self.genesis_trusted_bases(run_label).await?;
@@ -1978,6 +2084,77 @@ impl VhcService {
             roster,
             bind_addr: Some(bind_addr),
         }))
+    }
+
+    /// Judge a roster-stale refusal against the recovery invariant (floors advance only from
+    /// verified own-base evidence) and return the error the join transaction acts on:
+    ///
+    /// - the stored record verifies (signature + certificate chain) **to this node's own base
+    ///   identity**, for **this instance's scope** (run hash, role, our endpoint id) ⇒ it is a
+    ///   fresher execution of OUR OWN ladder (a predecessor this restart lost track of):
+    ///   bounds-checked [`mint_incarnation_above`](crate::store::VhcStore::mint_incarnation_above)
+    ///   repairs the counter and [`VhcError::OwnFloorRepaired`] tells the transaction to restart
+    ///   authorship from the top, once;
+    /// - anything else — a foreign base in our slot, an unverifiable record, a scope mismatch,
+    ///   an out-of-domain ordinal, an empty stored slot — **fails closed** as a typed terminal:
+    ///   a collision (or a lying registry) is never a floor to adopt. The registry's structural
+    ///   decision drove the retry logic only; no naked registry number ever touched a counter.
+    fn repair_own_roster_floor(
+        &self,
+        keystore: &daemon_vhc_session::keystore::VhcKeystore,
+        identity: &crate::credentials::RunInstanceIdentity<'_>,
+        stored_incarnation: u64,
+        stored: Option<&daemon_vhc_proto::RosterRecord>,
+    ) -> VhcError {
+        let fail_closed = |why: String| {
+            VhcError::Discovery(format!(
+                "roster publish refused stale (stored incarnation {stored_incarnation}) and the \
+                 stored record is not verified own-base evidence — failing closed, no floor \
+                 adopted: {why}"
+            ))
+        };
+        let Some(record) = stored else {
+            return fail_closed("the registry returned no stored record".into());
+        };
+        let own_base = match keystore.base_identity() {
+            Ok(key) => daemon_vhc_proto::peer_id(&key),
+            Err(e) => return fail_closed(format!("no base identity: {e}")),
+        };
+        // Full verification AGAINST OUR OWN BASE as the only trusted issuer: signature by the
+        // record's sender, certificate chain + scope binding, issuer == our base.
+        if let Err(e) = record.authorize(std::slice::from_ref(&own_base)) {
+            return fail_closed(format!("stored record does not verify to our base: {e}"));
+        }
+        if record.body.run_id.0 != identity.genesis_hash {
+            return fail_closed("stored record is scoped to a different run".into());
+        }
+        if record.body.role != identity.role {
+            return fail_closed(format!(
+                "stored record is scoped to role `{}`, ours is `{}`",
+                record.body.role, identity.role
+            ));
+        }
+        match crate::roster::local_endpoint_id(keystore) {
+            Ok(own_endpoint) if record.body.endpoint_id == own_endpoint => {}
+            Ok(_) => return fail_closed("stored record names a different endpoint id".into()),
+            Err(e) => return fail_closed(format!("no local endpoint id: {e}")),
+        }
+        // Verified own-base evidence: bounds-checked counter repair (typed refusal on an
+        // out-of-domain floor or exhaustion — never a wrap).
+        let floor = record.body.incarnation;
+        match self.store.mint_incarnation_above(floor) {
+            Ok(minted) => {
+                tracing::info!(
+                    run = identity.run_label,
+                    role = identity.role,
+                    floor,
+                    minted,
+                    "own roster floor repaired: the join transaction restarts above it"
+                );
+                VhcError::OwnFloorRepaired { floor }
+            }
+            Err(e) => fail_closed(format!("counter repair refused: {e}")),
+        }
     }
 
     /// The run's genesis-trusted certificate issuers: fetch the frozen envelope (blake3-verified
@@ -2109,12 +2286,65 @@ impl VhcService {
         let Some(dir) = &self.seat_read else {
             return crate::credentials::SeatBootstrap::default();
         };
-        match dir.read_seat(run_label, &self.config.seat_role).await {
-            Ok(daemon_vhc_proto::SeatState::Leased(lease)) => crate::credentials::SeatBootstrap {
-                peer_certs: vec![lease.certificate.clone()],
-                ws_base: lease.body.endpoint.ws.clone(),
-            },
-            _ => crate::credentials::SeatBootstrap::default(),
+        let lease = match dir.read_seat(run_label, &self.config.seat_role).await {
+            Ok(daemon_vhc_proto::SeatState::Leased(lease)) => lease,
+            _ => return crate::credentials::SeatBootstrap::default(),
+        };
+        // The stored lease is registry METADATA until the full peer-side acceptance passes:
+        // signature + certificate chain to a genesis-trusted base + expiry + the persisted
+        // verified leadership-term floor ([SEAT-3] v2 — a registry serving a stale lease is
+        // refused here, and nothing it serves ever advances a local counter). A refused lease
+        // degrades to the empty bootstrap: the join proceeds without seat trust, and `CertCheck`
+        // still gates every frame.
+        let trusted = match self.genesis_trusted_bases(run_label).await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(run = run_label, error = %e, "seat bootstrap: no trust set");
+                return crate::credentials::SeatBootstrap::default();
+            }
+        };
+        let mut terms = daemon_vhc_proto::SeatTermLedger::new();
+        if let Ok(Some((term, claimant))) = self.store.seat_term(run_label, &self.config.seat_role)
+        {
+            terms.restore_floor(
+                lease.body.run_id,
+                &self.config.seat_role,
+                term,
+                daemon_vhc_proto::PeerId(claimant),
+            );
+        }
+        match crate::seat::authorize_incumbent(
+            &lease,
+            trusted.bases(),
+            &daemon_vhc_proto::RevocationLedger::new(),
+            &terms,
+            now_ms() as u64,
+            crate::seat::default_skew_ms(),
+        ) {
+            Ok(authorized) => {
+                // Verified evidence — and only verified evidence — advances the persisted floor.
+                if let Err(e) = self.store.observe_seat_term(
+                    run_label,
+                    &self.config.seat_role,
+                    authorized.leadership_term,
+                    &authorized.claimant.0,
+                ) {
+                    tracing::warn!(run = run_label, error = %e, "seat bootstrap: floor persist");
+                }
+                crate::credentials::SeatBootstrap {
+                    peer_certs: vec![authorized.certificate],
+                    ws_base: lease.body.endpoint.ws.clone(),
+                    seat_grant: Some((*lease).clone()),
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    run = run_label,
+                    error = %e,
+                    "seat bootstrap: stored lease refused (joining without seat trust)"
+                );
+                crate::credentials::SeatBootstrap::default()
+            }
         }
     }
 
@@ -2417,18 +2647,56 @@ impl VhcService {
 
     /// Resolve the late-join checkpoint restore for a run (spec §9): the registry's best
     /// pointer FOR THIS ROLE — the freshest live pointer, else the freshest drain snapshot;
-    /// another role's pointer is never consulted — decoded to the wire restore form (`None` =
-    /// fresh start / no discovery / nothing published for the role). A malformed pointer hash
-    /// is dropped (fresh start), never a hard join failure.
+    /// another role's pointer is never consulted for the restore itself — decoded to the wire
+    /// restore form (`None` = fresh start / no discovery / nothing published for the role). A
+    /// malformed pointer hash is dropped (fresh start), never a hard join failure.
+    ///
+    /// **Join-time cadence-vs-ring reachability** (the recovery-honesty check): a restorer
+    /// replays forward across the coordinator's retained record ring
+    /// ([`daemon_vhc_proto::RETAINED_RECORD_HORIZON_ROUNDS`]), and with three seats the run
+    /// progresses while one trainer is absent — no static cadence/ring relation guarantees the
+    /// fence stays reachable. So the judgment is made HERE, from actual checkpoint metadata,
+    /// before any rehydration: when the restore fence is more than the horizon behind the run's
+    /// live head, the join refuses typed ([`VhcError::CheckpointStale`]) instead of wedging
+    /// into the module's post-restore `GapRefused`. The head estimate is the freshest
+    /// checkpoint round visible for the run (the coordinator's pointer) — a LOWER bound on the
+    /// true head, so this check is conservative and the in-module refusal remains the
+    /// authoritative backstop. No coordinator pointer = no judgment (nothing to compare
+    /// against). Benign at min/max 2/2 (rounds pause while a peer is down); mandatory before
+    /// C2's larger fleets.
     async fn resolve_restore(
         &self,
         run_id: &str,
         role: &str,
-    ) -> Option<protocol::CheckpointRestore> {
-        let discovery = self.discovery.as_ref()?;
+    ) -> Result<Option<protocol::CheckpointRestore>, VhcError> {
+        let Some(discovery) = self.discovery.as_ref() else {
+            return Ok(None);
+        };
         let role = if role.is_empty() { "trainer" } else { role };
-        let pointer = discovery.fetch_checkpoint(run_id, role).await.ok()??;
-        let hash = hex32(&pointer.hash)?;
+        let Some(pointer) = discovery
+            .fetch_checkpoint(run_id, role)
+            .await
+            .ok()
+            .flatten()
+        else {
+            return Ok(None);
+        };
+        let Some(hash) = hex32(&pointer.hash) else {
+            return Ok(None);
+        };
+        if role != "coordinator" {
+            if let Ok(Some(coord)) = discovery.fetch_checkpoint(run_id, "coordinator").await {
+                let head = coord.round.max(pointer.round);
+                let horizon = daemon_vhc_proto::RETAINED_RECORD_HORIZON_ROUNDS;
+                if head > pointer.round.saturating_add(horizon) {
+                    return Err(VhcError::CheckpointStale {
+                        restored: pointer.round,
+                        head,
+                        horizon,
+                    });
+                }
+            }
+        }
         // The node resolved this role's freshest restore pointer (spec §9); the joining worker
         // fetches its by-reference checkpoint document and streams each family's windows via
         // chunk-keyed rehydration ([SF-6]). This is the node-visible half of the restore path.
@@ -2438,10 +2706,10 @@ impl VhcService {
             round = pointer.round,
             "resolved late-join checkpoint restore pointer (streaming by-ref rehydration follows)"
         );
-        Some(protocol::CheckpointRestore {
+        Ok(Some(protocol::CheckpointRestore {
             round: pointer.round,
             hash,
-        })
+        }))
     }
 }
 
@@ -2531,11 +2799,12 @@ impl VhcApi for VhcService {
         // to the probe-based eligibility against the allowlisted coordinator (offline / no-registry
         // path). Either way the persisted eligibility is node-computed — the app never re-derives it.
         //
-        // COORDINATOR DUTY FIRST (architecture §6.3; [SEAT-1]): when the owner enabled seat
+        // COORDINATOR DUTY FIRST (architecture §6.3; [SEAT-1] v2): when the owner enabled seat
         // claiming and this is a fresh instance, try the seat — assess the configured seat role,
-        // claim (or re-adopt) the registry slot, and run the join AT THE WON LEASE'S INCARNATION
-        // (fencing_token == incarnation end-to-end). A live foreign incumbent, a lost CAS race,
-        // or an ineligible seat-role assessment stands down to the trainer default.
+        // claim (or re-adopt) the registry slot, and run the join AT THE WON LEASE'S
+        // counter-minted execution incarnation (the leadership term rides the lease
+        // independently). A live foreign incumbent, a lost CAS race, or an ineligible seat-role
+        // assessment stands down to the trainer default.
         let seat_join = if existing.is_none() {
             self.try_seat_join(&worker, &run_id).await
         } else {
@@ -2610,10 +2879,11 @@ impl VhcApi for VhcService {
                     } else {
                         role
                     },
-                    // The seat-won join runs at the LEASE incarnation ([SEAT-1]: the fencing
-                    // token IS the incarnation — the CAS mints identity, never the counter).
-                    // Every other join is a new execution: a never-reused counter mint
-                    // (decisions D1). No path re-publishes a dead instance's incarnation.
+                    // The seat-won join runs at the LEASE'S execution incarnation — which the
+                    // keeper COUNTER-MINTED at claim ([SEAT-1] v2: the counter mints every
+                    // execution identity; the leadership term rides the lease independently).
+                    // Every other join is likewise a fresh counter mint (decisions D1). No path
+                    // re-publishes a dead instance's incarnation.
                     instance: if let Some(inc) = seat_incarnation {
                         inc
                     } else {
@@ -2643,12 +2913,66 @@ impl VhcApi for VhcService {
         // certificate under the base identity, stamp the minted incarnation into the tuple, and
         // author the secrets-free plane-selection credentials (the token, if any, lands only in
         // the keystore record `credentials_ref` points at — never on the wire).
-        let restore = self.resolve_restore(&run_id, &id.role).await;
+        let restore = match self.resolve_restore(&run_id, &id.role).await {
+            Ok(r) => r,
+            Err(e) => {
+                if existing.is_none() {
+                    self.arbiter.release(&id);
+                    if fresh_child {
+                        worker.shutdown().await;
+                    }
+                }
+                return Err(e.to_api());
+            }
+        };
         let seat = self.resolve_seat_bootstrap(&run_id).await;
-        let (delivery_tuple, credentials, credentials_ref) = match self
-            .author_join(&run_id, &coordinator, &id, assessed_tuple, restore, seat)
+        let mut id = id;
+        let authored = match self
+            .author_join(
+                &run_id,
+                &coordinator,
+                &id,
+                assessed_tuple.clone(),
+                restore.clone(),
+                seat.clone(),
+            )
             .await
         {
+            // A verified own-roster-floor repair (judged inside the authorship step): the raised
+            // counter invalidates this provisional identity WHOLESALE — unwind the reservation,
+            // mint the superseding incarnation, re-admit, re-author. Once; a second stale
+            // refusal surfaces typed. A seat-won join is excluded: its incarnation binds the
+            // won lease, so a poisoned roster there stands down (the keeper's next claim mints
+            // fresh above the repaired counter anyway).
+            Err(VhcError::OwnFloorRepaired { floor })
+                if existing.is_none() && seat_incarnation.is_none() =>
+            {
+                self.arbiter.release(&id);
+                tracing::info!(
+                    run_id,
+                    floor,
+                    "join: restarting authorship above the repaired roster floor"
+                );
+                let restarted = async {
+                    id.instance = self.store.mint_incarnation()?;
+                    let charge = self.derive_charge(&eligibility, &policy, &id.role)?;
+                    let priority = self.store.run_priority(&run_id)?;
+                    self.admit_placed(&id, charge, priority)
+                        .map_err(VhcError::Resources)?;
+                    Ok(())
+                }
+                .await;
+                match restarted {
+                    Ok(()) => {
+                        self.author_join(&run_id, &coordinator, &id, assessed_tuple, restore, seat)
+                            .await
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            other => other,
+        };
+        let (delivery_tuple, credentials, credentials_ref) = match authored {
             Ok(v) => v,
             Err(e) => {
                 if existing.is_none() {

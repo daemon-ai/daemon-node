@@ -72,6 +72,19 @@ pub const STATE_ELEM_BYTES: u64 = 4;
 /// per-chunk cost point (fewer per-op costs vs tighter guest memory bound).
 pub const STATE_CHUNK_SIZE_TARGET: u64 = 4 << 20;
 
+/// The **retained record horizon** (rounds): the minimum span of committed round records a
+/// conforming coordinator retains and re-serves for a rejoiner's replay-forward (the semantic
+/// catch-up lane — a restorer at round `R` can bridge to a live head `H` only when
+/// `H - R <= horizon`; past it the intervening records are gone and folding across the gap
+/// would fork the det trajectory).
+///
+/// This is CONTRACT vocabulary, not algorithm: the consensus SDK's stored-round ring implements
+/// it (its `NUM_STORED_ROUNDS` is derived from this constant — one source), and the node's
+/// join-time checkpoint-freshness check consumes it host-side without linking round vocabulary
+/// (ABI §12.5 [OWN-3]). Companions: [`validate_checkpoint_cadence`] bounds the PAYLOAD lane the
+/// same way at authoring time.
+pub const RETAINED_RECORD_HORIZON_ROUNDS: u64 = 4;
+
 /// The consensus-canonical family every det-state manifest MUST carry.
 pub const MASTER_FAMILY: &str = "master";
 

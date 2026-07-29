@@ -52,7 +52,19 @@ use crate::attach::{Attach, CertCheck, InboundVerdict};
 use crate::protocol::{AdmittedTuple, Event, LeaveMode, TerminalOutcome};
 
 /// How long an unresolved inbound sequence gap may stand before the session classifies it
-/// unrecoverable (no backfill plane exists yet; reordered frames usually resolve in milliseconds).
+/// unrecoverable. Reordered frames usually resolve in milliseconds; a gap that outlives this
+/// deadline means the frame is genuinely absent from every attached plane.
+///
+/// The terminal is TYPED-RETRYABLE, deliberately: recovery is the node's rejoin transaction
+/// (fresh incarnation, checkpoint restore + replay-forward), not an in-session repair. Recovery
+/// from loss decomposes into three distinct invariants — (1) transport sequence repair (the
+/// exact missing `(sender, channel, seq)` frames), (2) semantic record catch-up (the records a
+/// rejoiner needs, e.g. the coordinator's replay-forward ring), and (3) module/journal
+/// reconstruction (rebuilding a crashed instance's state). Only (2) exists today, narrowly.
+/// Exact-frame range repair over a durable archive substrate — which would serve (1) and (3) —
+/// is FUTURE WORK (a post-C1 design track, pre-C2 for coordinator reconstruction), neither
+/// built here nor rejected permanently. Stretching this deadline only postpones the same
+/// verdict; it is not the fix.
 const GAP_DEADLINE: Duration = Duration::from_secs(20);
 
 /// The bounded hold for gapped/back-pressured frames awaiting re-presentation.
@@ -93,6 +105,11 @@ pub struct RoleSessionSpec {
     pub trusted_bases: Vec<PeerId>,
     /// Peer certificates known at join (later arrivals ride the control plane).
     pub peer_certs: Vec<RunKeyCertificate>,
+    /// The coordinator's full signed seat grant known at join ([SEAT-1] v2 — from the node's
+    /// authorized seat read; the seat winner carries its own). Ingested into the attach's
+    /// leadership-term floor and re-announced on-plane beside the certificate. `None` = the
+    /// floor starts ungoverned (the first distributed grant governs it).
+    pub seat_grant: Option<daemon_vhc_proto::SeatLease>,
     /// The transport + provider bindings.
     pub providers: RoleProviders,
     /// The journal sink for this incarnation.
@@ -345,6 +362,7 @@ async fn run_role(
         own_cert,
         trusted_bases,
         mut peer_certs,
+        seat_grant,
         providers,
         journal,
         drain_deadline,
@@ -435,17 +453,35 @@ async fn run_role(
 
     // Inbound: §12.1 attach — signature, scope, MANDATORY certificate chain, dedup/gap — then
     // opaque delivery below the pump.
-    let cert_check = CertCheck::new(trusted_bases.clone(), peer_certs.clone());
+    let mut cert_check = CertCheck::new(trusted_bases.clone(), peer_certs.clone());
+    // The join-time seat grant ([SEAT-1] v2 bootstrap half): the node already authorized it, but
+    // the session re-runs the observation-grade acceptance itself — the attach's term floor
+    // advances only from evidence IT verified, never from a caller's claim.
+    let seat_grant_record =
+        seat_grant.and_then(|grant| match cert_check.ingest_seat_grant(grant.clone()) {
+            Ok(()) => Some(crate::distribution::DistributionRecord::SeatGrant(
+                Box::new(grant),
+            )),
+            Err(e) => {
+                tracing::warn!(run = run_label, error = %e, "join-time seat grant refused");
+                None
+            }
+        });
     let attach = Attach::new(identity.run_id, identity.epoch, cert_check, pump.clone());
     let mut inbound = providers.control.subscribe();
 
-    // §12.3 distribution: announce this incarnation's certificate on the control plane so peers
-    // can verify our frames without an out-of-band exchange. Best-effort by design (supersession
-    // is the safety floor); a WS plane additionally re-announces on every reconnect AND on a slow
-    // anti-entropy cadence via the resubscribe registration made at provider construction (a peer
-    // whose planes come up after this one-shot announce converges on the next cadence tick —
-    // re-publishing here would be suppressed by the plane's own content-hash dedupe).
+    // §12.3 distribution: announce this incarnation's certificate — and the verified seat grant,
+    // when the join carried one — on the control plane so peers can verify our frames (and fence
+    // superseded coordinators) without an out-of-band exchange. Best-effort by design
+    // (supersession is the safety floor); a WS plane additionally re-announces on every reconnect
+    // AND on a slow anti-entropy cadence via the resubscribe registration made at provider
+    // construction (a peer whose planes come up after this one-shot announce converges on the
+    // next cadence tick — re-publishing here would be suppressed by the plane's own content-hash
+    // dedupe).
     if let Ok(bytes) = own_cert_record.to_bytes() {
+        let _ = providers.control.publish(&bytes).await;
+    }
+    if let Some(bytes) = seat_grant_record.as_ref().and_then(|r| r.to_bytes().ok()) {
         let _ = providers.control.publish(&bytes).await;
     }
     tracing::debug!(
@@ -1295,8 +1331,10 @@ fn hold_frame(held: &mut VecDeque<(std::time::Instant, Vec<u8>)>, frame: &[u8]) 
 }
 
 /// Re-present held frames in arrival order. Returns the typed fault when a held frame has aged
-/// past the gap deadline (no backfill plane exists — the session classifies retryable and the
-/// node rejoins as a fresh incarnation).
+/// past the gap deadline: the session classifies RETRYABLE and the node rejoins as a fresh
+/// incarnation (checkpoint restore + semantic catch-up) — see [`GAP_DEADLINE`] for why the
+/// in-session repair lane (exact-frame backfill from a durable archive) is future work, not
+/// this path.
 fn retry_held(
     attach: &mut Attach,
     held: &mut VecDeque<(std::time::Instant, Vec<u8>)>,

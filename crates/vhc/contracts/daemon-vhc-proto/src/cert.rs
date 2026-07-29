@@ -116,6 +116,10 @@ pub enum CertError {
     /// The per-run key is dead: explicitly revoked by a signed record, or its incarnation is
     /// superseded by a higher one for the same role slot ([`crate::revocation`]).
     Revoked,
+    /// The sender presents under a seat-governed role but is not the claimant bound at the
+    /// highest VERIFIED leadership term the receiver holds ([`crate::seat::SeatTermLedger`]) —
+    /// a fenced (superseded) coordinator, dead regardless of its certificate ([SEAT-3] v2).
+    SeatSuperseded,
 }
 
 impl core::fmt::Display for CertError {
@@ -152,6 +156,13 @@ impl core::fmt::Display for CertError {
                 write!(
                     f,
                     "the per-run key is revoked or its incarnation is superseded"
+                )
+            }
+            Self::SeatSuperseded => {
+                write!(
+                    f,
+                    "the sender is not the seat claimant bound at the highest verified \
+                     leadership term (a fenced coordinator)"
                 )
             }
         }

@@ -19,8 +19,11 @@ use serde::{Deserialize, Serialize};
 use crate::coordinator::config::RunConfig;
 
 /// The fixed ring of stored rounds (Psyche `NUM_STORED_ROUNDS`, Appendix A.1) — absorbs out-of-order
-/// arrivals and the stall ladder (§6.2).
-pub const NUM_STORED_ROUNDS: usize = 4;
+/// arrivals and the stall ladder (§6.2). Derived from the CONTRACT's retained-record horizon
+/// (`daemon_vhc_proto::RETAINED_RECORD_HORIZON_ROUNDS` — one source): the ring is what makes the
+/// coordinator's replay-forward honor that horizon, and the node's join-time checkpoint-freshness
+/// check consumes the same constant host-side.
+pub const NUM_STORED_ROUNDS: usize = daemon_vhc_proto::RETAINED_RECORD_HORIZON_ROUNDS as usize;
 
 /// The run lifecycle phase (spec §6.2; Psyche `RunState`, Appendix A.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -451,6 +451,196 @@ async fn restart_reconverges_as_a_fresh_incarnation() {
     assert_eq!(worker.joins(), vec!["run-k"]);
 }
 
+/// A pre-session worker refusal (the fresh child answered the join transaction with a typed
+/// error before its session ever spoke) leaves NO ghost: the still-`starting` row synthesizes
+/// its retryable terminal, the reservation releases, the retry schedule survives, and the tick
+/// reconverges — the exact run-g wedge (a refused `JoinRun` behind a false `running` row the
+/// reconciler skipped forever).
+#[tokio::test]
+async fn refused_join_leaves_no_ghost_and_keeps_the_retry_schedule() {
+    let worker = StreamingWorker::new();
+    let svc = service_over(VhcStore::open_in_memory().unwrap(), worker.clone(), 5);
+    svc.vhc_join("run-n".into(), policy(), "op".into())
+        .await
+        .unwrap();
+    let row = svc.store().get_run("run-n").unwrap().unwrap();
+    assert_eq!(
+        row.run_state,
+        RunState::Starting,
+        "a dispatched JoinRun proves nothing: the row is starting, not running"
+    );
+    assert_eq!(svc.arbiter().instances(), 1);
+
+    // The child refuses BEFORE any RunPhase (e.g. "JoinRun before AssessRun") and dies.
+    let stream = worker.streams.lock().unwrap().pop().unwrap();
+    stream
+        .send(protocol::Event::Error {
+            class: protocol::ErrorClass::Module,
+            detail: "JoinRun before AssessRun: no resolved run".into(),
+        })
+        .unwrap();
+    drop(stream);
+
+    wait_for(&svc, "run-n", |s| s == RunState::FailedRetryable).await;
+    let row = svc.store().get_run("run-n").unwrap().unwrap();
+    assert!(
+        row.terminal_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("pre-session worker refusal")),
+        "the refusal is run-attributed and typed, got: {:?}",
+        row.terminal_reason
+    );
+    assert_eq!(svc.arbiter().instances(), 0, "no ghost reservation");
+    assert_eq!(row.retry_count, 1);
+    assert!(
+        row.next_retry_ms.is_some(),
+        "the retry schedule survives the refusal"
+    );
+
+    // The reconciler is NOT blocked by a ghost entry: the due retry reconverges fresh.
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    assert_eq!(svc.reconcile_tick().await.unwrap(), 1);
+    assert_eq!(worker.joins().len(), 2);
+}
+
+/// A worker child that enforces the fresh-child protocol contract: `join_streaming` REFUSES
+/// unless an `assess` preceded it on this child — the real subprocess's "JoinRun before
+/// AssessRun" refusal, at the seam. The restart-resume defect was exactly a path that skipped
+/// the assess; this fake makes any such regression a hard test failure.
+struct AssessFirstWorker {
+    inner: Arc<StreamingWorker>,
+    assessed: Mutex<bool>,
+}
+
+#[async_trait]
+impl WorkerControl for AssessFirstWorker {
+    async fn probe(&self) -> Result<Hardware, VhcError> {
+        self.inner.probe().await
+    }
+    async fn assess(
+        &self,
+        envelope: Vec<u8>,
+        role: Option<String>,
+    ) -> Result<Eligibility, VhcError> {
+        *self.assessed.lock().unwrap() = true;
+        self.inner.assess(envelope, role).await
+    }
+    async fn join(
+        &self,
+        _run_id: String,
+        _coordinator: String,
+        _credentials: Vec<u8>,
+        _policy: JoinPolicy,
+        _admitted_tuple: Option<protocol::AdmittedTuple>,
+    ) -> Result<(), VhcError> {
+        unreachable!("the streaming path is the only join surface here")
+    }
+    async fn join_streaming(
+        &self,
+        run_id: String,
+        coordinator: String,
+        credentials: Vec<u8>,
+        policy: JoinPolicy,
+        admitted_tuple: Option<protocol::AdmittedTuple>,
+    ) -> Result<tokio::sync::mpsc::UnboundedReceiver<protocol::Event>, VhcError> {
+        if !*self.assessed.lock().unwrap() {
+            return Err(VhcError::Worker(
+                "JoinRun before AssessRun: no resolved run".into(),
+            ));
+        }
+        self.inner
+            .join_streaming(run_id, coordinator, credentials, policy, admitted_tuple)
+            .await
+    }
+    async fn leave(&self, run_id: String, mode: LeaveMode) -> Result<(), VhcError> {
+        self.inner.leave(run_id, mode).await
+    }
+    async fn throttle(
+        &self,
+        vram_cap_mb: Option<u32>,
+        duty_cycle_pct: Option<u8>,
+        paused: bool,
+    ) -> Result<(), VhcError> {
+        self.inner
+            .throttle(vram_cap_mb, duty_cycle_pct, paused)
+            .await
+    }
+}
+
+/// A discovery that resolves one run — the restart transaction's assess input.
+struct EnvelopeDiscovery;
+
+#[async_trait]
+impl daemon_vhc_node::RunDiscovery for EnvelopeDiscovery {
+    async fn list_runs(&self) -> Result<Vec<daemon_vhc_node::DiscoveredRun>, VhcError> {
+        Ok(Vec::new())
+    }
+    async fn get_run(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<daemon_vhc_node::DiscoveredRun>, VhcError> {
+        Ok(Some(daemon_vhc_node::DiscoveredRun {
+            run_id: run_id.to_string(),
+            coordinator: "wss://coord.example".into(),
+            envelope_hash: "deadbeef".into(),
+            proto_version: 3,
+        }))
+    }
+    async fn fetch_envelope(&self, _run_id: &str) -> Result<Vec<u8>, VhcError> {
+        Ok(b"frozen-envelope-bytes".to_vec())
+    }
+    async fn fetch_checkpoint(
+        &self,
+        _run_id: &str,
+        _role: &str,
+    ) -> Result<Option<daemon_vhc_node::CheckpointPointer>, VhcError> {
+        Ok(None)
+    }
+}
+
+/// A restart with discovery drives the ONE join transaction — resolve → **assess** → join — on
+/// a fresh child that refuses any join without a prior assess (the real worker's contract). The
+/// pre-fix `start()` sent `JoinRun` cold and would fail this test at the seam.
+#[tokio::test]
+async fn restart_assesses_the_fresh_child_before_it_joins() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("vhc.db");
+    {
+        let worker = StreamingWorker::new();
+        let svc = service_over(VhcStore::open(&path).unwrap(), worker.clone(), 5);
+        svc.vhc_join("run-f".into(), policy(), "op".into())
+            .await
+            .unwrap();
+    }
+    let inner = StreamingWorker::new();
+    let svc = Arc::new(VhcService::new(VhcServiceParts {
+        config: config(5),
+        store: VhcStore::open(&path).unwrap(),
+        worker: Arc::new(AssessFirstWorker {
+            inner: inner.clone(),
+            assessed: Mutex::new(false),
+        }),
+        feed: None,
+        discovery: Some(Arc::new(EnvelopeDiscovery)),
+        budget: None,
+        worker_factory: None,
+        identity_dir: None,
+        seat_directory: None,
+    }));
+    svc.bind_self();
+    assert_eq!(
+        svc.start().await.unwrap(),
+        1,
+        "the restart transaction assessed the fresh child, then joined"
+    );
+    assert_eq!(inner.joins(), vec!["run-f"]);
+    let row = svc.store().get_run("run-f").unwrap().unwrap();
+    assert_eq!(row.run_state, RunState::Starting);
+    observe_ready(&svc, "run-f");
+    let row = svc.store().get_run("run-f").unwrap().unwrap();
+    assert_eq!(row.run_state, RunState::Running);
+}
+
 /// Transport loss is OBSERVED: a pump stream that closes without its instance's terminal event
 /// classifies the instance `failed_retryable` (durable intent preserved) and the tick
 /// reconverges it as a fresh incarnation.

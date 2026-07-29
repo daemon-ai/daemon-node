@@ -70,8 +70,9 @@ pub use det_state::{
     param_chunk_count, validate_checkpoint_cadence, validate_profile_chunk,
     validate_state_chunk_size, CkptDocSection, DetStateManifest, FamilyEntry, FamilyRef,
     LayoutBinding, DET_STATE_MANIFEST_FORMAT, MASTER_FAMILY, REPLICATED_FAMILY_PREFIX,
-    STATE_CHUNK_SIZE_TARGET, STATE_ELEM_BYTES, STATE_RETAIN_ROOTS_DEFAULT, STATE_STORE_BYTES_GRANT,
-    STATE_STREAMS_MAX_GRANT, STATE_WRITE_BUDGET_GRANT,
+    RETAINED_RECORD_HORIZON_ROUNDS, STATE_CHUNK_SIZE_TARGET, STATE_ELEM_BYTES,
+    STATE_RETAIN_ROOTS_DEFAULT, STATE_STORE_BYTES_GRANT, STATE_STREAMS_MAX_GRANT,
+    STATE_WRITE_BUDGET_GRANT,
 };
 pub use envelope::{DeviceMinimums, SignedEnvelope};
 pub use error::VhcProtoError;
@@ -115,8 +116,9 @@ pub use roster::{
 };
 pub use seat::{
     ControlEndpoint, SeatDecision, SeatLease, SeatLeaseBody, SeatLeaseError, SeatMutationResponse,
-    SeatRelease, SeatReleaseBody, SeatRequest, SeatSlot, SeatState, DEFAULT_SEAT_HEARTBEAT_MS,
-    DEFAULT_SEAT_SKEW_MS, DEFAULT_SEAT_TTL_MS, MAX_SEAT_SKEW_MS,
+    SeatRelease, SeatReleaseBody, SeatRequest, SeatSlot, SeatState, SeatTermLedger,
+    DEFAULT_SEAT_HEARTBEAT_MS, DEFAULT_SEAT_SKEW_MS, DEFAULT_SEAT_TTL_MS, MAX_ORDINAL,
+    MAX_SEAT_SKEW_MS,
 };
 pub use sign::{peer_id, sign_canonical, verify_canonical, Signed, SigningKey, VerifyingKey};
 pub use transition::{

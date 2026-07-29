@@ -64,7 +64,7 @@ fn lease_body(defaults: &Value, spec: &Value) -> SeatLeaseBody {
             .to_string(),
         epoch: get_u64("epoch"),
         incarnation: get_u64("incarnation"),
-        fencing_token: get_u64("fencing_token"),
+        leadership_term: get_u64("leadership_term"),
         claimant: PeerId([get_fill("claimant"); 32]),
         module_hash: Hash([get_fill("module"); 32]),
         endpoint: ControlEndpoint {
@@ -116,7 +116,7 @@ fn release_of(defaults: &Value, spec: &Value) -> SeatRelease {
             run_id: Hash([run; 32]),
             role,
             incarnation: u64_of(spec, "incarnation").expect("incarnation"),
-            fencing_token: u64_of(spec, "fencing_token").expect("fencing_token"),
+            leadership_term: u64_of(spec, "leadership_term").expect("leadership_term"),
             claimant: PeerId([fill(spec, "claimant").expect("claimant"); 32]),
         },
         sig: Signature([0u8; 64]),
@@ -130,7 +130,7 @@ fn slot_of(defaults: &Value, spec: &Value) -> SeatSlot {
         .map(|l| lease_of(lease_body(defaults, l)));
     SeatSlot {
         lease,
-        last_fencing_token: u64_of(spec, "last_fencing_token"),
+        last_leadership_term: u64_of(spec, "last_leadership_term"),
     }
 }
 
@@ -153,12 +153,18 @@ fn assert_decision(name: &str, step: usize, expect: &Value, got: &SeatDecision) 
 }
 
 fn assert_slot(name: &str, step: usize, expect: &Value, slot: &SeatSlot) {
-    let leased_token = slot.lease.as_ref().map(|l| l.body.fencing_token);
+    let leased_term = slot.lease.as_ref().map(|l| l.body.leadership_term);
+    let leased_incarnation = slot.lease.as_ref().map(|l| l.body.incarnation);
     let leased_claimant = slot.lease.as_ref().map(|l| u64::from(l.body.claimant.0[0]));
     assert_eq!(
-        leased_token,
-        u64_of(expect, "leased_token"),
-        "vector `{name}` step {step}: leased_token"
+        leased_term,
+        u64_of(expect, "leased_term"),
+        "vector `{name}` step {step}: leased_term"
+    );
+    assert_eq!(
+        leased_incarnation,
+        u64_of(expect, "leased_incarnation"),
+        "vector `{name}` step {step}: leased_incarnation"
     );
     assert_eq!(
         leased_claimant,
@@ -166,9 +172,9 @@ fn assert_slot(name: &str, step: usize, expect: &Value, slot: &SeatSlot) {
         "vector `{name}` step {step}: leased_claimant"
     );
     assert_eq!(
-        slot.last_fencing_token,
-        u64_of(expect, "last_fencing_token"),
-        "vector `{name}` step {step}: last_fencing_token"
+        slot.last_leadership_term,
+        u64_of(expect, "last_leadership_term"),
+        "vector `{name}` step {step}: last_leadership_term"
     );
 }
 

@@ -8,34 +8,50 @@
 //! A seat claim is a canonical-CBOR [`SeatLeaseBody`] signed by the **claimant's certified
 //! per-run key**, distributed as a [`SeatLease`] that carries the claimant's
 //! [`RunKeyCertificate`] beside the body (a separate distribution record, never a frame-envelope
-//! field — ABI §12.1). The registry stores the signed object and CASes on the **fencing token**
-//! (classic compare-and-set with increment) but creates no authority: peers verify the lease
-//! signature, the certificate chain to a genesis-named base identity, and the supersession floor
-//! (architecture §6.3.1) themselves. A stale claimant's records are refused once a higher fencing
-//! token exists, regardless of what the registry says.
+//! field — ABI §12.1). The registry stores the signed object and CASes on the **leadership
+//! term** but creates no authority: peers verify the lease signature, the certificate chain to a
+//! genesis-named base identity, and the term floor themselves. A stale claimant's records are
+//! refused once a higher term exists, regardless of what the registry says.
 //!
-//! **Fencing token ≡ incarnation.** The fencing token is bound to the role-instance incarnation
-//! (`fencing_token == incarnation`, both carried explicitly; verifiers assert equality). Because
-//! the registry accepts a claim only at `stored + 1`, the seat slot allocates the coordinator
-//! role's incarnations in step with the certificate chain: a takeover is a new incarnation, which
-//! is exactly what advances the peers' supersession floor (implicit revocation of the fenced
-//! predecessor — [`crate::revocation::RevocationLedger`]).
+//! # Two identities, two order relations (scheme v2)
+//!
+//! - **Execution identity** — [`SeatLeaseBody::incarnation`] is the claimant's node-local,
+//!   never-reused role-instance incarnation (ABI §8.1 `instance`): it names a sandbox, a per-run
+//!   key, a journal stream, and a channel sequence namespace, and is meaningful only within one
+//!   base identity's ladder.
+//! - **Leadership identity** — [`SeatLeaseBody::leadership_term`] is the run-role-global
+//!   monotonic term ordering seat ownership ACROSS base identities. The registry CAS accepts any
+//!   **strictly greater** term (sparse, never `floor + 1` exactly): local counters on different
+//!   boxes are unrelated, so dense increments cannot be authored honestly.
+//!
+//! The retired v1 scheme bound them together (`fencing_token == incarnation`), which broke as
+//! soon as leadership could move between nodes whose local counters diverged. **Renew = same
+//! execution, same term; every NEW execution key — takeover, same-base restart, or upgrade —
+//! obtains a new grant at `term > floor`** (a new incarnation mints a new per-run key, hence a
+//! new claimant).
 //!
 //! **Wall clock is liveness, never safety.** Expiry (`expires_at_ms` + a bounded skew grace)
-//! only gates when a takeover may be attempted; the fencing token is what fences the superseded
-//! claimant. A premature, skew-driven takeover costs liveness, not safety.
+//! only gates when a takeover may be attempted; the term is what fences the superseded claimant.
+//! A premature, skew-driven takeover costs liveness, not safety.
+//!
+//! **Bounded integer domain.** Every `u64` ordinal in a seat body (term, incarnation) is pinned
+//! to `<= i64::MAX` — one domain across Rust, SQLite, and the TypeScript registry port, so no
+//! implementation can wrap, truncate, or disagree at the edges. Out-of-domain values are a
+//! structural refusal.
 //!
 //! The registry-side acceptance rule is the pure [`SeatSlot::fold`] — normative CAS semantics any
 //! conforming seat registry implements bit-for-bit (the shared test vectors pin it), exactly as
 //! [`crate::revocation::RevocationLedger`] pins receiver-side revocation semantics. The fold
-//! validates **structure only** (domain tag, token≡incarnation, windows, endpoint presence, slot
+//! validates **structure only** (domain tag, bounds, windows, endpoint presence, slot
 //! consistency); it MUST NOT verify signatures or judge authority — peers do that.
 
 use serde::{Deserialize, Serialize};
 
 use crate::bytes::{Hash, PeerId, Signature};
 use crate::cert::{CertError, CertScope, RunKeyCertificate};
-use crate::domains::{SEAT_LEASE_DOMAIN, SEAT_RELEASE_DOMAIN};
+use crate::domains::{
+    SEAT_LEASE_DOMAIN, SEAT_LEASE_DOMAIN_V1, SEAT_RELEASE_DOMAIN, SEAT_RELEASE_DOMAIN_V1,
+};
 use crate::error::VhcProtoError;
 use crate::sign::{peer_id, sign_canonical, verify_canonical, SigningKey};
 
@@ -47,6 +63,11 @@ pub const DEFAULT_SEAT_HEARTBEAT_MS: u64 = 10_000;
 pub const DEFAULT_SEAT_SKEW_MS: u64 = 5_000;
 /// Ceiling any configured skew grace is clamped to (a larger grace only delays takeover).
 pub const MAX_SEAT_SKEW_MS: u64 = 30_000;
+
+/// The inclusive upper bound of the shared ordinal domain (terms, incarnations): `i64::MAX`,
+/// the largest value every store in the system (SQLite integers, JS bigint folds pinned by the
+/// shared vectors) represents exactly and compares identically.
+pub const MAX_ORDINAL: u64 = i64::MAX as u64;
 
 /// The control-plane endpoint a leased coordinator publishes for peers to dial. At least one of
 /// the fields must be present; both may be (a dual-plane coordinator). Part of the signed body,
@@ -67,7 +88,8 @@ impl ControlEndpoint {
     }
 }
 
-/// The signed body of a coordinator seat lease. Every field is part of the signed preimage.
+/// The signed body of a coordinator seat lease (scheme v2). Every field is part of the signed
+/// preimage.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SeatLeaseBody {
     /// Domain-separation tag — MUST be [`SEAT_LEASE_DOMAIN`].
@@ -76,15 +98,19 @@ pub struct SeatLeaseBody {
     pub run_id: Hash,
     /// The envelope role label being claimed (e.g. `coordinator`).
     pub role: String,
-    /// The run epoch this lease is scoped to. An epoch change REBINDS on renew (same
-    /// incarnation, same fencing token, reissued certificate) — never a takeover.
+    /// The run epoch this lease is scoped to. An epoch change REBINDS on renew (same execution
+    /// identity, same term, reissued certificate) — never a takeover.
     pub epoch: u64,
-    /// The never-reused monotonic role-instance incarnation id (ABI §8.1 `instance`).
+    /// The claimant's **execution incarnation** (ABI §8.1 `instance`): node-local, never-reused,
+    /// minted only by the claimant's durable counter. Names the sandbox/key/journal/sequence
+    /// namespace this lease's holder runs as; meaningful only within the claimant's base
+    /// identity. `<= MAX_ORDINAL`.
     pub incarnation: u64,
-    /// The monotonic fencing token. INVARIANT: `fencing_token == incarnation` (both carried for
-    /// explicitness; every verifier asserts equality). The registry accepts a claim only at
-    /// `stored + 1`.
-    pub fencing_token: u64,
+    /// The **leadership term**: the run-role-global monotonic seat order. The registry CAS
+    /// accepts a claim only at a term STRICTLY GREATER than the slot's floor (sparse — local
+    /// counters across boxes are unrelated). Peers fence the superseded claimant on this term,
+    /// never on the incarnation. `<= MAX_ORDINAL`.
+    pub leadership_term: u64,
     /// The claimant's certified per-run public key — the §12.1 frame-envelope `sender` this
     /// incarnation signs with, and the key that signs this lease.
     pub claimant: PeerId,
@@ -95,8 +121,8 @@ pub struct SeatLeaseBody {
     pub endpoint: ControlEndpoint,
     /// Claimant wall clock at issue (milliseconds; skew diagnostics).
     pub issued_at_ms: u64,
-    /// Claimant wall clock at expiry (milliseconds). Liveness only — never safety (the fencing
-    /// token is the safety mechanism).
+    /// Claimant wall clock at expiry (milliseconds). Liveness only — never safety (the term is
+    /// the safety mechanism).
     pub expires_at_ms: u64,
     /// Advisory renew cadence; the TTL should be ≥ 3× this.
     pub heartbeat_interval_ms: u64,
@@ -126,10 +152,10 @@ pub struct SeatReleaseBody {
     pub run_id: Hash,
     /// The released role label.
     pub role: String,
-    /// The releasing incarnation.
+    /// The releasing claimant's execution incarnation (must match the held lease).
     pub incarnation: u64,
-    /// The released fencing token. INVARIANT: `fencing_token == incarnation`.
-    pub fencing_token: u64,
+    /// The released leadership term (must match the held lease).
+    pub leadership_term: u64,
     /// The releasing claimant's per-run key (must match the held lease).
     pub claimant: PeerId,
 }
@@ -154,12 +180,13 @@ pub enum SeatLeaseError {
         /// The tag actually carried.
         got: String,
     },
-    /// `fencing_token != incarnation` — the bound-token invariant is violated.
-    TokenIncarnationMismatch {
-        /// The carried fencing token.
-        fencing_token: u64,
-        /// The carried incarnation.
-        incarnation: u64,
+    /// An ordinal (term / incarnation) is outside the shared bounded domain
+    /// (`> MAX_ORDINAL`) — a value no store in the system may represent.
+    OutOfDomain {
+        /// The offending field.
+        field: &'static str,
+        /// The carried value.
+        value: u64,
     },
     /// `expires_at_ms <= issued_at_ms`, or a zero heartbeat interval.
     InvalidWindow,
@@ -179,6 +206,14 @@ pub enum SeatLeaseError {
         /// The verifier's clock (ms).
         now_ms: u64,
     },
+    /// The lease's term is at or below a higher verified leadership term the receiver has
+    /// observed — a fenced (superseded) claimant, dead regardless of the registry.
+    TermSuperseded {
+        /// The lease's term.
+        got: u64,
+        /// The highest verified term the receiver holds.
+        floor: u64,
+    },
 }
 
 impl core::fmt::Display for SeatLeaseError {
@@ -187,12 +222,9 @@ impl core::fmt::Display for SeatLeaseError {
             Self::WrongDomain { got } => {
                 write!(f, "seat domain `{got}` is not the expected seat domain")
             }
-            Self::TokenIncarnationMismatch {
-                fencing_token,
-                incarnation,
-            } => write!(
+            Self::OutOfDomain { field, value } => write!(
                 f,
-                "fencing token {fencing_token} is not bound to incarnation {incarnation}"
+                "seat {field} {value} is outside the bounded ordinal domain (max {MAX_ORDINAL})"
             ),
             Self::InvalidWindow => write!(f, "lease expiry/heartbeat window is invalid"),
             Self::MissingEndpoint => write!(f, "lease publishes no dialable control endpoint"),
@@ -205,6 +237,10 @@ impl core::fmt::Display for SeatLeaseError {
                 expires_at_ms,
                 now_ms,
             } => write!(f, "lease expired at {expires_at_ms} (now {now_ms})"),
+            Self::TermSuperseded { got, floor } => write!(
+                f,
+                "lease term {got} is superseded (highest verified term {floor})"
+            ),
         }
     }
 }
@@ -223,9 +259,17 @@ impl From<SeatLeaseError> for VhcProtoError {
     }
 }
 
+/// Bounded-domain check for one ordinal field.
+fn in_domain(field: &'static str, value: u64) -> Result<(), SeatLeaseError> {
+    if value > MAX_ORDINAL {
+        return Err(SeatLeaseError::OutOfDomain { field, value });
+    }
+    Ok(())
+}
+
 impl SeatLeaseBody {
     /// Structural validation — the invariants BOTH sides enforce (the registry before storing,
-    /// every verifier before trusting): domain tag, token≡incarnation, a positive expiry window,
+    /// every verifier before trusting): domain tag, bounded ordinals, a positive expiry window,
     /// a non-zero heartbeat, and a dialable endpoint. Signature-free by design.
     ///
     /// # Errors
@@ -236,12 +280,8 @@ impl SeatLeaseBody {
                 got: self.domain.clone(),
             });
         }
-        if self.fencing_token != self.incarnation {
-            return Err(SeatLeaseError::TokenIncarnationMismatch {
-                fencing_token: self.fencing_token,
-                incarnation: self.incarnation,
-            });
-        }
+        in_domain("incarnation", self.incarnation)?;
+        in_domain("leadership_term", self.leadership_term)?;
         if self.expires_at_ms <= self.issued_at_ms || self.heartbeat_interval_ms == 0 {
             return Err(SeatLeaseError::InvalidWindow);
         }
@@ -252,6 +292,8 @@ impl SeatLeaseBody {
     }
 
     /// The execution-identity scope this lease claims — what the embedded certificate must bind.
+    /// Scoped by the **incarnation** (execution identity), never the term (leadership identity):
+    /// certificates certify executions; grants order leadership.
     #[must_use]
     pub fn cert_scope(&self) -> CertScope {
         CertScope {
@@ -304,9 +346,9 @@ impl SeatLease {
     /// The full peer-side acceptance: structure, self-signature, the certificate chain to a
     /// **genesis-trusted** base identity, the certificate's binding over exactly this lease's
     /// scope and claimant, and expiry (with the skew grace). Compose with
-    /// [`crate::revocation::RevocationLedger::judge`] over [`SeatLeaseBody::cert_scope`] for
-    /// explicit-revocation + supersession-floor enforcement (architecture §6.3.1) — a lease below
-    /// the floor is dead even if everything here verifies.
+    /// [`crate::revocation::RevocationLedger::judge`] over [`SeatLeaseBody::cert_scope`] (the
+    /// per-base execution judgment) AND [`SeatTermLedger::judge`] (the cross-base leadership
+    /// judgment) — a lease below either floor is dead even if everything here verifies.
     ///
     /// # Errors
     /// The applicable [`SeatLeaseError`]. The registry MUST NOT run this check — authority is
@@ -332,6 +374,26 @@ impl SeatLease {
         Ok(())
     }
 
+    /// The observation-grade acceptance for **grant distribution** (feeding a
+    /// [`SeatTermLedger`]): structure, self-signature, and the genesis-trusted certificate
+    /// chain binding exactly this lease's scope and claimant — everything
+    /// [`authorize`](Self::authorize) checks EXCEPT expiry. An expired grant is still the latest
+    /// verified ownership statement: the term floor is monotonic ownership HISTORY, while expiry
+    /// gates takeover LIVENESS — a receiver that refused to learn "term 7 was won" just because
+    /// the lease has since lapsed would happily keep honoring term 3.
+    ///
+    /// # Errors
+    /// The applicable [`SeatLeaseError`].
+    pub fn verify_grant(&self, trusted_bases: &[PeerId]) -> Result<(), SeatLeaseError> {
+        self.verify_signature()?;
+        if !trusted_bases.contains(&self.certificate.base_identity) {
+            return Err(SeatLeaseError::UntrustedBase);
+        }
+        self.certificate
+            .authorizes_sender(&self.body.cert_scope(), &self.body.claimant)?;
+        Ok(())
+    }
+
     /// Whether the lease is past `expires_at_ms` plus the skew grace. Expiry gates takeover
     /// liveness only; fencing is the safety mechanism.
     #[must_use]
@@ -341,7 +403,7 @@ impl SeatLease {
 }
 
 impl SeatReleaseBody {
-    /// Structural validation: domain tag + token≡incarnation.
+    /// Structural validation: domain tag + bounded ordinals.
     ///
     /// # Errors
     /// The applicable [`SeatLeaseError`].
@@ -351,12 +413,8 @@ impl SeatReleaseBody {
                 got: self.domain.clone(),
             });
         }
-        if self.fencing_token != self.incarnation {
-            return Err(SeatLeaseError::TokenIncarnationMismatch {
-                fencing_token: self.fencing_token,
-                incarnation: self.incarnation,
-            });
-        }
+        in_domain("incarnation", self.incarnation)?;
+        in_domain("leadership_term", self.leadership_term)?;
         Ok(())
     }
 }
@@ -389,18 +447,177 @@ impl SeatRelease {
     }
 }
 
-// -- the registry-side slot + the normative CAS fold ------------------------------------------------
+// -- the receiver-side leadership-term ledger ---------------------------------------------------
+
+/// A receiver's **leadership-term floor** for the coordinator seats it observes: the highest
+/// VERIFIED term per `(run, role)`, and the claimant that term binds. Fed **only** by seat
+/// grants that passed the full peer-side acceptance ([`SeatLease::authorize`] + the caller's
+/// revocation judgment) — never by generic certificates (a coordinator-role certificate that
+/// never won the seat must not fence the incumbent) and never by naked registry metadata (the
+/// registry is untrusted storage; "accepted" means stored, not authorized).
+///
+/// This is the cross-base half of coordinator-sender authorization: ordinary frame acceptance
+/// uses the per-base execution floors ([`crate::revocation::RevocationLedger`]); coordinator
+/// frames additionally require the sender to be the claimant bound at the highest verified term.
+/// A partitioned receiver enforces its highest *observed* term — not necessarily the globally
+/// latest one (architecture §4.4 posture: peer-local floors protect after observation; signer
+/// transfer under equivocation remains an explicit trust-statement item).
+#[derive(Debug, Default)]
+pub struct SeatTermLedger {
+    /// `(run, role)` → the highest verified term and the claimant it binds.
+    floors: std::collections::BTreeMap<(Hash, String), (u64, PeerId)>,
+}
+
+impl SeatTermLedger {
+    /// An empty ledger.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Observe one VERIFIED seat grant (the caller has already run the full peer-side
+    /// acceptance — this method deliberately takes the lease, not raw bytes, so an unverified
+    /// object cannot reach it by construction). Advances the `(run, role)` floor monotonically;
+    /// an equal-term re-observation of the SAME claimant refreshes nothing and changes nothing;
+    /// a lower term is ignored (stale grant, kept out by the floor).
+    pub fn observe_verified_grant(&mut self, lease: &SeatLease) {
+        let key = (lease.body.run_id, lease.body.role.clone());
+        let (term, claimant) = (lease.body.leadership_term, lease.body.claimant);
+        match self.floors.get(&key) {
+            Some((floor, _)) if term <= *floor => {}
+            _ => {
+                self.floors.insert(key, (term, claimant));
+            }
+        }
+    }
+
+    /// Restore a persisted floor — a term this receiver ITSELF verified and durably recorded
+    /// earlier (node-restart continuity; the durable row is written only downstream of
+    /// [`observe_verified_grant`](Self::observe_verified_grant)-grade acceptance). Same
+    /// monotonic fold as observation: a lower/equal restore never regresses a live floor.
+    pub fn restore_floor(&mut self, run_id: Hash, role: &str, term: u64, claimant: PeerId) {
+        let key = (run_id, role.to_string());
+        match self.floors.get(&key) {
+            Some((floor, _)) if term <= *floor => {}
+            _ => {
+                self.floors.insert(key, (term, claimant));
+            }
+        }
+    }
+
+    /// The highest verified term for `(run, role)`, if any grant has been observed.
+    #[must_use]
+    pub fn floor(&self, run_id: &Hash, role: &str) -> Option<u64> {
+        self.floors
+            .get(&(*run_id, role.to_string()))
+            .map(|(t, _)| *t)
+    }
+
+    /// Judge a seat lease against the floor: refused typed when its term is BELOW the highest
+    /// verified term (a fenced predecessor). An equal term is accepted only for the exact bound
+    /// claimant (the incumbent's own re-presentation); an equal term under a different claimant
+    /// is a collision — fail closed.
+    ///
+    /// # Errors
+    /// [`SeatLeaseError::TermSuperseded`].
+    pub fn judge(&self, lease: &SeatLease) -> Result<(), SeatLeaseError> {
+        let Some((floor, bound)) = self
+            .floors
+            .get(&(lease.body.run_id, lease.body.role.clone()))
+        else {
+            return Ok(());
+        };
+        let term = lease.body.leadership_term;
+        if term < *floor || (term == *floor && lease.body.claimant != *bound) {
+            return Err(SeatLeaseError::TermSuperseded {
+                got: term,
+                floor: *floor,
+            });
+        }
+        Ok(())
+    }
+
+    /// Whether `sender` is the claimant bound at the highest verified term for `(run, role)` —
+    /// the coordinator-frame authorization predicate. `None` when no grant has been observed
+    /// (the caller decides whether an ungoverned seat is acceptable in its context).
+    #[must_use]
+    pub fn binds(&self, run_id: &Hash, role: &str, sender: &PeerId) -> Option<bool> {
+        self.floors
+            .get(&(*run_id, role.to_string()))
+            .map(|(_, bound)| bound == sender)
+    }
+}
+
+// -- the explicit v1 interpretation (archived state only) ---------------------------------------
+
+/// The retired v1 lease body (`fencing_token == incarnation`), decodable for **interpreting
+/// archived state only** (e.g. the run-g evidence fixture): `execution_incarnation =
+/// incarnation`, `leadership_term = fencing_token`. The v1 signature preimage is the v1 byte
+/// layout, so a v1 object can never be re-verified or re-presented as v2 — this type carries no
+/// authority and no product path authors or accepts it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeatLeaseBodyV1 {
+    /// v1 domain tag — [`SEAT_LEASE_DOMAIN_V1`].
+    pub domain: String,
+    /// The run's cryptographic identity.
+    pub run_id: Hash,
+    /// The claimed role label.
+    pub role: String,
+    /// The run epoch.
+    pub epoch: u64,
+    /// The conflated ordinal (v1: `== fencing_token`). Interpret as the execution incarnation.
+    pub incarnation: u64,
+    /// The conflated ordinal (v1: `== incarnation`). Interpret as the leadership term.
+    pub fencing_token: u64,
+    /// The claimant's per-run key.
+    pub claimant: PeerId,
+    /// The pinned module hash.
+    pub module_hash: Hash,
+    /// The published control endpoint.
+    pub endpoint: ControlEndpoint,
+    /// Issue stamp (ms).
+    pub issued_at_ms: u64,
+    /// Expiry stamp (ms).
+    pub expires_at_ms: u64,
+    /// Advisory renew cadence (ms).
+    pub heartbeat_interval_ms: u64,
+}
+
+impl SeatLeaseBodyV1 {
+    /// The v2 interpretation of an archived v1 body: `(execution_incarnation, leadership_term)`.
+    /// Read-only forensics — never authority (see the type docs).
+    ///
+    /// # Errors
+    /// [`SeatLeaseError::WrongDomain`] when the body is not a v1 body.
+    pub fn interpret(&self) -> Result<(u64, u64), SeatLeaseError> {
+        if self.domain != SEAT_LEASE_DOMAIN_V1 {
+            return Err(SeatLeaseError::WrongDomain {
+                got: self.domain.clone(),
+            });
+        }
+        Ok((self.incarnation, self.fencing_token))
+    }
+}
+
+/// The retired v1 release domain check (companion to [`SeatLeaseBodyV1`]; see
+/// [`SEAT_RELEASE_DOMAIN_V1`]).
+#[must_use]
+pub fn is_v1_release_domain(domain: &str) -> bool {
+    domain == SEAT_RELEASE_DOMAIN_V1
+}
+
+// -- the registry-side slot + the normative CAS fold --------------------------------------------
 
 /// The readable projection of one run-role seat slot.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SeatState {
-    /// No lease holds the seat. `last_fencing_token` is the release/expiry tombstone floor —
-    /// tokens never reset; the next claim must present `floor + 1` (`None` = never claimed:
-    /// the first claim's token is accepted as presented).
+    /// No lease holds the seat. `last_leadership_term` is the release/expiry tombstone floor —
+    /// terms never reset; the next claim must present a strictly greater term (`None` = never
+    /// claimed: the first claim's term is accepted as presented).
     Unclaimed {
         /// The tombstone floor.
-        last_fencing_token: Option<u64>,
+        last_leadership_term: Option<u64>,
     },
     /// A signed lease holds the seat. Whether it is *live* is the reader's judgment (expiry +
     /// authority verification are peer-side; the registry only stores and CASes). Boxed for
@@ -412,9 +629,9 @@ pub enum SeatState {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SeatRequest {
-    /// Claim / take over the seat (CAS at `stored + 1`).
+    /// Claim / take over the seat (CAS at a strictly greater term — sparse).
     Claim(SeatLease),
-    /// Renew (heartbeat) the held lease — same claimant, same incarnation, same token; the
+    /// Renew (heartbeat) the held lease — same claimant, same incarnation, same term; the
     /// re-signed body extends expiry and may rebind the epoch (same key, reissued certificate).
     Renew(SeatLease),
     /// Release the seat, leaving the tombstone floor.
@@ -428,7 +645,7 @@ pub enum SeatRequest {
 pub enum SeatDecision {
     /// Stored; the slot now reflects the request.
     Accepted,
-    /// The object violates a structural invariant (domain, token≡incarnation, window, endpoint).
+    /// The object violates a structural invariant (domain, bounds, window, endpoint).
     RejectedStructural {
         /// A human-readable reason (diagnostic only; never authority).
         reason: String,
@@ -438,26 +655,27 @@ pub enum SeatDecision {
     RejectedHeld,
     /// Nothing to renew/release — the slot is unclaimed.
     RejectedNotHeld,
-    /// The compare-and-swap failed: the presented fencing token does not match what the slot
-    /// requires. The loser re-reads and either accepts the incumbent or retries at the floor + 1.
+    /// The compare-and-swap failed: the presented term does not satisfy what the slot requires.
+    /// The loser re-reads and either accepts the incumbent or retries above the floor.
     RejectedFencingConflict {
-        /// The token the slot requires (claim: `stored + 1`; renew/release: the held token).
+        /// The floor the request must relate to (claim: must be STRICTLY GREATER than this;
+        /// renew/release: must EQUAL the held term).
         expected: u64,
-        /// The token the request presented.
+        /// The term the request presented.
         got: u64,
     },
 }
 
 /// One run-role seat slot as the registry stores it: the current lease (if any) plus the
-/// monotonic token floor. INVARIANT: while leased, `last_fencing_token ==
-/// Some(lease.body.fencing_token)`; after a release/takeover the floor persists (tokens never
+/// monotonic term floor. INVARIANT: while leased, `last_leadership_term ==
+/// Some(lease.body.leadership_term)`; after a release/takeover the floor persists (terms never
 /// reset).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SeatSlot {
     /// The stored lease, if the seat is claimed.
     pub lease: Option<SeatLease>,
-    /// The highest fencing token this slot has ever stored (the tombstone floor).
-    pub last_fencing_token: Option<u64>,
+    /// The highest leadership term this slot has ever stored (the tombstone floor).
+    pub last_leadership_term: Option<u64>,
 }
 
 impl SeatSlot {
@@ -473,7 +691,7 @@ impl SeatSlot {
         match &self.lease {
             Some(lease) => SeatState::Leased(Box::new(lease.clone())),
             None => SeatState::Unclaimed {
-                last_fencing_token: self.last_fencing_token,
+                last_leadership_term: self.last_leadership_term,
             },
         }
     }
@@ -485,19 +703,23 @@ impl SeatSlot {
     ///
     /// Structural only (registry posture): domain/invariant checks, slot-key consistency
     /// (`run_id`/`role` against the stored lease), expiry by the registry clock + skew grace,
-    /// and the token CAS. NO signature verification, NO authority judgment.
+    /// and the term CAS. NO signature verification, NO authority judgment.
     ///
-    /// Claim acceptance:
-    /// - held by the SAME claimant: the held token (idempotent refresh) or `held + 1`
-    ///   (self-supersession — a planned handover to the claimant's own next incarnation);
+    /// Claim acceptance (**sparse monotonic** — never `floor + 1` exactly: leadership terms
+    /// derive from claimant-local state, so dense increments cannot be authored honestly):
+    /// - held by the SAME claimant: the held term (idempotent refresh) or any STRICTLY GREATER
+    ///   term (the claimant's own voluntary advance);
     /// - held by another claimant and NOT expired: refused (`RejectedHeld`);
-    /// - expired or unclaimed: `floor + 1` exactly (`None` floor = first claim, any token).
+    /// - expired or unclaimed: any term STRICTLY GREATER than the floor (`None` floor = never
+    ///   claimed: the presented term stands).
     ///
-    /// Renew requires the identity five-tuple `(run_id, role, incarnation, fencing_token,
+    /// Renew requires the identity five-tuple `(run_id, role, incarnation, leadership_term,
     /// claimant)` to match the held lease exactly; epoch/module/endpoint/expiry may change (the
     /// epoch-rebind rule). An expired-but-untaken lease may still renew — grace, not safety.
+    /// **A new execution identity (new incarnation ⇒ new per-run key ⇒ new claimant) can never
+    /// renew**: it claims fresh at a higher term.
     ///
-    /// Release requires `(run_id, role, fencing_token, claimant)` to match; the floor persists.
+    /// Release requires `(run_id, role, leadership_term, claimant)` to match; the floor persists.
     #[must_use]
     pub fn fold(&self, request: &SeatRequest, now_ms: u64, skew_ms: u64) -> (Self, SeatDecision) {
         let refuse = |d: SeatDecision| (self.clone(), d);
@@ -515,27 +737,25 @@ impl SeatSlot {
                         });
                     }
                     if cur.body.claimant == lease.body.claimant {
-                        // Idempotent refresh at the held token, or self-supersession at +1.
-                        if lease.body.fencing_token == cur.body.fencing_token
-                            || lease.body.fencing_token == cur.body.fencing_token + 1
-                        {
+                        // Idempotent refresh at the held term, or the claimant's own advance.
+                        if lease.body.leadership_term >= cur.body.leadership_term {
                             return self.store(lease);
                         }
                         return refuse(SeatDecision::RejectedFencingConflict {
-                            expected: cur.body.fencing_token + 1,
-                            got: lease.body.fencing_token,
+                            expected: cur.body.leadership_term,
+                            got: lease.body.leadership_term,
                         });
                     }
                     if !cur.is_expired(now_ms, skew_ms) {
                         return refuse(SeatDecision::RejectedHeld);
                     }
                 }
-                match self.last_fencing_token {
+                match self.last_leadership_term {
                     None => self.store(lease),
-                    Some(floor) if lease.body.fencing_token == floor + 1 => self.store(lease),
+                    Some(floor) if lease.body.leadership_term > floor => self.store(lease),
                     Some(floor) => refuse(SeatDecision::RejectedFencingConflict {
-                        expected: floor + 1,
-                        got: lease.body.fencing_token,
+                        expected: floor,
+                        got: lease.body.leadership_term,
                     }),
                 }
             }
@@ -554,12 +774,12 @@ impl SeatSlot {
                     });
                 }
                 if lease.body.claimant != cur.body.claimant
-                    || lease.body.fencing_token != cur.body.fencing_token
+                    || lease.body.leadership_term != cur.body.leadership_term
                     || lease.body.incarnation != cur.body.incarnation
                 {
                     return refuse(SeatDecision::RejectedFencingConflict {
-                        expected: cur.body.fencing_token,
-                        got: lease.body.fencing_token,
+                        expected: cur.body.leadership_term,
+                        got: lease.body.leadership_term,
                     });
                 }
                 self.store(lease)
@@ -579,17 +799,17 @@ impl SeatSlot {
                     });
                 }
                 if release.body.claimant != cur.body.claimant
-                    || release.body.fencing_token != cur.body.fencing_token
+                    || release.body.leadership_term != cur.body.leadership_term
                 {
                     return refuse(SeatDecision::RejectedFencingConflict {
-                        expected: cur.body.fencing_token,
-                        got: release.body.fencing_token,
+                        expected: cur.body.leadership_term,
+                        got: release.body.leadership_term,
                     });
                 }
                 (
                     Self {
                         lease: None,
-                        last_fencing_token: self.last_fencing_token,
+                        last_leadership_term: self.last_leadership_term,
                     },
                     SeatDecision::Accepted,
                 )
@@ -605,14 +825,14 @@ impl SeatSlot {
     /// Store `lease`, advancing the floor.
     fn store(&self, lease: &SeatLease) -> (Self, SeatDecision) {
         let floor = self
-            .last_fencing_token
-            .map_or(lease.body.fencing_token, |f| {
-                f.max(lease.body.fencing_token)
+            .last_leadership_term
+            .map_or(lease.body.leadership_term, |f| {
+                f.max(lease.body.leadership_term)
             });
         (
             Self {
                 lease: Some(lease.clone()),
-                last_fencing_token: Some(floor),
+                last_leadership_term: Some(floor),
             },
             SeatDecision::Accepted,
         )
@@ -642,14 +862,14 @@ mod tests {
         Hash([n; 32])
     }
 
-    fn body(claimant: PeerId, incarnation: u64) -> SeatLeaseBody {
+    fn body(claimant: PeerId, incarnation: u64, term: u64) -> SeatLeaseBody {
         SeatLeaseBody {
             domain: SEAT_LEASE_DOMAIN.to_string(),
             run_id: run(1),
             role: "coordinator".into(),
             epoch: 0,
             incarnation,
-            fencing_token: incarnation,
+            leadership_term: term,
             claimant,
             module_hash: Hash([0xCC; 32]),
             endpoint: ControlEndpoint {
@@ -662,11 +882,11 @@ mod tests {
         }
     }
 
-    /// A lease claimed by `run_key(seed)` at `incarnation`, certified by `base`.
-    fn lease(base: &SigningKey, seed: u8, incarnation: u64) -> SeatLease {
+    /// A lease claimed by `run_key(seed)` at `(incarnation, term)`, certified by `base`.
+    fn lease(base: &SigningKey, seed: u8, incarnation: u64, term: u64) -> SeatLease {
         let run_key = key(seed);
         let claimant = peer_id(&run_key);
-        let b = body(claimant, incarnation);
+        let b = body(claimant, incarnation, term);
         let cert = RunKeyCertificate::issue(base, b.cert_scope(), claimant).unwrap();
         SeatLease::claim(&run_key, cert, b).unwrap()
     }
@@ -674,7 +894,9 @@ mod tests {
     #[test]
     fn a_lease_round_trips_through_canonical_cbor_and_authorizes() {
         let base = key(1);
-        let l = lease(&base, 2, 0);
+        // Term and incarnation are independent ordinals: a low local incarnation may hold a
+        // high leadership term (leadership moved to a fresh box).
+        let l = lease(&base, 2, 2, 40);
         let bytes = crate::canonical::to_canonical_vec(&l).unwrap();
         let back: SeatLease = crate::canonical::from_canonical_slice(&bytes).unwrap();
         assert_eq!(l, back);
@@ -685,28 +907,43 @@ mod tests {
     }
 
     #[test]
-    fn tampered_body_and_wrong_domain_are_refused_typed() {
+    fn tampered_body_wrong_domain_and_out_of_domain_ordinals_are_refused_typed() {
         let base = key(1);
-        let mut l = lease(&base, 2, 0);
-        l.body.fencing_token = 1; // breaks token≡incarnation AND the signature
-        assert_eq!(
-            l.verify_signature(),
-            Err(SeatLeaseError::TokenIncarnationMismatch {
-                fencing_token: 1,
-                incarnation: 0
-            })
-        );
-        let mut l = lease(&base, 2, 3);
+        let mut l = lease(&base, 2, 3, 7);
         l.body.epoch = 9; // re-scope without re-signing
         assert_eq!(l.verify_signature(), Err(SeatLeaseError::BadSignature));
 
         let run_key = key(2);
-        let mut b = body(peer_id(&run_key), 0);
-        b.domain = "daemon-vhc/cert/2".into();
+        let mut b = body(peer_id(&run_key), 0, 1);
+        b.domain = SEAT_LEASE_DOMAIN_V1.into(); // the retired scheme's tag is not this scheme
         assert!(matches!(
             b.validate(),
             Err(SeatLeaseError::WrongDomain { .. })
         ));
+
+        // Ordinals beyond i64::MAX are outside the shared bounded domain — structural refusal
+        // (SQLite and the TS bigint fold could not represent/compare them identically).
+        let mut b = body(peer_id(&run_key), 0, 1);
+        b.leadership_term = MAX_ORDINAL + 1;
+        assert_eq!(
+            b.validate(),
+            Err(SeatLeaseError::OutOfDomain {
+                field: "leadership_term",
+                value: MAX_ORDINAL + 1
+            })
+        );
+        let mut b = body(peer_id(&run_key), 0, 1);
+        b.incarnation = u64::MAX;
+        assert!(matches!(
+            b.validate(),
+            Err(SeatLeaseError::OutOfDomain {
+                field: "incarnation",
+                ..
+            })
+        ));
+        // The boundary value itself is in-domain.
+        let b = body(peer_id(&run_key), MAX_ORDINAL, MAX_ORDINAL);
+        assert!(b.validate().is_ok());
     }
 
     #[test]
@@ -714,20 +951,16 @@ mod tests {
         let base = key(1);
         let run_key = key(2);
         let claimant = peer_id(&run_key);
-
-        // Token not bound to the incarnation.
-        let mut b = body(claimant, 4);
-        b.fencing_token = 5;
-        let cert = RunKeyCertificate::issue(&base, b.cert_scope(), claimant).unwrap();
-        assert!(SeatLease::claim(&run_key, cert.clone(), b).is_err());
+        let cert =
+            RunKeyCertificate::issue(&base, body(claimant, 4, 9).cert_scope(), claimant).unwrap();
 
         // No dialable endpoint.
-        let mut b = body(claimant, 4);
+        let mut b = body(claimant, 4, 9);
         b.endpoint = ControlEndpoint::default();
         assert!(SeatLease::claim(&run_key, cert.clone(), b).is_err());
 
         // A key that is not the body's claimant cannot author the lease.
-        let b = body(claimant, 4);
+        let b = body(claimant, 4, 9);
         assert!(SeatLease::claim(&key(3), cert, b).is_err());
     }
 
@@ -735,7 +968,7 @@ mod tests {
     fn authorize_refuses_untrusted_base_cert_mismatch_and_expiry() {
         let base = key(1);
         let trusted = [peer_id(&base)];
-        let l = lease(&base, 2, 0);
+        let l = lease(&base, 2, 0, 1);
 
         // Untrusted base: the same object under a different trust set is refused.
         assert_eq!(
@@ -746,7 +979,7 @@ mod tests {
         // A certificate for a different scope (wrong module) is a typed cert refusal.
         let run_key = key(2);
         let claimant = peer_id(&run_key);
-        let b = body(claimant, 0);
+        let b = body(claimant, 0, 1);
         let mut wrong_scope = b.cert_scope();
         wrong_scope.module_hash = Hash([0xDD; 32]);
         let cert = RunKeyCertificate::issue(&base, wrong_scope, claimant).unwrap();
@@ -766,15 +999,87 @@ mod tests {
     }
 
     #[test]
-    fn an_epoch_rebind_renews_under_the_same_token_with_a_reissued_certificate() {
-        // Contract: a renew across an epoch boundary rebinds the certificate (same key, new epoch,
-        // possibly a new module), same incarnation, same fencing token — a renew, not a takeover.
+    fn sparse_terms_claim_over_the_floor_and_dense_arithmetic_is_never_required() {
+        // The scope separation's operational core: a takeover claims at ANY term strictly above
+        // the floor — the successor's term derives from ITS state, not the predecessor's + 1.
+        let base = key(1);
+        let slot = SeatSlot::new();
+        // First claim: the presented term stands (floor None).
+        let l0 = lease(&base, 2, 5, 17);
+        let (slot, d) = slot.fold(&SeatRequest::Claim(l0.clone()), 2_000, 5_000);
+        assert_eq!(d, SeatDecision::Accepted);
+        assert_eq!(slot.last_leadership_term, Some(17));
+
+        // A foreign claim while the incumbent is live is held out regardless of term.
+        let foreign = lease(&base, 6, 1, 40);
+        let (_, d) = slot.fold(&SeatRequest::Claim(foreign.clone()), 2_000, 5_000);
+        assert_eq!(d, SeatDecision::RejectedHeld);
+
+        // After expiry, a sparse jump (17 → 40) is accepted; the floor follows.
+        let (slot2, d) = slot.fold(&SeatRequest::Claim(foreign), 99_999, 5_000);
+        assert_eq!(d, SeatDecision::Accepted);
+        assert_eq!(slot2.last_leadership_term, Some(40));
+
+        // An equal-or-lower term is a fencing conflict against the floor.
+        let stale = lease(&base, 7, 9, 40);
+        let (_, d) = slot2.fold(&SeatRequest::Claim(stale), 99_999, 5_000);
+        assert_eq!(
+            d,
+            SeatDecision::RejectedFencingConflict {
+                expected: 40,
+                got: 40
+            }
+        );
+    }
+
+    #[test]
+    fn a_new_execution_identity_never_renews_it_claims_fresh_above_the_floor() {
+        // Renew is bound to the exact held execution identity: a new incarnation mints a new
+        // per-run key, hence a new claimant — the fold sees a foreign renew and refuses. The
+        // successor execution claims fresh at a higher term instead.
+        let base = key(1);
+        let held = lease(&base, 2, 3, 10);
+        let slot = SeatSlot {
+            lease: Some(held.clone()),
+            last_leadership_term: Some(10),
+        };
+        // Same box, NEW incarnation (new key seed): renew refused — not the held claimant.
+        let successor = lease(&base, 4, 4, 10);
+        let (_, d) = slot.fold(&SeatRequest::Renew(successor), 2_000, 5_000);
+        assert_eq!(
+            d,
+            SeatDecision::RejectedFencingConflict {
+                expected: 10,
+                got: 10
+            }
+        );
+        // The held claimant renewing with a CHANGED incarnation is equally refused (the lease
+        // binds one execution identity).
+        let run_key = key(2);
+        let claimant = peer_id(&run_key);
+        let mut b = body(claimant, 4, 10);
+        b.expires_at_ms = 90_000;
+        let cert = RunKeyCertificate::issue(&base, b.cert_scope(), claimant).unwrap();
+        let rebound = SeatLease::claim(&run_key, cert, b).unwrap();
+        let (_, d) = slot.fold(&SeatRequest::Renew(rebound), 2_000, 5_000);
+        assert!(matches!(d, SeatDecision::RejectedFencingConflict { .. }));
+        // After expiry the successor claims fresh above the floor — the honest path.
+        let successor = lease(&base, 4, 4, 11);
+        let (next, d) = slot.fold(&SeatRequest::Claim(successor), 99_999, 5_000);
+        assert_eq!(d, SeatDecision::Accepted);
+        assert_eq!(next.last_leadership_term, Some(11));
+    }
+
+    #[test]
+    fn an_epoch_rebind_renews_under_the_same_term_with_a_reissued_certificate() {
+        // Contract: a renew across an epoch boundary rebinds the certificate (same key, new
+        // epoch, possibly a new module), same incarnation, same term — a renew, not a takeover.
         let base = key(1);
         let run_key = key(2);
         let claimant = peer_id(&run_key);
-        let l0 = lease(&base, 2, 3);
+        let l0 = lease(&base, 2, 3, 12);
 
-        let mut b1 = body(claimant, 3);
+        let mut b1 = body(claimant, 3, 12);
         b1.epoch = 1;
         b1.module_hash = Hash([0xEE; 32]);
         b1.expires_at_ms = 90_000;
@@ -783,12 +1088,12 @@ mod tests {
 
         let slot = SeatSlot {
             lease: Some(l0),
-            last_fencing_token: Some(3),
+            last_leadership_term: Some(12),
         };
         let (next, decision) = slot.fold(&SeatRequest::Renew(l1.clone()), 40_000, 5_000);
         assert_eq!(decision, SeatDecision::Accepted);
         assert_eq!(next.lease, Some(l1.clone()));
-        assert_eq!(next.last_fencing_token, Some(3));
+        assert_eq!(next.last_leadership_term, Some(12));
         // And the rebound lease authorizes under the new epoch's certificate.
         assert!(l1.authorize(&[peer_id(&base)], 40_000, 5_000).is_ok());
     }
@@ -797,7 +1102,7 @@ mod tests {
     fn release_signs_verifies_and_folds_to_a_tombstoned_slot() {
         let base = key(1);
         let run_key = key(2);
-        let l = lease(&base, 2, 4);
+        let l = lease(&base, 2, 4, 20);
         let release = SeatRelease::sign(
             &run_key,
             SeatReleaseBody {
@@ -805,7 +1110,7 @@ mod tests {
                 run_id: l.body.run_id,
                 role: l.body.role.clone(),
                 incarnation: 4,
-                fencing_token: 4,
+                leadership_term: 20,
                 claimant: l.body.claimant,
             },
         )
@@ -814,29 +1119,29 @@ mod tests {
 
         let slot = SeatSlot {
             lease: Some(l),
-            last_fencing_token: Some(4),
+            last_leadership_term: Some(20),
         };
         let (next, decision) = slot.fold(&SeatRequest::Release(release), 2_000, 5_000);
         assert_eq!(decision, SeatDecision::Accepted);
         assert_eq!(
             next.state(),
             SeatState::Unclaimed {
-                last_fencing_token: Some(4)
+                last_leadership_term: Some(20)
             }
         );
-        // The floor persists: the next claim must present 5.
-        let next_claim = lease(&base, 6, 5);
+        // The floor persists: the next claim must exceed 20 — sparsely.
+        let next_claim = lease(&base, 6, 1, 33);
         let (after, decision) = next.fold(&SeatRequest::Claim(next_claim), 3_000, 5_000);
         assert_eq!(decision, SeatDecision::Accepted);
-        assert_eq!(after.last_fencing_token, Some(5));
-        // A re-claim at the released token is a fencing conflict.
-        let stale = lease(&base, 7, 4);
+        assert_eq!(after.last_leadership_term, Some(33));
+        // A re-claim at the released term is a fencing conflict.
+        let stale = lease(&base, 7, 9, 20);
         let (_, decision) = next.fold(&SeatRequest::Claim(stale), 3_000, 5_000);
         assert_eq!(
             decision,
             SeatDecision::RejectedFencingConflict {
-                expected: 5,
-                got: 4
+                expected: 20,
+                got: 20
             }
         );
     }
@@ -852,7 +1157,7 @@ mod tests {
             run_id: run(1),
             role: "coordinator".into(),
             incarnation: 1,
-            fencing_token: 1,
+            leadership_term: 1,
             claimant,
         };
         assert!(matches!(
@@ -864,15 +1169,93 @@ mod tests {
     }
 
     #[test]
+    fn the_term_ledger_advances_only_on_verified_grants_and_fences_predecessors() {
+        let base = key(1);
+        let incumbent = lease(&base, 2, 3, 10);
+        let mut ledger = SeatTermLedger::new();
+        assert_eq!(ledger.floor(&run(1), "coordinator"), None);
+        assert_eq!(
+            ledger.binds(&run(1), "coordinator", &incumbent.body.claimant),
+            None
+        );
+
+        ledger.observe_verified_grant(&incumbent);
+        assert_eq!(ledger.floor(&run(1), "coordinator"), Some(10));
+        assert!(ledger.judge(&incumbent).is_ok());
+        assert_eq!(
+            ledger.binds(&run(1), "coordinator", &incumbent.body.claimant),
+            Some(true)
+        );
+
+        // A successor's verified grant at a sparse higher term fences the incumbent.
+        let successor = lease(&base, 4, 1, 25);
+        ledger.observe_verified_grant(&successor);
+        assert_eq!(ledger.floor(&run(1), "coordinator"), Some(25));
+        assert_eq!(
+            ledger.judge(&incumbent),
+            Err(SeatLeaseError::TermSuperseded { got: 10, floor: 25 })
+        );
+        assert_eq!(
+            ledger.binds(&run(1), "coordinator", &incumbent.body.claimant),
+            Some(false)
+        );
+        assert_eq!(
+            ledger.binds(&run(1), "coordinator", &successor.body.claimant),
+            Some(true)
+        );
+
+        // A stale grant never rolls the floor back.
+        ledger.observe_verified_grant(&incumbent);
+        assert_eq!(ledger.floor(&run(1), "coordinator"), Some(25));
+
+        // An equal term under a DIFFERENT claimant is a collision — fail closed.
+        let equivocation = lease(&base, 6, 9, 25);
+        assert_eq!(
+            ledger.judge(&equivocation),
+            Err(SeatLeaseError::TermSuperseded { got: 25, floor: 25 })
+        );
+    }
+
+    #[test]
+    fn v1_bodies_interpret_read_only_and_never_validate_as_v2() {
+        // The archived v1 shape decodes for forensics; its interpretation maps the conflated
+        // ordinal into the two scopes. It can never re-enter the live system: the v2 validate
+        // refuses the v1 domain tag, and the v1 preimage cannot carry a v2 signature.
+        let v1 = SeatLeaseBodyV1 {
+            domain: SEAT_LEASE_DOMAIN_V1.to_string(),
+            run_id: run(1),
+            role: "coordinator".into(),
+            epoch: 0,
+            incarnation: 19,
+            fencing_token: 19,
+            claimant: peer_id(&key(2)),
+            module_hash: Hash([0xCC; 32]),
+            endpoint: ControlEndpoint {
+                ws: Some("wss://x".into()),
+                iroh_ticket: None,
+            },
+            issued_at_ms: 1,
+            expires_at_ms: 2,
+            heartbeat_interval_ms: 3,
+        };
+        assert_eq!(v1.interpret().unwrap(), (19, 19));
+        let bytes = crate::canonical::to_canonical_vec(&v1).unwrap();
+        let back: SeatLeaseBodyV1 = crate::canonical::from_canonical_slice(&bytes).unwrap();
+        assert_eq!(back, v1);
+        assert!(is_v1_release_domain(SEAT_RELEASE_DOMAIN_V1));
+        assert!(!is_v1_release_domain(SEAT_RELEASE_DOMAIN));
+    }
+
+    #[test]
     fn seat_state_and_response_round_trip_through_canonical_cbor() {
         let base = key(1);
-        let l = lease(&base, 2, 0);
+        let l = lease(&base, 2, 0, 1);
         for state in [
             SeatState::Unclaimed {
-                last_fencing_token: None,
+                last_leadership_term: None,
             },
             SeatState::Unclaimed {
-                last_fencing_token: Some(7),
+                last_leadership_term: Some(7),
             },
             SeatState::Leased(Box::new(l)),
         ] {

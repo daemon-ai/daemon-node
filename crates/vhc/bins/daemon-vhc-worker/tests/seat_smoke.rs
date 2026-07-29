@@ -37,7 +37,8 @@ use daemon_vhc_proto::genesis::{
 };
 use daemon_vhc_proto::{
     blake3_hash, peer_id, to_canonical_vec, ControlEndpoint, GenesisEnvelope, PeerId,
-    RevocationLedger, SeatDecision, SeatState, SignedEnvelope, SigningKey, DEFAULT_SEAT_SKEW_MS,
+    RevocationLedger, SeatDecision, SeatState, SeatTermLedger, SignedEnvelope, SigningKey,
+    DEFAULT_SEAT_SKEW_MS,
 };
 use daemon_vhc_session::journal_home::RUN_DIR_ENV;
 use daemon_vhc_session::keystore::{VhcKeystore, IDENTITY_DIR_ENV};
@@ -341,11 +342,14 @@ async fn coordinator_seat_claim_launch_and_trainer_lease_resolve() {
     let coord_tuple = assess_role(&mut coord, &wire, COORD_ROLE, step).await;
     let bid = derive_bid(
         &registry.read(RUN_LABEL, COORD_ROLE),
+        None,
         now,
         DEFAULT_SEAT_SKEW_MS,
     )
     .expect("virgin slot bids");
-    // Provision the coordinator identity at the bid incarnation, then author + CAS the lease.
+    // Provision the coordinator identity at its execution incarnation (== the virgin bid value
+    // here only by coincidence — the two are independent ordinals, [SEAT-1] v2), then author +
+    // CAS the lease at the term bid.
     provision(&coord, &coord_tuple, COORD_ROLE, bid);
     let seat_scope = CoordinatorSeat {
         run_label: RUN_LABEL,
@@ -361,7 +365,8 @@ async fn coordinator_seat_claim_launch_and_trainer_lease_resolve() {
     let lease = author_claim(
         &VhcKeystore::open(coord.identity.path()).unwrap(),
         &seat_scope,
-        bid,
+        bid, // execution incarnation (provisioned above)
+        bid, // leadership term
         now,
     )
     .expect("author claim");
@@ -377,6 +382,9 @@ async fn coordinator_seat_claim_launch_and_trainer_lease_resolve() {
         iroh: None,
         presign_base: None,
         peer_certs: Vec::new(),
+        // The winner's own grant rides its credentials ([SEAT-1] v2 grant distribution): the
+        // session re-verifies, primes its term floor, and announces it on-plane.
+        seat_grant: Some(lease.clone()),
         secret_ref: None,
         expires_at_ms: 0,
         restore: None,
@@ -398,7 +406,8 @@ async fn coordinator_seat_claim_launch_and_trainer_lease_resolve() {
         },
     )
     .unwrap();
-    let contender_lease = author_claim(&contender, &seat_scope, bid + 1, now + 1_000).unwrap();
+    let contender_lease =
+        author_claim(&contender, &seat_scope, bid + 1, bid + 1, now + 1_000).unwrap();
     assert_eq!(
         registry
             .claim(RUN_LABEL, &contender_lease, now + 1_000)
@@ -416,6 +425,7 @@ async fn coordinator_seat_claim_launch_and_trainer_lease_resolve() {
         &stored,
         &[coord_base, trainer_base],
         &RevocationLedger::new(),
+        &SeatTermLedger::new(),
         now + 2_000,
         DEFAULT_SEAT_SKEW_MS,
     )
@@ -430,8 +440,10 @@ async fn coordinator_seat_claim_launch_and_trainer_lease_resolve() {
         ws_auth: WsAuthSpec::None,
         iroh: None,
         presign_base: None,
-        // Bootstrap trust: the seat holder's certificate (so the trainer verifies its frames).
+        // Bootstrap trust: the seat holder's certificate (so the trainer verifies its frames)
+        // and the AUTHORIZED grant (so the trainer's term floor governs the coordinator slot).
         peer_certs: vec![authorized.certificate.clone()],
+        seat_grant: Some(stored.clone()),
         secret_ref: None,
         expires_at_ms: 0,
         restore: None,

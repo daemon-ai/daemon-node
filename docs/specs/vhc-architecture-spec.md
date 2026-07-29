@@ -24,6 +24,17 @@ derivation contract in full), drafted in parallel with this spec; `vhc-migration
 decompositions, and the swarm→vhc rename manifest. Where this spec defers a detail to a
 companion, the deferral is explicit.
 
+**The archived program architecture doc is a TARGET where it diverges.** The frozen
+`daemon-vhc-architecture.md` (archived under the program docs) reads as current in places where
+it is aspirational; the tracked specs here are authoritative for what exists. Known divergences:
+its §5.3 journal-archive publication and standby coordinator failover have no product callers
+(coordinator crash reconstruction is a named pre-C2 workstream); in-session transport
+sequence-gap recovery is typed-retryable rejoin, not archive backfill (transport repair, semantic
+catch-up, and module/journal reconstruction are three distinct recovery invariants that will
+eventually share one durable archive substrate); and the seat lease is scheme v2 — a leadership
+term separate from the execution incarnation (ABI §12.4 [SEAT-1]) — superseding any
+`token == incarnation` framing.
+
 **Naming.** This spec uses the subsystem's new name, **vhc**; the shipping code is still named
 `swarm` (`daemon-swarm-*` crates, `SwarmApi`, `daemon-train`). Shipping code is cited by its real
 name; new vocabulary, ABI symbols, and future crate/API names use `vhc`. The rename is a separate
@@ -814,10 +825,15 @@ purely from the frozen genesis plus the certificate the frame carries.
   verifier rejects any record whose sequence does not advance, so a captured record cannot be
   replayed to un-revoke or re-revoke. Records propagate on the control plane best-effort — delivery
   is not assumed synchronous or total.
-- **[CI-5]** **Incarnation supersession is the partition-safe floor.** Because revocation delivery
-  is best-effort, correctness does not depend on it: a higher incarnation always supersedes a lower
-  one for the same `(run, role)`, so a certificate for a stale incarnation is refused even where no
-  revocation record has arrived. Supersession is the floor that holds under partition; revocation is
+- **[CI-5]** **Incarnation supersession is the partition-safe floor — per base identity.** Because
+  revocation delivery is best-effort, correctness does not depend on it: a higher incarnation
+  supersedes a lower one within the same `(run, role, base identity)` ladder, so a certificate for
+  a stale incarnation is refused even where no revocation record has arrived. The base identity is
+  load-bearing: a role names a duty, not a seat — a run whose roster carries two trainers has two
+  independent trainer ladders, one per base, and each base may only supersede its OWN keys.
+  Cross-base ordering exists in exactly one place, the coordinator seat's leadership term (ABI
+  §12.4 [SEAT-1]), which is a separate ordinal fed only by verified seat grants — never by
+  certificate incarnations. Supersession is the floor that holds under partition; revocation is
   the timely-but-best-effort layer above it.
 - **[CI-6]** **Epoch rebinds, incarnation rotates.** An epoch change rebinds the *same* per-run key
   under a new certificate (the key is stable across epochs of one incarnation). Key rotation happens

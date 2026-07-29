@@ -38,6 +38,10 @@ pub struct SeatBootstrap {
     pub peer_certs: Vec<RunKeyCertificate>,
     /// The seat-published WS control endpoint, when the lease carries one.
     pub ws_base: Option<String>,
+    /// The full AUTHORIZED seat grant ([SEAT-1] v2): rides the credentials so the session can
+    /// prime its leadership-term floor and re-announce the grant on-plane (the worker's attach
+    /// re-verifies before its floor advances — this is bootstrap carriage, not trust).
+    pub seat_grant: Option<daemon_vhc_proto::SeatLease>,
 }
 
 /// The resolved plane-bootstrap material one authorship pass consumes: the late-join checkpoint
@@ -162,6 +166,9 @@ pub fn author_join(
         // worker authenticates coordinator frames without waiting for the on-plane announcement
         // (which a late subscriber misses). `CertCheck` still gates trust by genesis base.
         peer_certs: seat.peer_certs,
+        // The authorized seat grant ([SEAT-1] v2 bootstrap half); the session re-verifies it
+        // before its leadership-term floor advances.
+        seat_grant: seat.seat_grant,
         secret_ref,
         expires_at_ms,
         restore,

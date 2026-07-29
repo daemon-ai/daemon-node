@@ -53,12 +53,27 @@ pub const GOSSIP_TOPIC_DOMAIN: &[u8] = b"daemon-vhc/gossip-topic/1.0.0";
 /// Domain-separation tag bound into every coordinator seat-lease preimage (spec §6.3; the
 /// Authority-signed fenced lease). Distinct from the certificate domain so a lease signature can
 /// never be replayed as a certificate or a frame signature, and vice versa.
-pub const SEAT_LEASE_DOMAIN: &str = "daemon-vhc/seat-lease/1.0.0";
+///
+/// **Retired scheme** (v1, `fencing_token == incarnation`): the string keeps naming the old
+/// derivation forever; nothing authors it. Kept for the explicit v1 *interpretation* of archived
+/// state ([`crate::seat::SeatLeaseBodyV1`]) — never for live authority.
+pub const SEAT_LEASE_DOMAIN_V1: &str = "daemon-vhc/seat-lease/1.0.0";
 
-/// Domain-separation tag bound into every seat-release preimage (the claimant's signed statement
-/// that it gives the seat up). Distinct from [`SEAT_LEASE_DOMAIN`] so a release signature can
-/// never be replayed as a live lease.
-pub const SEAT_RELEASE_DOMAIN: &str = "daemon-vhc/seat-release/1.0.0";
+/// Domain-separation tag bound into every seat-lease preimage at scheme v2: the lease separates
+/// the run-role-global `leadership_term` (the seat's CAS/fencing order) from the claimant's
+/// node-local `execution_incarnation` — two different order relations the v1 scheme conflated
+/// (`fencing_token == incarnation`), which broke as soon as leadership could move across base
+/// identities whose local counters are unrelated. A new domain string because the preimage
+/// layout AND the meaning changed (MAJOR bump per the registry rules above).
+pub const SEAT_LEASE_DOMAIN: &str = "daemon-vhc/seat-lease/2.0.0";
+
+/// Retired v1 seat-release scheme tag (see [`SEAT_LEASE_DOMAIN_V1`]).
+pub const SEAT_RELEASE_DOMAIN_V1: &str = "daemon-vhc/seat-release/1.0.0";
+
+/// Domain-separation tag bound into every seat-release preimage at scheme v2 (the claimant's
+/// signed statement that it gives the seat up). Distinct from [`SEAT_LEASE_DOMAIN`] so a release
+/// signature can never be replayed as a live lease.
+pub const SEAT_RELEASE_DOMAIN: &str = "daemon-vhc/seat-release/2.0.0";
 
 /// Domain-separation tag bound into every iroh roster-record preimage (the registry-served
 /// signed reachability statement). Distinct from the seat/cert/frame domains so a roster

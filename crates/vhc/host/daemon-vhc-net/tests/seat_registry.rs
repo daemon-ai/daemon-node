@@ -9,8 +9,8 @@
 //! The registry-posture split is asserted explicitly: the registry ACCEPTS a structurally-valid
 //! lease whose authority is garbage (untrusted base, forged signature) — it is untrusted storage
 //! and never judges authority — while a PEER verifying the same stored object refuses it typed.
-//! Fencing (the token CAS + the certificate supersession floor) is what protects the run, never
-//! the registry's opinion.
+//! Fencing (the leadership-term CAS + the certificate supersession floor) is what protects the
+//! run, never the registry's opinion.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -50,7 +50,7 @@ fn body(claimant: PeerId, incarnation: u64, issued_at_ms: u64) -> SeatLeaseBody 
         role: ROLE.to_string(),
         epoch: 0,
         incarnation,
-        fencing_token: incarnation,
+        leadership_term: incarnation,
         claimant,
         module_hash: module_hash(),
         endpoint: ControlEndpoint {
@@ -63,7 +63,9 @@ fn body(claimant: PeerId, incarnation: u64, issued_at_ms: u64) -> SeatLeaseBody 
     }
 }
 
-/// A claim by run key `seed`, certified by `base`, at `incarnation`, issued at `issued_at_ms`.
+/// A claim by run key `seed`, certified by `base`, at execution incarnation `incarnation` with
+/// `leadership_term == incarnation` (coincidental in this transport suite; the identity-scope
+/// semantics live in the proto fold vectors), issued at `issued_at_ms`.
 fn lease(base: &SigningKey, seed: u8, incarnation: u64, issued_at_ms: u64) -> SeatLease {
     let run_key = key(seed);
     let claimant = peer_id(&run_key);
@@ -209,7 +211,7 @@ async fn full_seat_lifecycle_over_the_frozen_http_surface() {
     assert_eq!(
         client.read_seat(&run, ROLE).await.expect("read"),
         Some(SeatState::Unclaimed {
-            last_fencing_token: None
+            last_leadership_term: None
         })
     );
 
@@ -228,7 +230,7 @@ async fn full_seat_lifecycle_over_the_frozen_http_surface() {
         other => panic!("expected the stored lease: {other:?}"),
     }
 
-    // Renew (heartbeat): a re-signed body under the same identity/token extends expiry.
+    // Renew (heartbeat): a re-signed body under the same identity/term extends expiry.
     backend.set_now(11_000);
     let run_key = key(2);
     let mut renewed_body = l0.body.clone();
@@ -240,7 +242,7 @@ async fn full_seat_lifecycle_over_the_frozen_http_surface() {
         SeatClaimOutcome::Won(_)
     ));
 
-    // Release: the seat unclaims but the fencing floor persists (tokens never reset).
+    // Release: the seat unclaims but the term floor persists (terms never reset).
     let release = SeatRelease::sign(
         &run_key,
         SeatReleaseBody {
@@ -248,7 +250,7 @@ async fn full_seat_lifecycle_over_the_frozen_http_surface() {
             run_id: run_hash(),
             role: ROLE.to_string(),
             incarnation: 0,
-            fencing_token: 0,
+            leadership_term: 0,
             claimant: peer_id(&run_key),
         },
     )
@@ -260,7 +262,7 @@ async fn full_seat_lifecycle_over_the_frozen_http_surface() {
     assert_eq!(
         client.read_seat(&run, ROLE).await.expect("read"),
         Some(SeatState::Unclaimed {
-            last_fencing_token: Some(0)
+            last_leadership_term: Some(0)
         })
     );
 
@@ -275,7 +277,7 @@ async fn concurrent_claims_produce_one_winner_and_typed_losers_who_re_read() {
     let run = RunId::new(RUN_LABEL);
     let base = key(1);
 
-    // Four claimants race the virgin slot at the same first token.
+    // Four claimants race the virgin slot at the same first term.
     let leases: Vec<SeatLease> = (0..4).map(|i| lease(&base, 10 + i, 0, 1_000)).collect();
     let (a, b, c, d) = tokio::join!(
         client.claim_seat(&run, &leases[0]),
@@ -302,7 +304,7 @@ async fn concurrent_claims_produce_one_winner_and_typed_losers_who_re_read() {
         assert_eq!(*state, SeatState::Leased(Box::new(winner.clone())));
     }
 
-    // A loser bidding token+1 while the incumbent is live still loses (fencing never overrides
+    // A loser bidding a higher term while the incumbent is live still loses (fencing never overrides
     // liveness — takeover needs expiry first).
     let eager = lease(&base, 20, 1, 2_000);
     assert!(matches!(
@@ -330,14 +332,14 @@ async fn a_fenced_stale_claimant_is_refused_by_registry_and_peers() {
     ));
     backend.set_now(1_000 + TTL_MS + DEFAULT_SEAT_SKEW_MS + 1);
 
-    // The standby takes over at exactly floor + 1 (a fresh incarnation).
+    // The standby takes over at a term above the floor (a fresh execution incarnation).
     let l1 = lease(&base, 3, 1, 40_000);
     assert!(matches!(
         client.claim_seat(&run, &l1).await.expect("takeover"),
         SeatClaimOutcome::Won(_)
     ));
 
-    // REGISTRY fence: the stale claimant's renew at the old token is a typed conflict carrying
+    // REGISTRY fence: the stale claimant's renew at the old term is a typed conflict carrying
     // the current state (it learns it was superseded).
     let stale = match client.renew_seat(&run, &l0).await.expect("stale renew") {
         SeatClaimOutcome::Lost { decision, state } => (decision, state),

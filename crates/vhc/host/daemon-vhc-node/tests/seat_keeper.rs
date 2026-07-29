@@ -205,12 +205,17 @@ async fn keeper_claims_renews_and_releases_on_pause() {
         .set_admitted_tuple(RUN, &protocol::encode(&tuple()).unwrap())
         .unwrap();
 
-    // First pass: the virgin slot is claimed at bid 0.
+    // First pass: the virgin slot is claimed at term 0 with a FRESH counter-minted execution
+    // incarnation ([SEAT-1] v2 — the term orders leadership, the counter names the execution).
     let notes = svc.seat_tick().await.unwrap();
     assert!(
         matches!(
             notes.as_slice(),
-            [SeatNote::Claimed { run_label, incarnation: 0 }] if run_label == RUN
+            [SeatNote::Claimed {
+                run_label,
+                incarnation: 1,
+                leadership_term: 0,
+            }] if run_label == RUN
         ),
         "got {notes:?}"
     );
@@ -226,12 +231,14 @@ async fn keeper_claims_renews_and_releases_on_pause() {
         "got {notes:?}"
     );
 
-    // Owner pause: the seat releases FENCED — the slot unclaims, the token floor persists.
+    // Owner pause: the seat releases FENCED — the slot unclaims, the term floor persists.
     svc.vhc_pause(RUN.to_string(), "op-p".into()).await.unwrap();
     match directory.registry.read(RUN, ROLE) {
-        SeatState::Unclaimed { last_fencing_token } => {
+        SeatState::Unclaimed {
+            last_leadership_term,
+        } => {
             assert_eq!(
-                last_fencing_token,
+                last_leadership_term,
                 Some(0),
                 "the floor survives the release"
             );
@@ -241,9 +248,9 @@ async fn keeper_claims_renews_and_releases_on_pause() {
     // A paused run leaves the keeper's coverage entirely (no claim while paused).
     assert!(svc.seat_tick().await.unwrap().is_empty());
 
-    // A successor claims at floor + 1; after resume-of-intent the keeper STANDS BY against the
-    // live incumbent (fencing is safety, not a fight). The intent axis is enough to re-cover the
-    // run: flip it back to joined directly (a full resume needs a live worker seam).
+    // A successor claims at a term above the floor; after resume-of-intent the keeper STANDS BY
+    // against the live incumbent (fencing is safety, not a fight). The intent axis is enough to
+    // re-cover the run: flip it back to joined directly (a full resume needs a live worker seam).
     let other_identity = tempfile::tempdir().unwrap();
     let other_keystore = VhcKeystore::open(other_identity.path()).unwrap();
     let successor = daemon_vhc_node::seat::author_claim(
@@ -256,7 +263,8 @@ async fn keeper_claims_renews_and_releases_on_pause() {
             module_hash: MODULE,
             endpoint: candidate().endpoint,
         },
-        1,
+        7, // the successor's OWN execution incarnation (claimant-local, not a fleet ordinal)
+        1, // a leadership term above the tombstone floor
         directory.now(),
     )
     .unwrap();
@@ -276,14 +284,16 @@ async fn keeper_claims_renews_and_releases_on_pause() {
         "stand by against a live incumbent: {notes:?}"
     );
     match directory.registry.read(RUN, ROLE) {
-        SeatState::Leased(lease) => assert_eq!(lease.body.incarnation, 1, "the successor holds"),
+        SeatState::Leased(lease) => {
+            assert_eq!(lease.body.leadership_term, 1, "the successor holds");
+        }
         other => panic!("expected the successor's lease, got {other:?}"),
     }
 }
 
 /// The SHUTDOWN hook (`VhcService::release_seats`, driven by the daemon's graceful-shutdown
 /// block): a node holding the coordinator seat surrenders it FENCED on clean shutdown — the slot
-/// unclaims with the token floor persisted, so a standby takes over at floor + 1 without waiting
+/// unclaims with the term floor persisted, so a standby takes over above it without waiting
 /// out the lease TTL. Idempotent: a second release (nothing held) is a no-op.
 #[tokio::test]
 async fn shutdown_releases_the_held_seat_fenced() {
@@ -341,9 +351,11 @@ async fn shutdown_releases_the_held_seat_fenced() {
     // Clean shutdown: every held seat releases fenced — unclaimed slot, floor persisted.
     svc.release_seats().await;
     match directory.registry.read(RUN, ROLE) {
-        SeatState::Unclaimed { last_fencing_token } => {
+        SeatState::Unclaimed {
+            last_leadership_term,
+        } => {
             assert_eq!(
-                last_fencing_token,
+                last_leadership_term,
                 Some(0),
                 "the floor survives the release"
             );
@@ -451,12 +463,12 @@ impl WorkerControl for RoleDirectedWorker {
     }
 }
 
-/// The JOIN-side seat coupling ([SEAT-1] end-to-end): with coordinator duty enabled, `vhc_join`
-/// assesses the seat role, wins the virgin slot's CAS, and runs the join AT THE LEASE'S
-/// INCARNATION — the fencing token IS the execution identity's incarnation (never the minted
-/// counter), and the keeper holds the lease for the resident renew loop.
+/// The JOIN-side seat coupling ([SEAT-1] v2 end-to-end): with coordinator duty enabled,
+/// `vhc_join` assesses the seat role, wins the virgin slot's CAS, and runs the join AT THE
+/// LEASE'S counter-minted execution incarnation — the leadership term rides the lease as its
+/// own independent ordinal — and the keeper holds the lease for the resident renew loop.
 #[tokio::test]
-async fn join_runs_the_coordinator_role_at_the_seat_bid_incarnation() {
+async fn join_runs_the_coordinator_role_at_the_seat_lease_incarnation() {
     let identity = tempfile::tempdir().unwrap();
     VhcKeystore::open(identity.path()).unwrap();
     let directory = FakeDirectory::new();
@@ -489,13 +501,14 @@ async fn join_runs_the_coordinator_role_at_the_seat_bid_incarnation() {
         .await
         .unwrap();
 
-    // The registry holds OUR lease at the virgin bid, token == incarnation == 0.
+    // The registry holds OUR lease at the virgin term bid with a fresh counter-minted
+    // execution incarnation — two independent ordinals ([SEAT-1] v2).
     let lease = match directory.registry.read(RUN, ROLE) {
         SeatState::Leased(l) => *l,
         other => panic!("expected the won lease, got {other:?}"),
     };
-    assert_eq!(lease.body.fencing_token, 0);
-    assert_eq!(lease.body.incarnation, 0);
+    assert_eq!(lease.body.leadership_term, 0);
+    assert_eq!(lease.body.incarnation, 1);
 
     // The join was delivered AT the lease incarnation, under the seat role.
     let joins = worker.joins.lock().unwrap().clone();
@@ -505,7 +518,7 @@ async fn join_runs_the_coordinator_role_at_the_seat_bid_incarnation() {
     assert_eq!(tuple.role, ROLE, "the seat role is the joined role");
     assert_eq!(
         tuple.incarnation, lease.body.incarnation,
-        "fencing_token == incarnation, end-to-end"
+        "the join runs at the lease's execution incarnation, end-to-end"
     );
 
     // The keeper HOLDS the won lease: the next resident pass renews (never re-claims).
@@ -537,7 +550,8 @@ async fn join_stands_down_to_trainer_when_a_live_incumbent_holds() {
             module_hash: MODULE,
             endpoint: candidate().endpoint,
         },
-        0,
+        1, // the incumbent's own execution incarnation
+        0, // the virgin term
         directory.now(),
     )
     .unwrap();
@@ -584,7 +598,7 @@ async fn join_stands_down_to_trainer_when_a_live_incumbent_holds() {
     assert_eq!(tuple.role, "trainer", "stood down to the trainer default");
     assert!(
         tuple.incarnation > 0,
-        "the trainer identity is the minted counter, never the foreign lease's token"
+        "the trainer identity is the minted counter, never anything from the foreign lease"
     );
     // The incumbent's lease is untouched.
     match directory.registry.read(RUN, ROLE) {
@@ -594,25 +608,33 @@ async fn join_stands_down_to_trainer_when_a_live_incumbent_holds() {
 }
 
 /// Fencing at the keeper: a held lease whose seat moved (expiry + takeover) is DROPPED on the
-/// refused renew — the fenced claimant never fights, and a later pass bids fresh at floor + 1.
+/// refused renew — the fenced claimant never fights, and a later pass bids fresh above the floor.
 #[tokio::test]
 async fn keeper_drops_a_fenced_lease_on_refused_renew() {
     let identity = tempfile::tempdir().unwrap();
     VhcKeystore::open(identity.path()).unwrap();
     let directory = FakeDirectory::new();
-    let keeper = SeatKeeper::new(directory.clone(), identity.path().to_path_buf());
+    let keeper = SeatKeeper::new(
+        directory.clone(),
+        identity.path().to_path_buf(),
+        Arc::new(VhcStore::open_in_memory().unwrap()),
+    );
     let t0 = 1_000_000u64;
     directory.set_now(t0);
 
-    // Claim the virgin slot at bid 0.
+    // Claim the virgin slot at term 0 (fresh counter-minted incarnation 1).
     let notes = keeper.tick(&[candidate()], t0).await;
     assert!(matches!(
         notes.as_slice(),
-        [SeatNote::Claimed { incarnation: 0, .. }]
+        [SeatNote::Claimed {
+            incarnation: 1,
+            leadership_term: 0,
+            ..
+        }]
     ));
-    assert_eq!(keeper.held_incarnation(RUN), Some(0));
+    assert_eq!(keeper.held_incarnation(RUN), Some(1));
 
-    // The lease expires unrenewed; a standby takes the seat at floor + 1.
+    // The lease expires unrenewed; a standby takes the seat at a term above the floor.
     let t1 = t0 + DEFAULT_SEAT_TTL_MS * 2;
     directory.set_now(t1);
     let other_identity = tempfile::tempdir().unwrap();
@@ -627,14 +649,15 @@ async fn keeper_drops_a_fenced_lease_on_refused_renew() {
             module_hash: MODULE,
             endpoint: candidate().endpoint,
         },
-        1,
+        3, // the standby's own execution incarnation
+        1, // a term above the expired holder's
         t1,
     )
     .unwrap();
     assert_eq!(
         directory.registry.claim(RUN, &takeover, t1).decision,
         SeatDecision::Accepted,
-        "an expired lease is taken over at floor + 1"
+        "an expired lease is taken over at a term above the floor"
     );
 
     // The old holder's renew is REFUSED: the keeper drops the fenced lease (never a fight).

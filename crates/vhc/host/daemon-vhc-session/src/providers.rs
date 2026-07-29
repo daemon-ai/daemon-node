@@ -154,6 +154,11 @@ pub struct LiveAttachInputs<'a> {
     /// The session's own §12.3 certificate announcement bytes (published on attach by the
     /// session; registered here as a WS resubscribe frame so reconnects re-announce).
     pub own_cert_announcement: Vec<u8>,
+    /// The join's verified seat-grant announcement bytes ([SEAT-1] v2 grant distribution's
+    /// anti-entropy half), when the credentials carried a grant — registered as a WS
+    /// resubscribe frame beside the certificate so every reconnect + cadence tick re-carries
+    /// the leadership evidence to late subscribers.
+    pub seat_grant_announcement: Option<Vec<u8>>,
     /// The identity keystore (the iroh transport secret's home — resolved by reference).
     pub keystore: &'a VhcKeystore,
 }
@@ -216,6 +221,9 @@ pub async fn build_role_providers(
     )
     .await?;
     ws.add_resubscribe_frame(inputs.own_cert_announcement);
+    if let Some(grant) = inputs.seat_grant_announcement {
+        ws.add_resubscribe_frame(grant);
+    }
     let ws = Arc::new(ws);
     tracing::debug!(
         run = inputs.run_label,

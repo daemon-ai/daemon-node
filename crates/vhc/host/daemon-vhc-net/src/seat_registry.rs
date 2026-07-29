@@ -15,9 +15,9 @@
 //! (`daemon-vhc-proto/tests/fixtures/seat-cas-vectors.json`) catch.
 //!
 //! Faithful to the registry posture (untrusted storage): **structural validation only** — the
-//! fold checks domains, the token≡incarnation binding, windows, endpoint presence, slot
-//! consistency, expiry by the registry clock + skew grace, and the fencing-token CAS. It never
-//! verifies a signature and never judges authority; peers do that.
+//! fold checks domains, bounded ordinals, windows, endpoint presence, slot consistency, expiry
+//! by the registry clock + skew grace, and the sparse leadership-term CAS ([SEAT-1] v2). It
+//! never verifies a signature and never judges authority; peers do that.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -97,7 +97,7 @@ impl FakeSeatRegistry {
             .get(&(run.to_string(), role.to_string()))
             .map_or(
                 SeatState::Unclaimed {
-                    last_fencing_token: None,
+                    last_leadership_term: None,
                 },
                 SeatSlot::state,
             )

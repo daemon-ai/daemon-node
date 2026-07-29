@@ -137,6 +137,7 @@ fn rig(wasm: &[u8], admitted_quotas: Option<AdmittedQuotas>) -> Rig {
         own_cert: certified.cert.clone(),
         trusted_bases: vec![peer_id(&base)],
         peer_certs: vec![certified.cert],
+        seat_grant: None,
         providers: RoleProviders {
             control: plane.clone(),
             payloads: Arc::new(MemoryContentStore::new()),

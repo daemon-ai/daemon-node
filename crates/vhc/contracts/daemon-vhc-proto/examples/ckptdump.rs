@@ -5,6 +5,9 @@
 
 fn main() {
     let path = std::env::args().nth(1).expect("usage: ckptdump <doc.bin>");
+    // An operator diagnostic over an operator-named wire file: no containment boundary applies
+    // (the disallowed-methods rule guards the engine's contained-exec roots, not dump tools).
+    #[allow(clippy::disallowed_methods)]
     let bytes = std::fs::read(&path).expect("read doc");
     let (manifest, sections) =
         daemon_vhc_proto::det_state::decode_checkpoint_doc(&bytes).expect("decode checkpoint doc");

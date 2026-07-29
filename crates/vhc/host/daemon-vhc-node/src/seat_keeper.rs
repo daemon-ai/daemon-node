@@ -9,15 +9,22 @@
 //! duty (`[vhc] seat_claim`), the node service drives one keeper pass per heartbeat interval over
 //! every joined run whose admitted role is the configured seat role —
 //!
-//! - **unheld slot**: read the slot, derive a bid (`None` while a live incumbent holds — stand
-//!   by), author + CAS the claim; a lost race stands by (fencing-is-safe-not-seamless);
-//! - **held lease**: re-sign with a fresh expiry under the SAME token and renew; a refused renew
-//!   means the seat moved — the claimant is FENCED and drops the lease (never a takeover fight);
+//! - **unheld slot**: read the slot, derive a term bid (`None` while a live incumbent holds —
+//!   stand by), mint a **fresh execution incarnation** from the node counter, author + CAS the
+//!   claim; a lost race stands by (fencing-is-safe-not-seamless);
+//! - **held lease**: re-sign with a fresh expiry under the SAME execution identity and term and
+//!   renew; a refused renew means the seat moved — the claimant is FENCED and drops the lease
+//!   (never a takeover fight);
 //! - **release**: an owner pause/leave (and node shutdown) releases the held lease signed, so the
-//!   registry tombstones the token and the floor persists.
+//!   registry tombstones the term and the floor persists.
 //!
 //! The registry stays untrusted storage throughout: every outcome here is a structural CAS fold;
-//! authority judgments live peer-side ([`crate::seat::authorize_incumbent`]).
+//! authority judgments live peer-side ([`crate::seat::authorize_incumbent`]). The two identities
+//! stay in their scopes ([SEAT-1] v2): the **execution incarnation** comes only from the durable
+//! node counter ([`VhcStore::mint_incarnation`]); the **leadership term** bids above the highest
+//! floor the node can see and, once WON, persists into the node's verified-term floor
+//! ([`VhcStore::observe_seat_term`]) — a registry answering stale/low state can only lose the
+//! CAS, never poison either counter.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -31,6 +38,7 @@ use daemon_vhc_session::keystore::VhcKeystore;
 
 use crate::seat::{author_claim, author_release, author_renew, derive_bid, CoordinatorSeat};
 use crate::service::VhcError;
+use crate::store::VhcStore;
 
 /// The seat-slot directory seam — the registry's four seat operations, abstracted so the keeper
 /// runs identically over the production [`RegistryClient`] and a test fold.
@@ -62,7 +70,7 @@ impl SeatDirectory for RegistryClient {
             .await
             .map_err(net)?
             .unwrap_or(SeatState::Unclaimed {
-                last_fencing_token: None,
+                last_leadership_term: None,
             }))
     }
     async fn claim_seat(&self, run: &str, lease: &SeatLease) -> Result<SeatClaimOutcome, VhcError> {
@@ -121,12 +129,14 @@ impl SeatCandidate {
 /// What one keeper pass observed for a run (surfaced by the service as events).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SeatNote {
-    /// The claim CAS was won: this node now holds the seat at the carried incarnation.
+    /// The claim CAS was won: this node now holds the seat at the carried identities.
     Claimed {
         /// The run whose seat was claimed.
         run_label: String,
-        /// The lease incarnation (== fencing token, [SEAT-1]).
+        /// The lease's execution incarnation (counter-minted; names the execution).
         incarnation: u64,
+        /// The lease's leadership term (orders seat ownership; [SEAT-1] v2).
+        leadership_term: u64,
     },
     /// The heartbeat renewed the held lease.
     Renewed {
@@ -150,19 +160,27 @@ pub enum SeatNote {
 }
 
 /// The resident seat keeper: held leases + the directory + the identity store the claims are
-/// authored against.
+/// authored against + the durable node store the identities are minted/persisted through.
 pub struct SeatKeeper {
     directory: Arc<dyn SeatDirectory>,
     identity_dir: PathBuf,
+    store: Arc<VhcStore>,
     held: Mutex<BTreeMap<String, SeatLease>>,
 }
 
 impl SeatKeeper {
-    /// A keeper authoring against the identity store at `identity_dir`, over `directory`.
-    pub fn new(directory: Arc<dyn SeatDirectory>, identity_dir: PathBuf) -> Self {
+    /// A keeper authoring against the identity store at `identity_dir`, over `directory`, with
+    /// `store` as the durable identity substrate (execution-incarnation counter + persisted
+    /// verified leadership-term floors).
+    pub fn new(
+        directory: Arc<dyn SeatDirectory>,
+        identity_dir: PathBuf,
+        store: Arc<VhcStore>,
+    ) -> Self {
         Self {
             directory,
             identity_dir,
+            store,
             held: Mutex::new(BTreeMap::new()),
         }
     }
@@ -177,9 +195,9 @@ impl SeatKeeper {
     }
 
     /// Claim (or re-adopt) the seat for `candidate` NOW and return the incarnation the winning
-    /// lease carries — the JOIN-side coupling ([SEAT-1] end-to-end): the coordinator-role join
-    /// runs at exactly this incarnation, so `fencing_token == incarnation` holds from the CAS
-    /// through the certified execution identity.
+    /// lease carries — the JOIN-side coupling: the coordinator-role join runs at exactly the
+    /// lease's execution incarnation, so the certified execution identity and the granted seat
+    /// name the same instance (the leadership term rides the lease independently, [SEAT-1] v2).
     ///
     /// - a LIVE lease whose claimant is this node's own provisioned key at that incarnation is
     ///   re-adopted (held + renewed by the resident loop) — the node-restart resume;
@@ -218,6 +236,14 @@ impl SeatKeeper {
                     .is_some_and(|key| daemon_vhc_proto::peer_id(&key) == lease.body.claimant);
                 if ours {
                     let incarnation = lease.body.incarnation;
+                    // Our own signed lease re-adopted: its term is verified by construction
+                    // (the claimant key proved ours above) — persist the floor.
+                    self.store.observe_seat_term(
+                        &candidate.run_label,
+                        &candidate.role,
+                        lease.body.leadership_term,
+                        &lease.body.claimant.0,
+                    )?;
                     self.held
                         .lock()
                         .expect("seat keeper lock")
@@ -259,8 +285,9 @@ impl SeatKeeper {
         notes
     }
 
-    /// Claim an unheld slot when the bid derives (unclaimed → floor + 1; expired incumbent →
-    /// takeover at held + 1; live incumbent → stand by).
+    /// Claim an unheld slot when the term bid derives (unclaimed/expired → above the highest
+    /// visible floor; live incumbent → stand by). The claim runs at a FRESH counter-minted
+    /// execution incarnation — never the term ([SEAT-1] v2).
     async fn claim(
         &self,
         candidate: &SeatCandidate,
@@ -270,11 +297,16 @@ impl SeatKeeper {
             .directory
             .read_seat(&candidate.run_label, &candidate.role)
             .await?;
-        let Some(bid) = derive_bid(&state, now_ms, DEFAULT_SEAT_SKEW_MS) else {
+        let verified_floor = self
+            .store
+            .seat_term(&candidate.run_label, &candidate.role)?
+            .map(|(term, _)| term);
+        let Some(bid) = derive_bid(&state, verified_floor, now_ms, DEFAULT_SEAT_SKEW_MS) else {
             return Ok(None); // a live incumbent holds — stand by
         };
+        let incarnation = self.store.mint_incarnation()?;
         let keystore = self.keystore()?;
-        let lease = author_claim(&keystore, &candidate.scope(), bid, now_ms)
+        let lease = author_claim(&keystore, &candidate.scope(), incarnation, bid, now_ms)
             .map_err(|e| VhcError::Internal(format!("author seat claim: {e}")))?;
         match self
             .directory
@@ -283,6 +315,14 @@ impl SeatKeeper {
         {
             SeatClaimOutcome::Won(won) => {
                 let incarnation = won.body.incarnation;
+                let leadership_term = won.body.leadership_term;
+                // Won = our own signed grant — verified by construction; persist the floor.
+                self.store.observe_seat_term(
+                    &candidate.run_label,
+                    &candidate.role,
+                    leadership_term,
+                    &won.body.claimant.0,
+                )?;
                 self.held
                     .lock()
                     .expect("seat keeper lock")
@@ -290,6 +330,7 @@ impl SeatKeeper {
                 Ok(Some(SeatNote::Claimed {
                     run_label: candidate.run_label.clone(),
                     incarnation,
+                    leadership_term,
                 }))
             }
             // Lost the race: another claimant CASed first — stand by (never a takeover fight).
@@ -297,8 +338,8 @@ impl SeatKeeper {
         }
     }
 
-    /// Heartbeat a held lease: re-sign with a fresh expiry under the SAME token. A refusal means
-    /// the seat moved — this claimant is fenced and the lease drops.
+    /// Heartbeat a held lease: re-sign with a fresh expiry under the SAME execution identity and
+    /// term. A refusal means the seat moved — this claimant is fenced and the lease drops.
     async fn renew(
         &self,
         candidate: &SeatCandidate,
@@ -336,7 +377,7 @@ impl SeatKeeper {
     }
 
     /// Release the held lease for `run_label` (owner pause/leave, node shutdown): a signed
-    /// release the registry tombstones — the floor persists, a successor bids floor + 1. No-op
+    /// release the registry tombstones — the floor persists, a successor bids above it. No-op
     /// when nothing is held.
     pub async fn release_run(&self, run_label: &str) -> Result<(), VhcError> {
         let Some(lease) = self
@@ -356,8 +397,13 @@ impl SeatKeeper {
             endpoint: lease.body.endpoint.clone(),
         };
         let keystore = self.keystore()?;
-        let release = author_release(&keystore, &scope, lease.body.incarnation)
-            .map_err(|e| VhcError::Internal(format!("author seat release: {e}")))?;
+        let release = author_release(
+            &keystore,
+            &scope,
+            lease.body.incarnation,
+            lease.body.leadership_term,
+        )
+        .map_err(|e| VhcError::Internal(format!("author seat release: {e}")))?;
         self.directory
             .release_seat(run_label, &lease.body.role, &release)
             .await

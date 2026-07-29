@@ -143,11 +143,24 @@ async fn join_live(
         daemon_vhc_session::distribution::DistributionRecord::Cert(binding.own_cert.clone())
             .to_bytes()
             .map_err(|e| format!("certificate announcement: {e}"))?;
+    // The node-verified seat grant rides the same anti-entropy surface as the certificate
+    // ([SEAT-1] v2 grant distribution): registered as a resubscribe frame here, published on
+    // attach by the session (which re-verifies before its own floor advances).
+    let seat_grant_announcement = creds
+        .seat_grant
+        .as_ref()
+        .map(|grant| {
+            daemon_vhc_session::distribution::DistributionRecord::SeatGrant(Box::new(grant.clone()))
+                .to_bytes()
+                .map_err(|e| format!("seat grant announcement: {e}"))
+        })
+        .transpose()?;
     let mut providers = build_role_providers(LiveAttachInputs {
         credentials: creds,
         coordinator,
         run_label: run_id,
         own_cert_announcement: announcement,
+        seat_grant_announcement,
         keystore: &keystore,
     })
     .await?;
@@ -200,6 +213,7 @@ async fn join_live(
         own_cert: binding.own_cert,
         trusted_bases: binding.trusted_bases,
         peer_certs,
+        seat_grant: creds.seat_grant.clone(),
         providers,
         journal,
         drain_deadline: DRAIN_DEADLINE,
@@ -785,6 +799,9 @@ async fn main() {
                                 own_cert: binding.own_cert.clone(),
                                 trusted_bases: binding.trusted_bases,
                                 peer_certs: vec![binding.own_cert],
+                                // The in-process plane has no registry: no seat grant at join
+                                // (the floor starts ungoverned; on-plane grants govern it).
+                                seat_grant: None,
                                 providers: in_process_providers(),
                                 journal,
                                 drain_deadline: DRAIN_DEADLINE,
