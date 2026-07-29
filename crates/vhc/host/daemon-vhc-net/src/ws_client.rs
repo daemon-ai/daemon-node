@@ -302,10 +302,16 @@ async fn conn_loop(
                         let mut sh = shared.lock().expect("ws shared lock");
                         sh.connected = true;
                         sh.connects = sh.connects.saturating_add(1);
+                        tracing::info!(reconnects = sh.connects, "ws control plane reconnected");
                         s
                     }
-                    Err(_) => {
+                    Err(e) => {
                         failed_attempts = failed_attempts.saturating_add(1);
+                        tracing::warn!(
+                            attempt = failed_attempts,
+                            error = %e,
+                            "ws control plane re-dial failed"
+                        );
                         if let Some(max) = reconnect.max_attempts {
                             if failed_attempts >= max {
                                 return;
@@ -340,8 +346,23 @@ async fn conn_loop(
 /// a late one finally converges.
 const RESUBSCRIBE_REANNOUNCE: Duration = Duration::from_secs(60);
 
+/// The client-side keepalive ping cadence. A WAN socket that dies WITHOUT a FIN/RST (NAT mapping
+/// expiry, an edge silently dropping the connection) goes HALF-OPEN: `write.send` keeps
+/// "succeeding" into the kernel's retransmission buffer and `read.next()` simply never returns —
+/// the serve loop never observes `Disconnected`, so the reconnect loop never runs and the plane
+/// is dead for the life of the process. Observed live on the two-box WAN rung: both trainers'
+/// planes went silent ~65 min after attach (no error, no reconnect, zero TCP sockets left) and
+/// the run stalled forever. Liveness therefore cannot be inferred from writes; it must be proven
+/// by the PEER — a ping whose pong (any inbound traffic counts) refreshes the idle deadline.
+const KEEPALIVE_PING: Duration = Duration::from_secs(20);
+
+/// How long the socket may stay silent (no inbound frame, pong, or ping) before it is declared
+/// dead and reconnected. Three ping cadences: tolerant of jitter, still far inside a round.
+const IDLE_DEADLINE: Duration = Duration::from_secs(60);
+
 /// Serve one connected socket: resend resubscribe frames, then pump outbound publishes up and
-/// inbound frames down until the socket drops or the plane is closed.
+/// inbound frames down until the socket drops, goes silent past the idle deadline, or the plane
+/// is closed.
 async fn serve(
     stream: WsStream,
     outbound_rx: &mut UnboundedReceiver<Vec<u8>>,
@@ -363,8 +384,28 @@ async fn serve(
     reannounce.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     reannounce.tick().await; // consume the immediate first tick — this connect just re-sent above
 
+    let mut keepalive = tokio::time::interval(KEEPALIVE_PING);
+    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    keepalive.tick().await; // consume the immediate first tick — the connect itself proves liveness
+    let mut last_inbound = tokio::time::Instant::now();
+
     loop {
         tokio::select! {
+            _ = keepalive.tick() => {
+                // Half-open detection (see [`KEEPALIVE_PING`]): the write may "succeed" into a
+                // dead socket, but the pong it solicits can only come from a live peer — the
+                // idle deadline is the actual verdict.
+                if last_inbound.elapsed() >= IDLE_DEADLINE {
+                    tracing::warn!(
+                        idle = ?last_inbound.elapsed(),
+                        "ws control plane went silent past the idle deadline; reconnecting"
+                    );
+                    return ServeOutcome::Disconnected;
+                }
+                if write.send(Message::Ping(Vec::new().into())).await.is_err() {
+                    return ServeOutcome::Disconnected;
+                }
+            }
             _ = reannounce.tick() => {
                 // §12.3 anti-entropy (see [`RESUBSCRIBE_REANNOUNCE`]): a late-subscribing peer
                 // converges on the next cadence tick instead of never.
@@ -387,13 +428,16 @@ async fn serve(
                     return ServeOutcome::Closed;
                 }
             },
-            inbound = read.next() => match inbound {
-                Some(Ok(Message::Binary(payload))) => deliver(shared, payload.to_vec()),
-                // Text frames are ignored (the protocol is binary-only); ping/pong ride tungstenite's
-                // automatic handling; a Close begins teardown.
-                Some(Ok(Message::Text(_) | Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => {}
-                Some(Ok(Message::Close(_))) | None => return ServeOutcome::Disconnected,
-                Some(Err(_)) => return ServeOutcome::Disconnected,
+            inbound = read.next() => {
+                last_inbound = tokio::time::Instant::now();
+                match inbound {
+                    Some(Ok(Message::Binary(payload))) => deliver(shared, payload.to_vec()),
+                    // Text frames are ignored (the protocol is binary-only); ping/pong ride
+                    // tungstenite's automatic handling; a Close begins teardown.
+                    Some(Ok(Message::Text(_) | Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => {}
+                    Some(Ok(Message::Close(_))) | None => return ServeOutcome::Disconnected,
+                    Some(Err(_)) => return ServeOutcome::Disconnected,
+                }
             },
         }
     }
