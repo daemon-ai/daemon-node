@@ -595,6 +595,32 @@ impl VhcService {
                                     terminated = true;
                                     break;
                                 }
+                                // The worker's tuple-rederivation refusal is a PRE-SESSION join
+                                // refusal like any other typed error — without this arm it was
+                                // translated to a Warning only, leaving the `Starting` row and
+                                // its live instance entry in place, which the reconciler then
+                                // skips forever (observed live: the M4 hard-kill drill wedged in
+                                // `Starting` after macOS's working-set figure drifted). The
+                                // synthesized retryable terminal releases the reservation and
+                                // schedules the retry, whose reconvergence re-assesses and
+                                // adopts the drifted tuple.
+                                protocol::Event::AdmittedTupleMismatch {
+                                    run_id,
+                                    field,
+                                    generation: gen,
+                                } if run_id == run && gen == generation && !sessioned => {
+                                    let _ = me.handle_worker_event(&ev);
+                                    let _ = me.handle_pre_session_refusal(
+                                        run,
+                                        *generation,
+                                        &format!(
+                                            "admitted tuple field `{field}` drifted at join-time \
+                                             rederivation"
+                                        ),
+                                    );
+                                    terminated = true;
+                                    break;
+                                }
                                 _ => {}
                             }
                         }
@@ -933,8 +959,8 @@ impl VhcService {
         // The fresh child holds NO resolved run: a JoinRun without a prior AssessRun is a typed
         // worker refusal ("JoinRun before AssessRun"). Re-run the assess on THIS child with the
         // run's envelope and the persisted directed role — exactly what the original join did —
-        // so the child resolves the genesis/module before the join lands. The admitted tuple
-        // still comes from the store (identity continuity), never from this re-assess.
+        // so the child resolves the genesis/module before the join lands.
+        let mut fresh_tuple: Option<protocol::AdmittedTuple> = None;
         if let Some(discovery) = &self.discovery {
             let assess = async {
                 let envelope = discovery.fetch_envelope(&run.run_id).await?;
@@ -945,21 +971,56 @@ impl VhcService {
                         elig.reasons.join("; ")
                     )));
                 }
-                Ok(())
+                Ok(elig.admitted_tuple)
             };
-            if let Err(e) = assess.await {
-                tracing::warn!(run_id = run.run_id, error = %e, "reconverge: re-assess on the fresh child failed");
-                self.arbiter.release(&id);
-                if self.worker_factory.is_some() {
-                    worker.shutdown().await;
+            match assess.await {
+                Ok(t) => fresh_tuple = t,
+                Err(e) => {
+                    tracing::warn!(run_id = run.run_id, error = %e, "reconverge: re-assess on the fresh child failed");
+                    self.arbiter.release(&id);
+                    if self.worker_factory.is_some() {
+                        worker.shutdown().await;
+                    }
+                    return Err(e);
                 }
-                return Err(e);
             }
         }
+        // The tuple the join delivers: the persisted one while it still describes this box, the
+        // fresh re-assessment when any join-recomputed field drifted. Reconvergence is the
+        // REPLACE entry mode — a fresh incarnation whose certificate is re-authored either way —
+        // so adopting the fresh measurement is re-admission, not identity mutation. Without the
+        // adoption a drifted field wedges the intent permanently: the worker rederives at
+        // `JoinRun` and refuses the stale tuple on every retry (observed live on macOS, whose
+        // capability report digests `recommendedMaxWorkingSetSize` — a figure that moves with
+        // ambient memory state, e.g. after the killed predecessor's memory was reclaimed).
         let persisted_tuple = run
             .admitted_tuple
             .as_deref()
             .and_then(|b| protocol::decode::<protocol::AdmittedTuple>(b).ok());
+        let persisted_tuple = match (persisted_tuple, fresh_tuple) {
+            (Some(p), Some(mut f)) => {
+                // Equalize the incarnation before comparing — the fresh tuple predates this
+                // attempt's minting (the worker's own rederivation does the same through
+                // `TupleIdentity`), and `author_join` re-stamps it either way.
+                f.incarnation = p.incarnation;
+                match p.first_artifact_mismatch(&f) {
+                    Some(field) => {
+                        tracing::info!(
+                            run_id = run.run_id,
+                            field,
+                            "reconverge: admitted tuple drifted since the last admission; \
+                             adopting the fresh assessment (REPLACE-mode re-admission)"
+                        );
+                        Some(f)
+                    }
+                    None => Some(p),
+                }
+            }
+            // No persisted tuple (a pre-admission row): the fresh assessment IS the admission.
+            (None, f @ Some(_)) => f,
+            // No discovery/no fresh tuple: the persisted one is all there is (offline path).
+            (p, None) => p,
+        };
         let restore = match self.resolve_restore(&run.run_id, &run.role).await {
             Ok(r) => r,
             Err(e) => {

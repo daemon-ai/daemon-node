@@ -503,6 +503,54 @@ async fn refused_join_leaves_no_ghost_and_keeps_the_retry_schedule() {
     assert_eq!(worker.joins().len(), 2);
 }
 
+/// The worker's tuple-rederivation refusal (`AdmittedTupleMismatch`) is a pre-session join
+/// refusal like any other typed error: no ghost, retry schedule intact, the tick reconverges.
+/// The pre-fix pump translated it to a Warning only, leaving the `starting` row and its live
+/// instance entry in place — the reconciler skipped the run forever (the M4 hard-kill wedge:
+/// macOS's working-set figure drifted between admission and the restart's rederivation).
+#[tokio::test]
+async fn tuple_mismatch_refusal_leaves_no_ghost_and_keeps_the_retry_schedule() {
+    let worker = StreamingWorker::new();
+    let svc = service_over(VhcStore::open_in_memory().unwrap(), worker.clone(), 5);
+    svc.vhc_join("run-m".into(), policy(), "op".into())
+        .await
+        .unwrap();
+    let generation = svc.store().get_run("run-m").unwrap().unwrap().instance;
+    assert_eq!(svc.arbiter().instances(), 1);
+
+    // The child rederives the tuple at JoinRun, observes drift, refuses typed, and dies.
+    let stream = worker.streams.lock().unwrap().pop().unwrap();
+    stream
+        .send(protocol::Event::AdmittedTupleMismatch {
+            run_id: "run-m".into(),
+            field: "capability_report_digest".into(),
+            generation,
+        })
+        .unwrap();
+    drop(stream);
+
+    wait_for(&svc, "run-m", |s| s == RunState::FailedRetryable).await;
+    let row = svc.store().get_run("run-m").unwrap().unwrap();
+    assert!(
+        row.terminal_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("capability_report_digest")
+                && r.contains("pre-session worker refusal")),
+        "the refusal is run-attributed and names the drifted field, got: {:?}",
+        row.terminal_reason
+    );
+    assert_eq!(svc.arbiter().instances(), 0, "no ghost reservation");
+    assert!(
+        row.next_retry_ms.is_some(),
+        "the retry schedule survives the refusal"
+    );
+
+    // The reconciler is NOT blocked: the due retry reconverges fresh.
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    assert_eq!(svc.reconcile_tick().await.unwrap(), 1);
+    assert_eq!(worker.joins().len(), 2);
+}
+
 /// A worker child that enforces the fresh-child protocol contract: `join_streaming` REFUSES
 /// unless an `assess` preceded it on this child — the real subprocess's "JoinRun before
 /// AssessRun" refusal, at the seam. The restart-resume defect was exactly a path that skipped
@@ -639,6 +687,162 @@ async fn restart_assesses_the_fresh_child_before_it_joins() {
     observe_ready(&svc, "run-f");
     let row = svc.store().get_run("run-f").unwrap().unwrap();
     assert_eq!(row.run_state, RunState::Running);
+}
+
+/// A worker whose `assess` answers with a scripted admitted tuple and whose `join_streaming`
+/// records the tuple it was delivered — the seam for the drift-adoption regression.
+struct MeasuringWorker {
+    inner: Arc<StreamingWorker>,
+    assessed_tuple: protocol::AdmittedTuple,
+    delivered: Mutex<Vec<Option<protocol::AdmittedTuple>>>,
+}
+
+#[async_trait]
+impl WorkerControl for MeasuringWorker {
+    async fn probe(&self) -> Result<Hardware, VhcError> {
+        self.inner.probe().await
+    }
+    async fn assess(
+        &self,
+        _envelope: Vec<u8>,
+        _role: Option<String>,
+    ) -> Result<Eligibility, VhcError> {
+        Ok(Eligibility {
+            eligible: true,
+            admitted_tuple: Some(self.assessed_tuple.clone()),
+            ..Default::default()
+        })
+    }
+    async fn join(
+        &self,
+        _run_id: String,
+        _coordinator: String,
+        _credentials: Vec<u8>,
+        _policy: JoinPolicy,
+        _admitted_tuple: Option<protocol::AdmittedTuple>,
+    ) -> Result<(), VhcError> {
+        unreachable!("the streaming path is the only join surface here")
+    }
+    async fn join_streaming(
+        &self,
+        run_id: String,
+        coordinator: String,
+        credentials: Vec<u8>,
+        policy: JoinPolicy,
+        admitted_tuple: Option<protocol::AdmittedTuple>,
+    ) -> Result<tokio::sync::mpsc::UnboundedReceiver<protocol::Event>, VhcError> {
+        self.delivered.lock().unwrap().push(admitted_tuple.clone());
+        self.inner
+            .join_streaming(run_id, coordinator, credentials, policy, admitted_tuple)
+            .await
+    }
+    async fn leave(&self, run_id: String, mode: LeaveMode) -> Result<(), VhcError> {
+        self.inner.leave(run_id, mode).await
+    }
+    async fn throttle(
+        &self,
+        vram_cap_mb: Option<u32>,
+        duty_cycle_pct: Option<u8>,
+        paused: bool,
+    ) -> Result<(), VhcError> {
+        self.inner
+            .throttle(vram_cap_mb, duty_cycle_pct, paused)
+            .await
+    }
+}
+
+/// Reconvergence ADOPTS a drifted admitted tuple: when any join-recomputed field differs
+/// between the persisted admission and the fresh child's re-assessment, the fresh measurement
+/// is what the join delivers and persists — reconvergence is the REPLACE entry mode (fresh
+/// incarnation, re-authored certificate), so this is re-admission, not identity mutation.
+/// Without the adoption a drifted field wedges the intent permanently: the worker rederives at
+/// `JoinRun` and refuses the stale tuple on every retry.
+#[tokio::test]
+async fn reconverge_adopts_a_drifted_admitted_tuple() {
+    let fresh = protocol::AdmittedTuple {
+        module_hash: [1u8; 32],
+        config_hash: [2u8; 32],
+        grants_hash: [3u8; 32],
+        genesis_hash: [4u8; 32],
+        role: "trainer".into(),
+        backend: "wgpu".into(),
+        ..Default::default()
+    };
+    // The persisted admission drifted in a join-recomputed field (the macOS working-set class
+    // drifts the capability digest; `backend` stands in for the comparison seam here).
+    let stale = protocol::AdmittedTuple {
+        backend: "cpu".into(),
+        ..fresh.clone()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("vhc.db");
+    let first_gen;
+    {
+        let worker = StreamingWorker::new();
+        let svc = service_over(VhcStore::open(&path).unwrap(), worker.clone(), 5);
+        svc.vhc_join("run-t".into(), policy(), "op".into())
+            .await
+            .unwrap();
+        first_gen = svc.store().get_run("run-t").unwrap().unwrap().instance;
+        // Plant the stale persisted admission (stamped with its instance, as a real one is).
+        let planted = protocol::AdmittedTuple {
+            incarnation: first_gen,
+            ..stale
+        };
+        svc.store()
+            .set_admitted_tuple("run-t", &protocol::encode(&planted).unwrap())
+            .unwrap();
+    }
+    // The restart reconverges the intent on a fresh child whose re-assessment measures `fresh`.
+    let inner = StreamingWorker::new();
+    let worker = Arc::new(MeasuringWorker {
+        inner: inner.clone(),
+        assessed_tuple: fresh.clone(),
+        delivered: Mutex::new(Vec::new()),
+    });
+    let svc = Arc::new(VhcService::new(VhcServiceParts {
+        config: config(5),
+        store: VhcStore::open(&path).unwrap(),
+        worker: worker.clone(),
+        feed: None,
+        discovery: Some(Arc::new(EnvelopeDiscovery)),
+        budget: None,
+        worker_factory: None,
+        identity_dir: None,
+        seat_directory: None,
+    }));
+    svc.bind_self();
+    assert_eq!(svc.start().await.unwrap(), 1);
+
+    let row = svc.store().get_run("run-t").unwrap().unwrap();
+    let second_gen = row.instance;
+    assert!(second_gen > first_gen);
+    let delivered = worker.delivered.lock().unwrap();
+    let last = delivered
+        .last()
+        .unwrap()
+        .as_ref()
+        .expect("the reconverged join delivered a tuple");
+    assert_eq!(
+        last.backend, "wgpu",
+        "the drifted field carries the FRESH measurement, not the stale admission"
+    );
+    assert_eq!(
+        last.incarnation, second_gen,
+        "the adopted tuple is stamped with the fresh incarnation"
+    );
+    // The adoption is durable: the store now holds the fresh admission.
+    let persisted: protocol::AdmittedTuple = protocol::decode(
+        svc.store()
+            .get_run("run-t")
+            .unwrap()
+            .unwrap()
+            .admitted_tuple
+            .as_deref()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(persisted.backend, "wgpu");
 }
 
 /// Transport loss is OBSERVED: a pump stream that closes without its instance's terminal event
