@@ -36,6 +36,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use daemon_vhc_host::run::state_store::SealedReadError;
 use daemon_vhc_host::run::{
     DeviceProfile, EnvelopeRoleGrants, JournalSink, MigrationInput, OpOutcome, OpRequest,
     OwnerPolicy, ParticipationLane, PumpHandle, RunConfig, RunEnd, RunIdentity,
@@ -1486,37 +1487,41 @@ async fn service_op(
                     // small document, not the whole family every slot.
                     let mut chunks_durable = true;
                     if let Ok(capture) = decode_snapshot_doc(&bytes) {
-                        let mut referenced: Vec<[u8; 32]> = Vec::new();
-                        for section in &capture.sections {
-                            if let daemon_vhc_proto::det_state::CkptDocSection::ByRef(_, fref) =
-                                section
-                            {
-                                referenced.push(fref.fold.0);
-                                if let Some(chunks) = pump.sealed_fold_chunks(&fref.fold.0) {
-                                    for (h, chunk) in &chunks {
-                                        if let Err(e) = providers.artifacts.put_content(chunk).await
-                                        {
-                                            // A checkpoint whose chunks are not durable is
-                                            // POISON: announcing it hands every restoring peer
-                                            // a pointer to a miss it treats as fatal (observed
-                                            // live — both trainers died at the restore fetch).
-                                            // The document put succeeded, but the pointer is
-                                            // only announced when every referenced chunk is.
-                                            tracing::warn!(
-                                                chunk = %h.to_hex(),
-                                                error = %e,
-                                                "live checkpoint chunk put failed; \
-                                                 withholding the checkpoint announcement"
-                                            );
-                                            chunks_durable = false;
-                                        }
-                                    }
+                        let referenced: Vec<[u8; 32]> = capture
+                            .sections
+                            .iter()
+                            .filter_map(|s| match s {
+                                daemon_vhc_proto::det_state::CkptDocSection::ByRef(_, fref) => {
+                                    Some(fref.fold.0)
                                 }
-                            }
-                        }
-                        // Pin the freshest checkpoint's families out of retention eviction (§8.2,
-                        // C6); a superseded checkpoint's folds re-enter ordinary retention.
+                                daemon_vhc_proto::det_state::CkptDocSection::Inline(..) => None,
+                            })
+                            .collect();
+                        // Pin the referenced families out of retention eviction (§8.2, C6)
+                        // BEFORE the upload walk, not after: at ceremony scale the referenced
+                        // families are gigabytes and the upload takes minutes, during which the
+                        // guest keeps training and re-sealing — an unpinned superseded fold can
+                        // be evicted mid-walk, and the run-i post-mortem is a live checkpoint
+                        // whose whole `ef` family went un-uploaded while three sibling families
+                        // landed. A superseded checkpoint's folds re-enter ordinary retention.
                         pump.repin_checkpoint(&referenced);
+                        chunks_durable = upload_referenced_families(
+                            &capture,
+                            |fold| pump.sealed_fold_chunks(fold),
+                            |fold| pump.state_chunk_map(fold).is_some(),
+                            providers.artifacts.as_ref(),
+                        )
+                        .await;
+                        if !chunks_durable {
+                            let _ = events.send(Event::Warning {
+                                class: "checkpoint_durability".into(),
+                                detail: format!(
+                                    "live checkpoint at round {round} withheld: a referenced \
+                                     family is not durable on the content plane (see the \
+                                     session log for the family/fold)"
+                                ),
+                            });
+                        }
                     }
                     if chunks_durable {
                         let hash = hash.to_hex();
@@ -1777,7 +1782,31 @@ async fn finish(
                 .filter(|w| *w != u64::MAX)
                 .unwrap_or(0);
             let checkpoint = match capture {
-                Some(capture) => persist_drain_snapshot(providers, &capture).await,
+                Some(capture) => {
+                    // The drain pointer obeys the SAME durability invariant as the live cadence:
+                    // chunks first, document + announcement only when every referenced family is
+                    // durable. (The pre-fix drain persisted ONLY the document — every by-ref
+                    // drain pointer was poisoned by construction for a cross-process restore.)
+                    // No eviction race here: the guest has quiesced, so nothing re-seals.
+                    let durable = upload_referenced_families(
+                        &capture,
+                        |fold| pump.sealed_fold_chunks(fold),
+                        |fold| pump.state_chunk_map(fold).is_some(),
+                        providers.artifacts.as_ref(),
+                    )
+                    .await;
+                    if durable {
+                        persist_drain_snapshot(providers, &capture).await
+                    } else {
+                        let _ = events.send(Event::Warning {
+                            class: "checkpoint_durability".into(),
+                            detail: "drain snapshot withheld: a referenced family is not \
+                                     durable on the content plane (see the session log)"
+                                .into(),
+                        });
+                        None
+                    }
+                }
                 None => {
                     tracing::debug!(
                         run = run_label,
@@ -1945,6 +1974,67 @@ fn classify_trap(trap: &daemon_vhc_host::trap::Trap) -> TerminalOutcome {
             reason: format!("module trapped: {trap}"),
         },
     }
+}
+
+/// Make every by-ref family a checkpoint document references DURABLE on the content plane, or
+/// report that the pointer must be withheld. This is the one seam both pointer publications (the
+/// live cadence's put recognition and the graceful-leave drain) share, because the invariant is
+/// theirs jointly: **a checkpoint pointer is announced only when every chunk it references is
+/// durably fetchable** — an announced pointer over a missing chunk kills every restoring peer at
+/// its first window read (the run-h and run-i verdicts, both fatal to the run).
+///
+/// Per referenced family, in document order:
+/// - **Self-sealed here** ([SF-R1]): upload every chunk content-addressed (`put_content` is
+///   idempotent — unchanged chunks re-upload nothing at the store). Any put failure withholds.
+/// - **Not sealed here but registered externally-sourced** ([SF-R2]): the family's chunks came
+///   FROM the content plane (the restore streamed them chunk-keyed), so they are durable by the
+///   publication that put them there — nothing to upload.
+/// - **Anything else**: this instance can neither serve nor attribute the family (a superseded
+///   fold already evicted, a capture referencing state the store never held, or a custody hole
+///   under a sealed fold). Withhold, LOUDLY, naming the typed reason — the silent-skip
+///   predecessor of this arm is exactly what poisoned run-i's live pointer.
+async fn upload_referenced_families(
+    capture: &daemon_vhc_host::run::SnapshotCapture,
+    sealed: impl Fn(&[u8; 32]) -> Result<Vec<(daemon_vhc_proto::Hash, Vec<u8>)>, SealedReadError>,
+    externally_sourced: impl Fn(&[u8; 32]) -> bool,
+    artifacts: &dyn ContentStore,
+) -> bool {
+    let mut durable = true;
+    for section in &capture.sections {
+        let daemon_vhc_proto::det_state::CkptDocSection::ByRef(name, fref) = section else {
+            continue;
+        };
+        match sealed(&fref.fold.0) {
+            Ok(chunks) => {
+                for (h, chunk) in &chunks {
+                    if let Err(e) = artifacts.put_content(chunk).await {
+                        tracing::warn!(
+                            family = %name,
+                            chunk = %h.to_hex(),
+                            error = %e,
+                            "checkpoint chunk put failed; the pointer will be withheld"
+                        );
+                        durable = false;
+                    }
+                }
+            }
+            // Restored by-reference and never re-sealed locally: already durable at its source.
+            Err(SealedReadError::NotSealed) if externally_sourced(&fref.fold.0) => {}
+            Err(e) => {
+                tracing::warn!(
+                    family = %name,
+                    fold = %fref.fold.to_hex(),
+                    chunks = fref.chunk_hashes.len(),
+                    error = %e,
+                    "checkpoint references a family this instance cannot serve; the pointer \
+                     will be withheld (an announced pointer over a missing chunk is fatal to \
+                     every restoring peer)"
+                );
+                durable = false;
+            }
+        }
+    }
+    durable
 }
 
 /// Persist the drain snapshot (manifest + sections, canonical CBOR) to the payload plane and
@@ -2152,6 +2242,148 @@ mod tests {
         assert_eq!(back.manifest, capture.manifest);
         assert_eq!(back.sections, capture.sections);
         assert!(decode_snapshot_doc(b"not-a-snapshot-doc").is_err());
+    }
+
+    /// THE RUN-I REGRESSION: a checkpoint document referencing a family the instance can
+    /// neither serve (not self-sealed) nor attribute (not registered externally-sourced) is NOT
+    /// durable — the pointer must be withheld. The pre-fix seam silently skipped the
+    /// un-enumerable family and announced anyway; the rejoining trainer died at its first
+    /// window read (`payload miss`), and the run was unrecoverable for every late join.
+    #[tokio::test]
+    async fn an_unservable_referenced_family_withholds_the_checkpoint_pointer() {
+        use daemon_vhc_proto::det_state::{CkptDocSection, FamilyRef};
+        let served = b"master-family-chunk".to_vec();
+        let served_hash = daemon_vhc_proto::blake3_hash(&served);
+        let fref = |fold: u8, hashes: Vec<daemon_vhc_proto::Hash>| FamilyRef {
+            fold: daemon_vhc_proto::Hash([fold; 32]),
+            byte_len: 8,
+            chunk_size: 8,
+            chunk_hashes: hashes,
+        };
+        let capture = daemon_vhc_host::run::SnapshotCapture {
+            manifest: b"m".to_vec(),
+            sections: vec![
+                CkptDocSection::ByRef("master".into(), fref(1, vec![served_hash])),
+                CkptDocSection::ByRef("ef".into(), fref(2, vec![daemon_vhc_proto::Hash([9; 32])])),
+                CkptDocSection::Inline("round".into(), vec![0; 8]),
+            ],
+        };
+        let store = daemon_vhc_net::MemoryContentStore::new();
+        // `master` is self-sealed and uploads; `ef` is NEITHER self-sealed nor registered
+        // externally-sourced (the run-i shape) — the whole pointer is withheld.
+        let durable = upload_referenced_families(
+            &capture,
+            |fold| {
+                (fold == &[1u8; 32])
+                    .then(|| vec![(served_hash, served.clone())])
+                    .ok_or(SealedReadError::NotSealed)
+            },
+            |_| false,
+            &store,
+        )
+        .await;
+        assert!(!durable, "an unservable family withholds the pointer");
+        // The servable family's chunks still landed (idempotent, and the next slot reuses them).
+        assert_eq!(store.get_content(&served_hash).await.unwrap(), served);
+    }
+
+    /// A restored-by-reference family the instance never re-sealed is ALREADY durable at its
+    /// source (its chunks came FROM the content plane): with every other family self-sealed and
+    /// uploaded, the pointer stands.
+    #[tokio::test]
+    async fn an_externally_sourced_family_counts_as_durable() {
+        use daemon_vhc_proto::det_state::{CkptDocSection, FamilyRef};
+        let served = b"self-sealed-chunk".to_vec();
+        let served_hash = daemon_vhc_proto::blake3_hash(&served);
+        let capture = daemon_vhc_host::run::SnapshotCapture {
+            manifest: b"m".to_vec(),
+            sections: vec![
+                CkptDocSection::ByRef(
+                    "master".into(),
+                    FamilyRef {
+                        fold: daemon_vhc_proto::Hash([1; 32]),
+                        byte_len: 8,
+                        chunk_size: 8,
+                        chunk_hashes: vec![served_hash],
+                    },
+                ),
+                CkptDocSection::ByRef(
+                    "ef".into(),
+                    FamilyRef {
+                        fold: daemon_vhc_proto::Hash([2; 32]),
+                        byte_len: 8,
+                        chunk_size: 8,
+                        chunk_hashes: vec![daemon_vhc_proto::Hash([9; 32])],
+                    },
+                ),
+            ],
+        };
+        let store = daemon_vhc_net::MemoryContentStore::new();
+        let durable = upload_referenced_families(
+            &capture,
+            |fold| {
+                (fold == &[1u8; 32])
+                    .then(|| vec![(served_hash, served.clone())])
+                    .ok_or(SealedReadError::NotSealed)
+            },
+            |fold| fold == &[2u8; 32], // ef restored by-ref, never re-sealed here
+            &store,
+        )
+        .await;
+        assert!(
+            durable,
+            "an externally-sourced family is durable at its source"
+        );
+        assert_eq!(store.get_content(&served_hash).await.unwrap(), served);
+    }
+
+    /// A chunk put failure withholds the pointer — the pre-run-h shape, kept regressed at the
+    /// shared seam.
+    #[tokio::test]
+    async fn a_chunk_put_failure_withholds_the_checkpoint_pointer() {
+        use daemon_vhc_proto::det_state::{CkptDocSection, FamilyRef};
+
+        /// A content store whose puts always fail (the transport-outage shape).
+        #[derive(Debug)]
+        struct RefusingStore;
+        #[async_trait::async_trait]
+        impl ContentStore for RefusingStore {
+            async fn put_content(
+                &self,
+                _bytes: &[u8],
+            ) -> Result<daemon_vhc_proto::Hash, daemon_vhc_net::VhcNetError> {
+                Err(daemon_vhc_net::VhcNetError::PayloadMiss("refused".into()))
+            }
+            async fn get_content(
+                &self,
+                hash: &daemon_vhc_proto::Hash,
+            ) -> Result<Vec<u8>, daemon_vhc_net::VhcNetError> {
+                Err(daemon_vhc_net::VhcNetError::PayloadMiss(hash.to_hex()))
+            }
+        }
+
+        let chunk = b"chunk".to_vec();
+        let chunk_hash = daemon_vhc_proto::blake3_hash(&chunk);
+        let capture = daemon_vhc_host::run::SnapshotCapture {
+            manifest: b"m".to_vec(),
+            sections: vec![CkptDocSection::ByRef(
+                "master".into(),
+                FamilyRef {
+                    fold: daemon_vhc_proto::Hash([1; 32]),
+                    byte_len: 8,
+                    chunk_size: 8,
+                    chunk_hashes: vec![chunk_hash],
+                },
+            )],
+        };
+        let durable = upload_referenced_families(
+            &capture,
+            |_| Ok(vec![(chunk_hash, chunk.clone())]),
+            |_| false,
+            &RefusingStore,
+        )
+        .await;
+        assert!(!durable);
     }
 
     #[test]

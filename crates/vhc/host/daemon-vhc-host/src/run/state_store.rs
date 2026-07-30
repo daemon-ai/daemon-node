@@ -61,6 +61,47 @@ use crate::run::state_spill::{SpillReadError, SpillStore};
 /// namespace discipline as guest staging ids (ABI §10.2), with its own per-instance counter.
 pub const STATE_STREAM_ID_TOP_BIT: u64 = 1 << 63;
 
+/// Why a sealed family's chunks could not be enumerated for publication
+/// ([`StateStore::sealed_chunks`]) — typed so a checkpoint publisher can DISTINGUISH "this fold
+/// was never sealed here / was evicted" (possibly an externally-sourced restored family, already
+/// durable at its source) from "the fold is sealed but its bytes cannot be produced" (a custody
+/// hole — always a withheld pointer plus a loud operator diagnostic).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SealedReadError {
+    /// `fold` names no sealed family in this store: never sealed here, or already evicted under
+    /// retention ([SF-7]).
+    NotSealed,
+    /// The fold is sealed but a constituent chunk has no store entry — a custody accounting
+    /// hole (refcount bug), never expected.
+    ChunkUnaccounted(daemon_vhc_proto::Hash),
+    /// The fold is sealed but a constituent chunk's bytes cannot be read back (spill corruption,
+    /// tamper, or IO) — the [`SpillReadError`] detail rides along.
+    ChunkUnreadable(daemon_vhc_proto::Hash, String),
+}
+
+impl std::fmt::Display for SealedReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotSealed => {
+                write!(
+                    f,
+                    "fold not sealed here (never sealed, or evicted under retention)"
+                )
+            }
+            Self::ChunkUnaccounted(h) => {
+                write!(
+                    f,
+                    "sealed chunk {} has no store entry (custody accounting hole)",
+                    h.to_hex()
+                )
+            }
+            Self::ChunkUnreadable(h, detail) => {
+                write!(f, "sealed chunk {} unreadable: {detail}", h.to_hex())
+            }
+        }
+    }
+}
+
 /// A typed state-store refusal — the linker maps each onto its trap
 /// (`crate::trap::TrapCode`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -481,21 +522,37 @@ impl StateStore {
 
     /// The `(chunk hash, chunk bytes)` list of a sealed fold in fold order — what a checkpoint
     /// publisher (or the golden harness standing in for the payload plane) uploads content-addressed
-    /// so a restoring instance's chunk-keyed [SF-R2] fetch resolves. `None` if the fold is not
-    /// sealed here.
-    #[must_use]
-    pub fn sealed_chunks(&self, fold: &[u8; 32]) -> Option<Vec<(daemon_vhc_proto::Hash, Vec<u8>)>> {
-        let sealed = self.sealed.get(fold)?;
+    /// so a restoring instance's chunk-keyed [SF-R2] fetch resolves.
+    ///
+    /// The refusal is TYPED, never a bare miss: the run-i post-mortem was a live checkpoint
+    /// pointer announced over a family whose enumeration failed silently — with the reason
+    /// invisible, the poisoned pointer was indistinguishable from a family that legitimately
+    /// had nothing to upload. Every arm here names which invariant broke.
+    ///
+    /// # Errors
+    /// [`SealedReadError::NotSealed`] when `fold` is not a sealed family in this store (never
+    /// sealed here, or evicted under retention); [`SealedReadError::ChunkUnaccounted`] /
+    /// [`SealedReadError::ChunkUnreadable`] when the fold IS sealed but a constituent chunk
+    /// cannot be produced (custody accounting hole / spill corruption or IO).
+    pub fn sealed_chunks(
+        &self,
+        fold: &[u8; 32],
+    ) -> Result<Vec<(daemon_vhc_proto::Hash, Vec<u8>)>, SealedReadError> {
+        let sealed = self.sealed.get(fold).ok_or(SealedReadError::NotSealed)?;
         let mut out = Vec::with_capacity(sealed.chunks.len());
         for (h, _len) in &sealed.chunks {
-            let entry = self.chunks.get(h)?;
-            // Custody-verified read (resident or disk); a corrupt/missing spilled chunk yields
-            // `None` here — the publisher/harness treats an unavailable chunk as fatal, never a
-            // silent short upload.
-            let bytes = self.read_chunk(h, entry).ok()?;
+            let entry = self.chunks.get(h).ok_or(SealedReadError::ChunkUnaccounted(
+                daemon_vhc_proto::Hash(*h),
+            ))?;
+            // Custody-verified read (resident or disk); a corrupt/missing spilled chunk is a
+            // typed refusal — the publisher/harness treats an unavailable chunk as fatal, never
+            // a silent short upload.
+            let bytes = self.read_chunk(h, entry).map_err(|e| {
+                SealedReadError::ChunkUnreadable(daemon_vhc_proto::Hash(*h), format!("{e:?}"))
+            })?;
             out.push((daemon_vhc_proto::Hash(*h), bytes));
         }
-        Some(out)
+        Ok(out)
     }
 
     /// Lift a sealed family out for carriage into a successor instance's store (the in-process

@@ -759,12 +759,17 @@ impl PumpHandle {
 
     /// The `(chunk hash, chunk bytes)` list of a fold this instance self-sealed ([SF-R1]) — the
     /// content a checkpoint publisher uploads to the payload plane, and what the golden harness
-    /// reads from the draining instance to stand in for that plane. `None` if not sealed here.
-    #[must_use]
+    /// reads from the draining instance to stand in for that plane. The refusal is typed
+    /// ([`crate::run::state_store::SealedReadError`]) so the publisher can distinguish
+    /// "not sealed here" from a custody hole — never a silent skip.
+    ///
+    /// # Errors
+    /// See [`crate::run::state_store::StateStore::sealed_chunks`].
     pub fn sealed_fold_chunks(
         &self,
         fold: &[u8; 32],
-    ) -> Option<Vec<(daemon_vhc_proto::Hash, Vec<u8>)>> {
+    ) -> Result<Vec<(daemon_vhc_proto::Hash, Vec<u8>)>, crate::run::state_store::SealedReadError>
+    {
         self.shared
             .state
             .lock()
