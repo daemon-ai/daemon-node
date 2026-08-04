@@ -5,12 +5,11 @@ appended — at every program boundary, and it is status, not normative text. No
 in the tracked specs (§2). If this file contradicts a chat log, a memory, or an archived
 document, this file wins; if it contradicts a tracked spec, the spec wins.
 
-Last rewritten: 2026-07-28 (ceremony run geometry reduced to fit the fleet:
-`CEREMONY_SEQ_LEN` 2048 → 512, model untouched — the frozen 2048-token geometry composed a
-45,182,790,853 B per-device estimate that fit neither 32 GiB seat, proven by real device
-failures after the native-lane compile defects were fixed on hardware; at 512 the composed
-estimate is 20,041,849,456 B, under the M4 floor's 26,800,553,984 B usable supply with 25 %
-margin, and this box re-probed GREEN at the new geometry).
+Last rewritten: 2026-08-04 (Phase A complete: the C1 two-box WAN rung ran for real —
+run-j finished 24/24 rounds with zero det-digest mismatch across both seats, and run-k
+passed both trainer churn drills (hard-kill restore and graceful leave/rejoin) on the
+One-Lifecycle/Two-Identities wave; evidence under
+`~/experiments/ceremony-artifacts/c1-20260728/archive/`).
 
 ## 1. What we are building, and the next milestone
 
@@ -73,12 +72,12 @@ discovered at the lowest rung capable of showing them.
   Status: **green** — the plan-emitting trainer admits through PC-12 dev-authority provisioning;
   all twelve gates pass.
 - **C1 — on demand / nightly.** Two real boxes, real transport (relay), small geometry; adds
-  WAN churn drills and remote product-path drive. Status: **software delta green, hardware
-  blocked.** The relay-carried transport posture is a merge gate now
-  (`iroh_relay_plane.rs`: real `iroh-relay`, roster records with zero direct addresses so the
-  relay is the only dial path, training + the full graceful-churn choreography through it).
-  The physical two-box execution is blocked: the relay box times out and no other fleet seat
-  is reachable from the build host (§8.1).
+  WAN churn drills and remote product-path drive. Status: **green on real hardware.**
+  The relay-carried transport posture is a merge gate (`iroh_relay_plane.rs`), and the
+  physical rung has now run end to end: run-j (Strix Halo + M4 over the M1-mini relay and
+  the Cloudflare registry/R2 content plane) completed 24/24 rounds with zero digest
+  mismatch, and run-k passed the hard-kill and graceful leave/rejoin trainer drills with
+  digest agreement restored after each (§7).
 - **C2 — the milestone.** Three boxes over WAN at ceremony geometry per the runbook
   (G-1..G-6), on a frozen candidate. Preflight is only what G-1..G-6 require — relay, sealed
   binaries, identities, corpus, genesis, seat, and a green fit verdict per box — each item
@@ -100,96 +99,59 @@ None of these blocks C0 or C1.
 
 ## 7. Current state (rewrite this section at every boundary)
 
-- Integration trunk: `vhc-integration`, converged — admitted-tuple extension committed, guest
-  wave merged green (`98eae678`), topic branches pruned, one worktree per line.
-- Doctrine amendment: landed — `[RC-15]` (estimate demoted, verdict is authority) in the
-  architecture spec; composed-side `claim` vocabulary renamed to `estimate` across specs, code
-  and wire keys; `FitVerdict`/`FitProbeKey`/`FitVerdictStore` types in `daemon-vhc-resource`;
-  the caller-less estimate-driven selection path (`select`/`SelectionPolicy`/`validate_against`)
-  deleted.
-- PC-12 provisioning: landed. The provisioned-profile file (`daemon-vhc-resource::provision`,
-  `DAEMON_VHC_PROFILE_DIR`, path-reference like the identity store) carries profiles + envelopes,
-  the owner acceptance policy, and lane bounds; the node hands `<data>/vhc/profiles` to workers;
-  the worker assembles a `ResourceAuthority` from it at every admission site (assess, join
-  re-verify, switch fence). Development authorities are a separate, doubly-opt-in acceptance
-  (`accepted_development_authorities` on BOTH the owner policy and the run's requirements);
-  integration evidence only, never ceremony certification. The worker's
-  `DAEMON_TRAIN_REVISION_OUT` mode exports its own revision records for provisioning tools.
-  An un-provisioned box still refuses `EstimateNotComposable`, typed (asserted by test).
-- Genesis authoring: requirement derivation runs the module's assessment against the SAME
-  plan-relevant config the genesis pins for the role (empty-config assessment was refused by the
-  plan-emitting trainer, rightly). A CPU-lane capability report states `NotApplicableToLane` for
-  the per-allocation ceiling; the pool-bound check validates a CPU estimate against usable supply.
-- The node's join surfaces an ineligible assessment's own reasons instead of converting every
-  assess refusal into a "nothing to reserve" internal error.
-- Operator provisioning: `cargo run -p xtask -- vhc-provision-dev-profile --worker-bin <bin>
-  --out <dir> --authority <64-hex> [--class cpu]` runs the box's own worker in revision-export
-  mode and writes the PC-12 provisioned file the node's `DAEMON_VHC_PROFILE_DIR` reads. xtask is
-  the ONE named non-dev edge `vhc-dep-check` permits to enable the profile-minting
-  `test-support` feature (dev tooling, never shipped; minting is not vouching — acceptance
-  still requires the owner policy and the run's genesis to both name the authority).
-- C1 relay gate: landed in the acceptance lane (`iroh_relay_plane.rs`, ~160 s, rides
-  `xtask vhc-acceptance`). Relay-only reachability is representable in shipped config:
-  `[vhc.iroh] relays = "<url>"` + `advertise_ips = []`.
-- Gapped-restore divergence (found by the relay gate under load): a rejoiner whose restored
-  watermark lagged the live round silently skipped committed rounds and forked the det
-  trajectory. Fixed at both ends, both gate-proven: the rounds SDK refuses a gapped fold
-  (`Outbound::GapRefused` → ABI §4.5 outcome 3 `StaleRestore`, classified RETRYABLE — the
-  only nonzero outcome that is, because a retry restores a fresher checkpoint), and the
-  coordinator's join admission re-publishes its retained ring of committed records ascending
-  (replay-forward), so a rejoiner inside the retention window folds the gap instead of ending.
-- Fit probes (`[RC-15]`): the runner exists end to end and has produced its first real verdict.
-  The worker's `DAEMON_TRAIN_FIT_PROBE` mode drives the actual module on the actual measured
-  backend at the granted geometry under the enforced budget, consuming only pre-authored opaque
-  inputs (`daemon-vhc-resource::probe` directory contract — the worker binary links no round
-  vocabulary; authoring lives in `daemon-vhc-testkit::fit_probe` / `xtask vhc-fit-probe`), and
-  records a content-addressed FitVerdict keyed by (module, backend revision, plan, grant,
-  budget). Gate: `tests/fit_probe.rs` in the worker crate (CPU lane, green).
-- **Ceremony run geometry reduced to fit the fleet** (endorsed 2026-07-28): `CEREMONY_SEQ_LEN`
-  2048 → 512 in the frozen ceremony module (`daemon-vhc-testkit::ceremony`, the single source);
-  model, parameter count, init seed, and the pinned `expected_root` are all unchanged (the
-  full replica still trains every parameter — the persistent θ+AdamW floor stays 9.44 GB).
-  The composition prices the step transient twice (live + retained pool) under 21/20 headroom
-  + a 128 MiB reserve: at 2048 the transient was 16.69 GB and the estimate 45,182,790,853 B —
-  RED on both 32 GiB seats for real (5090 Vulkan OOM, M4 unified-memory grind); at 512 it is
-  4,714,647,800 B and the estimate 20,041,849,456 B, under the M4's 26,800,553,984 B usable
-  supply with 25 % margin. Powers of two only: a 2 MiB corpus shard holds whole sequences.
-- **ALL THREE SEATS HOLD GREEN VERDICTS AT THE REDUCED GEOMETRY, ON THEIR NATIVE LANES**
-  (2026-07-28 ~17:45). One module (`9ab98f90…`), one plan (`47898e5b…`), one grant
-  (`741671c4…`), one budget (141,757,180 B); each verdict keyed by the seat's own backend
-  revision. Measured peak guest linear memory is bit-identical on all three: 43,319,296 B.
-  - Strix Halo, Vulkan+SPIR-V (RADV): round 0 (30 real steps) committed in 155 s; key
-    `0764ec9d…`; `~/experiments/ceremony-artifacts/fit-probe-20260728-platform-vulkan-geometry512/`.
-  - Windows 5090, **native wgpu/DX12**: committed at +266 s; key `1f3827c3…`;
-    `…-windows-dx12-geometry512/`.
-  - M4 Mac, **native wgpu/Metal (WGSL→naga→MSL)**: committed at +261 s; key `cdf2a823…`;
-    `…-m4-metal-geometry512/`.
-  The frozen-geometry predecessor evidence stays in `…-platform-vulkan-spirv/` (GREEN) and
-  the RED seats' dirs — the capacity evidence the shrink answers.
-- **Native-lane compile defects: all three fixed and hardware-proven** (ceremony requirement —
-  Vulkan passthrough is a production fallback, not the ceremony answer). D1 bool-storage
-  (`BoolElem = u32` in the compute SDK), D2 i64-on-DX12 (`IntElem = i32` + the DX12 profile
-  no longer claims i64 — refusal typed at admission), D3 threadgroup-memory overrun (vendored
-  `cubek-matmul` clamp budgets the full declared shared memory incl. the partitioned writer;
-  selector tests pin it). Proof: thirty clean slices of native DX12 training at the old
-  geometry (capacity-only failure: DXGI device removal during buffer creation), zero refusals
-  in the native-Metal log — then the reduced-geometry GREENs above.
-- Two real device-lane defects the probe surfaced, both fixed and gate-proven:
-  1. cubecl's WGSL lane emits `var<storage> array<bool>` buffers (cmp/mask kernels), which WGSL
-     forbids as host-shareable — every such kernel was refused on RADV (`ComputeFault`). Fixed
-     by compiling the Vulkan adapter's kernels to SPIR-V (`burn/vulkan` beside `burn/wgpu` in
-     the host's `wgpu` feature).
-  2. The epoch watchdog epoch-killed a LIVE device slice: a ceremony-geometry round is one
-     slice whose wall grows with granted geometry (this box: ~690 s of device compute), so no
-     per-slice wall constant separates working from wedged. The deadline now extends on expiry
-     iff the guest entered a host import since the last expiry (host contact is the liveness
-     proof; device wall lives inside imports), and interrupts only a full budget with zero
-     import entries — pure-wasm spins still die within two budgets, fuel/op budgets untouched
-     (ABI §5.6 amended). Also: wasmtime reports the epoch trap as `interrupt`, which the
-     classifier misfiled as `BadModule`; now `BudgetEpoch`.
-- C0: green and pinned. C1: software delta green; the physical two-box WAN run is the next
-  action (§8.1). Fit probes: GREEN on all three seats, native lanes, reduced geometry.
-  Freeze/C2: not reached — the only rung left.
+- Integration trunk: `vhc-integration` at `24293e06`, clean. The One-Lifecycle/Two-Identities
+  wave is fully landed and field-proven:
+  - **One join transaction** (restart, retry, CLI join, fault recovery share one driver):
+    explicit `Starting` state, `Running` only on observed readiness, run-attributed
+    pre-session errors, no ghost instances, retry schedule preserved across refusals.
+  - **Two identities**: seat lease v2 (new domain tags) separates `leadership_term` from
+    `execution_incarnation`; sparse strictly-greater CAS; `SeatTermLedger` fed only by
+    verified seat grants (replacing the seat use of `role_floor()`); grant distribution rides
+    join bootstrap + WS resubscribe anti-entropy. Roster `RejectedStale` restarts the join
+    transaction from verified own-base evidence only; foreign/unverifiable records fail
+    closed. Bounded arithmetic both sides (Rust `i64` cast fixed, TS `asU64`/encoder bounds).
+    Specs corrected ([ROSTER-1] role in the slot key, [CI-5] per-base supersession, §12.4).
+  - **Checkpoint durability seam**: a pointer — live or drain — is announced only when every
+    referenced family is durable on the content plane (`upload_referenced_families`;
+    `SealedReadError` typed refusals; folds pinned before the upload walk). This closed the
+    run-h/run-i poisoned-pointer class.
+  - **Tuple-drift adoption**: a drifted `AdmittedTuple` (e.g. macOS `capability_report_digest`
+    instability) is a pre-session refusal on join and an adopted fresh assessment on
+    reconvergence (REPLACE-mode re-admission) — no infinite retry loop.
+  - **Join-time checkpoint freshness**: a restored fence behind the retained record horizon
+    (`RETAINED_RECORD_HORIZON_ROUNDS`) refuses typed (`CheckpointStale`) instead of wedging
+    into `GapRefused`.
+- **Phase A ran on the wire (C1 hardware green).** Two boxes — Strix Halo (coordinator +
+  co-located trainer, wgpu/Vulkan SPIR-V) and M4 (trainer, wgpu/Metal MSL) — over the
+  M1-mini iroh relay and the `daemon-vhc-dev` Cloudflare registry + R2 content plane:
+  - **run-j** (`eff51ffe…`): 24/24 rounds committed, **zero det-digest mismatch** across
+    both seats (30 s dual-transcript comparison, 24/24 AGREE); trainer live checkpoints
+    every 2 rounds. The durability seam fired in production: R2 briefly served 500s on a
+    chunk PUT → typed backoff retries → **pointer withheld**, nothing poisoned.
+  - **run-k** (`e09c75da…`): both trainer churn drills PASSED. Hard-kill of the M4 worker
+    after the first checkpoint → fresh worker, tuple drift adopted, restore from the live
+    round-1 pointer (4 by-ref families streamed from R2, zero payload misses), digest
+    agreement restored the next round. Graceful leave/rejoin → drain correctly declined to
+    mint mid-round (QuiesceDeadlineExceeded), rejoin restored the role-scoped round-3
+    pointer, digest agreement restored — the exact sequence that killed run-i now recovers.
+  - Evidence: `~/experiments/ceremony-artifacts/c1-20260728/archive/run-{h,i,j,k}/` (each
+    with `VERDICT.md`); run-h/run-i are the defect fixtures, run-j/run-k the green runs.
+- Doctrine, provisioning, probes, and geometry are unchanged from the 2026-07-28 boundary
+  and remain load-bearing: `[RC-15]` fit-verdict authority; PC-12 provisioning
+  (`DAEMON_VHC_PROFILE_DIR`, dev authorities doubly-opt-in, integration evidence only);
+  ceremony geometry `CEREMONY_SEQ_LEN = 512` (model/seed/expected-root unchanged); **all
+  three seats hold GREEN fit verdicts on their native lanes** (bit-identical measured peak
+  43,319,296 B; Strix/Vulkan-SPIR-V, 5090/native DX12, M4/native Metal MSL); native-lane
+  compile defects D1/D2/D3 fixed and hardware-proven; epoch-watchdog import-liveness
+  semantics (ABI §5.6). Note: a worker rebuild changes the backend revision — re-provision
+  the profile and re-run the fit probe, or the join refuses `EstimateNotComposable` (typed,
+  correct).
+- **Not claimed** (recorded): offline consensus replay from a sealed archive
+  (`publish_journal_archive()` has no product callers), general archive backfill,
+  in-session exact-frame loss repair, coordinator crash reconstruction, §5.3 standby
+  failover. These are the pre-C2 workstream (§8).
+- C0: green and pinned. C1: **green on hardware** (this boundary). Freeze/C2: the only
+  rung left — needs the Windows 5090 seat joined in and the pre-C2 workstream scoped.
 - Program archive: frozen and locked read-only 2026-07-27.
 
 ## 8. Fleet roster and next actions
@@ -204,15 +166,19 @@ a session then declared reachable boxes unreachable — access facts live here, 
 | Windows 5090 | `ssh usergpu356@37.230.134.194` (cmd.exe; build via sealed Nix cross-build, never on-box) | RTX 5090 32 GiB, Server 2022 | trainer | wgpu/DX12 |
 | M1 mini | `ssh m1@51.159.120.241` | Apple M1, 8 GiB | iroh relay only | — |
 
-All four answer ssh (verified 2026-07-28). Next actions (in order):
+All four answer ssh (verified 2026-08-04). Next actions (in order):
 
-1. ~~Fit probes on the M4 and 5090 at the reduced geometry~~ DONE — all three seats GREEN
-   on their native lanes (§7).
-2. Run C1 on two boxes: start the relay per the runbook §4.2, point both nodes' `[vhc.iroh]`
-   at it with WAN `advertise_ips`, drive over `ssh → daemon-cli`; fix what it surfaces. The
-   transport/churn semantics are already gate-proven; this run is about real WAN and real
-   hardware heterogeneity.
-3. Freeze; memoized preflight; run C2; evidence closure; human-signed master merge.
+1. ~~Fit probes at the reduced geometry~~ DONE — all three seats GREEN, native lanes (§7).
+2. ~~Run C1 on two boxes~~ DONE — run-j complete + zero mismatch, run-k churn drills
+   passed (§7).
+3. Pre-C2 workstream (scoped, not started): coordinator crash reconstruction (journal
+   replay into a fresh guest, archive publication wiring, fenced resumption) over the
+   durable archive substrate with its three projections (transport repair, semantic
+   catch-up, module reconstruction) — one substrate, three invariants; plus the registry
+   Byzantine posture owner decision (§6).
+4. Bring the Windows 5090 seat into a three-box run (its worker lane builds with
+   `vhc-net,wgpu-spirv`; native DX12 verdict is already green).
+5. Freeze; memoized preflight; run C2; evidence closure; human-signed master merge.
 
 ## 9. Agent contract
 
