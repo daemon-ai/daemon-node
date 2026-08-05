@@ -1942,6 +1942,29 @@ verdict (runbook §3.4) and coordinator reconstruction both consume them remotel
   chain is the consensus-critical one; trainer chains ride the same identity scheme (their
   journals and peer digest transcripts are replay/evidence inputs). A referenceless (in-memory)
   seat has no durable chain and publishes nothing.
+- **[AR-7] The head carries the run's freshness claim.** Each head body MAY state `round`: the
+  highest committed `RoundRecord` the session had published when the segment sealed (additive —
+  absent on pre-extension heads, ignored by pre-extension readers). The claim is maintained
+  structurally (the session's egress relay probes published frames for the round-record shape;
+  no consensus schema is linked) and is only ever read VERIFIED — a join judges checkpoint
+  staleness against the latest `round` across the seat lineage's authorized heads, never
+  against registry metadata or a segment ordinal.
+- **[AR-8] Coordinator reconstruction (crash recovery).** A seat-role join whose run has
+  published archive history MUST rebuild the coordinator's consensus state (retained record
+  ring, delivery cursors, round height) BEFORE reporting ready — resuming behind the run's own
+  durable record forks the run. The node resolves and verifies the head lineage (typed refusal
+  on missing/conflicting/broken heads) and carries it in the credentials as bootstrap; the
+  worker RE-VERIFIES against the genesis-trusted bases and replays the recovered record stream
+  — attested segments (local file when it hash-matches the head, else the content plane, both
+  hash-verified) plus the newest chain's local unsealed tail chained by §8.2 links — **through
+  the sandbox** (consensus never folds natively in the host): recorded authoritative frames
+  are delivered verbatim (original senders and sequence numbers), the instance drains, and the
+  exported §10.2 state capture founds the real instance's migration. A migration that founds a
+  fresh journal chain journals its validated restore manifest as the chain's anchoring
+  snapshot record, so every chain is self-contained for replay and for the next
+  reconstruction. A checkpoint whose manifest byte-matches a recorded snapshot anchors a
+  fast path (replay only the post-anchor tail); otherwise the full lineage replays from
+  genesis — correct by policy determinism, bounded by the archived history.
 
 Wire shapes: `ArchiveHeadBody`/`ArchiveHeadRecord`/`ArchiveHeadDecision` in `daemon-vhc-proto`
 (domain `daemon-vhc/archive-head/1.0.0`); transport `PUT {base}/runs/:id/archive/head`,

@@ -340,6 +340,7 @@ mod tests {
                 epoch: 0,
                 module: Hash([0x2A; 32]),
                 predecessor: None,
+                round: None,
             },
         )
         .expect("publish")

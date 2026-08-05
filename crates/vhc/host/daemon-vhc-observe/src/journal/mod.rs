@@ -14,11 +14,14 @@
 //! What REMAINS here (oracle tooling over the substrate):
 //! * [`archive`] — the coordinator sealed record archive: attested chain heads, fork detection,
 //!   replication/retention policy.
+//! * [`assemble`] — product-archive assembly: verify a run's published ABI §8.8 head records +
+//!   content objects into the §3.4 replay layout.
 //! * [`consensus`] — consensus replay from an archive through the sandboxed coordinator module.
 //! * [`oracle`] — the coordinator-oracle migration: the replay oracle over journal-backed capture.
 //! * [`verifier`] — the worker input-replay verifier skeleton (types + a sim-fed harness shape).
 
 pub mod archive;
+pub mod assemble;
 pub mod consensus;
 pub mod oracle;
 pub mod verifier;
@@ -30,9 +33,14 @@ pub use archive::{
     detect_fork, ArchiveError, AttestedHead, ChainHead, ForkEvidence, RecordArchive,
     ReplicationPolicy, RetentionPolicy,
 };
+pub use assemble::{
+    assemble_archive, coordinator_lineage, envelope_trusted_bases, verify_chains, AssembleError,
+    AssembleReport, VerifiedChain,
+};
 pub use consensus::{
-    extract_consensus_capture, recover_chain_from_archive, replay_consensus_from_archive,
-    ConsensusCapture, ConsensusReplayError, ConsensusReplayReport, RecoveredChain,
+    extract_consensus_capture, recover_chain_from_archive, recover_chain_from_verified_heads,
+    replay_consensus_from_archive, replay_consensus_from_verified_archive, ConsensusCapture,
+    ConsensusReplayError, ConsensusReplayReport, RecoveredChain,
 };
 pub use daemon_vhc_journal::{
     format_version, scan_bytes, scan_file, Body, ExecIdentity, Journal, JournalError, JournalPaths,

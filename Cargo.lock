@@ -5225,6 +5225,7 @@ dependencies = [
  "daemon-vhc-det",
  "daemon-vhc-guest-build",
  "daemon-vhc-host",
+ "daemon-vhc-journal",
  "daemon-vhc-net",
  "daemon-vhc-node",
  "daemon-vhc-observe",
@@ -5234,6 +5235,7 @@ dependencies = [
  "daemon-vhc-sdk-rounds",
  "daemon-vhc-session",
  "thiserror 2.0.18",
+ "tokio",
  "wasm-encoder 0.251.0",
 ]
 

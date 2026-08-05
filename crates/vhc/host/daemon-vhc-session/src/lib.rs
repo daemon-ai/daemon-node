@@ -41,6 +41,7 @@ pub mod protocol;
 #[cfg(feature = "live")]
 pub mod providers;
 pub mod provisioning;
+pub mod reconstruct;
 pub mod role_session;
 pub mod seam;
 

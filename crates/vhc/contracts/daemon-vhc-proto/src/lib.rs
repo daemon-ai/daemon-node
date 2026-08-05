@@ -51,7 +51,9 @@ pub mod transition;
 pub mod version;
 
 pub use archive::{
+    coordinator_lineage, envelope_trusted_bases, latest_round_claim, verify_chains,
     ArchiveChainSlot, ArchiveHeadBody, ArchiveHeadDecision, ArchiveHeadError, ArchiveHeadRecord,
+    ChainVerifyError, VerifiedChain,
 };
 pub use bytes::{Hash, IrohId, PeerId, Root, Seed, Signature, StateDigest};
 pub use canonical::{from_canonical_slice, to_canonical_vec};

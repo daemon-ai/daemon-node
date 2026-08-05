@@ -25,32 +25,39 @@
 //!                                     coordinator module hash; its blake3 IS the run id)
 //!   coordinator.wasm                  the genesis-pinned coordinator module (blake3 must equal the
 //!                                     envelope's `coordinator.wasm` artifact hash)
-//!   heads.cbor                        CBOR: [ { body: <chain-head>, sigs: [ {signer, sig} ] } ]
-//!                                     — the attested sealed-chain heads (segment 0 .. N, contiguous)
+//!   heads.cbor                        CBOR: [ <archive-head-record> ] — the run's published ABI
+//!                                     §8.8 head records (every role's chains; the reader
+//!                                     authorizes each against the envelope's genesis-trusted
+//!                                     bases and selects the coordinator lineage itself)
 //!   segments/<segment_hash_hex>.seg   the sealed record-archive segment bytes (content-addressed;
 //!                                     the file stem is the segment's blake3 content address)
 //!   payloads/<blake3_hex>.bin         the committed update-container payload objects, by content hash
 //!   peers/<peerid_hex>.digests.cbor   CBOR: [ [round, <16-byte digest>] ] — that peer's per-round
-//!                                     post-ingest det-state digests (the `--watch` transcript)
+//!                                     post-ingest det-state digests
 //! ```
 //!
 //! `envelope.cbor`, `coordinator.wasm`, `heads.cbor`, and `segments/` are REQUIRED (the consensus
 //! oracle). `payloads/` is required for the digest-from-payloads re-verification. `peers/` is
 //! optional — absent, the per-peer agreement section is empty (the consensus oracle still runs).
+//!
+//! `xtask vhc-archive-pull` assembles this layout from a run's registry + content plane (the
+//! product archive); [`daemon_vhc_observe::assemble_archive`] is the shared verifying core.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use daemon_vhc_observe::journal::archive::{ChainHead, RecordArchive};
 use daemon_vhc_observe::{
-    replay_consensus_from_archive, AttestedHead, AuthorityConfig, ConsensusReplayError, RecordSig,
-    ReplayError, ReplicationPolicy, RetentionPolicy,
+    coordinator_lineage, envelope_trusted_bases, replay_consensus_from_verified_archive,
+    verify_chains, AuthorityConfig, ConsensusReplayError, ReplayError, ReplicationPolicy,
+    RetentionPolicy,
 };
+use daemon_vhc_proto::archive::ArchiveHeadRecord;
 use daemon_vhc_proto::genesis::GenesisEnvelope;
-use daemon_vhc_proto::{blake3_hash, from_canonical_slice, Hash, PeerId, Signature};
+use daemon_vhc_proto::{blake3_hash, from_canonical_slice, Hash};
 use daemon_vhc_session::replay_sandbox::SandboxedCoordinator;
 
 /// The parsed `vhc-replay` inputs.
@@ -58,37 +65,6 @@ pub struct Args {
     pub archive: PathBuf,
     pub run: String,
     pub json: bool,
-}
-
-/// A `RecordSig` in serde-friendly form (the sdk `RecordSig` is not `Serialize`).
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct StoredSig {
-    signer: PeerId,
-    sig: Signature,
-}
-
-/// An attested head in serde-friendly form (the observe `AttestedHead` is not `Serialize` because
-/// its `RecordSig`s are not) — `body` is the serde `ChainHead`, `sigs` the raw signer+signature.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct StoredHead {
-    body: ChainHead,
-    sigs: Vec<StoredSig>,
-}
-
-impl StoredHead {
-    fn into_attested(self) -> AttestedHead {
-        AttestedHead {
-            body: self.body,
-            sigs: self
-                .sigs
-                .into_iter()
-                .map(|s| RecordSig {
-                    signer: s.signer,
-                    sig: s.sig,
-                })
-                .collect(),
-        }
-    }
 }
 
 /// The consensus-oracle verdict (both re-derivation + digest-from-payloads).
@@ -208,18 +184,53 @@ fn verify_archive(args: &Args) -> Result<ReplayVerdict> {
     );
     let sandbox = SandboxedCoordinator::new(coord_wasm);
 
-    // -- the attested sealed-chain heads ---------------------------------------------------------
+    // -- the published archive-head records (ABI §8.8): authorize + select the lineage ----------
     let heads_bytes = std::fs::read(dir.join("heads.cbor"))
         .with_context(|| format!("read {}/heads.cbor", dir.display()))?;
-    let stored_heads: Vec<StoredHead> = from_canonical_slice(&heads_bytes)
+    let records: Vec<ArchiveHeadRecord> = from_canonical_slice(&heads_bytes)
         .map_err(|e| anyhow::anyhow!("decode heads.cbor: {e}"))?;
-    let heads: Vec<AttestedHead> = stored_heads
-        .into_iter()
-        .map(StoredHead::into_attested)
+    anyhow::ensure!(!records.is_empty(), "heads.cbor carries no head records");
+    let trusted = envelope_trusted_bases(&envelope);
+    anyhow::ensure!(
+        !trusted.is_empty(),
+        "envelope names no genesis-trusted base identities"
+    );
+    let chains =
+        verify_chains(&run_id, &trusted, records).context("verify published head records")?;
+    let coordinator_role = envelope
+        .roles
+        .keys()
+        .find(|r| r.contains("coordinator"))
+        .cloned()
+        .context("envelope names no coordinator role")?;
+    let lineage =
+        coordinator_lineage(&chains, &coordinator_role).context("order coordinator lineage")?;
+    // Cross-chain (restart-succession) replay lands with coordinator reconstruction; a single
+    // uninterrupted chain is the C1/C1.5 shape this oracle certifies today.
+    let [chain] = lineage.as_slice() else {
+        bail!(
+            "coordinator lineage spans {} chains (restart succession); cross-chain replay is \
+             not yet certified — replay each chain against its own span",
+            lineage.len()
+        );
+    };
+    let heads: Vec<ChainHead> = chain
+        .heads
+        .iter()
+        .map(|record| ChainHead {
+            run_id: record.body.run_id,
+            epoch: record.body.epoch,
+            role: record.body.role.clone(),
+            instance: record.body.instance,
+            module: record.body.module,
+            segment: record.body.segment,
+            segment_hash: record.body.segment_hash,
+            prev_hash: record.body.prev_hash,
+            records: record.body.records,
+        })
         .collect();
-    anyhow::ensure!(!heads.is_empty(), "heads.cbor carries no attested heads");
 
-    // -- the record archive: publish every sealed segment + ingest every head -------------------
+    // -- the record archive: publish every sealed segment (content-addressed, re-hashed) --------
     let mut archive = RecordArchive::new(
         authority,
         ReplicationPolicy { factor: 1 },
@@ -230,12 +241,6 @@ fn verify_archive(args: &Args) -> Result<ReplayVerdict> {
         archive
             .publish_segment(bytes)
             .map_err(|e| anyhow::anyhow!("publish segment {}: {e}", path.display()))?;
-    }
-    for head in &heads {
-        // A fork or unauthoritative head here is a hard input error (the archive is corrupt).
-        archive
-            .ingest_head(head.clone())
-            .map_err(|e| anyhow::anyhow!("ingest head: {e}"))?;
     }
 
     // -- the content-addressed payload objects ---------------------------------------------------
@@ -252,29 +257,30 @@ fn verify_archive(args: &Args) -> Result<ReplayVerdict> {
     }
 
     // -- oracle mode: sandboxed consensus re-derivation + digest-from-payloads -------------------
-    let consensus = match replay_consensus_from_archive(&sandbox, &archive, &heads, &payloads) {
-        Ok(report) => ConsensusVerdict {
-            agree: true,
-            segments_verified: report.segments_verified,
-            records_recovered: report.records_recovered,
-            rounds_verified: report.replay.rounds_verified,
-            payload_entries_verified: report.payload_entries_verified,
-            first_divergence_round: None,
-            detail: None,
-        },
-        Err(e) => {
-            let round = divergence_round(&e);
-            ConsensusVerdict {
-                agree: false,
-                segments_verified: 0,
-                records_recovered: 0,
-                rounds_verified: 0,
-                payload_entries_verified: 0,
-                first_divergence_round: round,
-                detail: Some(e.to_string()),
+    let consensus =
+        match replay_consensus_from_verified_archive(&sandbox, &archive, &heads, &payloads) {
+            Ok(report) => ConsensusVerdict {
+                agree: true,
+                segments_verified: report.segments_verified,
+                records_recovered: report.records_recovered,
+                rounds_verified: report.replay.rounds_verified,
+                payload_entries_verified: report.payload_entries_verified,
+                first_divergence_round: None,
+                detail: None,
+            },
+            Err(e) => {
+                let round = divergence_round(&e);
+                ConsensusVerdict {
+                    agree: false,
+                    segments_verified: 0,
+                    records_recovered: 0,
+                    rounds_verified: 0,
+                    payload_entries_verified: 0,
+                    first_divergence_round: round,
+                    detail: Some(e.to_string()),
+                }
             }
-        }
-    };
+        };
 
     // -- oracle mode: per-peer digest agreement (the G-2 transcript) -----------------------------
     let per_peer = per_peer_verdict(dir)?;

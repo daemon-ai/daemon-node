@@ -281,13 +281,16 @@ round.
                                     coordinator module hash; its blake3 IS the run id)
   coordinator.wasm                  the genesis-pinned coordinator module (blake3 == the envelope's
                                     coordinator.wasm artifact hash)
-  heads.cbor                        CBOR: [ { body: <chain-head>, sigs: [ {signer, sig} ] } ]
-                                    — the attested sealed-chain heads (segment 0 .. N, contiguous)
+  heads.cbor                        CBOR: [ <archive-head-record> ] — the run's published ABI §8.8
+                                    head records (every role's chains; the reader authorizes each
+                                    against the envelope's genesis-trusted bases and selects the
+                                    coordinator lineage itself)
   segments/<segment_hash_hex>.seg   the sealed record-archive segment bytes (content-addressed; the
                                     file stem is the segment's blake3 content address)
   payloads/<blake3_hex>.bin         the committed update-container payload objects, by content hash
   peers/<peerid_hex>.digests.cbor   CBOR: [ [round, <16-byte digest>] ] — that peer's per-round
-                                    post-ingest det-state digests (the `detail --watch` transcript)
+                                    post-ingest det-state digests (extracted from the coordinator
+                                    chain's recorded signed `Digest` inputs)
 ```
 
 `envelope.cbor`, `coordinator.wasm`, `heads.cbor`, and `segments/` are required (the consensus
@@ -307,6 +310,30 @@ genesis-trusted bases while pulling the layout above together. The rotation poli
 age bound is the recovery-point cadence: a live run's remote archive trails its journal by at
 most one open segment span. Segments seal only on roll/terminal — an aborted process's unsealed
 tail is recovered, sealed and republished by the next incarnation's startup reconciliation.
+
+#### `cargo run -p xtask -- vhc-archive-pull` — assemble the layout from a live run
+
+```
+cargo run -p xtask -- vhc-archive-pull --run <run-id> --base <gateway base> \
+    [--bearer <token> | --org <org> --actor <actor>] --out <dir>
+```
+
+Pulls the layout above from the registry + content plane with a third party's trust posture: the
+envelope is blake3-verified against the run descriptor, every published head record is authorized
+(`ArchiveHeadRecord::authorize` — per-run signature + certificate chain to a genesis-trusted
+base), every chain is re-folded structurally, and every content object (segments, committed
+payloads, the pinned `coordinator.wasm`) is fetched by content address and re-hashed on arrival.
+Committed payload hashes are enumerated from the coordinator lineage's published `RoundRecord`s;
+the per-peer digest transcripts are extracted from its recorded signed `Digest` inputs. The
+verifying core is `daemon_vhc_observe::assemble_archive` — the same function the testkit gate
+(`daemon-vhc-testkit/tests/archive_assembly.rs`) drives end-to-end: real sandboxed coordinator
+run → per-seal publisher → untrusted stores → assembly → GREEN `vhc-replay` (that test keeps its
+assembled layout under `DVHC_KEEP_ARCHIVE=<dir>` for a manual CLI smoke).
+
+A coordinator lineage that spans MULTIPLE chains (restart succession) assembles fine — every
+chain's heads and segments land in the layout — but `vhc-replay` refuses it typed for now:
+cross-chain replay lands with sandboxed coordinator reconstruction (the join-transaction rebuild),
+which owns the seam semantics.
 
 ### 3.5 The per-round digest on the product API
 
@@ -540,6 +567,15 @@ never wait it out.
   (graceful). With `min = max = 3` the run parks below the floor — confirm the parked state via
   `detail` for a bounded interval (2× the calibrated round wall), then `daemon-cli vhc join <run-id>`
   → restore from checkpoint → resume. Zero digest disagreement across the seam.
+- **Coordinator crash drill** (ABI §8.8 [AR-8]): hard-kill the COORDINATOR's worker after at
+  least one sealed segment has published (`GET …/archive/heads` non-empty). Expected: the
+  node's rejoin resolves + verifies the head lineage, the fresh worker reconstructs the
+  consensus state through the sandbox (log line "coordinator reconstruction: replaying the
+  recovered lineage through the sandbox" with chain/frame counts), reports ready only after
+  the replay drains, and the run resumes WITHOUT re-opening any round the durable record
+  already committed — digest agreement from the next round onward. A join refused with a
+  head-verification error is the fork/corruption fail-closed path: adjudicate the archive
+  (§5.7), never force a fresh seat.
 
 ### 5.6 Completion
 

@@ -665,6 +665,9 @@ impl UpgradeSteps for LiveUpgradeSteps<'_> {
                 // so its streamed restore resolves them self-sealed (clone: a retried attempt
                 // re-seeds a fresh successor store).
                 carried_state: self.carried_state.clone(),
+                // The switch seam CONTINUES the retiring chain (which journaled the drain
+                // snapshot at quiesce) — never a chain-founding anchor.
+                anchor: false,
             }),
         )
         .map_err(|e| StepFailure::new(format!("start_run_migrating: {e}")))?;

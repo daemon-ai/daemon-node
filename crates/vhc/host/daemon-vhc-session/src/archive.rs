@@ -22,6 +22,7 @@
 //! interprets the archive is harness tooling, not this production path).
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use daemon_vhc_journal::{scan_file, JournalPaths, SealedSegment};
@@ -134,6 +135,11 @@ pub struct ArchiveSpec {
     pub journal_dir: PathBuf,
     /// The series' founding incarnation — the chain scope's `chain_instance`.
     pub chain_instance: u64,
+    /// The committed-round watermark cell (`0` = none yet, else `round + 1`): allocated beside
+    /// the chain coordinates, ADVANCED by the session's egress relay on every published
+    /// `RoundRecord` (structural probe — no schema linked), and stamped by the publisher into
+    /// each head as the ABI §8.8 freshness claim ([`daemon_vhc_proto::ArchiveHeadBody::round`]).
+    pub round_claim: Arc<AtomicU64>,
 }
 
 /// Capped exponential backoff for the publisher's retry loops: transient store/registry faults
@@ -150,6 +156,13 @@ async fn backoff(attempt: u32) {
 ///
 /// The publisher never blocks the session: seals arrive over the unbounded hook channel, uploads
 /// and head publishes happen here with capped-backoff retries.
+///
+/// [`ArchiveSpec::round_claim`] is the session-maintained committed-round watermark (`0` = none
+/// yet, else `round + 1` — see [`crate::role_session`]'s egress relay): each published head
+/// stamps the claim current at publish time as [`daemon_vhc_proto::ArchiveHeadBody::round`].
+/// Sampling at publish (not seal) can only OVER-state a segment's span — the staleness judgment
+/// reading the claim compares against a horizon that absorbs the skew, and freshness evidence
+/// that errs fresh never admits a staler joiner.
 pub fn spawn_archive_publisher(
     run_label: String,
     run_id: Hash,
@@ -169,6 +182,7 @@ pub fn spawn_archive_publisher(
             heads,
             segments,
             bindings,
+            round_claim: spec.round_claim,
             published_tip: None,
             predecessor: None,
         };
@@ -200,6 +214,8 @@ struct Publisher {
     heads: Arc<dyn ArchiveHeadStore>,
     segments: Arc<dyn ContentStore>,
     bindings: Arc<Mutex<Vec<SignerBinding>>>,
+    /// The committed-round watermark (`0` = none, else `round + 1`) stamped on each head.
+    round_claim: Arc<AtomicU64>,
     /// The highest head ordinal the store holds for this chain (`None` = nothing published).
     published_tip: Option<u64>,
     /// The predecessor chain's terminal head address (segment 0's succession link), resolved
@@ -420,6 +436,7 @@ impl Publisher {
             epoch: sealed.id.epoch,
             module: sealed.id.module,
             predecessor: (sealed.segment == 0).then_some(self.predecessor).flatten(),
+            round: self.round_claim.load(Ordering::Relaxed).checked_sub(1),
         };
         let record = {
             let bindings = self.bindings.lock().expect("signer bindings mutex");
@@ -638,6 +655,7 @@ mod tests {
                 seals: rx,
                 journal_dir: jdir.clone(),
                 chain_instance: sink.founding_instance(),
+                round_claim: Arc::new(AtomicU64::new(0)),
             },
             heads.clone(),
             segments.clone(),
@@ -684,6 +702,7 @@ mod tests {
                 seals: rx,
                 journal_dir: jdir.clone(),
                 chain_instance: 1,
+                round_claim: Arc::new(AtomicU64::new(0)),
             },
             heads.clone(),
             segments.clone(),
@@ -743,6 +762,7 @@ mod tests {
                 seals: rx,
                 journal_dir: jdir.clone(),
                 chain_instance: sink.founding_instance(),
+                round_claim: Arc::new(AtomicU64::new(0)),
             },
             heads.clone(),
             segments.clone(),

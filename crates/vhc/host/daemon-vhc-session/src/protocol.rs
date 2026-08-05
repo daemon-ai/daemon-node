@@ -1108,6 +1108,27 @@ pub struct SessionCredentials {
     /// pointer this instance restores from before it runs. `None` = a fresh start from genesis.
     #[serde(default)]
     pub restore: Option<CheckpointRestore>,
+    /// An optional COORDINATOR RECONSTRUCTION directive (§8.8 crash recovery): present when the
+    /// node found published archive history for this seat's role and the instance must rebuild
+    /// the coordinator's consensus state (retained ring + delivery cursors) from its durable
+    /// journal BEFORE reporting ready. `None` = no published history — a genuinely fresh seat.
+    /// Additive (`#[serde(default)]` keeps pre-extension credential buffers decodable).
+    #[serde(default)]
+    pub reconstruct: Option<CoordinatorRecovery>,
+}
+
+/// The node-resolved coordinator crash-recovery directive ([`SessionCredentials::reconstruct`]):
+/// the archive-head records of the seat's published journal lineage, fetched from the run's head
+/// store and VERIFIED node-side (`daemon_vhc_proto::verify_chains` + `coordinator_lineage`
+/// against the genesis-trusted bases). Carriage is bootstrap, not trust — the worker re-verifies
+/// every record against the same genesis before acting on it, exactly like `peer_certs` and
+/// `seat_grant`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoordinatorRecovery {
+    /// The head records of the role's published chains (every chain, founding order — the worker
+    /// re-derives the lineage itself; a subset would silently truncate history).
+    #[serde(default)]
+    pub heads: Vec<daemon_vhc_proto::ArchiveHeadRecord>,
 }
 
 /// A late-join checkpoint restore reference (the node-resolved registry pointer): the round the
@@ -1858,6 +1879,7 @@ mod tests {
             secret_ref: None,
             expires_at_ms: 0,
             restore: None,
+            reconstruct: None,
         };
         let back = SessionCredentials::from_bytes(&ws_only.to_bytes().unwrap()).unwrap();
         assert_eq!(back, ws_only);
@@ -1913,6 +1935,9 @@ mod tests {
                 round: 42,
                 hash: [0x7C; 32],
             }),
+            // The §8.8 reconstruction directive round-trips (an additive field: the ws_only
+            // form above proves a directive-free body still decodes).
+            reconstruct: Some(CoordinatorRecovery { heads: Vec::new() }),
         };
         let back = SessionCredentials::from_bytes(&full.to_bytes().unwrap()).unwrap();
         assert_eq!(back, full);

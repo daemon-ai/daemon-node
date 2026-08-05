@@ -470,4 +470,11 @@ pub struct MigrationInput {
     /// successor serves these folds self-sealed ([SF-R1]) rather than fetching them from a plane
     /// the in-process switch never published to.
     pub carried_state: Vec<crate::run::state_store::CarriedFamily>,
+    /// Whether this migration FOUNDS a new journal chain (a late-join restore or a crash
+    /// reconstruction — a fresh journal home, segment 0): when set, the validated restore
+    /// manifest is journaled as the chain's anchoring tag-10 right after `da_migrate` accepts,
+    /// so the successor chain is self-contained for replay and reconstruction (§8.3/§8.8).
+    /// `false` on the live module switch, whose seam CONTINUES the retiring chain — that chain
+    /// already carries the drain snapshot the switch migrated from.
+    pub anchor: bool,
 }

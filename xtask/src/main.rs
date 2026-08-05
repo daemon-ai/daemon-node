@@ -21,6 +21,7 @@
 
 #![forbid(unsafe_code)]
 
+mod archive_pull;
 mod ceremony;
 mod publish;
 mod replay;
@@ -314,6 +315,31 @@ enum Cmd {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Assemble a run's PRODUCT archive (ABI §8.8) from the registry + content plane into the
+    /// replay layout `vhc-replay` consumes: authorize every published head record against the
+    /// envelope's genesis-trusted bases, re-fold every chain, fetch + re-hash every sealed
+    /// segment / committed payload / the pinned coordinator module, and extract the per-peer
+    /// digest transcripts from the coordinator chain's recorded inputs.
+    VhcArchivePull {
+        /// The run id (genesis hash hex).
+        #[arg(long)]
+        run: String,
+        /// The coordinator/gateway base (e.g. `https://…/api/v1/vhc`).
+        #[arg(long)]
+        base: String,
+        /// `vhc:*`-scoped bearer token (gateway path).
+        #[arg(long)]
+        bearer: Option<String>,
+        /// Internal identity org id (direct-to-`apps/vhc` dev path; pair with `--actor`).
+        #[arg(long)]
+        org: Option<String>,
+        /// Internal identity actor (pair with `--org`).
+        #[arg(long)]
+        actor: Option<String>,
+        /// The output archive directory (the `vhc-replay` layout).
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// Run BOTH replay-oracle modes (input replay + sandboxed consensus re-derivation) over an
     /// on-disk archive directory and emit a per-round, per-peer machine-readable verdict
     /// (agree/disagree + first divergence round). Green over a genuine archive; red with the
@@ -536,6 +562,23 @@ fn main() -> anyhow::Result<()> {
             witness_s,
             cooldown_s,
             stop_rounds,
+            out,
+        }),
+        Cmd::VhcArchivePull {
+            run,
+            base,
+            bearer,
+            org,
+            actor,
+            out,
+        } => archive_pull::run(archive_pull::Args {
+            run,
+            base,
+            bearer,
+            internal: match (org, actor) {
+                (Some(org), Some(actor)) => Some((org, actor)),
+                _ => None,
+            },
             out,
         }),
         Cmd::VhcReplay { archive, run, json } => replay::run(replay::Args { archive, run, json }),

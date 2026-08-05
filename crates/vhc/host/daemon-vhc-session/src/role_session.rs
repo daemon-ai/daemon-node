@@ -335,9 +335,15 @@ pub fn spawn_role(
         signing_seed: spec.run.signing_seed,
         certificate: spec.own_cert.clone(),
     }]));
+    // The committed-round watermark (`0` = none, else `round + 1`): the egress relay advances
+    // the cell the archive spec carries ([`crate::archive::ArchiveSpec::round_claim`]), and the
+    // archive publisher stamps it into each head as the ABI §8.8 freshness claim. A session
+    // without an archive seam still relays through a (publisher-less) cell.
+    let mut round_claim = Arc::new(AtomicU64::new(0));
     let archive_publisher = match (spec.archive.take(), spec.providers.archive_heads.clone()) {
         (Some(archive), Some(heads)) => {
             let journal_dir = archive.journal_dir.clone();
+            round_claim = archive.round_claim.clone();
             let task = crate::archive::spawn_archive_publisher(
                 run_label.clone(),
                 Hash(spec.run.identity.run_id),
@@ -362,8 +368,16 @@ pub fn spawn_role(
                 round: 0,
                 generation: generation.load(Ordering::SeqCst),
             });
-            let outcome =
-                run_role(&label, spec, &events, cmd_rx, &generation, &signer_bindings).await;
+            let outcome = run_role(
+                &label,
+                spec,
+                &events,
+                cmd_rx,
+                &generation,
+                &signer_bindings,
+                &round_claim,
+            )
+            .await;
             let _ = events.send(Event::RunTerminated {
                 run_id: label,
                 generation: generation.load(Ordering::SeqCst),
@@ -442,6 +456,7 @@ async fn run_role(
     mut commands: mpsc::UnboundedReceiver<RoleCommand>,
     generation: &Arc<AtomicU64>,
     signer_bindings: &Arc<std::sync::Mutex<Vec<crate::archive::SignerBinding>>>,
+    round_claim: &Arc<AtomicU64>,
 ) -> TerminalOutcome {
     let RoleSessionSpec {
         module,
@@ -635,7 +650,7 @@ async fn run_role(
             }
             _ = egress.notified() => {
                 if let Err(reason) = relay_egress(
-                    &current.pump, &providers, &mut current.egress, events, gen_now,
+                    &current.pump, &providers, &mut current.egress, events, gen_now, round_claim,
                 ).await {
                     transport_fault = Some(reason);
                     break 'session;
@@ -777,6 +792,7 @@ async fn run_role(
         &mut current.egress,
         events,
         gen_now,
+        round_claim,
     )
     .await;
 
@@ -1147,6 +1163,9 @@ async fn perform_switch(
                 // successor's streamed restore resolves them self-sealed ([SF-R1]); clone because
                 // a rollback-and-retry attempt re-seeds a fresh successor store.
                 carried_state: carried_state.clone(),
+                // The switch seam CONTINUES the retiring chain (which journaled the drain
+                // snapshot at quiesce) — never a chain-founding anchor.
+                anchor: false,
             }),
         );
         let failure = match started {
@@ -1506,6 +1525,48 @@ fn frame_kind(frame: &[u8]) -> String {
     }
 }
 
+/// If a published frame carries a wire `RoundRecord`, its round number — else `None`.
+///
+/// A structural shape probe in the `frame_kind` discipline: the module frame stays opaque (no
+/// SDK schema is linked; the walk reads exactly the externally-tagged wire union's variant name
+/// and the record's `round` field, both fixed by the consensus wire contract). The value feeds
+/// the committed-round watermark the archive publisher stamps into attested heads — freshness
+/// evidence, not a consensus input (the replay oracle re-derives records from the journal, never
+/// from this probe).
+fn published_round_record(frame: &[u8]) -> Option<u64> {
+    use ciborium::value::Value;
+    let Ok(Value::Array(parts)) = ciborium::de::from_reader(frame) else {
+        return None;
+    };
+    let Some(Value::Bytes(payload)) = parts.get(1) else {
+        return None;
+    };
+    let inner: Value = ciborium::de::from_reader(payload.as_slice()).ok()?;
+    // The externally-tagged union: a 1-element map (serde's standard shape) or a
+    // `[name, value]` variant array — mirror `frame_kind`'s tolerance for both.
+    let (tag, body) = match &inner {
+        Value::Map(entries) if entries.len() == 1 => match &entries[0] {
+            (Value::Text(t), v) => (t.as_str(), v),
+            _ => return None,
+        },
+        Value::Array(items) if items.len() == 2 => match items.first() {
+            Some(Value::Text(t)) => (t.as_str(), &items[1]),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    if tag != "RoundRecord" {
+        return None;
+    }
+    let Value::Map(fields) = body else {
+        return None;
+    };
+    fields.iter().find_map(|(k, v)| match (k, v) {
+        (Value::Text(t), Value::Integer(n)) if t == "round" => u64::try_from(i128::from(*n)).ok(),
+        _ => None,
+    })
+}
+
 /// A short label for an op request kind — diagnostics only.
 fn op_kind(req: &OpRequest) -> &'static str {
     match req {
@@ -1598,6 +1659,7 @@ async fn relay_egress(
     cursors: &mut EgressCursors,
     events: &mpsc::UnboundedSender<Event>,
     generation: u64,
+    round_claim: &AtomicU64,
 ) -> Result<(), String> {
     // Guest log lines onto the node's own stream. This is how a guest panic becomes readable:
     // the SDK's hook forwards the message here a beat before the `unreachable` trap, so the line
@@ -1617,6 +1679,13 @@ async fn relay_egress(
     let published = pump.published();
     for (channel, seq, frame) in published.iter().skip(cursors.published) {
         tracing::trace!(channel, seq, kind = %frame_kind(frame), "egress: publishing module frame");
+        // Advance the committed-round watermark on every published `RoundRecord` — the archive
+        // publisher stamps it into each attested head as the §8.8 freshness claim. A structural
+        // shape probe (like `frame_kind`): the frame stays opaque, and only a coordinator seat
+        // ever publishes records, so trainer egress never matches.
+        if let Some(round) = published_round_record(frame) {
+            round_claim.fetch_max(round.saturating_add(1), Ordering::Relaxed);
+        }
         providers
             .control
             .publish(frame)

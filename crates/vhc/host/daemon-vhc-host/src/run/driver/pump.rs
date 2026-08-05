@@ -680,6 +680,18 @@ impl PumpHandle {
             .clone()
     }
 
+    /// The authoritative frames accepted ([`PumpHandle::deliver_frame`] →
+    /// [`DeliverVerdict::Accepted`]) but not yet PULLED by the guest. The §8.8 reconstruction
+    /// executor's pre-quiesce barrier: opening a Quiesce drain freezes still-queued frames (they
+    /// spool for a successor instance instead of folding, §4.4), so a replay that must export the
+    /// fully-folded state waits for this to reach zero first — the guest folds each frame before
+    /// pulling the next event, so an empty frame queue means the last fold completes before the
+    /// Quiesce is observed.
+    #[must_use]
+    pub fn pending_frames(&self) -> usize {
+        self.shared.state.lock().expect("pump lock").auth_spooled
+    }
+
     /// Drain the authoritative frames that spooled undelivered during the Quiesce drain (§4.4),
     /// in arrival order — the upgrade transaction re-delivers them into the NEW instance's pump
     /// at activation (§10.3 step 6 "spooled frames drain into the new instance"). Each

@@ -5,10 +5,10 @@ appended — at every program boundary, and it is status, not normative text. No
 in the tracked specs (§2). If this file contradicts a chat log, a memory, or an archived
 document, this file wins; if it contradicts a tracked spec, the spec wins.
 
-Last rewritten: 2026-08-04 (Phase A complete: the C1 two-box WAN rung ran for real —
-run-j finished 24/24 rounds with zero det-digest mismatch across both seats, and run-k
-passed both trainer churn drills (hard-kill restore and graceful leave/rejoin) on the
-One-Lifecycle/Two-Identities wave; evidence under
+Last rewritten: 2026-08-05 (pre-C2 hardening Phases 1–5 landed: cadence contract + typed
+storage taxonomy, deaf-path root cause + fix, incremental authenticated archive
+publication, GREEN replay assembly from the product archive, and sandboxed coordinator
+reconstruction in the join transaction; C1 hardware evidence unchanged under
 `~/experiments/ceremony-artifacts/c1-20260728/archive/`).
 
 ## 1. What we are building, and the next milestone
@@ -244,10 +244,72 @@ None of these blocks C0 or C1.
   - Docs moved with the change: ABI **§8.8** ([AR-1]..[AR-6]), runbook §3.4 "where the
     archive comes from", architecture-spec divergence note updated (§5.3 publication is
     now product).
-- **Not claimed** (recorded): GREEN replay assembly from the product archive (the xtask
-  pull into the §3.4 layout — Phase 4), general archive backfill, in-session exact-frame
-  loss repair, coordinator crash reconstruction, §5.3 standby failover. These are the
-  remaining pre-C2 phases (§8).
+- **Pre-C2 hardening — Phase 4 LANDED (2026-08-05): GREEN replay assembly from the
+  product archive.**
+  - **Assembler** (`daemon-vhc-observe::journal::assemble`): `assemble_archive` — envelope
+    → run id + trusted bases (`envelope_trusted_bases`: `identities.coordinator` +
+    `coordinator_set`); every published head record authorized ([AR-4]) + every chain
+    re-folded (`verify_chains`); coordinator lineage ordered by succession links
+    (`coordinator_lineage`); every content object fetched by address and RE-HASHED
+    (untrusted store); committed payloads enumerated from the lineage's published
+    `RoundRecord`s; per-peer digest transcripts extracted from its recorded signed
+    `Digest` inputs; §3.4 layout written atomically (tmp+rename).
+  - **Oracle entry** (`daemon-vhc-observe::consensus`): `recover_chain_from_verified_heads`
+    / `replay_consensus_from_verified_archive` — the structural walk for heads whose
+    authority the CALLER established through the §8.8 record scheme (the legacy
+    `AttestedHead`/`AuthorityConfig` path is unchanged for existing drills).
+  - **CLI**: `xtask vhc-archive-pull` (registry descriptor + envelope blake3-verify, head
+    snapshot, presigned content GETs through the production `R2Store`/`ContentStore`
+    path) → the layout; `xtask vhc-replay` reworked to the product `heads.cbor`
+    (`Vec<ArchiveHeadRecord>`, reader-side authorization; multi-chain lineage refused
+    typed until reconstruction lands — Phase 5).
+  - **Gate** (`daemon-vhc-testkit/tests/archive_assembly.rs`): real sandboxed
+    `coordinator_quorum` run (2 workers, 4 rounds, commitments + digests + receipts),
+    journaled with the per-seal hook feeding the REAL `spawn_archive_publisher` into
+    `FsArchiveHeadStore`/`FsContentStore`; a third party assembles from those stores
+    alone and the consensus oracle re-derives GREEN. The actual `vhc-replay` CLI ran
+    GREEN over the same assembled archive (5 segments, 4 rounds re-derived, 8 payload
+    entries, per-peer digest agreement all rounds; `DVHC_KEEP_ARCHIVE` keeps the layout).
+- **Pre-C2 hardening — Phase 5 LANDED (2026-08-05): sandboxed coordinator reconstruction
+  in the join transaction (ABI §8.8 [AR-7]/[AR-8]).**
+  - **Shared verification in the contract crate**: `verify_chains` / `coordinator_lineage` /
+    `envelope_trusted_bases` (+ `VerifiedChain`, `ChainVerifyError`, `latest_round_claim`)
+    moved from the observe assembler into `daemon-vhc-proto::archive` — node, worker, and
+    oracle all run the SAME verification; no `daemon-vhc-observe` linkage in the production
+    host.
+  - **The head carries the freshness claim** ([AR-7]): `ArchiveHeadBody.round` (additive) —
+    the committed-round watermark at seal time, maintained by a structural probe of published
+    frames in the session's egress relay (no consensus schema linked) and stamped by the
+    publisher.
+  - **Node orchestrates** (`resolve_recovery`): fetch heads via the registry
+    (`RunDiscovery::fetch_archive_heads` → `HttpArchiveHeadStore`), verify against the
+    envelope's trusted bases — **missing/conflicting/broken lineage = typed join refusal**;
+    a seat-role join with verified history carries `SessionCredentials.reconstruct`
+    (`CoordinatorRecovery { heads }` — carriage is bootstrap, not trust). `CheckpointStale`
+    is REWIRED: staleness judged against the latest VERIFIED committed-round claim across
+    the seat lineage (fallback: the graceful-drain pointer), not registry metadata.
+  - **Worker executes** (`daemon-vhc-session::reconstruct`): re-verify the carried heads
+    against genesis trust; recover the record stream — attested segments (local journal file
+    when it hash-matches the head, else the content plane; both re-hashed; `prev_blake3`
+    cross-checked) plus the newest chain's local unsealed tail; replay the recorded signed
+    frames VERBATIM through a throwaway sandbox instance (consensus never folds natively),
+    drain behind a pre-quiesce barrier, export the §10.2 capture — which founds the real
+    instance's migration with an anchoring snapshot (`MigrationInput.anchor`: a
+    chain-founding migration journals its restore manifest as the new chain's tag-10, so
+    every chain is self-contained). Checkpoint-anchored fast path only when the recovered
+    stream's snapshot byte-matches the restore capture; otherwise full replay from genesis.
+    `RoleReady` only after the rebuilt state is live.
+  - **Regressions**: crash → product-path reconstruction → byte-identical resumed decisions
+    (`daemon-vhc-testkit/tests/reconstruct_product.rs`); conflicting-heads and
+    untrusted-attestor typed refusals (worker); stale-trainer-vs-verified-head and
+    conflicting-heads typed refusals (node, `tests/service.rs`).
+  - Docs moved with the change: ABI §8.8 [AR-7]/[AR-8]; runbook §5.5 coordinator crash
+    drill.
+- **Not claimed** (recorded): general archive backfill, in-session exact-frame
+  loss repair, §5.3 standby failover, and cross-chain (restart-succession) replay in the
+  OFFLINE oracle — `xtask vhc-replay` still certifies a single uninterrupted chain and
+  refuses a multi-chain lineage typed (the product reconstruction executor walks the full
+  lineage; teaching the offline oracle the seam semantics is follow-on work).
 - C0: green and pinned. C1: **green on hardware** (this boundary). Freeze/C2: the only
   rung left — needs the Windows 5090 seat joined in and the pre-C2 workstream scoped.
 - Program archive: frozen and locked read-only 2026-07-27.
@@ -273,11 +335,13 @@ All four answer ssh (verified 2026-08-04). Next actions (in order):
    sequential): ~~Phase 1 cadence contract + typed storage taxonomy~~ DONE (§7).
    ~~Phase 2 deaf-path instrumentation + root cause~~ DONE (§7: relay-first DO, server
    Binary heartbeat, client deafness verdict, plane_health surface, live churn
-   regression). ~~Phase 3 incremental authenticated archive publication~~ DONE (§7:
+   regression).    ~~Phase 3 incremental authenticated archive publication~~ DONE (§7:
    proto archive contract, seal-hook publisher, head stores, cloud archive slots,
-   ABI §8.8). Next: Phase 4 GREEN replay assembly from the product archive, then
-   Phases 5–6 (sandboxed coordinator reconstruction → disk custody), then C1.5; plus
-   the registry Byzantine posture owner decision (§6).
+   ABI §8.8). ~~Phase 4 GREEN replay assembly~~ DONE (§7: `assemble_archive` +
+   `vhc-archive-pull` + product `vhc-replay`, end-to-end gate GREEN). ~~Phase 5
+   sandboxed coordinator reconstruction~~ DONE (§7: node-verified head lineage +
+   worker sandbox replay + rewired `CheckpointStale`, [AR-7]/[AR-8]). Next: Phase 6
+   disk custody, then C1.5; plus the registry Byzantine posture owner decision (§6).
 4. Bring the Windows 5090 seat into a three-box run (its worker lane builds with
    `vhc-net,wgpu-spirv`; native DX12 verdict is already green).
 5. Freeze; memoized preflight; run C2; evidence closure; human-signed master merge.

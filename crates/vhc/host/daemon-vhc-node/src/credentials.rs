@@ -22,7 +22,8 @@ use daemon_vhc_proto::RunKeyCertificate;
 use daemon_vhc_session::config::{RegistryAuthConfig, RegistryConfig};
 use daemon_vhc_session::keystore::{KeystoreError, VhcKeystore};
 use daemon_vhc_session::protocol::{
-    CheckpointRestore, CredentialsRecord, IrohPlane, SessionCredentials, WsAuthSpec,
+    CheckpointRestore, CoordinatorRecovery, CredentialsRecord, IrohPlane, SessionCredentials,
+    WsAuthSpec,
 };
 use daemon_vhc_session::provisioning::{provision_run_identity, ProvisionScope};
 
@@ -56,6 +57,10 @@ pub struct JoinBootstrap {
     pub seat: SeatBootstrap,
     /// The node-resolved iroh plane (`None` = WS-only; opt-in via `[vhc].iroh.enabled`).
     pub iroh: Option<IrohPlane>,
+    /// The coordinator crash-recovery directive (§8.8): the node-verified archive-head lineage
+    /// a seat-role join with published history must reconstruct from before reporting ready.
+    /// `None` = a fresh seat / not the seat role.
+    pub reconstruct: Option<CoordinatorRecovery>,
 }
 
 /// The output of one authorship pass: the wire credentials bytes for `JoinRun.credentials` and
@@ -102,6 +107,7 @@ pub fn author_join(
         restore,
         seat,
         iroh,
+        reconstruct,
     } = bootstrap;
     let cred = |e: KeystoreError| VhcError::Internal(format!("credential authorship: {e}"));
 
@@ -172,6 +178,9 @@ pub fn author_join(
         secret_ref,
         expires_at_ms,
         restore,
+        // The §8.8 reconstruction directive (node-verified archive lineage; the worker
+        // re-verifies before acting — carriage, not trust).
+        reconstruct,
     };
     let wire = credentials
         .to_bytes()

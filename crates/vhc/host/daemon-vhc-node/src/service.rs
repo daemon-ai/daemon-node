@@ -1064,7 +1064,24 @@ impl VhcService {
             // No discovery/no fresh tuple: the persisted one is all there is (offline path).
             (p, None) => p,
         };
-        let restore = match self.resolve_restore(&run.run_id, &run.role).await {
+        // The recovery half of the join transaction (§8.8): the verified archive lineage —
+        // the reconstruction directive for a seat-role reconvergence (a crash restart is
+        // exactly the case with published history behind it) and the verified head estimate
+        // for the restore staleness judgment.
+        let recovery = match self.resolve_recovery(&run.run_id, &run.role).await {
+            Ok(r) => r,
+            Err(e) => {
+                self.arbiter.release(&id);
+                if self.worker_factory.is_some() {
+                    worker.shutdown().await;
+                }
+                return Err(e);
+            }
+        };
+        let restore = match self
+            .resolve_restore(&run.run_id, &run.role, recovery.verified_head)
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
                 self.arbiter.release(&id);
@@ -1081,7 +1098,10 @@ impl VhcService {
                 &run.coordinator,
                 &id,
                 persisted_tuple,
-                restore,
+                JoinResume {
+                    restore,
+                    reconstruct: recovery.reconstruct,
+                },
                 seat,
             )
             .await
@@ -1256,7 +1276,23 @@ impl VhcService {
             worker.shutdown().await;
             return;
         }
-        let restore = match self.resolve_restore(run_id, "trainer").await {
+        // The verified head estimate for the staleness judgment (a trainer never carries the
+        // reconstruction directive — the seat lineage is not its history to rebuild).
+        let recovery = match self.resolve_recovery(run_id, "trainer").await {
+            Ok(r) => r,
+            Err(e) => {
+                self.arbiter.release(&id);
+                warn_co!(format!(
+                    "co-located trainer recovery resolution refused: {e}"
+                ));
+                worker.shutdown().await;
+                return;
+            }
+        };
+        let restore = match self
+            .resolve_restore(run_id, "trainer", recovery.verified_head)
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
                 self.arbiter.release(&id);
@@ -1267,7 +1303,17 @@ impl VhcService {
         };
         let seat = self.resolve_seat_bootstrap(run_id).await;
         let (delivery_tuple, credentials, _credentials_ref) = match self
-            .author_join(run_id, &coordinator, &id, assessed_tuple, restore, seat)
+            .author_join(
+                run_id,
+                &coordinator,
+                &id,
+                assessed_tuple,
+                JoinResume {
+                    restore,
+                    reconstruct: recovery.reconstruct,
+                },
+                seat,
+            )
             .await
         {
             Ok(v) => v,
@@ -2055,9 +2101,13 @@ impl VhcService {
         coordinator: &str,
         id: &RoleInstanceId,
         tuple: Option<protocol::AdmittedTuple>,
-        restore: Option<protocol::CheckpointRestore>,
+        resume: JoinResume,
         seat: crate::credentials::SeatBootstrap,
     ) -> Result<AuthoredDelivery, VhcError> {
+        let JoinResume {
+            restore,
+            reconstruct,
+        } = resume;
         let tuple = tuple.map(|mut t| {
             t.incarnation = id.instance;
             t
@@ -2098,6 +2148,7 @@ impl VhcService {
                 restore,
                 seat,
                 iroh,
+                reconstruct,
             },
         )?;
         Ok((Some(tuple), authored.wire, authored.credentials_ref))
@@ -2779,19 +2830,24 @@ impl VhcService {
     /// replays forward across the coordinator's retained record ring
     /// ([`daemon_vhc_proto::RETAINED_RECORD_HORIZON_ROUNDS`]), and with three seats the run
     /// progresses while one trainer is absent — no static cadence/ring relation guarantees the
-    /// fence stays reachable. So the judgment is made HERE, from actual checkpoint metadata,
-    /// before any rehydration: when the restore fence is more than the horizon behind the run's
-    /// live head, the join refuses typed ([`VhcError::CheckpointStale`]) instead of wedging
-    /// into the module's post-restore `GapRefused`. The head estimate is the freshest
-    /// checkpoint round visible for the run (the coordinator's pointer) — a LOWER bound on the
-    /// true head, so this check is conservative and the in-module refusal remains the
-    /// authoritative backstop. No coordinator pointer = no judgment (nothing to compare
-    /// against). Benign at min/max 2/2 (rounds pause while a peer is down); mandatory before
-    /// C2's larger fleets.
+    /// fence stays reachable. So the judgment is made HERE, from actual run evidence, before
+    /// any rehydration: when the restore fence is more than the horizon behind the run's live
+    /// head, the join refuses typed ([`VhcError::CheckpointStale`]) instead of wedging into the
+    /// module's post-restore `GapRefused`.
+    ///
+    /// The head estimate prefers `verified_head` — the latest committed-round claim across the
+    /// seat lineage's SIGNED archive heads ([`Self::resolve_recovery`]); certificate-chained
+    /// evidence, never registry metadata — and keeps the registry's coordinator pointer as a
+    /// fallback lower bound (heads published before the round claim existed carry none). Every
+    /// source is a LOWER bound on the true head, so the check stays conservative and the
+    /// in-module refusal remains the authoritative backstop. No evidence = no judgment (nothing
+    /// to compare against). Benign at min/max 2/2 (rounds pause while a peer is down);
+    /// mandatory before C2's larger fleets.
     async fn resolve_restore(
         &self,
         run_id: &str,
         role: &str,
+        verified_head: Option<u64>,
     ) -> Result<Option<protocol::CheckpointRestore>, VhcError> {
         let Some(discovery) = self.discovery.as_ref() else {
             return Ok(None);
@@ -2809,8 +2865,14 @@ impl VhcService {
             return Ok(None);
         };
         if role != "coordinator" {
-            if let Ok(Some(coord)) = discovery.fetch_checkpoint(run_id, "coordinator").await {
-                let head = coord.round.max(pointer.round);
+            let pointer_head = discovery
+                .fetch_checkpoint(run_id, "coordinator")
+                .await
+                .ok()
+                .flatten()
+                .map(|coord| coord.round);
+            if let Some(evidence) = verified_head.into_iter().chain(pointer_head).max() {
+                let head = evidence.max(pointer.round);
                 let horizon = daemon_vhc_proto::RETAINED_RECORD_HORIZON_ROUNDS;
                 if head > pointer.round.saturating_add(horizon) {
                     return Err(VhcError::CheckpointStale {
@@ -2835,6 +2897,103 @@ impl VhcService {
             hash,
         }))
     }
+
+    /// Resolve the run's published archive lineage for the join (§8.8; the recovery half of the
+    /// join transaction): fetch every stored archive-head record, VERIFY each one against the
+    /// genesis-trusted bases (the registry stores, it never vouches —
+    /// [`daemon_vhc_proto::verify_chains`]), order the seat role's chains founding-first by
+    /// their succession links, and derive
+    ///
+    /// - the **coordinator reconstruction directive**: a SEAT-ROLE join with published history
+    ///   must rebuild the coordinator's consensus state (retained ring + delivery cursors) from
+    ///   its durable journal before reporting ready — the verified lineage's head records ride
+    ///   the credentials ([`protocol::CoordinatorRecovery`]; carriage, not trust — the worker
+    ///   re-verifies against the same genesis); and
+    /// - the **verified head estimate**: the latest committed-round claim across the lineage's
+    ///   signed heads — the freshness evidence [`Self::resolve_restore`]'s staleness judgment
+    ///   compares against.
+    ///
+    /// No discovery seam / no published seat history resolves EMPTY (a genuinely fresh seat).
+    /// An unverifiable snapshot refuses TYPED and fails the join closed: booting a fresh
+    /// coordinator past history that exists but does not authenticate would fork the run — the
+    /// node's retry schedule keeps it live, never a silent fresh boot.
+    async fn resolve_recovery(
+        &self,
+        run_id: &str,
+        role: &str,
+    ) -> Result<RecoveryResolution, VhcError> {
+        let Some(discovery) = self.discovery.as_ref() else {
+            return Ok(RecoveryResolution::default());
+        };
+        let heads = discovery.fetch_archive_heads(run_id).await?;
+        if heads.is_empty() {
+            return Ok(RecoveryResolution::default());
+        }
+        // The run's cryptographic identity + trust set, from the frozen genesis (never registry
+        // metadata, never ambient config).
+        let bytes = discovery.fetch_envelope(run_id).await?;
+        let wire: daemon_vhc_proto::SignedEnvelope = daemon_vhc_proto::from_canonical_slice(&bytes)
+            .map_err(|e| VhcError::Discovery(format!("decode signed envelope: {e}")))?;
+        let frozen = daemon_vhc_proto::FrozenGenesis::open(wire.bytes, wire.signature, wire.signer)
+            .map_err(|e| VhcError::Discovery(format!("verify genesis envelope: {e}")))?;
+        let run_hash = *frozen.run_id();
+        let env = frozen
+            .decode()
+            .map_err(|e| VhcError::Discovery(format!("decode genesis: {e}")))?;
+        let trusted = daemon_vhc_proto::envelope_trusted_bases(&env);
+        let chains = daemon_vhc_proto::verify_chains(&run_hash, &trusted, heads).map_err(|e| {
+            VhcError::Discovery(format!("published archive heads do not verify: {e}"))
+        })?;
+        let seat_role = &self.config.seat_role;
+        if !chains.iter().any(|c| &c.role == seat_role) {
+            // Trainer chains may exist without a seat lineage (their custody is their own);
+            // with no seat history there is no reconstruction and no freshness claim.
+            return Ok(RecoveryResolution::default());
+        }
+        let lineage = daemon_vhc_proto::coordinator_lineage(&chains, seat_role)
+            .map_err(|e| VhcError::Discovery(format!("archive lineage cannot be ordered: {e}")))?;
+        let verified_head = daemon_vhc_proto::latest_round_claim(&lineage);
+        let reconstruct = (role == seat_role).then(|| protocol::CoordinatorRecovery {
+            heads: lineage
+                .iter()
+                .flat_map(|chain| chain.heads.iter().cloned())
+                .collect(),
+        });
+        if let Some(directive) = &reconstruct {
+            tracing::info!(
+                run = run_id,
+                chains = lineage.len(),
+                heads = directive.heads.len(),
+                round = verified_head,
+                "resolved coordinator reconstruction directive from the verified archive lineage"
+            );
+        }
+        Ok(RecoveryResolution {
+            reconstruct,
+            verified_head,
+        })
+    }
+}
+
+/// What [`VhcService::resolve_recovery`] resolved from the run's published archive heads: the
+/// seat-role reconstruction directive (a coordinator join only) and the latest VERIFIED
+/// committed-round claim across the seat lineage (every join's staleness evidence). Both empty =
+/// a fresh seat / no published history.
+#[derive(Default)]
+struct RecoveryResolution {
+    /// The reconstruction directive to ride the credentials (`None` = fresh seat, or not the
+    /// seat role).
+    reconstruct: Option<protocol::CoordinatorRecovery>,
+    /// The latest verified committed-round claim across the seat lineage's signed heads.
+    verified_head: Option<u64>,
+}
+
+/// The join's node-resolved RESUME inputs, authored into the credentials as one unit: the role's
+/// checkpoint restore pointer ([`VhcService::resolve_restore`]) and the §8.8 coordinator
+/// reconstruction directive ([`VhcService::resolve_recovery`]).
+struct JoinResume {
+    restore: Option<protocol::CheckpointRestore>,
+    reconstruct: Option<protocol::CoordinatorRecovery>,
 }
 
 /// Decode a 64-char lowercase-hex blake3 into a 32-byte array (`None` on any malformation).
@@ -3037,7 +3196,25 @@ impl VhcApi for VhcService {
         // certificate under the base identity, stamp the minted incarnation into the tuple, and
         // author the secrets-free plane-selection credentials (the token, if any, lands only in
         // the keystore record `credentials_ref` points at — never on the wire).
-        let restore = match self.resolve_restore(&run_id, &id.role).await {
+        // The recovery half of the join transaction (§8.8): the verified archive lineage — the
+        // reconstruction directive for a seat-role join with published history, and the
+        // verified head estimate the restore staleness judgment consumes.
+        let recovery = match self.resolve_recovery(&run_id, &id.role).await {
+            Ok(r) => r,
+            Err(e) => {
+                if existing.is_none() {
+                    self.arbiter.release(&id);
+                    if fresh_child {
+                        worker.shutdown().await;
+                    }
+                }
+                return Err(e.to_api());
+            }
+        };
+        let restore = match self
+            .resolve_restore(&run_id, &id.role, recovery.verified_head)
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
                 if existing.is_none() {
@@ -3057,7 +3234,10 @@ impl VhcApi for VhcService {
                 &coordinator,
                 &id,
                 assessed_tuple.clone(),
-                restore.clone(),
+                JoinResume {
+                    restore: restore.clone(),
+                    reconstruct: recovery.reconstruct.clone(),
+                },
                 seat.clone(),
             )
             .await
@@ -3088,8 +3268,18 @@ impl VhcApi for VhcService {
                 .await;
                 match restarted {
                     Ok(()) => {
-                        self.author_join(&run_id, &coordinator, &id, assessed_tuple, restore, seat)
-                            .await
+                        self.author_join(
+                            &run_id,
+                            &coordinator,
+                            &id,
+                            assessed_tuple,
+                            JoinResume {
+                                restore,
+                                reconstruct: recovery.reconstruct,
+                            },
+                            seat,
+                        )
+                        .await
                     }
                     Err(e) => Err(e),
                 }

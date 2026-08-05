@@ -570,6 +570,25 @@ impl RegistryClient {
         Ok(snapshot.entries)
     }
 
+    /// An [`crate::ArchiveHeadStore`] for `run` against this registry's base, carrying the same
+    /// credential (the node-side read of a run's published archive heads — coordinator crash
+    /// recovery + the `CheckpointStale` freshness judgment). The returned records are UNVERIFIED
+    /// registry state: the caller judges every one (`daemon_vhc_proto::verify_chains` against the
+    /// genesis-trusted bases) — the store stores, it never vouches.
+    #[must_use]
+    pub fn archive_head_store(&self, run: &RunId) -> crate::HttpArchiveHeadStore {
+        let store = crate::HttpArchiveHeadStore::new(
+            self.egress.clone(),
+            self.base_url.clone(),
+            run.clone(),
+        );
+        match &self.auth {
+            Auth::None => store,
+            Auth::Bearer(token) => store.with_bearer(token.clone()),
+            Auth::Internal { org_id, actor } => store.with_internal(org_id.clone(), actor.clone()),
+        }
+    }
+
     /// Issue one seat mutation (claim/renew) and map the frozen status contract: 2xx + `Accepted`
     /// ⇒ [`SeatClaimOutcome::Won`]; 409 + a decoded [`SeatMutationResponse`] ⇒
     /// [`SeatClaimOutcome::Lost`] with the refusal and the slot's current state; anything else is

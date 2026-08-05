@@ -88,6 +88,13 @@ daemon-vhc-node = { workspace = true }
 # estimate from an authenticated Backend Execution Profile — the one input a test cannot fabricate.
 # Dev-only by gate (`xtask vhc-dep-check` fails any production edge that enables it).
 daemon-vhc-resource = { workspace = true, features = ["test-support"] }
+# The Phase-4 archive-assembly gate runs the REAL per-seal archive publisher (an async task over
+# the fs archive-head + content stores). Test-only.
+tokio = { workspace = true }
+# The Phase-5 crash-restart drill (`tests/reconstruct_product.rs`) authors the crashed
+# coordinator's durable journal fixture and asserts its on-disk shape (sealed prefix + unsealed
+# tail) before reconstructing through the product executor. host/* -> host/* (allowed), test-only.
+daemon-vhc-journal = { workspace = true }
 # Test-only: the two v1-worker matrix combinations' `AbiUnsupportedMajor` refusal input is a synthetic
 # ABI-major-1 wasm image hand-assembled in `tests/matrix_combinations.rs` (no vendored/recorded bytes, no
 # soon-to-retire v1 guest crate) — the same `wasm-encoder` shape the host driver-selection tests

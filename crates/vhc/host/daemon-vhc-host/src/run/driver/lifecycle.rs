@@ -614,6 +614,15 @@ pub fn start_run_migrating(
                 // wake any egress waiter.
                 {
                     let mut st = shared.state.lock().expect("pump lock");
+                    // A chain-founding migration (late join / crash reconstruction) journals the
+                    // validated restore manifest as the new chain's anchoring tag-10 BEFORE any
+                    // event lands, so the successor chain is self-contained: replay and
+                    // reconstruction re-anchor here instead of walking predecessor-chain state
+                    // (§8.3/§8.8). The live switch never sets this — its seam continues the
+                    // retiring chain, which already carries the drain snapshot.
+                    if mig.anchor {
+                        st.sink.snapshot(&mig.capture.manifest)?;
+                    }
                     st.migrate_validated = true;
                     st.note_egress();
                 }

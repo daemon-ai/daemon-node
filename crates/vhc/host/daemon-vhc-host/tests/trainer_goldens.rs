@@ -1131,6 +1131,8 @@ fn trainer_checkpoint_restores_across_migration_with_digest_continuity() {
             restore: true,
             migrate_fuel: None,
             carried_state: Vec::new(),
+            // A from-capture restart founds its journal chain — the anchoring tag-10 lands.
+            anchor: true,
         }),
     )
     .expect("start migrating");

@@ -272,6 +272,8 @@ impl Coordinator {
                 restore: true,
                 migrate_fuel: None,
                 carried_state: Vec::new(),
+                // A from-capture (re)start founds its own journal chain — anchor it (§8.3/§8.8).
+                anchor: true,
             }),
         )
     }

@@ -37,11 +37,13 @@ pub use capture::RunCapture;
 pub use desync::{digest_tally, DesyncVerdict};
 pub use health::{RoundHealth, RunHealth};
 pub use journal::{
-    detect_fork, extract_consensus_capture, recover_chain_from_archive,
-    replay_consensus_from_archive, ArchiveError, AttestedHead, Body, ChainHead, ConsensusCapture,
+    assemble_archive, coordinator_lineage, detect_fork, envelope_trusted_bases,
+    extract_consensus_capture, recover_chain_from_archive, recover_chain_from_verified_heads,
+    replay_consensus_from_archive, replay_consensus_from_verified_archive, verify_chains,
+    ArchiveError, AssembleError, AssembleReport, AttestedHead, Body, ChainHead, ConsensusCapture,
     ConsensusReplayError, ConsensusReplayReport, ExecIdentity, ForkEvidence, Journal, JournalError,
     JournalPaths, Record, RecordArchive, RecoveredChain, ReplicationPolicy, RetentionPolicy,
-    RotatePolicy, SidecarError,
+    RotatePolicy, SidecarError, VerifiedChain,
 };
 pub use log::{MessageKind, MessageLog};
 // Re-exported so tooling (the `xtask vhc-replay` archive verdict) can judge an archive's attested

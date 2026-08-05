@@ -746,6 +746,287 @@ async fn join_refuses_a_checkpoint_too_stale_for_the_retained_horizon() {
     assert_eq!(worker.calls().joins, vec!["run-fresh".to_string()]);
 }
 
+/// The §8.8 recovery surface: one allowlisted run, a REAL frozen genesis (the trust root the
+/// heads verify against), a trainer restore pointer, NO coordinator pointer — the only head
+/// evidence is the signed archive lineage's committed-round claim.
+struct ArchiveHeadDiscovery {
+    envelope_wire: Vec<u8>,
+    heads: Vec<daemon_vhc_proto::ArchiveHeadRecord>,
+    trainer_round: u64,
+}
+
+#[async_trait]
+impl RunDiscovery for ArchiveHeadDiscovery {
+    async fn list_runs(&self) -> Result<Vec<DiscoveredRun>, VhcError> {
+        Ok(Vec::new())
+    }
+    async fn get_run(&self, run_id: &str) -> Result<Option<DiscoveredRun>, VhcError> {
+        Ok(Some(DiscoveredRun {
+            run_id: run_id.to_string(),
+            coordinator: "https://coord.example/api/v1/vhc".into(),
+            envelope_hash: "deadbeef".into(),
+            proto_version: 3,
+        }))
+    }
+    async fn fetch_envelope(&self, _run_id: &str) -> Result<Vec<u8>, VhcError> {
+        Ok(self.envelope_wire.clone())
+    }
+    async fn fetch_checkpoint(
+        &self,
+        _run_id: &str,
+        role: &str,
+    ) -> Result<Option<daemon_vhc_node::CheckpointPointer>, VhcError> {
+        if role != "trainer" {
+            return Ok(None); // no coordinator pointer — the archive claim is the only evidence
+        }
+        Ok(Some(daemon_vhc_node::CheckpointPointer {
+            role: role.to_string(),
+            kind: "live".into(),
+            round: self.trainer_round,
+            hash: "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262".into(),
+            size: 1024,
+        }))
+    }
+    async fn fetch_archive_heads(
+        &self,
+        _run_id: &str,
+    ) -> Result<Vec<daemon_vhc_proto::ArchiveHeadRecord>, VhcError> {
+        Ok(self.heads.clone())
+    }
+}
+
+/// A minimal VALID frozen genesis (coordinator + trainer roles, fixture execution requirements)
+/// whose coordinator identity is `base`'s peer id — the trust root [`ArchiveHeadDiscovery`]'s
+/// heads chain to. Returns the `SignedEnvelope` wire bytes and the run's cryptographic id.
+fn frozen_genesis_wire(base: &daemon_vhc_proto::SigningKey) -> (Vec<u8>, daemon_vhc_proto::Hash) {
+    use daemon_vhc_proto::{GenesisEnvelope, Identities, RoleEntry, RunSection, SnapshotArtifact};
+    use std::collections::BTreeMap;
+
+    let mut artifacts = BTreeMap::new();
+    artifacts.insert(
+        "coord.wasm".to_string(),
+        SnapshotArtifact {
+            url: "r2://mods/coord.wasm".into(),
+            blake3: daemon_vhc_proto::Hash([0xC0; 32]),
+            size: None,
+        },
+    );
+    artifacts.insert(
+        "trainer.wasm".to_string(),
+        SnapshotArtifact {
+            url: "r2://mods/trainer.wasm".into(),
+            blake3: daemon_vhc_proto::Hash([0x14; 32]),
+            size: None,
+        },
+    );
+    let role = |module: &str, lane: &str| RoleEntry {
+        lane: lane.into(),
+        module: module.into(),
+        abi: "vhc@2".into(),
+        config: ciborium::value::Value::Map(vec![]),
+        grants: daemon_vhc_proto::RoleGrants::default(),
+        device_min: daemon_vhc_proto::DeviceMinimums::default(),
+        execution: Some(
+            daemon_vhc_proto::RoleExecutionRequirements::fixture_over_trivial_plan(vec![
+                "cpu".to_string()
+            ]),
+        ),
+    };
+    let mut roles = BTreeMap::new();
+    roles.insert("coordinator".to_string(), role("coord.wasm", "coordinator"));
+    roles.insert("trainer".to_string(), role("trainer.wasm", "trainer"));
+    let env = GenesisEnvelope {
+        run: RunSection {
+            schema: daemon_vhc_proto::GENESIS_SCHEMA_MAJOR,
+            run_label: "recovery-drill".into(),
+            min_peers: 1,
+            max_peers: 8,
+            access: daemon_vhc_proto::envelope::Access::Org,
+        },
+        roles,
+        artifacts,
+        corpus_manifest: None,
+        state_contract: None,
+        authority: ciborium::value::Value::Map(vec![]),
+        transport: daemon_vhc_proto::TransportSelection::default(),
+        identities: Identities {
+            coordinator: Some(daemon_vhc_proto::peer_id(base)),
+            coordinator_set: Vec::new(),
+            upgrade_authority: Vec::new(),
+        },
+    };
+    let frozen = env.freeze(base).expect("genesis freezes");
+    let run_id = *frozen.run_id();
+    let wire = daemon_vhc_proto::SignedEnvelope {
+        bytes: frozen.bytes().to_vec(),
+        signature: *frozen.signature(),
+        signer: *frozen.signer(),
+    };
+    (
+        daemon_vhc_proto::to_canonical_vec(&wire).expect("wire encodes"),
+        run_id,
+    )
+}
+
+/// One base-certified coordinator archive head at chain height 0 carrying `round` as its
+/// committed-round freshness claim.
+fn coordinator_head(
+    base: &daemon_vhc_proto::SigningKey,
+    run_id: daemon_vhc_proto::Hash,
+    segment_hash: daemon_vhc_proto::Hash,
+    round: Option<u64>,
+) -> daemon_vhc_proto::ArchiveHeadRecord {
+    let run_key = daemon_vhc_proto::SigningKey::from_bytes(&[0x77; 32]);
+    let module = daemon_vhc_proto::Hash([0xC0; 32]);
+    let cert = daemon_vhc_proto::cert::RunKeyCertificate::issue(
+        base,
+        daemon_vhc_proto::cert::CertScope {
+            run_id,
+            epoch: 0,
+            role: "coordinator".into(),
+            instance: 1,
+            module_hash: module,
+        },
+        daemon_vhc_proto::peer_id(&run_key),
+    )
+    .expect("cert issues");
+    daemon_vhc_proto::ArchiveHeadRecord::publish(
+        &run_key,
+        cert,
+        daemon_vhc_proto::ArchiveHeadBody {
+            domain: daemon_vhc_proto::domains::ARCHIVE_HEAD_DOMAIN.to_string(),
+            run_id,
+            role: "coordinator".into(),
+            chain_instance: 1,
+            segment: 0,
+            segment_hash,
+            prev_hash: daemon_vhc_proto::Hash([0; 32]),
+            records: 8,
+            instance: 1,
+            epoch: 0,
+            module,
+            predecessor: None,
+            round,
+        },
+    )
+    .expect("head publishes")
+}
+
+/// **The stale-trainer refusal against the TRUE run head** (§8.8; plan phase 5): the registry's
+/// coordinator pointer is ABSENT, and the only head evidence is the committed-round claim on the
+/// seat lineage's SIGNED archive heads — certificate-chained to the genesis coordinator identity.
+/// A trainer whose restore fence is more than the retained horizon behind that verified claim is
+/// refused typed at join; a claim at the horizon boundary joins.
+#[tokio::test]
+async fn join_refuses_a_trainer_stale_against_the_verified_archive_head() {
+    let base = daemon_vhc_proto::SigningKey::from_bytes(&[0xB5; 32]);
+    let (wire, run_id) = frozen_genesis_wire(&base);
+    let config = VhcConfig {
+        coordinator_allowlist: vec!["https://coord.example/api/v1/vhc".into()],
+        ..enabled_config()
+    };
+    let horizon = daemon_vhc_proto::RETAINED_RECORD_HORIZON_ROUNDS;
+
+    // Fence 1 vs a verified claim of 1 + horizon + 1: beyond reach — refused typed.
+    let worker = FakeWorker::new();
+    let svc = VhcService::new(VhcServiceParts {
+        config: config.clone(),
+        store: VhcStore::open_in_memory().unwrap(),
+        worker: worker.clone(),
+        feed: None,
+        discovery: Some(Arc::new(ArchiveHeadDiscovery {
+            envelope_wire: wire.clone(),
+            heads: vec![coordinator_head(
+                &base,
+                run_id,
+                daemon_vhc_proto::Hash([0xAA; 32]),
+                Some(1 + horizon + 1),
+            )],
+            trainer_round: 1,
+        })),
+        budget: None,
+        worker_factory: None,
+        identity_dir: None,
+        seat_directory: None,
+    });
+    let err = svc
+        .vhc_join("run-archive-stale".into(), policy(), "op".into())
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("checkpoint too stale"),
+        "typed staleness refusal against the verified archive claim, got: {err}"
+    );
+    assert!(worker.calls().joins.is_empty(), "no join was issued");
+
+    // Fence 1 vs a claim exactly at the horizon boundary: reachable — the join proceeds.
+    let worker = FakeWorker::new();
+    let svc = VhcService::new(VhcServiceParts {
+        config,
+        store: VhcStore::open_in_memory().unwrap(),
+        worker: worker.clone(),
+        feed: None,
+        discovery: Some(Arc::new(ArchiveHeadDiscovery {
+            envelope_wire: wire,
+            heads: vec![coordinator_head(
+                &base,
+                run_id,
+                daemon_vhc_proto::Hash([0xAA; 32]),
+                Some(1 + horizon),
+            )],
+            trainer_round: 1,
+        })),
+        budget: None,
+        worker_factory: None,
+        identity_dir: None,
+        seat_directory: None,
+    });
+    svc.vhc_join("run-archive-fresh".into(), policy(), "op".into())
+        .await
+        .expect("a fence within the verified horizon joins");
+    assert_eq!(worker.calls().joins, vec!["run-archive-fresh".to_string()]);
+}
+
+/// **The node-side conflicting-head refusal** (§8.8 [AR-4]): two base-certified heads at the
+/// same chain height with different content addresses are fork evidence — the join fails CLOSED
+/// (typed discovery error), never a silent fresh boot past history that exists.
+#[tokio::test]
+async fn join_refuses_conflicting_archive_heads_typed() {
+    let base = daemon_vhc_proto::SigningKey::from_bytes(&[0xB5; 32]);
+    let (wire, run_id) = frozen_genesis_wire(&base);
+    let worker = FakeWorker::new();
+    let svc = VhcService::new(VhcServiceParts {
+        config: VhcConfig {
+            coordinator_allowlist: vec!["https://coord.example/api/v1/vhc".into()],
+            ..enabled_config()
+        },
+        store: VhcStore::open_in_memory().unwrap(),
+        worker: worker.clone(),
+        feed: None,
+        discovery: Some(Arc::new(ArchiveHeadDiscovery {
+            envelope_wire: wire,
+            heads: vec![
+                coordinator_head(&base, run_id, daemon_vhc_proto::Hash([0xAA; 32]), Some(2)),
+                coordinator_head(&base, run_id, daemon_vhc_proto::Hash([0xBB; 32]), Some(2)),
+            ],
+            trainer_round: 1,
+        })),
+        budget: None,
+        worker_factory: None,
+        identity_dir: None,
+        seat_directory: None,
+    });
+    let err = svc
+        .vhc_join("run-forked".into(), policy(), "op".into())
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("do not verify"),
+        "typed fork refusal, got: {err}"
+    );
+    assert!(worker.calls().joins.is_empty(), "no join was issued");
+}
+
 #[tokio::test]
 async fn checkpoint_pointers_are_role_and_kind_scoped() {
     let d = CheckpointDiscovery::default();

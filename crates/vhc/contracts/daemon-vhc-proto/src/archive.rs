@@ -83,6 +83,17 @@ pub struct ArchiveHeadBody {
     /// first chain for this `(role, base)` and on every segment above 0.
     #[serde(default)]
     pub predecessor: Option<Hash>,
+    /// The **freshness claim**: the highest round the sealing span had COMMITTED (its own
+    /// module's `round_metrics` outcome) when this segment sealed. `None` when no round had
+    /// committed yet on this chain (and on heads published before the claim existed —
+    /// `skip_serializing_if` keeps the `None` encoding byte-identical to the pre-claim wire
+    /// form, so old signatures and predecessor content addresses stay valid).
+    ///
+    /// This is what a joiner's staleness judgment (`CheckpointStale`) compares against: the
+    /// latest verified committed round of the coordinator lineage — signed, certificate-chained
+    /// evidence, never registry metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub round: Option<u64>,
 }
 
 /// An archive head record: the signed [`ArchiveHeadBody`], the publisher per-run key's
@@ -396,6 +407,229 @@ impl ArchiveChainSlot {
     }
 }
 
+// -- the reader-side chain verification (shared by every verifier) --------------------------------
+//
+// The assembler (`daemon-vhc-observe`), the replay reader (`xtask vhc-replay`), the node's join
+// transaction, and the worker's reconstruction executor all make the SAME judgment over a
+// published head snapshot: authorize every record against the genesis-trusted bases, group by
+// chain scope, re-fold each chain structurally, and (for recovery) order the role's chains
+// founding-first by succession links. That judgment lives here — in the wire-contract crate —
+// so production hosts never link the oracle tooling to make it (ABI §12.5 [OWN-3]).
+
+/// One verified chain: its ordered head records and their content addresses. Produced by
+/// [`verify_chains`]; consumed by the assembler, the replay reader, the node's recovery
+/// resolution, and the worker's reconstruction executor.
+#[derive(Clone, Debug)]
+pub struct VerifiedChain {
+    /// The chain's role label.
+    pub role: String,
+    /// The chain scope's base identity (the certificate issuer).
+    pub base: PeerId,
+    /// The chain-scope instance (the founding incarnation).
+    pub chain_instance: u64,
+    /// The chain's head records, segment order (dense from 0 — the fold enforced it).
+    pub heads: Vec<ArchiveHeadRecord>,
+    /// The founding head's `predecessor` (a prior chain's terminal head content address).
+    pub predecessor: Option<Hash>,
+    /// The terminal (highest-segment) head's own content address.
+    pub terminal_address: Hash,
+}
+
+/// Why a head snapshot failed reader-side verification (typed; a snapshot that does not verify
+/// is never partially trusted).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ChainVerifyError {
+    /// A published head failed reader-side authorization (ABI §8.8 \[AR-4\]) or names a
+    /// different run.
+    Unauthorized {
+        /// The head's role label.
+        role: String,
+        /// The head's chain height.
+        segment: u64,
+        /// The typed refusal.
+        detail: String,
+    },
+    /// A chain's snapshot does not re-fold densely (corrupt or forked archive slots).
+    ChainFold {
+        /// The chain key `role/base-hex/instance`.
+        key: String,
+        /// The fold refusal.
+        detail: String,
+    },
+    /// The recovery lineage cannot be ordered (missing founding chain, broken or ambiguous
+    /// succession links).
+    Lineage(String),
+    /// A head record does not re-encode canonically (content addressing failed).
+    Codec(String),
+}
+
+impl core::fmt::Display for ChainVerifyError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Unauthorized {
+                role,
+                segment,
+                detail,
+            } => write!(f, "head (role {role}, segment {segment}) refused: {detail}"),
+            Self::ChainFold { key, detail } => write!(f, "chain {key} does not fold: {detail}"),
+            Self::Lineage(detail) => write!(f, "chain lineage: {detail}"),
+            Self::Codec(detail) => write!(f, "record encode: {detail}"),
+        }
+    }
+}
+
+impl std::error::Error for ChainVerifyError {}
+
+fn chain_key_str(role: &str, base: &PeerId, instance: u64) -> String {
+    format!("{role}/{}/{instance}", base.to_hex())
+}
+
+/// Authorize every head record against the genesis-trusted bases (ABI §8.8 \[AR-4\]), group by
+/// chain scope, and re-fold every chain through the normative structural fold — the reader-side
+/// verification every consumer of a head snapshot runs.
+///
+/// # Errors
+/// [`ChainVerifyError::Unauthorized`] / [`ChainVerifyError::ChainFold`].
+pub fn verify_chains(
+    run_id: &Hash,
+    trusted: &[PeerId],
+    records: Vec<ArchiveHeadRecord>,
+) -> Result<Vec<VerifiedChain>, ChainVerifyError> {
+    let mut by_chain: std::collections::BTreeMap<(String, PeerId, u64), Vec<ArchiveHeadRecord>> =
+        std::collections::BTreeMap::new();
+    for record in records {
+        if record.body.run_id != *run_id {
+            return Err(ChainVerifyError::Unauthorized {
+                role: record.body.role.clone(),
+                segment: record.body.segment,
+                detail: "head names a different run".into(),
+            });
+        }
+        record
+            .authorize(trusted)
+            .map_err(|e| ChainVerifyError::Unauthorized {
+                role: record.body.role.clone(),
+                segment: record.body.segment,
+                detail: e.to_string(),
+            })?;
+        by_chain.entry(record.chain_key()).or_default().push(record);
+    }
+
+    let mut chains: Vec<VerifiedChain> = Vec::new();
+    for ((role, base, instance), mut heads) in by_chain {
+        heads.sort_by_key(|r| r.body.segment);
+        let key = chain_key_str(&role, &base, instance);
+        let mut slot = ArchiveChainSlot::new();
+        for head in &heads {
+            match slot.fold(head.clone()) {
+                ArchiveHeadDecision::Accepted | ArchiveHeadDecision::AlreadyStored => {}
+                refused => {
+                    return Err(ChainVerifyError::ChainFold {
+                        key,
+                        detail: format!("{refused:?}"),
+                    })
+                }
+            }
+        }
+        let predecessor = heads.first().and_then(|h| h.body.predecessor);
+        let terminal_address = heads
+            .last()
+            .ok_or_else(|| ChainVerifyError::ChainFold {
+                key: key.clone(),
+                detail: "empty chain slot".into(),
+            })?
+            .content_address()
+            .map_err(|e| ChainVerifyError::Codec(e.to_string()))?;
+        chains.push(VerifiedChain {
+            role,
+            base,
+            chain_instance: instance,
+            heads,
+            predecessor,
+            terminal_address,
+        });
+    }
+    Ok(chains)
+}
+
+/// Order one role's chains founding-first by their succession links (ABI §8.8 \[AR-1\]: a
+/// successor chain's founding head names the predecessor chain's terminal head by content
+/// address). The recovery walk: the coordinator lineage for reconstruction and replay, a
+/// trainer's own lineage for its journal custody.
+///
+/// # Errors
+/// [`ChainVerifyError::Lineage`] on a missing founding chain or broken/ambiguous links.
+pub fn coordinator_lineage<'a>(
+    chains: &'a [VerifiedChain],
+    role: &str,
+) -> Result<Vec<&'a VerifiedChain>, ChainVerifyError> {
+    let of_role: Vec<&VerifiedChain> = chains.iter().filter(|c| c.role == role).collect();
+    if of_role.is_empty() {
+        return Err(ChainVerifyError::Lineage(format!(
+            "no {role}-role chains in the snapshot"
+        )));
+    }
+    let founding: Vec<&&VerifiedChain> =
+        of_role.iter().filter(|c| c.predecessor.is_none()).collect();
+    let [start] = founding.as_slice() else {
+        return Err(ChainVerifyError::Lineage(format!(
+            "expected exactly one founding {role} chain, found {}",
+            founding.len()
+        )));
+    };
+    let mut by_predecessor: std::collections::BTreeMap<Hash, &VerifiedChain> =
+        std::collections::BTreeMap::new();
+    for chain in &of_role {
+        if let Some(pred) = chain.predecessor {
+            if by_predecessor.insert(pred, chain).is_some() {
+                return Err(ChainVerifyError::Lineage(format!(
+                    "two {role} chains name the same predecessor {}",
+                    pred.to_hex()
+                )));
+            }
+        }
+    }
+    let mut lineage: Vec<&VerifiedChain> = vec![start];
+    let mut cursor = *start;
+    while let Some(next) = by_predecessor.get(&cursor.terminal_address) {
+        lineage.push(next);
+        cursor = next;
+    }
+    if lineage.len() != of_role.len() {
+        return Err(ChainVerifyError::Lineage(format!(
+            "{} {role} chain(s) do not link into the lineage",
+            of_role.len() - lineage.len()
+        )));
+    }
+    Ok(lineage)
+}
+
+/// The lineage's freshness statement: the highest [`ArchiveHeadBody::round`] claim across the
+/// verified chains, or `None` when no head carries one. This — signed, certificate-chained
+/// evidence from the run's own archive — is the head estimate a joiner's staleness judgment
+/// uses, never registry metadata.
+#[must_use]
+pub fn latest_round_claim(lineage: &[&VerifiedChain]) -> Option<u64> {
+    lineage
+        .iter()
+        .flat_map(|c| c.heads.iter())
+        .filter_map(|h| h.body.round)
+        .max()
+}
+
+/// The genesis-trusted base identities a reader authorizes archive heads against: the envelope's
+/// `identities.coordinator_set` plus `identities.coordinator` (ABI §8.8 \[AR-4\]).
+#[must_use]
+pub fn envelope_trusted_bases(envelope: &crate::genesis::GenesisEnvelope) -> Vec<PeerId> {
+    let mut trusted: Vec<PeerId> = envelope.identities.coordinator_set.clone();
+    if let Some(coord) = envelope.identities.coordinator {
+        if !trusted.contains(&coord) {
+            trusted.push(coord);
+        }
+    }
+    trusted
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -438,6 +672,7 @@ mod tests {
             epoch: 0,
             module: Hash([0x2A; 32]),
             predecessor: None,
+            round: None,
         }
     }
 

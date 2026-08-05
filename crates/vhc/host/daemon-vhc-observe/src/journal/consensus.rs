@@ -207,15 +207,47 @@ pub fn recover_chain_from_archive(
     archive: &RecordArchive,
     heads: &[AttestedHead],
 ) -> Result<RecoveredChain, ConsensusReplayError> {
-    let mut by_segment: BTreeMap<u64, &AttestedHead> = BTreeMap::new();
+    let mut by_segment: BTreeMap<u64, &super::archive::ChainHead> = BTreeMap::new();
     for head in heads {
         if !archive.head_is_authoritative(head) {
             return Err(ConsensusReplayError::Unauthoritative {
                 segment: head.body.segment,
             });
         }
-        by_segment.insert(head.body.segment, head);
+        by_segment.insert(head.body.segment, &head.body);
     }
+    walk_verified_chain(archive, &by_segment)
+}
+
+/// [`recover_chain_from_archive`] for heads whose authority the CALLER has already established —
+/// the ABI §8.8 product path, where a head is an `ArchiveHeadRecord` verified through
+/// `daemon_vhc_proto::archive::ArchiveHeadRecord::authorize` (per-run key + certificate chain to
+/// a genesis-trusted base) rather than an `AttestedHead` under the genesis `AuthorityConfig`.
+/// This function judges NOTHING about authority; it performs the structural walk only (chain
+/// contiguity, content re-hash, seal + scan). Passing unverified heads here forfeits the oracle's
+/// authenticity claim.
+///
+/// # Errors
+/// A typed [`ConsensusReplayError`] on a broken chain, a missing or content-mismatched segment,
+/// or an unscannable segment.
+pub fn recover_chain_from_verified_heads(
+    archive: &RecordArchive,
+    heads: &[super::archive::ChainHead],
+) -> Result<RecoveredChain, ConsensusReplayError> {
+    let mut by_segment: BTreeMap<u64, &super::archive::ChainHead> = BTreeMap::new();
+    for head in heads {
+        by_segment.insert(head.segment, head);
+    }
+    walk_verified_chain(archive, &by_segment)
+}
+
+/// The shared structural chain walk (steps 1–2 of the module contract, authority already
+/// judged): dense ordinals from 0, `prev_hash` linkage, content re-hash, sealed-scan, record
+/// recovery.
+fn walk_verified_chain(
+    archive: &RecordArchive,
+    by_segment: &BTreeMap<u64, &super::archive::ChainHead>,
+) -> Result<RecoveredChain, ConsensusReplayError> {
     let count = by_segment.len() as u64;
     let mut prev_hash: Option<Hash> = None;
     let mut records: Vec<Record> = Vec::new();
@@ -227,7 +259,7 @@ pub fn recover_chain_from_archive(
                 detail: "no authoritative head at this ordinal".into(),
             })?;
         if let Some(prev) = prev_hash {
-            if head.body.prev_hash != prev {
+            if head.prev_hash != prev {
                 return Err(ConsensusReplayError::ChainBroken {
                     segment,
                     detail: "prev_hash does not extend the previous head".into(),
@@ -236,13 +268,13 @@ pub fn recover_chain_from_archive(
         }
         let bytes =
             archive
-                .fetch(&head.body.segment_hash)
+                .fetch(&head.segment_hash)
                 .ok_or(ConsensusReplayError::MissingSegment {
                     segment,
-                    hash: head.body.segment_hash,
+                    hash: head.segment_hash,
                 })?;
         // A third party re-hashes what it fetched — the store is untrusted.
-        if blake3_hash(bytes) != head.body.segment_hash {
+        if blake3_hash(bytes) != head.segment_hash {
             return Err(ConsensusReplayError::ContentMismatch { segment });
         }
         let scan = scan_bytes(bytes).map_err(|e| ConsensusReplayError::BadSegment {
@@ -260,7 +292,7 @@ pub fn recover_chain_from_archive(
                 records.push(record);
             }
         }
-        prev_hash = Some(head.body.segment_hash);
+        prev_hash = Some(head.segment_hash);
     }
     Ok(RecoveredChain {
         segments_verified: count,
@@ -281,8 +313,32 @@ pub fn replay_consensus_from_archive(
     heads: &[AttestedHead],
     payloads: &BTreeMap<Hash, Vec<u8>>,
 ) -> Result<ConsensusReplayReport, ConsensusReplayError> {
-    // -- 1./2. chain walk + record recovery, from the archive alone ------------------------------
     let chain = recover_chain_from_archive(archive, heads)?;
+    replay_consensus_over_chain(sandbox, chain, payloads)
+}
+
+/// [`replay_consensus_from_archive`] for heads the CALLER already authorized (the ABI §8.8
+/// product path — see [`recover_chain_from_verified_heads`] for the trust contract).
+///
+/// # Errors
+/// A typed [`ConsensusReplayError`]; an incomplete verification is never a pass.
+pub fn replay_consensus_from_verified_archive(
+    sandbox: &dyn CoordinatorSandbox,
+    archive: &RecordArchive,
+    heads: &[super::archive::ChainHead],
+    payloads: &BTreeMap<Hash, Vec<u8>>,
+) -> Result<ConsensusReplayReport, ConsensusReplayError> {
+    let chain = recover_chain_from_verified_heads(archive, heads)?;
+    replay_consensus_over_chain(sandbox, chain, payloads)
+}
+
+/// Steps 3–4 over an already-recovered chain: sandboxed re-derivation + digest re-verification
+/// from the payloads alone.
+fn replay_consensus_over_chain(
+    sandbox: &dyn CoordinatorSandbox,
+    chain: RecoveredChain,
+    payloads: &BTreeMap<Hash, Vec<u8>>,
+) -> Result<ConsensusReplayReport, ConsensusReplayError> {
     let count = chain.segments_verified;
     let records_recovered = chain.records.len() as u64;
     let capture = extract_consensus_capture(&chain.records)?;

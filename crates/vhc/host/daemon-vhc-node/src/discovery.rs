@@ -116,6 +116,19 @@ pub trait RunDiscovery: Send + Sync {
         let _ = run_id;
         Ok(Vec::new())
     }
+
+    /// Fetch the run's stored archive-head records (`GET {base}/runs/:id/archive/heads`) —
+    /// UNVERIFIED registry state: the caller judges every record
+    /// (`daemon_vhc_proto::verify_chains` against the genesis-trusted bases) before trusting a
+    /// lineage or a round claim. Default empty (no registry state), so fakes/offline nodes need
+    /// not implement it.
+    async fn fetch_archive_heads(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<daemon_vhc_proto::ArchiveHeadRecord>, VhcError> {
+        let _ = run_id;
+        Ok(Vec::new())
+    }
 }
 
 /// The role-scoped restore preference (spec §9): the freshest `live` pointer, else the freshest
@@ -277,6 +290,18 @@ impl RunDiscovery for EgressRunDiscovery {
     ) -> Result<Vec<daemon_vhc_proto::RosterRecord>, VhcError> {
         self.registry
             .fetch_roster(&RunId::new(run_id))
+            .await
+            .map_err(|e| VhcError::Discovery(e.to_string()))
+    }
+
+    async fn fetch_archive_heads(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<daemon_vhc_proto::ArchiveHeadRecord>, VhcError> {
+        use daemon_vhc_net::ArchiveHeadStore as _;
+        self.registry
+            .archive_head_store(&RunId::new(run_id))
+            .fetch_heads()
             .await
             .map_err(|e| VhcError::Discovery(e.to_string()))
     }

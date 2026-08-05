@@ -200,6 +200,49 @@ async fn join_live(
                 migrate_fuel: None,
                 // A content-plane late-join restore (checkpoint document from the payload plane).
                 carried_state: Vec::new(),
+                // The restore founds a fresh journal chain — journal its anchoring tag-10.
+                anchor: true,
+            })
+        }
+    };
+    // Coordinator crash reconstruction (§8.8): a recovery directive means the seat has PUBLISHED
+    // journal history — rebuild its consensus state through the sandbox BEFORE the session spawns
+    // (RoleReady is reported only after the migrate step accepts the reconstructed capture). The
+    // worker re-verifies the carried heads against the genesis trust itself (carriage, not
+    // trust), and a reconstruction that fails refuses the join typed — a seat with a durable
+    // record that silently started fresh would fork the run behind its own history.
+    let restore = match &creds.reconstruct {
+        None => restore,
+        Some(recovery) => {
+            let capture = daemon_vhc_session::reconstruct::reconstruct_coordinator(
+                daemon_vhc_session::reconstruct::ReconstructSpec {
+                    heads: recovery.heads.clone(),
+                    run_id: daemon_vhc_proto::Hash(genesis_hash),
+                    trusted: binding.trusted_bases.clone(),
+                    role: binding.run.identity.role.clone(),
+                    run_label: run_id.to_string(),
+                    journal_root: daemon_vhc_session::journal_home::run_dir_from_env(),
+                    module: resolved.module.clone(),
+                    config: binding.run.config.clone(),
+                    grants: binding.run.grants.clone(),
+                    incarnation,
+                    restore: restore.map(|m| m.capture),
+                    // The export's quiesce ceiling: a reconstruction drains a full replay's
+                    // state, so it gets a generous fixed budget (independent of the session's
+                    // leave-drain deadline).
+                    deadline_ms: 60_000,
+                },
+                providers.payloads.clone(),
+            )
+            .await
+            .map_err(|e| format!("coordinator reconstruction: {e}"))?;
+            Some(daemon_vhc_host::run::MigrationInput {
+                capture,
+                restore: true,
+                migrate_fuel: None,
+                carried_state: Vec::new(),
+                // The reconstruction founds a fresh journal chain — journal its anchoring tag-10.
+                anchor: true,
             })
         }
     };
@@ -265,6 +308,7 @@ fn journal_sink(
         seals,
         journal_dir: dir,
         chain_instance: sink.founding_instance(),
+        round_claim: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
     };
     Ok((Box::new(sink), Some(archive)))
 }
