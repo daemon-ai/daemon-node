@@ -134,6 +134,16 @@ None of these blocks C0 or C1.
     agreement restored the next round. Graceful leave/rejoin → drain correctly declined to
     mint mid-round (QuiesceDeadlineExceeded), rejoin restored the role-scoped round-3
     pointer, digest agreement restored — the exact sequence that killed run-i now recovers.
+  - run-k epilogue (after the drills): a host disk-full incident killed both host
+    instances typed (`journal io error: No space left on device` → `FailedTerminal`);
+    recovery re-committed rounds and passed the pre-crash head, but exposed live evidence
+    for the named pre-C2 gaps — no coordinator det-state reconstruction (fresh seat,
+    operator-cycled trainer realignment), a post-churn deaf-coordinator wedge (zero
+    inbound frames while both planes reconnect healthily; second sighting after run-i),
+    and the ENOSPC trainer trap misclassified `BadModule`. Stale seat grants from the
+    dead generation were correctly refused by the `SeatTermLedger` floors throughout.
+    The run was ended by operator leave after the head advanced; full defect ledger in
+    the run-k `VERDICT.md`.
   - Evidence: `~/experiments/ceremony-artifacts/c1-20260728/archive/run-{h,i,j,k}/` (each
     with `VERDICT.md`); run-h/run-i are the defect fixtures, run-j/run-k the green runs.
 - Doctrine, provisioning, probes, and geometry are unchanged from the 2026-07-28 boundary
