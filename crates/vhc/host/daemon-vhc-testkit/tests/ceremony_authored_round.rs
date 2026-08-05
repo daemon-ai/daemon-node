@@ -155,6 +155,55 @@ fn uint_field(config: &Value, name: &str) -> u64 {
     .expect("a non-negative field")
 }
 
+/// D-SF3 AUTHORED == CONSUMED: the checkpoint cadence the fleet authoring validated against
+/// payload retention is the cadence the trainer guest actually decodes.
+///
+/// The defect this pins against: `remote_ckpt_cadence_rounds` was validated at authoring
+/// (`validate_checkpoint_cadence`) and REPORTED as the run's policy, but never placed into the
+/// trainer config — so every fleet guest fell back to its `#[serde(default)] = 0` and uploaded
+/// at every local boundary. The policy that ran was not the policy that was authored, and no
+/// gate observed the difference (G-4 was adjudicated against the authored value).
+///
+/// Two halves, both load-bearing:
+/// - the fleet form's `live` section carries `remote_ckpt_every` at the spec's value, under the
+///   exact field name the guest's `LiveCfg` schema deserializes;
+/// - the harness form (the module-assessment input, whose derived plan hash keys the fit
+///   verdicts) stays cadence-free — publication policy must never move the fit-probe key.
+#[test]
+fn the_authored_checkpoint_cadence_reaches_the_trainer_config() {
+    use daemon_vhc_testkit::ceremony::ceremony_trainer_config_harness;
+
+    let keys: Vec<SigningKey> = (0..FLEET_PEERS).map(fleet_key).collect();
+    let roster: Vec<PeerId> = keys.iter().map(peer_id).collect();
+    // The module identity does not participate in this seam; stand-in bytes are hashed the same
+    // way the real blob would be.
+    let frozen = author_fleet_genesis(b"cadence-wiring-stand-in", &roster);
+    let env = frozen.decode().expect("decode the fleet genesis");
+
+    let trainer_config = &env.roles.get("trainer").expect("trainer role").config;
+    let live = field(trainer_config, "live");
+    assert_eq!(
+        uint_field(&live, "remote_ckpt_every"),
+        8,
+        "the guest consumes the cadence the authoring validated (spec cadence 8), not its \
+         serde default of 0 (upload at every boundary)",
+    );
+
+    // The assessment input is the harness form; the cadence rides only the `live` half, so the
+    // plan the fit verdicts are keyed on cannot move with a cadence change.
+    let harness = ceremony_trainer_config_harness(&roster);
+    let Value::Map(entries) = &harness else {
+        panic!("the harness form is a map");
+    };
+    assert!(
+        !entries
+            .iter()
+            .any(|(k, _)| matches!(k, Value::Text(t) if t == "live")),
+        "the harness (assessment) form carries no live section — publication policy stays out \
+         of the fit-probe key",
+    );
+}
+
 #[test]
 fn the_fleet_authoring_opens_a_round_its_own_trainer_config_can_plan() {
     let coordinator_wasm = daemon_vhc_guest_build::guest_wasm("coordinator_quorum");

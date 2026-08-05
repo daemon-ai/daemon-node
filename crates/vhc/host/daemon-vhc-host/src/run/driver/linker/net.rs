@@ -234,15 +234,14 @@ pub(super) fn link(linker: &mut Linker<Host>) -> Result<(), wasmtime::Error> {
                 let frame = build_signed_frame(c.data(), u64::from(channel_id), seq, &payload)?;
                 st.sink
                     .publish(u64::from(channel_id), seq, &payload, &frame)
-                    .map_err(|e| Trap::bare(TrapCode::BadModule, e.to_string()))?;
+                    .map_err(Trap::from)?;
                 st.published.push((u64::from(channel_id), seq, frame));
                 st.note_egress();
                 // A registered stop cut (§4.4): the run is complete AT this publish — enqueue the
                 // Stop in the same critical section, so nothing else can enter the stream first.
                 if let Some((n, reason)) = st.stop_cut {
                     if st.published.len() >= n {
-                        st.enqueue_stop(reason)
-                            .map_err(|e| Trap::bare(TrapCode::BadModule, e.to_string()))?;
+                        st.enqueue_stop(reason).map_err(Trap::from)?;
                     }
                 }
                 Ok(seq)

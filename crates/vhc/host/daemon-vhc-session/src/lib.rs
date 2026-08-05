@@ -114,6 +114,9 @@ pub use backend::{
 };
 #[cfg(any(test, feature = "harness"))]
 pub use checkpoint::{CheckpointManifest, ReplayStep};
+/// The portable free-disk probe, surfaced for the node's interim storage gate (the node
+/// deliberately does not link the host runtime crate; this session crate already does).
+pub use daemon_vhc_host::probe::host_disk_free_mb;
 #[cfg(any(test, feature = "harness"))]
 pub use data::{
     BatchInterval, BatchLocation, Corpus, DataError, InnerStep, Manifest, MicroBatch, ShardDesc,

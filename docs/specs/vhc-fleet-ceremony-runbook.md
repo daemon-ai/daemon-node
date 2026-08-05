@@ -405,6 +405,14 @@ keys:
    authority, `--min-peers 3 --max-peers 3`, `--ckpt-cadence 8 --payload-retention 64`,
    `--stop-rounds 48`, and timers from the smoke calibration (round-max ≈ 3× the slowest measured
    wall; warmup generous). Review `authoring-report.txt`; the human ratifies it before seeding.
+   **Cadence wiring check:** `--ckpt-cadence` must land in the trainer role's `live` config as
+   `remote_ckpt_every` (ABI §12.14 [SF-6] wiring note) — a validated-but-unwired cadence silently
+   runs the guest's serde default of 0 (upload at every boundary), so the G-4 gate would never
+   exercise the authored policy. The authoring path wires it since the Phase-1 cadence fix
+   (regression: `ceremony_authored_round.rs::the_authored_checkpoint_cadence_reaches_the_trainer_config`);
+   confirm the value in `authoring-report.txt` alongside the other pins. The harness/assessment
+   config form stays `live`-free, so the cadence never moves the fit-probe key (no re-probe on a
+   cadence-only change — but the envelope bytes and hence the RUN ID always change).
 2. **Verify locally:** the tool re-opens the frozen envelope (re-derives the hash + verifies the
    signature) and reproduces the expected root before writing the artifacts.
 3. **Seed:** `VHC_BASE=<dev base> VHC_ENVELOPE_B64=$(cat <out>/envelope.b64) node

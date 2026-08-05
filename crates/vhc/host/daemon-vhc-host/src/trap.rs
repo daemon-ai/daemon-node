@@ -86,6 +86,17 @@ pub enum TrapCode {
     /// A `state_seal` on a stream whose emitted bytes ≠ its declared `byte_len` (ABI §12.14
     /// [SF-4]): the stream stays open (complete and retry); nothing was made durable.
     StateIncompleteSeal,
+    /// The HOST's durable-storage substrate is out of capacity (ENOSPC / quota exceeded) on a
+    /// load-bearing write (journal barrier, spill, payload staging). A HOST fault, never a
+    /// module defect: the module did nothing wrong and a fresh instance hits the same wall.
+    /// Recoverable — but only once capacity returns (the session classifies it storage-gated;
+    /// the node redispatches only after a free-space check passes, ABI §3.6).
+    HostStorageExhausted,
+    /// The HOST's durable-storage substrate failed for a NON-capacity reason on a load-bearing
+    /// write: permission denied, corruption, device error. A HOST fault, never a module defect —
+    /// and terminal for this node until an operator repairs the substrate (freeing space cannot;
+    /// distinct from [`Self::HostStorageExhausted`] for exactly that reason).
+    HostStorageFailed,
 }
 
 impl TrapCode {
@@ -123,6 +134,8 @@ impl TrapCode {
             Self::ComputeFault => "ComputeFault",
             Self::StateMisframedEmit => "StateMisframedEmit",
             Self::StateIncompleteSeal => "StateIncompleteSeal",
+            Self::HostStorageExhausted => "HostStorageExhausted",
+            Self::HostStorageFailed => "HostStorageFailed",
         }
     }
 }
@@ -228,6 +241,8 @@ mod tests {
             TrapCode::ComputeFault,
             TrapCode::StateMisframedEmit,
             TrapCode::StateIncompleteSeal,
+            TrapCode::HostStorageExhausted,
+            TrapCode::HostStorageFailed,
         ];
         let mut slugs: Vec<&str> = codes.iter().map(|c| c.slug()).collect();
         slugs.sort_unstable();

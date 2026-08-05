@@ -189,6 +189,10 @@ pub struct PersistedRun {
     pub running_since_ms: Option<i64>,
     /// The typed reason recorded with a terminal transition (operator-facing detail).
     pub terminal_reason: Option<String>,
+    /// The storage gate (M8): the last terminal was `HostStorageExhausted`, so the reconcile
+    /// loop redispatches this `failed_retryable` row only after the free-space check passes —
+    /// and a gated wait never consumes the retry budget.
+    pub storage_gated: bool,
 }
 
 /// A `vhc.db` error.
@@ -353,6 +357,15 @@ CREATE TABLE IF NOT EXISTS vhc_seat_terms (
 );
 ";
 
+/// M8: the **storage gate** flag (the typed storage taxonomy, ABI §12.10): set when an instance
+/// terminated `HostStorageExhausted` (ENOSPC/quota — a host capacity condition, never a module
+/// fault). A gated `failed_retryable` row is redispatched by the reconcile loop only once the
+/// node-state filesystem's free-space check passes, and a gated wait never consumes the retry
+/// budget. Interim mechanism until the disk custodian owns resume authorization. Append-only.
+const M8_STORAGE_GATE: &str = "\
+ALTER TABLE vhc_runs ADD COLUMN storage_gated INTEGER NOT NULL DEFAULT 0;
+";
+
 fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
         M::up(SCHEMA),
@@ -362,6 +375,7 @@ fn migrations() -> Migrations<'static> {
         M::up(M5_RUN_LIFECYCLE),
         M::up(M6_UPGRADE_RECORDS),
         M::up(M7_SEAT_TERMS),
+        M::up(M8_STORAGE_GATE),
     ])
 }
 
@@ -371,7 +385,8 @@ fn migrations() -> Migrations<'static> {
 const RUN_COLUMNS: &str = "run_id, coordinator, policy_json, desired_state, credentials_ref, \
      eligibility_json, last_phase, last_round, run_id_hash, epoch, role, instance, \
      envelope_schema_major, module_abi_major, selected_driver, module_hash, admitted_tuple, \
-     run_state, pending_run_state, retry_count, next_retry_ms, running_since_ms, terminal_reason";
+     run_state, pending_run_state, retry_count, next_retry_ms, running_since_ms, terminal_reason, \
+     storage_gated";
 
 fn hex_of(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
@@ -466,7 +481,8 @@ impl VhcStore {
                 retry_count       = 0,
                 next_retry_ms     = NULL,
                 running_since_ms  = excluded.updated_ms,
-                terminal_reason   = NULL",
+                terminal_reason   = NULL,
+                storage_gated     = 0",
             params![
                 run_id,
                 coordinator,
@@ -671,6 +687,27 @@ impl VhcStore {
             "UPDATE vhc_runs SET run_state = 'running', pending_run_state = NULL, \
              next_retry_ms = NULL, running_since_ms = ?2, updated_ms = ?2 WHERE run_id = ?1",
             params![run_id, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// Set / clear the storage gate (M8): a `HostStorageExhausted` terminal sets it; a passed
+    /// free-space check (or an explicit owner join) clears it. Idempotent.
+    pub fn set_storage_gated(&self, run_id: &str, gated: bool) -> Result<(), StoreError> {
+        self.lock().execute(
+            "UPDATE vhc_runs SET storage_gated = ?2, updated_ms = ?3 WHERE run_id = ?1",
+            params![run_id, i64::from(gated), now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// Reschedule the next reconvergence check WITHOUT consuming budget — the storage-gated
+    /// deferral: the disk being full is a capacity condition to wait out, so deferring the
+    /// redispatch must not count as a failed attempt ([`Self::bump_retry`] does).
+    pub fn defer_retry(&self, run_id: &str, next_retry_ms: i64) -> Result<(), StoreError> {
+        self.lock().execute(
+            "UPDATE vhc_runs SET next_retry_ms = ?2, updated_ms = ?3 WHERE run_id = ?1",
+            params![run_id, next_retry_ms, now_ms()],
         )?;
         Ok(())
     }
@@ -1100,6 +1137,7 @@ fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<PersistedRun, 
     let next_retry_ms: Option<i64> = row.get(20)?;
     let running_since_ms: Option<i64> = row.get(21)?;
     let terminal_reason: Option<String> = row.get(22)?;
+    let storage_gated: i64 = row.get(23)?;
     Ok((|| {
         Ok(PersistedRun {
             run_id,
@@ -1125,6 +1163,7 @@ fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<PersistedRun, 
             next_retry_ms,
             running_since_ms,
             terminal_reason,
+            storage_gated: storage_gated != 0,
         })
     })())
 }
@@ -1508,6 +1547,55 @@ mod tests {
             1
         );
         assert_eq!(store.get_run("run-R").unwrap().unwrap().retry_count, 0);
+    }
+
+    /// M8 storage-gate bookkeeping: the gate round-trips durably, `defer_retry` reschedules
+    /// WITHOUT consuming budget (the storage wait is not a failed attempt), and an explicit
+    /// owner join clears the gate along with the rest of the lifecycle bookkeeping.
+    #[test]
+    fn m8_storage_gate_and_budget_free_deferral() {
+        let store = VhcStore::open_in_memory().unwrap();
+        store
+            .put_join_intent(
+                "run-S",
+                "ws://c",
+                &v1_policy(),
+                None,
+                &VhcEligibility::default(),
+            )
+            .unwrap();
+        assert!(!store.get_run("run-S").unwrap().unwrap().storage_gated);
+
+        store
+            .begin_release("run-S", RunState::FailedRetryable, Some("storage"))
+            .unwrap();
+        store.commit_release("run-S").unwrap();
+        store.set_storage_gated("run-S", true).unwrap();
+        let due_at = now_ms() + 50;
+        store.defer_retry("run-S", due_at).unwrap();
+
+        let row = store.get_run("run-S").unwrap().unwrap();
+        assert!(row.storage_gated, "the gate is durable");
+        assert_eq!(row.retry_count, 0, "a deferral consumes no budget");
+        assert_eq!(row.next_retry_ms, Some(due_at), "the next check is due");
+        // The gated row still surfaces in the reconcile work list (the tick applies the gate).
+        assert_eq!(store.runs_awaiting_retry(due_at).unwrap().len(), 1);
+
+        store.set_storage_gated("run-S", false).unwrap();
+        assert!(!store.get_run("run-S").unwrap().unwrap().storage_gated);
+
+        // An explicit owner join re-arms the lifecycle: the gate clears with it.
+        store.set_storage_gated("run-S", true).unwrap();
+        store
+            .put_join_intent(
+                "run-S",
+                "ws://c",
+                &v1_policy(),
+                None,
+                &VhcEligibility::default(),
+            )
+            .unwrap();
+        assert!(!store.get_run("run-S").unwrap().unwrap().storage_gated);
     }
 
     /// The effective app-facing projection of the two axes (spec §6.1 six-state view): terminal

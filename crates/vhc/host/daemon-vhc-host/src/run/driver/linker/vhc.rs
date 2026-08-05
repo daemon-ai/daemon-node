@@ -185,13 +185,11 @@ pub(super) fn link(linker: &mut Linker<Host>) -> Result<(), wasmtime::Error> {
                                     st.spool_exhausted_reported = false;
                                 }
                             }
-                            st.sink
-                                .event(at, &ev.frame_bytes)
-                                .map_err(|e| Trap::bare(TrapCode::BadModule, e.to_string()))?;
+                            st.sink.event(at, &ev.frame_bytes).map_err(Trap::from)?;
                             if let Some((ch, seq, sender, ref orig)) = ev.signed {
                                 st.sink
                                     .signed_frame(ch, seq, sender, orig)
-                                    .map_err(|e| Trap::bare(TrapCode::BadModule, e.to_string()))?;
+                                    .map_err(Trap::from)?;
                             }
                             break (ev, at);
                         }
@@ -346,7 +344,7 @@ pub(super) fn link(linker: &mut Linker<Host>) -> Result<(), wasmtime::Error> {
                         let mut st = sh.state.lock().expect("pump lock");
                         st.sink
                             .read_back(src, u64::from(kind), RET_STATUS_DELIVERED, &v)
-                            .map_err(|e| Trap::bare(TrapCode::BadModule, e.to_string()))?;
+                            .map_err(Trap::from)?;
                     }
                     write_guest(c, out_ptr, &v)?;
                     let d = c.data_mut();
@@ -397,7 +395,7 @@ pub(super) fn link(linker: &mut Linker<Host>) -> Result<(), wasmtime::Error> {
                     let mut st = shared.state.lock().expect("pump lock");
                     st.sink
                         .read_back(src, u64::from(kind), RET_STATUS_DELIVERED, &value)
-                        .map_err(|e| Trap::bare(TrapCode::BadModule, e.to_string()))?;
+                        .map_err(Trap::from)?;
                 }
                 write_guest(c, out_ptr, &value)?;
                 let d = c.data_mut();
@@ -553,9 +551,7 @@ pub(super) fn link(linker: &mut Linker<Host>) -> Result<(), wasmtime::Error> {
                 }
                 // Accepted: journal the manifest verbatim (tag 10) under the sink's durability
                 // barrier (§8.4 rule 2), then capture for the upgrade transaction.
-                st.sink
-                    .snapshot(&manifest_bytes)
-                    .map_err(|e| Trap::bare(TrapCode::BadModule, e.to_string()))?;
+                st.sink.snapshot(&manifest_bytes).map_err(Trap::from)?;
                 st.accepted_snapshot = Some(SnapshotCapture {
                     manifest: manifest_bytes,
                     sections: captured,
@@ -850,7 +846,7 @@ pub(super) fn link(linker: &mut Linker<Host>) -> Result<(), wasmtime::Error> {
                             RET_STATUS_DELIVERED,
                             &fold,
                         )
-                        .map_err(|e| Trap::bare(TrapCode::BadModule, e.to_string()))?;
+                        .map_err(Trap::from)?;
                     fold
                 };
                 write_guest(c, out_ptr, &fold)?;
@@ -875,7 +871,7 @@ pub(super) fn link(linker: &mut Linker<Host>) -> Result<(), wasmtime::Error> {
                     // A credit-held stream write is un-held with its op (its bytes never left).
                     st.streams.cancel_held(op);
                     st.enqueue_completion(op, &CompletionResult::cancelled())
-                        .map_err(|e| Trap::bare(TrapCode::BadModule, e.to_string()))?;
+                        .map_err(Trap::from)?;
                     Ok(0) // cancel accepted: the op's completion reports Cancelled
                 } else {
                     Ok(1) // already completed/cancelled or never issued

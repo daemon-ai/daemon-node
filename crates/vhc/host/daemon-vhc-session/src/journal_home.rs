@@ -27,7 +27,7 @@
 
 use std::path::{Path, PathBuf};
 
-use daemon_vhc_host::run::{Dropped, JournalSink, RunIdentity, SinkError};
+use daemon_vhc_host::run::{Dropped, JournalSink, RunIdentity, SinkError, StorageFault};
 use daemon_vhc_journal::record::{
     Body, ClockRec, CompletionRec, ConditionRec, DeviceProfileRec, DropId, DropRec, EventRec,
     ExecIdentity, ExecutionGrantRec, InitRec, InstantiationRec, RunHeader, SignedFrameRec,
@@ -176,9 +176,19 @@ impl DurableSink {
     }
 }
 
-/// Map a substrate error onto the driver's sink error.
+/// Map a substrate error onto the driver's sink error, preserving the storage-fault class:
+/// an `Io` failure from the durable substrate is a HOST condition (`ENOSPC`/quota →
+/// [`StorageFault::Exhausted`], recoverable when capacity returns; permission / corruption /
+/// device → [`StorageFault::Failed`], operator-terminal). Codec/grammar failures keep the
+/// protocol attribution. This is the seam that once erased ENOSPC into a string and let it be
+/// blamed on the module (`BadModule` → `FailedTerminal`).
 fn sink_err(e: JournalError) -> SinkError {
-    SinkError(e.to_string())
+    match &e {
+        JournalError::Io(io) => {
+            SinkError::storage(StorageFault::classify_io(io.kind()), e.to_string())
+        }
+        _ => SinkError::protocol(e.to_string()),
+    }
 }
 
 impl JournalSink for DurableSink {
@@ -341,7 +351,7 @@ impl JournalSink for DurableSink {
             .publish(channel, payload, frame.to_vec())
             .map_err(sink_err)?;
         if journal_seq != seq {
-            return Err(SinkError(format!(
+            return Err(SinkError::protocol(format!(
                 "driver/journal publish seq divergence on channel {channel}: driver {seq}, \
                  journal {journal_seq} (§8.4 rule 2)"
             )));
@@ -481,6 +491,35 @@ mod tests {
             instance: 3,
             module: [0x2A; 32],
         }
+    }
+
+    /// The substrate → sink error mapping preserves the storage-fault class: ENOSPC/quota is
+    /// the recoverable exhaustion class, every other I/O failure is the operator-terminal
+    /// substrate class, and codec/grammar failures carry no storage fault at all. The trap each
+    /// converts to is a HOST attribution for the storage pair — the historical ENOSPC →
+    /// `BadModule` erasure is the regression under test.
+    #[test]
+    fn sink_err_preserves_the_storage_fault_class() {
+        use daemon_vhc_host::trap::{Trap, TrapCode};
+        use std::io;
+
+        let enospc = sink_err(JournalError::Io(io::Error::new(
+            io::ErrorKind::StorageFull,
+            "no space left on device",
+        )));
+        assert_eq!(enospc.fault, Some(StorageFault::Exhausted));
+        assert_eq!(Trap::from(enospc).code, TrapCode::HostStorageExhausted);
+
+        let perm = sink_err(JournalError::Io(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "permission denied",
+        )));
+        assert_eq!(perm.fault, Some(StorageFault::Failed));
+        assert_eq!(Trap::from(perm).code, TrapCode::HostStorageFailed);
+
+        let codec = sink_err(JournalError::Codec("not canonical".into()));
+        assert_eq!(codec.fault, None);
+        assert_eq!(Trap::from(codec).code, TrapCode::BadModule);
     }
 
     #[test]

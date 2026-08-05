@@ -32,7 +32,7 @@ pub(super) fn link(linker: &mut Linker<Host>) -> Result<(), wasmtime::Error> {
                 st.next_timer_id += 1;
                 st.sink
                     .timer_arm(id, delay_ms, armed_at)
-                    .map_err(|e| Trap::bare(TrapCode::BadModule, e.to_string()))?;
+                    .map_err(Trap::from)?;
                 st.timers.push(ArmedTimer {
                     id,
                     fire_at: armed_at.saturating_add(delay_ms),
@@ -72,7 +72,7 @@ pub(super) fn link(linker: &mut Linker<Host>) -> Result<(), wasmtime::Error> {
                 };
                 st.sink
                     .timer_cancel(timer_id, u64::from(status))
-                    .map_err(|e| Trap::bare(TrapCode::BadModule, e.to_string()))?;
+                    .map_err(Trap::from)?;
                 Ok(status)
             })(&mut c);
             stash(&mut c, r)
@@ -88,9 +88,7 @@ pub(super) fn link(linker: &mut Linker<Host>) -> Result<(), wasmtime::Error> {
                 let now = c.data().slice.now;
                 let shared = c.data().shared.clone();
                 let mut st = shared.state.lock().expect("pump lock");
-                st.sink
-                    .clock(now)
-                    .map_err(|e| Trap::bare(TrapCode::BadModule, e.to_string()))?;
+                st.sink.clock(now).map_err(Trap::from)?;
                 Ok(now)
             })(&mut c);
             stash(&mut c, r)
@@ -288,9 +286,7 @@ pub(super) fn link(linker: &mut Linker<Host>) -> Result<(), wasmtime::Error> {
                 c.data_mut().slice.pending_device = None;
                 let shared = c.data().shared.clone();
                 let mut st = shared.state.lock().expect("pump lock");
-                st.sink
-                    .device_profile(&bytes)
-                    .map_err(|e| Trap::bare(TrapCode::BadModule, e.to_string()))?;
+                st.sink.device_profile(&bytes).map_err(Trap::from)?;
                 Ok(pack_status_len(RET_STATUS_DELIVERED, len as u32))
             })(&mut c);
             stash(&mut c, r)

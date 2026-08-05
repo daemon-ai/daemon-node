@@ -554,6 +554,16 @@ pub enum TerminalOutcome {
         /// Operator-facing detail (never branched on).
         reason: String,
     },
+    /// A recoverable HOST storage-capacity fault (`ENOSPC` / quota exceeded): the durable
+    /// substrate ran out of space — a host condition, never a module defect. Recoverable like
+    /// [`Self::FailedRetryable`], but the node's redispatch is **storage-gated**: it reconverges
+    /// only once a free-space check passes (the interim gate until the disk custodian owns
+    /// resume authorization), and a gated wait neither consumes the retry budget nor escalates
+    /// to terminal — a full disk is a capacity condition, not a crash loop.
+    FailedStorage {
+        /// Operator-facing detail (never branched on).
+        reason: String,
+    },
 }
 
 /// A self-assessment result for a run (§6.5, §10.2).

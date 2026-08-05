@@ -864,6 +864,33 @@ impl VhcService {
             if self.instances.lock().unwrap().contains_key(&run.run_id) {
                 continue;
             }
+            // The interim storage gate: a run whose last terminal was HostStorageExhausted is
+            // redispatched only once the node-state filesystem clears the reserve floor. A held
+            // gate defers WITHOUT consuming budget (the disk being full is not a failed attempt)
+            // and never blocks the rest of the pass. The Phase 6 custodian replaces this check
+            // as the resume authority.
+            if run.storage_gated {
+                if self.storage_gate_open() {
+                    self.store.set_storage_gated(&run.run_id, false)?;
+                } else {
+                    let due_at = now_ms() + retry.max_backoff_ms as i64;
+                    let _ = self.store.defer_retry(&run.run_id, due_at);
+                    let mut emitted = Vec::new();
+                    let _ = self.emit(
+                        VhcEvent::Warning {
+                            run_id: run.run_id.clone(),
+                            class: "storage_gate".to_string(),
+                            detail: format!(
+                                "redispatch held: free space below the {} MiB reserve floor \
+                                 (reclaim disk space to resume)",
+                                self.config.storage.reserve_mb
+                            ),
+                        },
+                        &mut emitted,
+                    );
+                    continue;
+                }
+            }
             match self.reconverge(&run).await {
                 Ok(()) => reconverged += 1,
                 Err(e) => {
@@ -900,6 +927,22 @@ impl VhcService {
             }
         }
         Ok(reconverged)
+    }
+
+    /// The interim storage gate's free-space check: open when the node-state filesystem (probed
+    /// at the identity dir — the durable state root) clears the configured reserve floor.
+    /// `reserve_mb = 0` disables the gate; a node without an identity dir has no probeable state
+    /// root, so the gate cannot hold. The probe's 0-on-failure maps to CLOSED — a state root
+    /// that cannot answer a space query is not one to redispatch onto.
+    fn storage_gate_open(&self) -> bool {
+        let reserve_mb = self.config.storage.reserve_mb;
+        if reserve_mb == 0 {
+            return true;
+        }
+        let Some(dir) = &self.identity_dir else {
+            return true;
+        };
+        daemon_vhc_session::host_disk_free_mb(dir) >= reserve_mb
     }
 
     /// The ONE join transaction for every non-owner-initiated entry (restart, retry, resume
@@ -1663,12 +1706,26 @@ impl VhcService {
             protocol::TerminalOutcome::FailedTerminal { reason } => {
                 (RunState::FailedTerminal, reason.clone())
             }
+            // The typed storage taxonomy: exhaustion (ENOSPC/quota) is recoverable, but its
+            // redispatch is STORAGE-GATED — the reconcile loop holds it behind the free-space
+            // check, and the wait neither consumes budget nor escalates (a full disk is a
+            // capacity condition, not a crash loop).
+            protocol::TerminalOutcome::FailedStorage { reason } => {
+                (RunState::FailedRetryable, reason.clone())
+            }
         };
+        let storage_gated = matches!(outcome, protocol::TerminalOutcome::FailedStorage { .. });
         // The bounded retry budget: a recoverable failure past the budget escalates to terminal
-        // with a typed reason; within it, the next reconvergence is backoff-scheduled.
+        // with a typed reason; within it, the next reconvergence is backoff-scheduled. A
+        // storage-gated failure bypasses the budget entirely — the gate (not the budget) is
+        // what bounds it, so it can never launder a crash loop: the moment the disk has
+        // headroom the run redispatches and any non-storage failure consumes budget normally.
         let retry = &self.config.retry;
         let consumed = row.as_ref().map_or(0, |r| r.retry_count);
-        let (target, reason, next_retry) = if target == RunState::FailedRetryable {
+        let (target, reason, next_retry) = if storage_gated {
+            let due = now_ms() + retry.max_backoff_ms as i64;
+            (RunState::FailedRetryable, reason, Some(due))
+        } else if target == RunState::FailedRetryable {
             if consumed >= retry.max_retries {
                 (
                     RunState::FailedTerminal,
@@ -1695,9 +1752,15 @@ impl VhcService {
         }
         // 3) The terminal commits.
         self.store.commit_release(run_id)?;
-        // 4) Retry bookkeeping.
+        // 4) Retry bookkeeping. A storage-gated terminal defers (schedules the next free-space
+        // check) without consuming budget, and durably marks the gate.
         if let Some(due) = next_retry {
-            let _ = self.store.bump_retry(run_id, due);
+            if storage_gated {
+                let _ = self.store.defer_retry(run_id, due);
+                let _ = self.store.set_storage_gated(run_id, true);
+            } else {
+                let _ = self.store.bump_retry(run_id, due);
+            }
         }
         // 5) [CI-7] identity custody: a terminal that ends the run identity (completed / left /
         // failed_terminal) deletes its per-run key material, certificates, and credentials
@@ -4070,5 +4133,134 @@ mod iroh_endpoint_tests {
             },
         );
         assert!(!svc.claim_node_iroh_endpoint("run-a", "coordinator", 5));
+    }
+}
+
+#[cfg(test)]
+mod storage_gate_tests {
+    use super::arbitration_tests::{coordinator_trainer_service, instance_id, NoopWorker};
+    use super::*;
+    use daemon_api::{VhcEligibility, VhcPolicy, VhcPolicyMode};
+
+    fn seed_joined_run(svc: &VhcService, run: &str, generation: u64) {
+        svc.store
+            .put_join_intent(
+                run,
+                "https://coord.local/vhc",
+                &VhcPolicy {
+                    mode: VhcPolicyMode::Idle,
+                    vram_cap_mb: 8_000,
+                    duty_cycle_pct: 90,
+                    schedule: None,
+                },
+                None,
+                &VhcEligibility::default(),
+            )
+            .expect("seed the joined intent");
+        svc.instances.lock().unwrap().insert(
+            run.to_string(),
+            InstanceEntry {
+                id: instance_id("trainer", generation),
+                generation,
+                worker: Arc::new(NoopWorker),
+            },
+        );
+    }
+
+    /// A `FailedStorage` terminal (host storage exhausted — the typed taxonomy) transitions the
+    /// row `failed_retryable` WITH the storage gate set, schedules the next free-space check,
+    /// and consumes NO retry budget: a full disk is a capacity condition to wait out, never a
+    /// crash loop to escalate.
+    #[test]
+    fn a_storage_terminal_gates_the_row_and_spends_no_budget() {
+        let svc = coordinator_trainer_service(OwnerBudget::unbounded());
+        seed_joined_run(&svc, "run-s", 3);
+
+        svc.handle_run_terminated(
+            "run-s",
+            3,
+            &protocol::TerminalOutcome::FailedStorage {
+                reason: "host storage exhausted: journal append".into(),
+            },
+        )
+        .expect("the terminal transitions");
+
+        let row = svc.store.get_run("run-s").expect("read").expect("row");
+        assert_eq!(row.run_state, RunState::FailedRetryable);
+        assert!(row.storage_gated, "the gate is durably marked");
+        assert_eq!(
+            row.retry_count, 0,
+            "a storage wait never consumes the retry budget"
+        );
+        assert!(
+            row.next_retry_ms.is_some(),
+            "the next free-space check is scheduled"
+        );
+        // The identity survives (failed_retryable is not identity-terminal) and repeated
+        // storage terminals can never escalate: run it past the ordinary budget.
+        for _ in 0..svc.config.retry.max_retries + 2 {
+            seed_joined_run(&svc, "run-s", 3);
+            svc.store.set_storage_gated("run-s", true).unwrap();
+            svc.handle_run_terminated(
+                "run-s",
+                3,
+                &protocol::TerminalOutcome::FailedStorage {
+                    reason: "still full".into(),
+                },
+            )
+            .expect("transitions again");
+        }
+        let row = svc.store.get_run("run-s").expect("read").expect("row");
+        assert_eq!(
+            row.run_state,
+            RunState::FailedRetryable,
+            "storage exhaustion never escalates to failed_terminal"
+        );
+    }
+
+    /// An ordinary retryable terminal is unchanged by the taxonomy: budget consumed, no gate.
+    #[test]
+    fn an_ordinary_retryable_terminal_is_ungated_and_budgeted() {
+        let svc = coordinator_trainer_service(OwnerBudget::unbounded());
+        seed_joined_run(&svc, "run-r", 5);
+
+        svc.handle_run_terminated(
+            "run-r",
+            5,
+            &protocol::TerminalOutcome::FailedRetryable {
+                reason: "transport loss".into(),
+            },
+        )
+        .expect("the terminal transitions");
+
+        let row = svc.store.get_run("run-r").expect("read").expect("row");
+        assert_eq!(row.run_state, RunState::FailedRetryable);
+        assert!(!row.storage_gated);
+        assert_eq!(row.retry_count, 1, "the ordinary path consumes budget");
+    }
+
+    /// The gate's free-space check: disabled (`reserve_mb = 0`) and unprobeable (no identity
+    /// dir) both read OPEN — the interim gate is best-effort and must never wedge a node it
+    /// cannot measure; an unmeetable floor over a real path reads CLOSED.
+    #[test]
+    fn the_free_space_check_opens_and_closes_on_the_reserve_floor() {
+        let mut svc = coordinator_trainer_service(OwnerBudget::unbounded());
+        assert!(svc.storage_gate_open(), "no identity dir: nothing to probe");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        svc.identity_dir = Some(dir.path().to_path_buf());
+        assert!(
+            svc.storage_gate_open(),
+            "the default floor is satisfiable on a working filesystem"
+        );
+
+        svc.config.storage.reserve_mb = u64::MAX;
+        assert!(
+            !svc.storage_gate_open(),
+            "an unmeetable floor holds the gate"
+        );
+
+        svc.config.storage.reserve_mb = 0;
+        assert!(svc.storage_gate_open(), "reserve 0 disables the gate");
     }
 }

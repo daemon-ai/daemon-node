@@ -89,7 +89,7 @@ impl JournalSink for JournalAdapter {
                 format: u64::from(daemon_vhc_observe::journal::format_version()),
             })))
             .map(|_| ())
-            .map_err(|e| SinkError(e.to_string()))
+            .map_err(|e| SinkError::protocol(e.to_string()))
     }
 
     fn instantiation(&mut self, counter: u64, reason: u64, at: u64) -> Result<(), SinkError> {
@@ -101,7 +101,7 @@ impl JournalSink for JournalAdapter {
                 at,
             }))
             .map(|_| ())
-            .map_err(|e| SinkError(e.to_string()))
+            .map_err(|e| SinkError::protocol(e.to_string()))
     }
 
     fn init(
@@ -117,7 +117,7 @@ impl JournalSink for JournalAdapter {
                 status,
             }))
             .map(|_| ())
-            .map_err(|e| SinkError(e.to_string()))
+            .map_err(|e| SinkError::protocol(e.to_string()))
     }
 
     fn execution_grant(&mut self, hash: [u8; 32], status: u64) -> Result<(), SinkError> {
@@ -127,7 +127,7 @@ impl JournalSink for JournalAdapter {
                 status,
             }))
             .map(|_| ())
-            .map_err(|e| SinkError(e.to_string()))
+            .map_err(|e| SinkError::protocol(e.to_string()))
     }
 
     fn event(&mut self, at: u64, frame: &[u8]) -> Result<(), SinkError> {
@@ -137,7 +137,7 @@ impl JournalSink for JournalAdapter {
                 frame: frame.to_vec(),
             }))
             .map(|_| ())
-            .map_err(|e| SinkError(e.to_string()))
+            .map_err(|e| SinkError::protocol(e.to_string()))
     }
 
     fn signed_frame(
@@ -156,7 +156,7 @@ impl JournalSink for JournalAdapter {
                 evidence: None,
             }))
             .map(|_| ())
-            .map_err(|e| SinkError(e.to_string()))
+            .map_err(|e| SinkError::protocol(e.to_string()))
     }
 
     fn next_seq(&mut self, channel: u64) -> u64 {
@@ -175,7 +175,7 @@ impl JournalSink for JournalAdapter {
         let (_, journal_seq) = self
             .journal
             .publish(channel, payload, frame.to_vec())
-            .map_err(|e| SinkError(e.to_string()))?;
+            .map_err(|e| SinkError::protocol(e.to_string()))?;
         assert_eq!(
             journal_seq, seq,
             "driver/journal seq agreement (§8.4 rule 2)"
@@ -187,7 +187,7 @@ impl JournalSink for JournalAdapter {
         self.journal
             .append(Body::Clock(ClockRec { now }))
             .map(|_| ())
-            .map_err(|e| SinkError(e.to_string()))
+            .map_err(|e| SinkError::protocol(e.to_string()))
     }
 
     fn timer_arm(&mut self, id: u64, delay: u64, armed_at: u64) -> Result<(), SinkError> {
@@ -198,14 +198,14 @@ impl JournalSink for JournalAdapter {
                 armed_at,
             }))
             .map(|_| ())
-            .map_err(|e| SinkError(e.to_string()))
+            .map_err(|e| SinkError::protocol(e.to_string()))
     }
 
     fn timer_cancel(&mut self, id: u64, status: u64) -> Result<(), SinkError> {
         self.journal
             .append(Body::TimerCancel(TimerCancelRec { id, status }))
             .map(|_| ())
-            .map_err(|e| SinkError(e.to_string()))
+            .map_err(|e| SinkError::protocol(e.to_string()))
     }
 
     fn read_back(
@@ -219,7 +219,7 @@ impl JournalSink for JournalAdapter {
         self.journal
             .read_back(src, kind, status, value)
             .map(|_| ())
-            .map_err(|e| SinkError(e.to_string()))
+            .map_err(|e| SinkError::protocol(e.to_string()))
     }
 
     fn device_profile(&mut self, profile: &[u8]) -> Result<(), SinkError> {
@@ -230,7 +230,7 @@ impl JournalSink for JournalAdapter {
                 },
             ))
             .map(|_| ())
-            .map_err(|e| SinkError(e.to_string()))
+            .map_err(|e| SinkError::protocol(e.to_string()))
     }
 
     fn drop_coalesced(
@@ -252,7 +252,7 @@ impl JournalSink for JournalAdapter {
                 },
             }))
             .map(|_| ())
-            .map_err(|e| SinkError(e.to_string()))
+            .map_err(|e| SinkError::protocol(e.to_string()))
     }
 
     fn condition(&mut self, code: &str, detail: &str) -> Result<(), SinkError> {
@@ -264,7 +264,7 @@ impl JournalSink for JournalAdapter {
                 },
             ))
             .map(|_| ())
-            .map_err(|e| SinkError(e.to_string()))
+            .map_err(|e| SinkError::protocol(e.to_string()))
     }
 
     fn completion(&mut self, op: u64, result: &[u8]) -> Result<(), SinkError> {
@@ -276,7 +276,7 @@ impl JournalSink for JournalAdapter {
                 },
             ))
             .map(|_| ())
-            .map_err(|e| SinkError(e.to_string()))
+            .map_err(|e| SinkError::protocol(e.to_string()))
     }
 
     fn snapshot(&mut self, manifest: &[u8]) -> Result<(), SinkError> {
@@ -289,7 +289,7 @@ impl JournalSink for JournalAdapter {
                 },
             ))
             .map(|_| ())
-            .map_err(|e| SinkError(e.to_string()))
+            .map_err(|e| SinkError::protocol(e.to_string()))
     }
 
     fn terminal(
@@ -310,7 +310,7 @@ impl JournalSink for JournalAdapter {
                 }),
             }))
             .map(|_| ())
-            .map_err(|e| SinkError(e.to_string()))
+            .map_err(|e| SinkError::protocol(e.to_string()))
     }
 }
 

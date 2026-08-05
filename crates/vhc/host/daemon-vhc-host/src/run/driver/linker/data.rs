@@ -387,8 +387,7 @@ fn service_self_sealed_fetch(
             detail: Some(detail),
         }),
     };
-    st.enqueue_completion(op, &result)
-        .map_err(|e| Trap::bare(TrapCode::BadModule, e.to_string()))?;
+    st.enqueue_completion(op, &result).map_err(Trap::from)?;
     Ok(op)
 }
 
@@ -460,8 +459,7 @@ fn service_state_ranged_fetch(
                 detail: Some("buffer quota exhausted (deny new buffers)".into()),
             }),
         };
-        st.enqueue_completion(op, &result)
-            .map_err(|e| Trap::bare(TrapCode::BadModule, e.to_string()))?;
+        st.enqueue_completion(op, &result).map_err(Trap::from)?;
         return Ok(op);
     }
     let request = OpRequest::ArtifactRange {
@@ -504,7 +502,6 @@ fn immediate_fetch_refusal(
         code,
         detail: Some(detail),
     });
-    st.enqueue_completion(op, &result)
-        .map_err(|e| Trap::bare(TrapCode::BadModule, e.to_string()))?;
+    st.enqueue_completion(op, &result).map_err(Trap::from)?;
     Ok(op)
 }

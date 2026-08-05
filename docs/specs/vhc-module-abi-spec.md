@@ -1564,6 +1564,14 @@ New v2 trap codes:
 | `ReadBackUnavailable` | `read_back` named a `(src, kind)` that stages nothing |
 | `MigrateBudget` | `da_migrate` exceeded its bounded fuel/memory (§10.3) |
 | `QuiesceDeadlineExceeded` | the guest failed to return from a `Quiesce` drain before the effective deadline; forced epoch interruption (§4.4, §11.3) |
+| `HostStorageExhausted` | the HOST's durable substrate (journal / sidecar / state store I/O) hit `ENOSPC` / quota — a host capacity condition, never a module defect; classified `FailedStorage` (§12.6 [RS-2]) with a storage-gated reconvergence (§12.10 [RL-4]) |
+| `HostStorageFailed` | a non-capacity HOST storage fault (permission denied, corruption, device error) — operator-terminal for this node; classified `FailedTerminal`, with the reason naming the HOST fault |
+
+The two `HostStorage*` codes are the **typed storage taxonomy**: a durable-substrate I/O failure
+MUST surface under one of them (classified from the `io::ErrorKind` at the journaling seam —
+`StorageFull`/`QuotaExceeded` → exhausted, anything else → failed) and MUST NOT be attributed to
+the module (`BadModule` erasing an ENOSPC into a module-fault terminal is the defect this
+taxonomy retires). Only protocol/codec sink failures retain the `BadModule` attribution.
 
 `MigrateUnsupported` is **not** in this table: it is an admission refusal (§1.5), never a trap.
 Every slug MUST be unique and stable (the v1 uniqueness test extends). Traps during `da_run` are
@@ -2670,7 +2678,8 @@ name-keyed CBOR (additive decode), inventoried for the accumulated WireVersion d
   | `Completed { outcome: u32 }` | the module signaled run end (`da_run` returned; `0` = clean) | terminal; release resources; never rejoin |
   | `Left { checkpoint: Option<text> }` | owner intent (leave); on a graceful leave `checkpoint` is the blake3 hex of the drain snapshot persisted to the payload plane | terminal; owner-driven |
   | `FailedRetryable { reason: text }` | recoverable environment fault: transport loss, provider fault, resource-budget breach, an unrecoverable inbound sequence gap with no backfill | may reconverge (rejoin as a NEW incarnation) under the retry budget |
-  | `FailedTerminal { reason: text }` | module trap, admission identity mismatch, certificate refusal, init/migrate refusal | no automatic rejoin; owner action |
+  | `FailedTerminal { reason: text }` | module trap, admission identity mismatch, certificate refusal, init/migrate refusal, host storage fault (`HostStorageFailed` — operator repairs the substrate) | no automatic rejoin; owner action |
+  | `FailedStorage { reason: text }` | recoverable HOST storage-capacity fault (`HostStorageExhausted`: ENOSPC / quota on the durable substrate) — a host condition, never a module defect | STORAGE-GATED reconvergence: redispatch only after the node's free-space check passes ([RL-4]); the gated wait consumes no retry budget and never escalates |
 
   `reason` strings are operator-facing detail and MUST NOT be branched on; the class is the
   contract. Terminal handling MUST be idempotent (duplicate delivery cannot double-release).
@@ -2915,6 +2924,13 @@ No new node↔worker wire is added — this section consumes §12.6's generation
   launder its budget by merely restarting. Mid-run reconvergence ALWAYS mints a new never-reused
   incarnation with freshly-authored credentials + certificate (§12.9); only a node restart —
   where no live predecessor can exist — retains the persisted incarnation.
+  **Storage-gated exception:** a `FailedStorage` terminal (§12.6 [RS-2]) sets a durable storage
+  gate on the row instead of consuming budget — the disk being full is a capacity condition to
+  wait out, not a crash loop to escalate. The reconciliation pass redispatches a gated run only
+  once the node-state filesystem's free-space check clears the configured reserve floor
+  (`[vhc.storage] reserve_mb`; `0` disables the gate), deferring budget-free otherwise; once the
+  gate opens, any subsequent non-storage failure consumes budget normally. *(Interim mechanism:
+  the disk custodian, when it lands, replaces the free-space check as the resume authority.)*
 - **[RL-5] Pause is durable owner intent with release-on-pause.** The client API gains
   `VhcPause { run_id, op_id }` / `VhcResume { run_id, op_id }` beside join/leave (op_id-idempotent
   intents; name-keyed CBOR, additive). Pause persists the intent FIRST (a paused run survives
@@ -3250,8 +3266,14 @@ shape-fixed here and land with their implementing waves.
   publisher uploads the by-ref document + its family chunks content-addressed to the payload
   plane — idempotent, so chunks unchanged since a prior slot upload nothing (skip-on-present).
   The [SF-5] cadence↔retention bound governs the remote cadence, enforced at genesis authoring.
-  Referenced folds are pinned out of retention eviction while their checkpoint is the freshest of
-  its (role, kind) slot ([SF-7]). Because the descriptor + document are `VhcProtoVersion`-2
+  *(Wiring note, normative for genesis authors:)* the remote cadence is a **module live-config**
+  value (the flagship trainer's `live.remote_ckpt_every`, serde default `0` = upload at every
+  boundary), so the authoring path MUST place the validated cadence into the role's `live`
+  config map — a cadence that is validated at authoring but omitted from the config silently
+  runs the default-0 policy (the run that executed was not the run that was authored). The
+  harness/assessment config form carries no `live` section, so publication policy never enters
+  the fit-probe key. Referenced folds are pinned out of retention eviction while their
+  checkpoint is the freshest of its (role, kind) slot ([SF-7]). Because the descriptor + document are `VhcProtoVersion`-2
   shapes (already bumped by [SF-5]), this wave adds no wire-version movement; the app↔node
   `WireVersion` is unchanged.
   **In-process live-module-switch carriage (normative as implemented).** A live module switch

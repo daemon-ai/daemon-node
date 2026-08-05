@@ -17,11 +17,83 @@
 //! Ordering/durability obligations (§8.4) are noted per method; the adapter maps them onto
 //! `append` vs `append_committed`.
 
+/// The storage-fault class a [`SinkError`] may carry (ABI §3.6 host-fault taxonomy). The durable
+/// substrate failing is a HOST condition, never a module defect — and the two classes recover
+/// differently: exhaustion recovers when capacity returns; a failed substrate (permission,
+/// corruption, device) needs an operator. Erasing the class into a string is exactly how a
+/// fleet ENOSPC was once attributed `BadModule` and terminated a healthy run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageFault {
+    /// Out of capacity: `ENOSPC` / quota exceeded. Recoverable once capacity returns.
+    Exhausted,
+    /// A non-capacity storage failure: permission denied, corruption, device error. Terminal
+    /// for this node until an operator repairs the substrate.
+    Failed,
+}
+
+impl StorageFault {
+    /// Classify an I/O error kind into the storage-fault taxonomy (the one place the mapping is
+    /// spelled, so every raise site and every adapter agrees).
+    #[must_use]
+    pub fn classify_io(kind: std::io::ErrorKind) -> Self {
+        match kind {
+            std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded => Self::Exhausted,
+            _ => Self::Failed,
+        }
+    }
+}
+
 /// A journaling failure. Journal writes are load-bearing (§8.4: a publish MUST NOT return before
 /// its barrier commits), so sink errors abort the affected import/run rather than being dropped.
+///
+/// Carries the [`StorageFault`] classification when the failure came from the durable substrate's
+/// I/O (`None` for protocol/codec sink failures), so the trap a raise site converts it into
+/// ([`From<SinkError> for Trap`](crate::trap::Trap)) attributes a host storage fault to the HOST
+/// — never to the module.
 #[derive(Debug, thiserror::Error)]
-#[error("journal sink: {0}")]
-pub struct SinkError(pub String);
+#[error("journal sink: {detail}")]
+pub struct SinkError {
+    /// The storage-fault classification; `None` for protocol/codec sink failures.
+    pub fault: Option<StorageFault>,
+    /// Human-readable detail.
+    pub detail: String,
+}
+
+impl SinkError {
+    /// A protocol/codec sink failure (no storage fault — the legacy attribution applies).
+    #[must_use]
+    pub fn protocol(detail: impl Into<String>) -> Self {
+        Self {
+            fault: None,
+            detail: detail.into(),
+        }
+    }
+
+    /// A storage-classified sink failure (the durable substrate's I/O failed).
+    #[must_use]
+    pub fn storage(fault: StorageFault, detail: impl Into<String>) -> Self {
+        Self {
+            fault: Some(fault),
+            detail: detail.into(),
+        }
+    }
+}
+
+impl From<SinkError> for crate::trap::Trap {
+    /// The one sink-error → trap mapping every raise site shares: a storage-classified failure
+    /// is a typed HOST fault (`HostStorageExhausted` / `HostStorageFailed`, ABI §3.6); only a
+    /// protocol/codec sink failure keeps the historical `BadModule` attribution.
+    fn from(e: SinkError) -> Self {
+        use crate::trap::TrapCode;
+        let code = match e.fault {
+            Some(StorageFault::Exhausted) => TrapCode::HostStorageExhausted,
+            Some(StorageFault::Failed) => TrapCode::HostStorageFailed,
+            None => TrapCode::BadModule,
+        };
+        let detail = e.to_string();
+        crate::trap::Trap::bare(code, detail)
+    }
+}
 
 /// The dropped/coalesced item's identity (ABI §8.3 `drop-id`): which fields are present depends
 /// on the drop class — a payload announcement carries its hash, a timer its id, an advisory

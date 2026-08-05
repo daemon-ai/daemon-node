@@ -98,8 +98,7 @@ pub(super) fn link(linker: &mut Linker<Host>) -> Result<(), wasmtime::Error> {
                 d.compute_ops_since_fence = 0;
                 let shared = c.data().shared.clone();
                 let mut st = shared.state.lock().expect("pump lock");
-                st.enqueue_fence(fence_id)
-                    .map_err(|e| Trap::bare(TrapCode::BadModule, e.to_string()))?;
+                st.enqueue_fence(fence_id).map_err(Trap::from)?;
                 drop(st);
                 shared.wake.notify_all();
                 Ok(())
@@ -154,7 +153,7 @@ pub(super) fn link(linker: &mut Linker<Host>) -> Result<(), wasmtime::Error> {
                                 daemon_vhc_abi::RET_STATUS_DELIVERED,
                                 &data,
                             )
-                            .map_err(|e| Trap::bare(TrapCode::BadModule, e.to_string()))?;
+                            .map_err(Trap::from)?;
                         match st.buffers.create_host(Arc::new(data)) {
                             Some(handle) => CompletionResult::Ok(SuccessPayload::Handle(handle)),
                             None => CompletionResult::Err(CompError {
@@ -168,8 +167,7 @@ pub(super) fn link(linker: &mut Linker<Host>) -> Result<(), wasmtime::Error> {
                         detail: Some(e.to_string()),
                     }),
                 };
-                st.enqueue_completion(op, &result)
-                    .map_err(|e| Trap::bare(TrapCode::BadModule, e.to_string()))?;
+                st.enqueue_completion(op, &result).map_err(Trap::from)?;
                 drop(st);
                 shared.wake.notify_all();
                 Ok(op)
@@ -215,7 +213,7 @@ pub(super) fn link(linker: &mut Linker<Host>) -> Result<(), wasmtime::Error> {
                     })?;
                 st.ops.finish(op); // pump-internal service at the call (see export)
                 st.enqueue_completion(op, &CompletionResult::Ok(SuccessPayload::Unit))
-                    .map_err(|e| Trap::bare(TrapCode::BadModule, e.to_string()))?;
+                    .map_err(Trap::from)?;
                 drop(st);
                 shared.wake.notify_all();
                 Ok(op)

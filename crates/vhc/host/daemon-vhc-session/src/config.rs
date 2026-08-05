@@ -226,6 +226,27 @@ impl Default for RetryConfig {
     }
 }
 
+/// The interim storage-gate configuration (`[vhc.storage]`): a run that failed with
+/// `HostStorageExhausted` (ENOSPC/quota — the typed storage taxonomy) is redispatched only once
+/// the node-state filesystem shows at least `reserve_mb` of free space. The gate never consumes
+/// the retry budget while it holds — a full disk is a capacity condition to wait out, not a
+/// crash loop to escalate. The Phase 6 disk custodian (atomic reservation, quotas, pressure
+/// states) replaces this check as the resume authority; the config key stays.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StorageConfig {
+    /// Minimum free space (MiB) on the node-state filesystem before a storage-gated run is
+    /// redispatched. `0` disables the gate (storage failures then retry like any recoverable
+    /// fault).
+    pub reserve_mb: u64,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self { reserve_mb: 2_048 }
+    }
+}
+
 /// Live module-upgrade bounds (`[vhc.upgrade]`, ABI §4.4/§9.6/§10.3) — the node clamps every
 /// `SwitchModule` it issues to these before touching the worker.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -308,6 +329,11 @@ pub struct VhcConfig {
     /// The reconvergence retry budget + reconciliation-tick cadence (`[vhc.retry]`).
     #[serde(default)]
     pub retry: RetryConfig,
+    /// The interim storage-gate floor (`[vhc.storage]`) — the free-space check a
+    /// storage-exhausted run's redispatch must pass. Superseded by the disk custodian's
+    /// resume authorization when it lands.
+    #[serde(default)]
+    pub storage: StorageConfig,
     /// The coordinator-registry discovery surface (A3; additive — defaults to "no registry").
     pub registry: RegistryConfig,
     /// iroh transport knobs.
@@ -350,6 +376,7 @@ impl Default for VhcConfig {
             seat_role: default_seat_role(),
             coordinator_trains: false,
             retry: RetryConfig::default(),
+            storage: StorageConfig::default(),
             registry: RegistryConfig::default(),
             iroh: IrohConfig::default(),
             owner_budget: OwnerBudgetConfig::default(),

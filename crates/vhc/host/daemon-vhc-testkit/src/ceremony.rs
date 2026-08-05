@@ -337,15 +337,33 @@ fn ceremony_profile_value() -> Value {
 /// The FROZEN ceremony trainer guest config (raw canonical CBOR): the frozen model
 /// ([`ceremony_model_value`]) + the SparseLoco profile + the seed-form state contract
 /// ([`ceremony_state_contract`]) + the fleet trainer roster + the `live` section naming the run +
-/// the corpus manifest pin. This is the `da_init`/`da_build` config the trainer role receives.
+/// the corpus manifest pin + the remote checkpoint cadence. This is the `da_init`/`da_build`
+/// config the trainer role receives.
+///
+/// `remote_ckpt_every` is the D-SF3 upload cadence the genesis authoring VALIDATED
+/// ([`CeremonyGenesisSpec::remote_ckpt_cadence_rounds`], checked against payload retention) —
+/// placed here into the guest's `live` section because a validated-but-unplaced cadence leaves
+/// the guest on its `#[serde(default)] = 0` (upload at every local boundary), i.e. a policy the
+/// run never authored. The cadence rides the `live` half, never the harness form: it is run
+/// publication policy, not resource geometry, so the module assessment (and with it the
+/// fit-verdict key) is untouched by construction.
 #[must_use]
-pub fn ceremony_trainer_config(run_label: &str, corpus_manifest: Hash, roster: &[PeerId]) -> Value {
+pub fn ceremony_trainer_config(
+    run_label: &str,
+    corpus_manifest: Hash,
+    roster: &[PeerId],
+    remote_ckpt_every: u64,
+) -> Value {
     let text = |s: &str| Value::Text(s.into());
     let live = Value::Map(vec![
         (text("run_label"), text(run_label)),
         (
             text("manifest"),
             Value::serialized(&corpus_manifest).expect("manifest hash value"),
+        ),
+        (
+            text("remote_ckpt_every"),
+            Value::Integer(remote_ckpt_every.into()),
         ),
     ]);
     let Value::Map(mut fields) = ceremony_trainer_config_harness(roster) else {
@@ -896,7 +914,12 @@ pub fn ceremony_genesis(
             lane: "trainer".into(),
             module: "worker.wasm".into(),
             abi: "vhc@2".into(),
-            config: ceremony_trainer_config(spec.run_label, spec.corpus_manifest, spec.roster),
+            config: ceremony_trainer_config(
+                spec.run_label,
+                spec.corpus_manifest,
+                spec.roster,
+                spec.remote_ckpt_cadence_rounds,
+            ),
             grants: control_channel(granted),
             device_min: daemon_vhc_proto::DeviceMinimums::default(),
         },
@@ -1346,6 +1369,28 @@ mod tests {
             daemon_vhc_proto::to_canonical_vec(model).unwrap(),
             daemon_vhc_proto::to_canonical_vec(&ceremony_model_value()).unwrap(),
             "frozen model embedded verbatim"
+        );
+
+        // The validated D-SF3 cadence is PLACED, not merely checked: the trainer's `live`
+        // section carries `remote_ckpt_every` at the spec's value, so the guest publishes at
+        // the authored cadence instead of its serde default (0 = every boundary).
+        let live = cfg
+            .iter()
+            .find_map(|(k, v)| matches!(k, Value::Text(t) if t == "live").then_some(v))
+            .expect("live in trainer config");
+        let Value::Map(live_fields) = live else {
+            panic!("live section is a map");
+        };
+        let cadence = live_fields
+            .iter()
+            .find_map(|(k, v)| matches!(k, Value::Text(t) if t == "remote_ckpt_every").then_some(v))
+            .expect("remote_ckpt_every in the live section")
+            .as_integer()
+            .expect("an integer cadence");
+        assert_eq!(
+            u64::try_from(i128::from(cadence)).unwrap(),
+            20,
+            "the authored cadence reaches the guest config"
         );
 
         // Changing the cadence past the retention floor is refused at authoring.

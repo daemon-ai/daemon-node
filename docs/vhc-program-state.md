@@ -156,10 +156,30 @@ None of these blocks C0 or C1.
   semantics (ABI §5.6). Note: a worker rebuild changes the backend revision — re-provision
   the profile and re-run the fit probe, or the join refuses `EstimateNotComposable` (typed,
   correct).
+- **Pre-C2 hardening (plan `production-ready_ceremony_completion_47713b86`, 8 sequential
+  phases) — Phase 1 LANDED (2026-08-05):**
+  - **Cadence contract wired**: `remote_ckpt_every` now flows from
+    `CeremonyGenesisSpec.remote_ckpt_cadence_rounds` into the trainer's `live` config
+    (`daemon-vhc-testkit/src/ceremony.rs`), with authored-vs-consumed regressions
+    (`ceremony_authored_round.rs`). **FitProbeKey does NOT move** (test-asserted: the
+    harness/assessment form carries no `live` section) — no re-probe needed; envelope
+    bytes and hence the run id change unconditionally on the next authoring.
+  - **Typed storage taxonomy**: `SinkError` carries a `StorageFault` class
+    (`Exhausted` = ENOSPC/quota, `Failed` = permission/corruption/device), classified
+    once at the journaling seam from `io::ErrorKind`; new traps `HostStorageExhausted` /
+    `HostStorageFailed`; new wire outcome `FailedStorage`; the node persists an M8
+    `storage_gated` flag and redispatches a gated run only when the node-state
+    filesystem clears `[vhc.storage] reserve_mb` (default 2048; interim gate until the
+    disk custodian) — the gated wait consumes NO retry budget and never escalates.
+    The run-k ENOSPC → `BadModule` → `FailedTerminal` misattribution is retired, with
+    regressions at every layer (sink classification, trap classes, node gate + budget).
+  - Docs moved with the change: ABI §7.6 trap table, §12.6 [RS-2] class table,
+    §12.10 [RL-4] storage-gated exception, §12.14 [SF-6] cadence wiring note;
+    runbook §4.7 cadence check. Housekeeping rules encoded in §9 of this file.
 - **Not claimed** (recorded): offline consensus replay from a sealed archive
   (`publish_journal_archive()` has no product callers), general archive backfill,
   in-session exact-frame loss repair, coordinator crash reconstruction, §5.3 standby
-  failover. These are the pre-C2 workstream (§8).
+  failover. These are the remaining pre-C2 phases (§8).
 - C0: green and pinned. C1: **green on hardware** (this boundary). Freeze/C2: the only
   rung left — needs the Windows 5090 seat joined in and the pre-C2 workstream scoped.
 - Program archive: frozen and locked read-only 2026-07-27.
@@ -181,11 +201,12 @@ All four answer ssh (verified 2026-08-04). Next actions (in order):
 1. ~~Fit probes at the reduced geometry~~ DONE — all three seats GREEN, native lanes (§7).
 2. ~~Run C1 on two boxes~~ DONE — run-j complete + zero mismatch, run-k churn drills
    passed (§7).
-3. Pre-C2 workstream (scoped, not started): coordinator crash reconstruction (journal
-   replay into a fresh guest, archive publication wiring, fenced resumption) over the
-   durable archive substrate with its three projections (transport repair, semantic
-   catch-up, module reconstruction) — one substrate, three invariants; plus the registry
-   Byzantine posture owner decision (§6).
+3. Pre-C2 workstream (plan `production-ready_ceremony_completion_47713b86`, strictly
+   sequential): ~~Phase 1 cadence contract + typed storage taxonomy~~ DONE (§7).
+   Next: Phase 2 deaf-path instrumentation + root cause (per-plane delivery counters,
+   DO fan-out audit, live-DO churn regression), then Phases 3–6 (archive publication →
+   replay assembly → sandboxed coordinator reconstruction → disk custody), then C1.5;
+   plus the registry Byzantine posture owner decision (§6).
 4. Bring the Windows 5090 seat into a three-box run (its worker lane builds with
    `vhc-net,wgpu-spirv`; native DX12 verdict is already green).
 5. Freeze; memoized preflight; run C2; evidence closure; human-signed master merge.
@@ -204,3 +225,13 @@ All four answer ssh (verified 2026-08-04). Next actions (in order):
 - **Timebox investigations.** If a probe or a test can answer the question, run it instead of
   investigating. Escalate only product-semantic questions (§6), never numbers.
 - **Resource discipline is unchanged**: capped jobs, one build at a time, diff-scoped lint.
+- **Boundary recording.** Every phase boundary rewrites §7/§8 of this file + commits, and
+  appends a dated section to the implementation handoff. Plan todos are marked as they land —
+  bookkeeping is part of done, never deferred.
+- **Reference docs move WITH the change, not after.** A landed change updates its normative
+  home in the same commit: trap/outcome changes → ABI §7.6/§12.6/§12.10; checkpoint/cadence →
+  ABI §12.14 + runbook §4.7; archive publication/custody → runbook §3.4/§6.1 + architecture
+  spec; disk custody → architecture spec resources + config reference.
+- **Disk discipline (operator + agent).** Evidence copies never land on the live-run
+  filesystem; check headroom before runs and before copies; collectors/logs live under the
+  artifacts dir; dead run state is reclaimed via the reconciliation tooling, never ad-hoc `rm`.

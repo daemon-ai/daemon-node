@@ -1957,7 +1957,12 @@ fn classify_natural_end(
 /// node reassesses against the live device inventory (the admitted claim's headroom is the
 /// primary defense; the hardware findings record that a faithful driver-OOM diagnostic is not
 /// distinguishable from a host-side pool rejection, so the class is judged conservatively
-/// recoverable). Everything else is a module/admission fault (terminal).
+/// recoverable). The HOST storage taxonomy is its own pair: exhaustion (`ENOSPC`/quota) is the
+/// storage-gated recoverable class ([`TerminalOutcome::FailedStorage`] — the node redispatches
+/// only once free space returns, never a blind retry loop against a full disk); a failed
+/// substrate (permission / corruption / device) is terminal for this node until an operator
+/// repairs it — and NEITHER is ever attributed to the module. Everything else is a
+/// module/admission fault (terminal).
 fn classify_trap(trap: &daemon_vhc_host::trap::Trap) -> TerminalOutcome {
     match trap.code {
         TrapCode::BudgetMemory
@@ -1969,6 +1974,12 @@ fn classify_trap(trap: &daemon_vhc_host::trap::Trap) -> TerminalOutcome {
         },
         TrapCode::ComputeFault => TerminalOutcome::FailedRetryable {
             reason: format!("device compute fault (capacity class): {trap}"),
+        },
+        TrapCode::HostStorageExhausted => TerminalOutcome::FailedStorage {
+            reason: format!("host storage exhausted: {trap}"),
+        },
+        TrapCode::HostStorageFailed => TerminalOutcome::FailedTerminal {
+            reason: format!("host storage fault (operator action required): {trap}"),
         },
         _ => TerminalOutcome::FailedTerminal {
             reason: format!("module trapped: {trap}"),
@@ -2187,6 +2198,29 @@ mod tests {
                 classify_trap(&trap(code)),
                 TerminalOutcome::FailedTerminal { .. }
             ));
+        }
+    }
+
+    #[test]
+    fn host_storage_traps_classify_by_the_storage_taxonomy() {
+        // Exhaustion (ENOSPC/quota) is the storage-gated recoverable class — its own outcome so
+        // the node can gate the redispatch on free space rather than blind-retrying against a
+        // full disk. A failed substrate (permission/corruption/device) is operator-terminal.
+        // Neither may EVER read as a module fault (the historical ENOSPC → BadModule →
+        // FailedTerminal misattribution is the regression under test).
+        let exhausted = classify_trap(&trap(TrapCode::HostStorageExhausted));
+        assert!(
+            matches!(exhausted, TerminalOutcome::FailedStorage { .. }),
+            "exhaustion routes to the storage-gated class, got {exhausted:?}"
+        );
+        match classify_trap(&trap(TrapCode::HostStorageFailed)) {
+            TerminalOutcome::FailedTerminal { reason } => {
+                assert!(
+                    reason.contains("host storage fault"),
+                    "the terminal reason names the HOST fault, never the module: {reason}"
+                );
+            }
+            other => panic!("a failed substrate is terminal, got {other:?}"),
         }
     }
 

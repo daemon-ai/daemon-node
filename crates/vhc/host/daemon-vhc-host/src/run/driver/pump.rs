@@ -273,13 +273,15 @@ impl PumpState {
         if self.stop_enqueued {
             return Ok(()); // the host delivers no further events after Stop (§4.4)
         }
-        let result_bytes = result.encode().map_err(|e| SinkError(e.to_string()))?;
+        let result_bytes = result
+            .encode()
+            .map_err(|e| SinkError::protocol(e.to_string()))?;
         self.sink.completion(op, &result_bytes)?;
         let frame_bytes = encode_event_frame(&RunEvent::Completion {
             op,
             result: result.clone(),
         })
-        .map_err(|e| SinkError(e.to_string()))?;
+        .map_err(|e| SinkError::protocol(e.to_string()))?;
         self.queue.push_back(QueuedEvent {
             frame_bytes,
             tag: daemon_vhc_abi::EV_TAG_COMPLETION,
@@ -302,7 +304,7 @@ impl PumpState {
             return Ok(()); // the host delivers no further events after Stop (§4.4)
         }
         let frame_bytes = encode_event_frame(&RunEvent::Fence { fence_id })
-            .map_err(|e| SinkError(e.to_string()))?;
+            .map_err(|e| SinkError::protocol(e.to_string()))?;
         self.queue.push_back(QueuedEvent {
             frame_bytes,
             tag: daemon_vhc_abi::EV_TAG_FENCE,
@@ -323,8 +325,8 @@ impl PumpState {
         if self.stop_enqueued {
             return Ok(());
         }
-        let frame_bytes =
-            encode_event_frame(&RunEvent::Stop { reason }).map_err(|e| SinkError(e.to_string()))?;
+        let frame_bytes = encode_event_frame(&RunEvent::Stop { reason })
+            .map_err(|e| SinkError::protocol(e.to_string()))?;
         self.stop_enqueued = true;
         self.stop_cut = None;
         self.queue.push_back(QueuedEvent {
@@ -405,10 +407,13 @@ impl PumpHandle {
             sender,
             payload,
         };
-        let frame_bytes = encode_event_frame(&ev).map_err(|e| SinkError(e.to_string()))?;
+        let frame_bytes =
+            encode_event_frame(&ev).map_err(|e| SinkError::protocol(e.to_string()))?;
         let mut st = self.shared.state.lock().expect("pump lock");
         if st.stop_enqueued {
-            return Err(SinkError("run is stopping; no further deliveries".into()));
+            return Err(SinkError::protocol(
+                "run is stopping; no further deliveries",
+            ));
         }
         if st.spool_frames != 0 && st.auth_spooled >= st.spool_frames {
             if !st.spool_exhausted_reported {
@@ -454,7 +459,9 @@ impl PumpHandle {
     ) -> Result<(), SinkError> {
         let mut st = self.shared.state.lock().expect("pump lock");
         if st.stop_enqueued {
-            return Err(SinkError("run is stopping; no further deliveries".into()));
+            return Err(SinkError::protocol(
+                "run is stopping; no further deliveries",
+            ));
         }
         if st.draining {
             // Advisory deliveries are frozen during a drain (§4.4); a gossip observation simply
@@ -479,7 +486,8 @@ impl PumpHandle {
             sender,
             payload,
         };
-        let frame_bytes = encode_event_frame(&ev).map_err(|e| SinkError(e.to_string()))?;
+        let frame_bytes =
+            encode_event_frame(&ev).map_err(|e| SinkError::protocol(e.to_string()))?;
         // Drop-oldest at the declared depth (§4.7 gossip rule), journaled.
         let queued = st.queue.iter().filter(|q| q.gossip_id.is_some()).count();
         if st.gossip_depth != 0 && queued >= st.gossip_depth {
@@ -513,7 +521,9 @@ impl PumpHandle {
         let hash = *blake3::hash(&bytes).as_bytes();
         let mut st = self.shared.state.lock().expect("pump lock");
         if st.stop_enqueued {
-            return Err(SinkError("run is stopping; no further deliveries".into()));
+            return Err(SinkError::protocol(
+                "run is stopping; no further deliveries",
+            ));
         }
         // Advisory dedup by hash: an undelivered announcement for identical bytes coalesces.
         if st.queue.iter().any(|q| q.payload_hash == Some(hash)) {
@@ -545,7 +555,8 @@ impl PumpHandle {
                 channel,
             },
         };
-        let frame_bytes = encode_event_frame(&ev).map_err(|e| SinkError(e.to_string()))?;
+        let frame_bytes =
+            encode_event_frame(&ev).map_err(|e| SinkError::protocol(e.to_string()))?;
         st.queue.push_back(QueuedEvent {
             frame_bytes,
             tag: daemon_vhc_abi::EV_TAG_PAYLOAD_READY,
@@ -580,10 +591,13 @@ impl PumpHandle {
                 },
             },
         };
-        let frame_bytes = encode_event_frame(&ev).map_err(|e| SinkError(e.to_string()))?;
+        let frame_bytes =
+            encode_event_frame(&ev).map_err(|e| SinkError::protocol(e.to_string()))?;
         let mut st = self.shared.state.lock().expect("pump lock");
         if st.stop_enqueued {
-            return Err(SinkError("run is stopping; no further deliveries".into()));
+            return Err(SinkError::protocol(
+                "run is stopping; no further deliveries",
+            ));
         }
         // Latest-wins at depth 1: replace any queued Budget, journaling the coalesce (§4.7).
         if let Some(pos) = st.queue.iter().position(|q| q.is_budget) {
@@ -714,7 +728,7 @@ impl PumpHandle {
             reason,
             deadline_ms,
         })
-        .map_err(|e| SinkError(e.to_string()))?;
+        .map_err(|e| SinkError::protocol(e.to_string()))?;
         let mut st = self.shared.state.lock().expect("pump lock");
         st.draining = true;
         // Host-side enforcement of the deadline the event advertises (§4.4/§11.3): a guest that
@@ -1120,7 +1134,7 @@ impl PumpHandle {
                 detail: Some(detail),
             }),
             (req, outcome) => {
-                return Err(SinkError(format!(
+                return Err(SinkError::protocol(format!(
                     "op outcome shape mismatch: request {req:?} answered with {outcome:?}"
                 )))
             }
@@ -1226,7 +1240,7 @@ pub(crate) fn fire_due_timers(st: &mut PumpState, now: u64) -> Result<(), Trap> 
                         daemon_vhc_abi::COALESCE_LATEST_WINS,
                         crate::run::journal::Dropped::timer(dropped),
                     )
-                    .map_err(|e| Trap::bare(TrapCode::BadModule, e.to_string()))?;
+                    .map_err(Trap::from)?;
             }
         }
         st.queue.push_back(QueuedEvent {
