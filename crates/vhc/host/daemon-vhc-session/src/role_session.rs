@@ -74,6 +74,32 @@ const HELD_FRAMES_MAX: usize = 256;
 /// The session's internal tick (pending-frame retries, guest-end polling, gap aging).
 const TICK: Duration = Duration::from_millis(50);
 
+/// How often the session surfaces the delivery-boundary counters as a `plane_health` warning
+/// event (deaf-path instrumentation): transport Binary received → session forwarded → attach
+/// verdict by class → module delivery, plus the last-authenticated-inbound watermark. Slow by
+/// design — it is a diagnosis surface for "the socket is healthy but nothing arrives", not
+/// telemetry; it also fires once at session end for the post-mortem.
+const PLANE_HEALTH_EVERY: Duration = Duration::from_secs(60);
+
+/// A transport-plane counter snapshot (the WS half of the deaf-path instrumentation), reported
+/// through [`RoleProviders::plane_stats`] by transports that keep delivery-boundary counters.
+/// Transport-agnostic by design: the session never links the WS client.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ControlPlaneStats {
+    /// Binary transport messages received (frames + server heartbeats).
+    pub binary_received: u64,
+    /// Server heartbeat frames consumed (expected-progress liveness signal).
+    pub heartbeats_received: u64,
+    /// Frames the transport delivered to local subscribers (post-dedupe).
+    pub frames_delivered: u64,
+    /// Frames dropped as content-hash duplicates (healthy dual-plane overlap).
+    pub frames_duplicate: u64,
+    /// Reconnects forced by the Binary-silence (deafness) verdict.
+    pub deaf_reconnects: u64,
+    /// Unix ms of the most recent Binary arrival (0 = never).
+    pub last_binary_unix_ms: u64,
+}
+
 /// The transport + provider bindings a role session services capabilities against. All three are
 /// OPAQUE seams: signed frames in/out, content-addressed bytes up/down — no schema, no
 /// coordinates, no credentials cross this surface.
@@ -84,6 +110,9 @@ pub struct RoleProviders {
     pub payloads: Arc<dyn ContentStore>,
     /// The artifact plane (module `data.fetch` by committed hash; the pump verifies + slices).
     pub artifacts: Arc<dyn ContentStore>,
+    /// Transport-plane counter access (the deaf-path instrumentation), when the bound transport
+    /// keeps them (the live WS plane does; loopback/test planes pass `None`).
+    pub plane_stats: Option<Arc<dyn Fn() -> ControlPlaneStats + Send + Sync>>,
 }
 
 /// Everything a role task binds, moved into the session at spawn. Construction is the caller's
@@ -518,6 +547,10 @@ async fn run_role(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut leave_requested: Option<LeaveMode> = None;
     let mut transport_fault: Option<String> = None;
+    // Deaf-path instrumentation: the attach-boundary counters + the slow reporting cadence.
+    let mut health = InboundHealth::default();
+    let mut last_health_emit = std::time::Instant::now();
+    let mut last_health_detail = String::new();
 
     'session: loop {
         let gen_now = generation.load(Ordering::SeqCst);
@@ -527,6 +560,7 @@ async fn run_role(
                     Some(frame) => {
                         if !accept_inbound(
                             &mut current.attach, &frame, own_sender, &mut held, events, gen_now,
+                            &mut health,
                         ) {
                             transport_fault = Some("inbound frame delivery failed".into());
                             break 'session;
@@ -628,6 +662,20 @@ async fn run_role(
                     transport_fault = Some(stale);
                     break 'session;
                 }
+                // The slow plane-health cadence: surface the delivery-boundary counters when
+                // they moved, so "healthy socket, nothing arriving" is diagnosable live.
+                if last_health_emit.elapsed() >= PLANE_HEALTH_EVERY {
+                    last_health_emit = std::time::Instant::now();
+                    let transport = providers.plane_stats.as_ref().map(|f| f());
+                    let detail = plane_health_detail(transport.as_ref(), &health);
+                    if detail != last_health_detail {
+                        last_health_detail = detail.clone();
+                        let _ = events.send(Event::Warning {
+                            class: "plane_health".into(),
+                            detail,
+                        });
+                    }
+                }
                 if current.run.is_finished() {
                     break 'session;
                 }
@@ -636,6 +684,17 @@ async fn run_role(
         if current.run.is_finished() {
             break 'session;
         }
+    }
+
+    // The post-mortem plane-health line: the terminal counter state rides out with the session
+    // (a deaf wedge's signature — Binary flowing at the transport, nothing past the attach — is
+    // otherwise gone with the process).
+    {
+        let transport = providers.plane_stats.as_ref().map(|f| f());
+        let _ = events.send(Event::Warning {
+            class: "plane_health".into(),
+            detail: plane_health_detail(transport.as_ref(), &health),
+        });
     }
 
     // Drain any egress the guest produced before the loop ended (final publishes/metrics race
@@ -1211,6 +1270,64 @@ pub fn grant_expansion(old: &AdmittedQuotas, new: &AdmittedQuotas) -> Option<Str
     None
 }
 
+/// The session's own delivery-boundary counters (the half downstream of the transport): every
+/// frame the dual plane forwarded, classified by its attach verdict at FIRST presentation, plus
+/// the last module-delivery watermark. Together with [`ControlPlaneStats`] this makes the full
+/// chain (WS Binary → dual-plane forwarded → attach verdict → module delivery) measurable.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct InboundHealth {
+    /// Frames the control-plane subscription forwarded to the session.
+    forwarded: u64,
+    /// Frames delivered to the module (attach `Deliver`).
+    delivered: u64,
+    /// Frames the attach judged duplicates (healthy dual-plane overlap).
+    duplicate: u64,
+    /// Frames held for re-presentation (gap / backpressure) at first presentation.
+    held: u64,
+    /// Frames refused typed (bad signature, scope, uncertified sender, revoked, malformed).
+    refused: u64,
+    /// Distribution records ingested off the same plane (certs / revocations / seat grants).
+    records: u64,
+    /// Unix ms of the most recent module delivery (0 = never) — last-authenticated-inbound.
+    last_delivered_unix_ms: u64,
+}
+
+/// One `plane_health` event line: the transport counters (when the bound plane keeps them) and
+/// the session's attach-boundary counters, in chain order.
+fn plane_health_detail(transport: Option<&ControlPlaneStats>, inbound: &InboundHealth) -> String {
+    let ws = match transport {
+        Some(t) => format!(
+            "ws[binary={} hb={} delivered={} dup={} deaf_reconnects={} last_binary_ms={}]",
+            t.binary_received,
+            t.heartbeats_received,
+            t.frames_delivered,
+            t.frames_duplicate,
+            t.deaf_reconnects,
+            t.last_binary_unix_ms
+        ),
+        None => "ws[n/a]".to_string(),
+    };
+    format!(
+        "{ws} session[forwarded={} delivered={} dup={} held={} refused={} records={} \
+         last_delivered_ms={}]",
+        inbound.forwarded,
+        inbound.delivered,
+        inbound.duplicate,
+        inbound.held,
+        inbound.refused,
+        inbound.records,
+        inbound.last_delivered_unix_ms
+    )
+}
+
+/// Wall-clock unix ms for the delivery watermarks (0 is reserved for "never").
+fn unix_ms_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
 /// Verify + deliver one inbound wire frame. Own-voice echoes (a plane that self-delivers) are
 /// dropped before verification; gapped and back-pressured frames are HELD for re-presentation —
 /// the reliable class never silently skips. Returns `false` on a pump/journal delivery failure.
@@ -1221,13 +1338,16 @@ fn accept_inbound(
     held: &mut VecDeque<(std::time::Instant, Vec<u8>)>,
     events: &mpsc::UnboundedSender<Event>,
     generation: u64,
+    health: &mut InboundHealth,
 ) -> bool {
     // §12.3 distribution records travel on the same plane beside frames; the classification is
     // structural (a record is a top-level map, a §12.1 frame a top-level array), so this decode
     // attempt is cheap and never speculative on frame bytes. A refused record is a typed
     // per-record advisory, never a session fault; our own echoed announcement ingests as an
     // idempotent no-op.
+    health.forwarded = health.forwarded.saturating_add(1);
     if let Ok(record) = crate::distribution::DistributionRecord::from_bytes(frame) {
+        health.records = health.records.saturating_add(1);
         match attach.ingest_distribution(record) {
             Ok(()) => {
                 tracing::debug!("inbound: distribution record ingested (peer cert/revocation)")
@@ -1248,14 +1368,21 @@ fn accept_inbound(
         return true;
     }
     match attach.deliver(frame) {
-        Ok(InboundVerdict::Deliver { .. } | InboundVerdict::Duplicate { .. }) => {
+        Ok(InboundVerdict::Deliver { .. }) => {
+            health.delivered = health.delivered.saturating_add(1);
+            health.last_delivered_unix_ms = unix_ms_now();
             tracing::trace!(
                 sender = envelope_sender(frame).map(|s| hex16(&s)),
                 "inbound: frame delivered to the module"
             );
             true
         }
+        Ok(InboundVerdict::Duplicate { .. }) => {
+            health.duplicate = health.duplicate.saturating_add(1);
+            true
+        }
         Ok(InboundVerdict::Gap { .. } | InboundVerdict::Backpressure { .. }) => {
+            health.held = health.held.saturating_add(1);
             tracing::debug!("inbound: frame held (gap/backpressure)");
             hold_frame(held, frame);
             true
@@ -1269,6 +1396,7 @@ fn accept_inbound(
             | InboundVerdict::CertRevoked { .. }),
         ) => {
             // A typed refusal of one frame, never a session fault: surface and continue.
+            health.refused = health.refused.saturating_add(1);
             tracing::debug!(?verdict, "inbound: frame refused (typed)");
             let _ = events.send(Event::Warning {
                 class: "frame_refused".into(),
@@ -2168,6 +2296,38 @@ mod tests {
 
     fn trap(code: TrapCode) -> Trap {
         Trap::new(code, "publish", None, "test")
+    }
+
+    #[test]
+    fn the_plane_health_line_reports_the_full_delivery_chain_in_order() {
+        // The deaf-wedge signature must be readable off one line: Binary flowing at the
+        // transport (binary>0) while nothing passes the attach (delivered=0, refused=0).
+        let transport = ControlPlaneStats {
+            binary_received: 42,
+            heartbeats_received: 7,
+            frames_delivered: 0,
+            frames_duplicate: 0,
+            deaf_reconnects: 1,
+            last_binary_unix_ms: 1_700_000_000_000,
+        };
+        let inbound = InboundHealth {
+            forwarded: 0,
+            delivered: 0,
+            duplicate: 0,
+            held: 0,
+            refused: 0,
+            records: 0,
+            last_delivered_unix_ms: 0,
+        };
+        let line = plane_health_detail(Some(&transport), &inbound);
+        assert_eq!(
+            line,
+            "ws[binary=42 hb=7 delivered=0 dup=0 deaf_reconnects=1 \
+             last_binary_ms=1700000000000] session[forwarded=0 delivered=0 dup=0 held=0 \
+             refused=0 records=0 last_delivered_ms=0]"
+        );
+        // A plane without counters (loopback / gossip-only) reports n/a, never omits the line.
+        assert!(plane_health_detail(None, &inbound).starts_with("ws[n/a] session["));
     }
 
     #[test]

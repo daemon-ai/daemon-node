@@ -504,6 +504,18 @@ abort protocol — `daemon-cli vhc pause` on all boxes (best-effort), archive al
 stores + the registry state + R2 record sets immediately, then §6.2 offline replay to localize. No
 restart of the run.
 
+**Plane liveness (deaf-path diagnosis).** Each role session reports a `plane_health` line
+(a warning-class event in `daemon-cli vhc detail`'s recent events) on a slow cadence and at
+session end: the transport counters (`ws[binary= hb= delivered= dup= deaf_reconnects=
+last_binary_ms=]`) followed by the attach-boundary counters (`session[forwarded= delivered=
+dup= held= refused= records= last_delivered_ms=]`), in delivery-chain order (ABI §12.8
+[LT-5]). Reading it: a frozen `ws[binary]` while the socket stays connected is registry-side
+deafness — the client detects it via the server heartbeat's expected-progress deadline and
+force-reconnects (counted in `deaf_reconnects`); `ws` advancing while `session[delivered]` is
+frozen localizes the loss between the dual plane and the attach (look at `refused`/`held`).
+Repeated `deaf_reconnects` without recovery is a registry finding — archive and adjudicate,
+never wait it out.
+
 ### 5.5 Churn drills (G-3/G-4)
 
 - **Hard-kill drill at ~round 12** (first checkpoint exists at 8): on the Mac, `kill -9` the

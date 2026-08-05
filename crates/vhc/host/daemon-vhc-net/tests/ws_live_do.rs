@@ -196,6 +196,65 @@ async fn live_ws_join_ready_progresses_to_round_open() {
     peer.shutdown().await;
 }
 
+/// The deaf-fan-out regression, live (Phase 2 root cause): before the relay-first fix, the DO's
+/// dissemination rode the wasm tick — a throwing or state-wiped shell silently black-holed every
+/// inbound frame while the sockets stayed Pong-healthy, and no server signal let a client
+/// distinguish "quiet" from "deaf" (the no-shell/throwing-tick halves are pinned by the DO's own
+/// `do-relay` unit suite). This drives the observable contract against the real DO: peer relay,
+/// the server Binary heartbeat on its 20 s cadence (consumed, never fanned out), and client
+/// churn (shutdown + fresh dial) landing back in the fan-out set with delivery intact.
+#[tokio::test(flavor = "multi_thread")]
+async fn live_heartbeat_cadence_and_churn_recovery() {
+    let Ok(base_url) = std::env::var("VHC_LIVE_WS_URL") else {
+        eprintln!("SKIP live deaf-path churn: set VHC_LIVE_WS_URL");
+        return;
+    };
+    let run_id = std::env::var("VHC_LIVE_RUN_ID").unwrap_or_else(|_| "run-live".into());
+
+    let a = connect_live(&base_url, &run_id).await;
+    let b = connect_live(&base_url, &run_id).await;
+    let mut sub_b = b.subscribe();
+
+    // Peer relay on the seeded run (the baseline the churn below must return to).
+    let frame = signed_heartbeat_bytes(&signing_key(31), 1);
+    a.publish(&frame).await.expect("publish");
+    assert_eq!(
+        recv_timeout(&mut sub_b, DELIVER).await.as_deref(),
+        Some(frame.as_slice()),
+        "peer relay delivers on the seeded run"
+    );
+
+    // The server Binary heartbeat arrives within its 20 s cadence (+ dial slack) and is
+    // consumed by the plane, never fanned out to the subscriber.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while b.stats().heartbeats_received == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "no server heartbeat within 30 s (cadence is 20 s): stats={:?}",
+            b.stats()
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(
+        recv_timeout(&mut sub_b, GRACE).await.is_none(),
+        "heartbeats are liveness bookkeeping, never subscriber deliveries"
+    );
+
+    // Client churn: a fresh dial (the reconnect path's shape) rejoins the fan-out set.
+    a.shutdown().await;
+    let a2 = connect_live(&base_url, &run_id).await;
+    let frame2 = signed_heartbeat_bytes(&signing_key(32), 2);
+    a2.publish(&frame2).await.expect("publish after churn");
+    assert_eq!(
+        recv_timeout(&mut sub_b, DELIVER).await.as_deref(),
+        Some(frame2.as_slice()),
+        "delivery to the standing peer survives the other peer's churn"
+    );
+
+    a2.shutdown().await;
+    b.shutdown().await;
+}
+
 /// The CERTIFIED-IDENTITY attach extension (§12.1/§12.3 over the live DO relay): the byte-opaque
 /// WS plane relays a §12.3 certificate DISTRIBUTION RECORD and a §12.1 frame byte-for-byte to the
 /// other peer, exactly as it relays the round-vocabulary control frames — proving the

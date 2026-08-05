@@ -2813,6 +2813,24 @@ structurally disjoint shapes), inventoried for the accumulated WireVersion decis
   surface already accepts `(artifact, put|get)` structurally, so no route, kind, or key rule is
   added; live confirmation against the dev R2 backend rides the R2-conditional lane (the SigV4
   API-token-scope fix), with the mock/filesystem gates mandatory meanwhile.
+- **[LT-5] Relay dissemination is unconditional, and delivery liveness is an expected-progress
+  signal — never Pong, never a blind timer.** A conforming WS relay (the registry coordinator
+  DO) disseminates every inbound frame to the other subscribed peers **relay-first**: fan-out
+  MUST NOT be sequenced behind, or gated on, any consensus/tick processing of the frame — a
+  throwing, poisoned, or uninitialized decision core must never black-hole peer traffic while
+  the sockets stay Ping/Pong-healthy (the observed deaf-fan-out wedge class). While at least one
+  subscriber socket is connected, the relay emits a **Binary heartbeat** — the 8-byte prefix
+  `DVHC-HB1`, an 8-byte big-endian sequence, an 8-byte big-endian unix-ms — such that a healthy
+  subscriber observes SOME Binary at least every heartbeat cadence (20 s; ordinary frame traffic
+  satisfies it). A heartbeat is transport liveness bookkeeping: consumed by the plane, counted,
+  never delivered to the module. On the client, Pong proves only socket liveness; the
+  **deafness verdict** arms on the first heartbeat of a connection (a pre-heartbeat relay, or a
+  legitimately quiet phase, never arms it), refreshes on every Binary, and on Binary silence
+  past the configured deadline (default 75 s — three missed heartbeats plus jitter) forces a
+  reconnect + resubscribe. Delivery-boundary counters (transport Binary received → dual-plane
+  forwarded → attach verdict by class → module delivery, plus the last-authenticated-inbound
+  watermark) are kept at each stage and surfaced as the session's `plane_health` advisory, so
+  "healthy socket, nothing arriving" is measurable, never inferred.
 - *(informative)* The durable per-incarnation journal home (`<run state dir>/<role>-<incarnation>/journal`,
   §8) and the run-state-root path reference the node exports to its worker are node↔worker
   process contract, not CBOR wire; they are recorded with §8's execution-identity text and noted

@@ -92,6 +92,7 @@ fn rig(wasm: &[u8], role: &str, config: Vec<u8>) -> Rig {
             control: plane.clone(),
             payloads: payloads.clone(),
             artifacts: artifacts.clone(),
+            plane_stats: None,
         },
         journal: Box::new(sink.clone()),
         drain_deadline: Duration::from_secs(10),

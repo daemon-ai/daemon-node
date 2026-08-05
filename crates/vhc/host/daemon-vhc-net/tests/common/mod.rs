@@ -453,6 +453,7 @@ pub mod ws_harness {
             initial_backoff: Duration::from_millis(20),
             max_backoff: Duration::from_millis(200),
             max_attempts: None,
+            ..ReconnectConfig::default()
         }
     }
 }

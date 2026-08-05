@@ -176,6 +176,36 @@ None of these blocks C0 or C1.
   - Docs moved with the change: ABI §7.6 trap table, §12.6 [RS-2] class table,
     §12.10 [RL-4] storage-gated exception, §12.14 [SF-6] cadence wiring note;
     runbook §4.7 cadence check. Housekeeping rules encoded in §9 of this file.
+- **Pre-C2 hardening — Phase 2 LANDED (2026-08-05): deaf-path root cause + fix.**
+  - **Root cause (DO fan-out audit)**: the registry `RunCoordinatorDO` sequenced WS
+    dissemination BEHIND the wasm tick — a throwing/poisoned or uninitialized shell
+    silently black-holed all relay while sockets stayed Pong-healthy (hibernation socket
+    survival itself was correct). No server liveness signal existed, so clients could not
+    distinguish quiet from deaf; Pong-fed idle deadlines can never see this class.
+  - **Fix, DO side** (`daemon-cloud` `apps/vhc`): relay-first dissemination (fan-out
+    unconditional, tick failures contained + logged, no-shell traffic still relayed) and a
+    Binary heartbeat (`DVHC-HB1` + seq + unix-ms) on the alarm cadence (20 s) whenever
+    sockets are connected, sharing the alarm with the shell's phase clock. Unit-pinned in
+    the new `do-relay` vitest suite (relay with no shell, relay despite a throwing tick,
+    heartbeat shape + rescheduling).
+  - **Fix, client side** (`daemon-vhc-net::ws_client`): delivery-boundary counters
+    (`WsPlaneStats`), heartbeat consumption (never fanned out), and the deafness verdict —
+    armed by the FIRST heartbeat of a connection, refreshed by any Binary, Binary silence
+    past `ReconnectConfig::binary_silence_deadline` (default 75 s) forces reconnect +
+    resubscribe; a pre-heartbeat server never arms it (no blind timer). Regressions in
+    `ws_control_plane.rs` (consumed heartbeat; forced deaf reconnect with no cycling).
+  - **Instrumentation**: the session counts each boundary (dual-plane forwarded → attach
+    verdict by class → module delivery + last-authenticated-inbound) and emits a
+    `plane_health` warning event every 60 s when moved and at session end, carrying the WS
+    transport counters via the new `RoleProviders::plane_stats` seam — surfaced in
+    `vhc detail` recent events.
+  - **Live churn regression**: `ws_live_do::live_heartbeat_cadence_and_churn_recovery`
+    (relay + real 20 s heartbeat + client churn recovery) green against wrangler-dev with
+    the fixed DO; the full 4-test live lane green.
+  - Docs moved with the change: ABI §12.8 [LT-5] (relay-first + heartbeat + deafness
+    verdict + plane-health counters), runbook §5.4 plane-liveness diagnosis. Known
+    pre-existing: cloud `seat.test.ts` has 4 failures on clean HEAD (seat-lease v2 fixture
+    drift, predates this phase; convergence work, Phase 8).
 - **Not claimed** (recorded): offline consensus replay from a sealed archive
   (`publish_journal_archive()` has no product callers), general archive backfill,
   in-session exact-frame loss repair, coordinator crash reconstruction, §5.3 standby
@@ -203,10 +233,11 @@ All four answer ssh (verified 2026-08-04). Next actions (in order):
    passed (§7).
 3. Pre-C2 workstream (plan `production-ready_ceremony_completion_47713b86`, strictly
    sequential): ~~Phase 1 cadence contract + typed storage taxonomy~~ DONE (§7).
-   Next: Phase 2 deaf-path instrumentation + root cause (per-plane delivery counters,
-   DO fan-out audit, live-DO churn regression), then Phases 3–6 (archive publication →
-   replay assembly → sandboxed coordinator reconstruction → disk custody), then C1.5;
-   plus the registry Byzantine posture owner decision (§6).
+   ~~Phase 2 deaf-path instrumentation + root cause~~ DONE (§7: relay-first DO, server
+   Binary heartbeat, client deafness verdict, plane_health surface, live churn
+   regression). Next: Phase 3 incremental authenticated archive publication, then
+   Phases 4–6 (replay assembly → sandboxed coordinator reconstruction → disk custody),
+   then C1.5; plus the registry Byzantine posture owner decision (§6).
 4. Bring the Windows 5090 seat into a three-box run (its worker lane builds with
    `vhc-net,wgpu-spirv`; native DX12 verdict is already green).
 5. Freeze; memoized preflight; run C2; evidence closure; human-signed master merge.

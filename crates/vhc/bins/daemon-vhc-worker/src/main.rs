@@ -75,6 +75,7 @@ fn in_process_providers() -> RoleProviders {
         control: Arc::new(daemon_vhc_net::LoopbackGossip::new()),
         payloads: Arc::new(daemon_vhc_net::MemoryContentStore::new()),
         artifacts: Arc::new(daemon_vhc_net::MemoryContentStore::new()),
+        plane_stats: None,
     }
 }
 

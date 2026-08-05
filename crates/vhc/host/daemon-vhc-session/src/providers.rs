@@ -225,6 +225,22 @@ pub async fn build_role_providers(
         ws.add_resubscribe_frame(grant);
     }
     let ws = Arc::new(ws);
+    // The deaf-path instrumentation seam: the session reads the WS plane's delivery-boundary
+    // counters through this transport-agnostic closure (it never links the WS client itself).
+    let plane_stats = {
+        let ws = ws.clone();
+        Arc::new(move || {
+            let s = ws.stats();
+            crate::role_session::ControlPlaneStats {
+                binary_received: s.binary_received,
+                heartbeats_received: s.heartbeats_received,
+                frames_delivered: s.frames_delivered,
+                frames_duplicate: s.frames_duplicate,
+                deaf_reconnects: s.deaf_reconnects,
+                last_binary_unix_ms: s.last_binary_unix_ms,
+            }
+        }) as Arc<dyn Fn() -> crate::role_session::ControlPlaneStats + Send + Sync>
+    };
     tracing::debug!(
         run = inputs.run_label,
         "live attach: WS control plane connected"
@@ -294,6 +310,7 @@ pub async fn build_role_providers(
         control,
         payloads: stores.clone(),
         artifacts: stores,
+        plane_stats: Some(plane_stats),
     })
 }
 

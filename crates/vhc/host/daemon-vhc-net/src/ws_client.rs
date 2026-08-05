@@ -89,6 +89,12 @@ pub struct ReconnectConfig {
     pub max_backoff: Duration,
     /// Consecutive failed dial attempts before giving up (`None` = retry forever).
     pub max_attempts: Option<u32>,
+    /// The Binary-silence (deafness) deadline: armed by the FIRST server heartbeat on a
+    /// connection, refreshed by every Binary; silence past this span forces a reconnect +
+    /// resubscribe (see [`HEARTBEAT_PREFIX`]). Default 75 s — three missed 20 s server
+    /// heartbeats plus jitter. A pre-heartbeat server never arms it (no false cycling in quiet
+    /// phases).
+    pub binary_silence_deadline: Duration,
 }
 
 impl Default for ReconnectConfig {
@@ -98,6 +104,7 @@ impl Default for ReconnectConfig {
             initial_backoff: Duration::from_millis(500),
             max_backoff: Duration::from_secs(30),
             max_attempts: None,
+            binary_silence_deadline: Duration::from_secs(75),
         }
     }
 }
@@ -125,6 +132,38 @@ impl WsConfig {
     }
 }
 
+/// The server heartbeat frame prefix (the registry DO's alarm-cadence Binary heartbeat).
+///
+/// The deaf-fan-out class (run-i/run-k): a subscriber silently dropped from the DO's broadcast
+/// set — or a DO whose dissemination path is wedged — keeps answering WS Pings, so a Pong-fed
+/// idle deadline can NEVER see the failure ("socket liveness is not delivery"). The heartbeat is
+/// the server's **expected-progress** signal on the same Binary path the real frames ride: while
+/// subscribed and healthy, SOME Binary arrives at least every heartbeat cadence, so Binary
+/// silence becomes a valid deafness verdict. A heartbeat frame is consumed by the plane
+/// (liveness bookkeeping) and never fanned out; a pre-heartbeat server simply never sends one,
+/// and the deadline stays UNARMED (old behavior, no false reconnect cycling in quiet phases).
+pub const HEARTBEAT_PREFIX: &[u8; 8] = b"DVHC-HB1";
+
+/// Delivery-boundary counters for one WS plane (the deaf-path instrumentation): every stage a
+/// frame passes on its way to the module is counted separately, so "the socket is healthy but
+/// nothing arrives" is measurable instead of invisible. Snapshot via [`WsControlPlane::stats`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WsPlaneStats {
+    /// Binary WS messages received (frames + heartbeats — raw arrivals before any judgment).
+    pub binary_received: u64,
+    /// Server heartbeat frames consumed (liveness bookkeeping, never fanned out).
+    pub heartbeats_received: u64,
+    /// Frames delivered to at least one local subscriber (post-dedupe fan-out).
+    pub frames_delivered: u64,
+    /// Frames dropped as content-hash duplicates (NET-6 — the healthy dual-plane overlap).
+    pub frames_duplicate: u64,
+    /// Reconnects forced by the Binary-silence (deafness) verdict specifically.
+    pub deaf_reconnects: u64,
+    /// Unix ms of the most recent Binary arrival (0 = never) — the last-authenticated-inbound
+    /// watermark `vhc detail` surfaces.
+    pub last_binary_unix_ms: u64,
+}
+
 /// State shared between the plane handle and the background connection task.
 struct Shared {
     /// Live local subscriber inboxes.
@@ -136,6 +175,8 @@ struct Shared {
     connects: u64,
     /// Whether the socket is currently up.
     connected: bool,
+    /// The delivery-boundary counters (deaf-path instrumentation).
+    stats: WsPlaneStats,
 }
 
 /// The node WS coordinator client, presented as a [`ControlPlane`].
@@ -165,6 +206,7 @@ impl WsControlPlane {
             dedupe: Deduper::new(),
             connects: 1,
             connected: true,
+            stats: WsPlaneStats::default(),
         }));
         let resubscribe = Arc::new(Mutex::new(Vec::new()));
         let (outbound_tx, outbound_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -215,6 +257,12 @@ impl WsControlPlane {
     #[must_use]
     pub fn is_connected(&self) -> bool {
         self.shared.lock().expect("ws shared lock").connected
+    }
+
+    /// A snapshot of the delivery-boundary counters (the deaf-path instrumentation).
+    #[must_use]
+    pub fn stats(&self) -> WsPlaneStats {
+        self.shared.lock().expect("ws shared lock").stats.clone()
     }
 
     /// Abort the background connection task (graceful shutdown; also runs on `Drop`).
@@ -322,7 +370,7 @@ async fn conn_loop(
                 }
             }
         };
-        let outcome = serve(stream, &mut outbound_rx, &shared, &resubscribe).await;
+        let outcome = serve(stream, &mut outbound_rx, &shared, &resubscribe, &reconnect).await;
         shared.lock().expect("ws shared lock").connected = false;
         match outcome {
             ServeOutcome::Closed => return,
@@ -368,6 +416,7 @@ async fn serve(
     outbound_rx: &mut UnboundedReceiver<Vec<u8>>,
     shared: &Arc<Mutex<Shared>>,
     resubscribe: &Arc<Mutex<Vec<Vec<u8>>>>,
+    reconnect: &ReconnectConfig,
 ) -> ServeOutcome {
     let (mut write, mut read) = stream.split();
 
@@ -384,10 +433,22 @@ async fn serve(
     reannounce.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     reannounce.tick().await; // consume the immediate first tick — this connect just re-sent above
 
-    let mut keepalive = tokio::time::interval(KEEPALIVE_PING);
+    // The liveness tick doubles as the deafness-deadline check, so it must fire at least twice
+    // per silence deadline (production: 20 s ping vs 75 s deadline — unchanged).
+    let ping_every = KEEPALIVE_PING
+        .min(reconnect.binary_silence_deadline / 2)
+        .max(Duration::from_millis(50));
+    let mut keepalive = tokio::time::interval(ping_every);
     keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     keepalive.tick().await; // consume the immediate first tick — the connect itself proves liveness
     let mut last_inbound = tokio::time::Instant::now();
+    // The Binary-silence (deafness) watermark: `None` until the FIRST server HEARTBEAT arrives on
+    // THIS connection — the heartbeat is the server's explicit cadence promise, so only it may
+    // arm the deadline (a pre-heartbeat server, or one that delivers a frame and then goes
+    // legitimately quiet, never arms it — no blind-timer reconnect cycling). Once armed, EVERY
+    // Binary refreshes it (frames prove delivery just as well). Pongs deliberately do NOT touch
+    // it: socket liveness is not delivery (the run-i/run-k deaf-fan-out class).
+    let mut last_binary: Option<tokio::time::Instant> = None;
 
     loop {
         tokio::select! {
@@ -401,6 +462,23 @@ async fn serve(
                         "ws control plane went silent past the idle deadline; reconnecting"
                     );
                     return ServeOutcome::Disconnected;
+                }
+                // Deafness detection: the server heartbeat armed the Binary deadline, so Binary
+                // silence past it means this subscriber is no longer being delivered to (dropped
+                // from the fan-out set, or the dissemination path is wedged) even though the
+                // socket answers Pings. Reconnect + resubscribe is the recovery.
+                if let Some(at) = last_binary {
+                    if at.elapsed() >= reconnect.binary_silence_deadline {
+                        let mut sh = shared.lock().expect("ws shared lock");
+                        sh.stats.deaf_reconnects = sh.stats.deaf_reconnects.saturating_add(1);
+                        drop(sh);
+                        tracing::warn!(
+                            silent = ?at.elapsed(),
+                            "ws control plane deaf: socket alive but no Binary within the \
+                             expected-progress deadline; reconnecting + resubscribing"
+                        );
+                        return ServeOutcome::Disconnected;
+                    }
                 }
                 if write.send(Message::Ping(Vec::new().into())).await.is_err() {
                     return ServeOutcome::Disconnected;
@@ -431,7 +509,29 @@ async fn serve(
             inbound = read.next() => {
                 last_inbound = tokio::time::Instant::now();
                 match inbound {
-                    Some(Ok(Message::Binary(payload))) => deliver(shared, payload.to_vec()),
+                    Some(Ok(Message::Binary(payload))) => {
+                        // Refresh only once armed; arming is the heartbeat's alone (below).
+                        if last_binary.is_some() {
+                            last_binary = Some(tokio::time::Instant::now());
+                        }
+                        {
+                            let mut sh = shared.lock().expect("ws shared lock");
+                            sh.stats.binary_received = sh.stats.binary_received.saturating_add(1);
+                            sh.stats.last_binary_unix_ms = unix_ms();
+                        }
+                        if payload.len() >= HEARTBEAT_PREFIX.len()
+                            && payload[..HEARTBEAT_PREFIX.len()] == HEARTBEAT_PREFIX[..]
+                        {
+                            // A server heartbeat: arms/refreshes the deafness deadline and is
+                            // counted; never fanned out to subscribers.
+                            last_binary = Some(tokio::time::Instant::now());
+                            let mut sh = shared.lock().expect("ws shared lock");
+                            sh.stats.heartbeats_received =
+                                sh.stats.heartbeats_received.saturating_add(1);
+                        } else {
+                            deliver(shared, payload.to_vec());
+                        }
+                    }
                     // Text frames are ignored (the protocol is binary-only); ping/pong ride
                     // tungstenite's automatic handling; a Close begins teardown.
                     Some(Ok(Message::Text(_) | Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => {}
@@ -456,6 +556,7 @@ async fn serve(
 fn deliver(shared: &Arc<Mutex<Shared>>, payload: Vec<u8>) {
     let mut sh = shared.lock().expect("ws shared lock");
     if sh.dedupe.contains(&payload) {
+        sh.stats.frames_duplicate = sh.stats.frames_duplicate.saturating_add(1);
         return;
     }
     let mut delivered = false;
@@ -465,8 +566,17 @@ fn deliver(shared: &Arc<Mutex<Shared>>, payload: Vec<u8>) {
         ok
     });
     if delivered {
+        sh.stats.frames_delivered = sh.stats.frames_delivered.saturating_add(1);
         sh.dedupe.observe(&payload);
     }
+}
+
+/// Wall-clock unix ms (the `last_binary_unix_ms` watermark; `0` is reserved for "never").
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
 }
 
 /// Install the aws-lc-rs [`CryptoProvider`](rustls::crypto::CryptoProvider) as the process default,

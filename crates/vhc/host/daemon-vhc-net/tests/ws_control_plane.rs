@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use common::ws_harness::{fast_reconnect, no_reconnect, MockWsCoordinator};
 use common::{recv_timeout, signed_heartbeat_bytes, signing_key, DELIVER, GRACE};
+use daemon_vhc_net::ws_client::HEARTBEAT_PREFIX;
 use daemon_vhc_net::{ControlPlane, WsAuth};
 use daemon_vhc_proto::{from_canonical_slice, to_canonical_vec, Hash, VHC_PROTO_VERSION};
 use daemon_vhc_sdk_consensus::messages::{Commitment, Locator};
@@ -149,6 +150,98 @@ async fn ws_reconnects_and_resubscribes() {
 
     // A post-reconnect coordinator emission still reaches the subscriber.
     let frame = signed_heartbeat_bytes(&signing_key(3), 7);
+    coord.broadcast(frame.clone());
+    assert_eq!(
+        recv_timeout(&mut sub, DELIVER).await.as_deref(),
+        Some(frame.as_slice())
+    );
+}
+
+/// A server heartbeat frame (the DO's `DVHC-HB1` liveness signal): prefix + seq + unix-ms.
+fn heartbeat_frame(seq: u64) -> Vec<u8> {
+    let mut f = Vec::with_capacity(HEARTBEAT_PREFIX.len() + 16);
+    f.extend_from_slice(HEARTBEAT_PREFIX);
+    f.extend_from_slice(&seq.to_be_bytes());
+    f.extend_from_slice(&0u64.to_be_bytes());
+    f
+}
+
+/// A server heartbeat is consumed by the plane (liveness bookkeeping + counters) and never
+/// reaches a subscriber; a regular frame alone never arms the deafness deadline.
+#[tokio::test(flavor = "multi_thread")]
+async fn ws_heartbeat_is_consumed_never_fanned_out() {
+    let coord = MockWsCoordinator::start().await;
+    let mut rc = fast_reconnect();
+    rc.binary_silence_deadline = Duration::from_millis(400);
+    let plane = coord.client("run-hb", WsAuth::None, rc).await;
+    coord.wait_peers(1).await;
+    let mut sub = plane.subscribe();
+
+    // A regular frame delivers to the subscriber but must NOT arm the deafness deadline: well
+    // past the 400 ms deadline the plane is still on its first connection (quiet phases on a
+    // pre-heartbeat server never trigger reconnect cycling).
+    let frame = signed_heartbeat_bytes(&signing_key(4), 1);
+    coord.broadcast(frame.clone());
+    assert_eq!(
+        recv_timeout(&mut sub, DELIVER).await.as_deref(),
+        Some(frame.as_slice())
+    );
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    assert_eq!(
+        plane.connect_count(),
+        1,
+        "a regular frame must not arm the deafness deadline"
+    );
+
+    // A heartbeat is counted and consumed — the subscriber never sees it.
+    coord.broadcast(heartbeat_frame(1));
+    wait_until(Duration::from_secs(2), || {
+        plane.stats().heartbeats_received >= 1
+    })
+    .await;
+    let stats = plane.stats();
+    assert!(stats.binary_received >= 2, "both binaries counted");
+    assert_eq!(stats.frames_delivered, 1, "only the real frame fanned out");
+    assert!(stats.last_binary_unix_ms > 0, "the inbound watermark moved");
+    assert!(recv_timeout(&mut sub, GRACE).await.is_none());
+}
+
+/// The deaf-fan-out regression: once a server heartbeat armed the expected-progress deadline,
+/// Binary silence past it forces a reconnect + resubscribe even though the socket itself stays
+/// healthy (the relay keeps answering Pings throughout — Pong is never delivery evidence).
+#[tokio::test(flavor = "multi_thread")]
+async fn ws_binary_silence_after_heartbeat_forces_deaf_reconnect() {
+    let coord = MockWsCoordinator::start().await;
+    let mut rc = fast_reconnect();
+    rc.binary_silence_deadline = Duration::from_millis(400);
+    let plane = coord.client("run-deaf", WsAuth::None, rc).await;
+    coord.wait_peers(1).await;
+
+    // Arm the deadline with one heartbeat, then go Binary-silent (the deaf fan-out).
+    coord.broadcast(heartbeat_frame(1));
+    wait_until(Duration::from_secs(2), || {
+        plane.stats().heartbeats_received >= 1
+    })
+    .await;
+
+    // The plane must declare deafness and cycle the connection.
+    wait_until(Duration::from_secs(5), || plane.connect_count() >= 2).await;
+    assert!(
+        plane.stats().deaf_reconnects >= 1,
+        "counted as a deaf cycle"
+    );
+
+    // The fresh connection is unarmed (no heartbeat arrived on it), so the plane does not keep
+    // cycling — and a post-reconnect broadcast still reaches the subscriber.
+    let stable = plane.connect_count();
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    assert_eq!(
+        plane.connect_count(),
+        stable,
+        "no reconnect cycling while the new connection is unarmed"
+    );
+    let mut sub = plane.subscribe();
+    let frame = signed_heartbeat_bytes(&signing_key(5), 2);
     coord.broadcast(frame.clone());
     assert_eq!(
         recv_timeout(&mut sub, DELIVER).await.as_deref(),
