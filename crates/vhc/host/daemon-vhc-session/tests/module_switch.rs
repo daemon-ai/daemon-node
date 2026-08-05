@@ -143,11 +143,13 @@ fn rig(wasm: &[u8], admitted_quotas: Option<AdmittedQuotas>) -> Rig {
             payloads: Arc::new(MemoryContentStore::new()),
             artifacts: Arc::new(MemoryContentStore::new()),
             plane_stats: None,
+            archive_heads: None,
         },
         journal: Box::new(sink.clone()),
         drain_deadline: Duration::from_secs(10),
         restore: None,
         admitted_quotas,
+        archive: None,
     };
     Rig {
         plane,

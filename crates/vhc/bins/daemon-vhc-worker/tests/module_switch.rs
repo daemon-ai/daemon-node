@@ -502,23 +502,40 @@ async fn switch_reissues_identity_and_continues_the_durable_journal() {
     );
     assert_eq!(first.header.id.instance, 1);
     assert_eq!(first.header.id.epoch, 0);
-    let last = daemon_vhc_journal::scan_file(
-        jdir.join(format!("segment-{:08}.dvhcjrn", ords[ords.len() - 1])),
-    )
-    .expect("scan continuation span");
-    assert_eq!(last.header.id.instance, 2);
-    assert_eq!(last.header.id.epoch, 1);
-    let post_seam_publish_seqs: Vec<u64> = last
-        .records
-        .iter()
-        .filter_map(|r| match &r.body {
+    // The continuation span: every post-seam segment carries the NEW identity, and its publish
+    // stream opens at seq 0. The terminal record's TAIL SEAL rolls the live segment (so the
+    // span's last records are archivable under its own key), leaving one trailing EMPTY,
+    // unsealed successor — the publishes live in the sealed segments before it.
+    let mut post_seam_publish_seqs: Vec<u64> = Vec::new();
+    for &ord in &ords[1..] {
+        let scan = daemon_vhc_journal::scan_file(jdir.join(format!("segment-{ord:08}.dvhcjrn")))
+            .expect("scan continuation span");
+        assert_eq!(scan.header.id.instance, 2);
+        assert_eq!(scan.header.id.epoch, 1);
+        post_seam_publish_seqs.extend(scan.records.iter().filter_map(|r| match &r.body {
             daemon_vhc_journal::Body::Publish(p) => Some(p.seq),
             _ => None,
-        })
-        .collect();
+        }));
+    }
     assert_eq!(
         post_seam_publish_seqs.first(),
         Some(&0),
         "the new incarnation's publish stream opened at seq 0"
+    );
+    let tail = daemon_vhc_journal::scan_file(
+        jdir.join(format!("segment-{:08}.dvhcjrn", ords[ords.len() - 1])),
+    )
+    .expect("scan the post-terminal successor");
+    assert!(
+        !tail.sealed && tail.records.is_empty(),
+        "the terminal tail seal leaves exactly one empty, unsealed successor segment"
+    );
+    let sealed_tail = daemon_vhc_journal::scan_file(
+        jdir.join(format!("segment-{:08}.dvhcjrn", ords[ords.len() - 2])),
+    )
+    .expect("scan the terminal-sealed segment");
+    assert!(
+        sealed_tail.sealed,
+        "the span holding the run's last records sealed at the terminal"
     );
 }

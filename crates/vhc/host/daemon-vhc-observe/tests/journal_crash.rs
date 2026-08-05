@@ -238,7 +238,10 @@ fn multi_segment_chain_recovers_after_tear_on_last_segment() {
     let dir = tempdir();
     let root = dir.join("journal");
     // Force rotation every 2 records so we get several segments.
-    let rotate = RotatePolicy { max_records: 2 };
+    let rotate = RotatePolicy {
+        max_records: 2,
+        ..RotatePolicy::default()
+    };
 
     {
         let mut j = Journal::create(&root, ident(), StaticKey::new([3u8; 32]), rotate).unwrap();
@@ -273,4 +276,164 @@ fn multi_segment_chain_recovers_after_tear_on_last_segment() {
         assert_eq!(r.ord, i as u64);
     }
     assert!(!records.is_empty());
+}
+
+/// The seal hook (the incremental archive-publication seam) reports, for EVERY roll, exactly the
+/// claim an archive head publishes: the sealed segment's identity, ordinal, path, content hash,
+/// chain link, and record count — and the reported chain links thread (each `prev_blake3` is the
+/// previous report's `segment_blake3`, from the genesis link).
+#[test]
+fn the_seal_hook_reports_the_publishable_chain_claim_on_every_roll() {
+    use std::sync::{Arc, Mutex};
+
+    use daemon_vhc_observe::journal::store::SealedSegment;
+
+    let dir = tempdir();
+    let root = dir.join("journal");
+    let rotate = RotatePolicy {
+        max_records: 2,
+        ..RotatePolicy::default()
+    };
+    let seals: Arc<Mutex<Vec<SealedSegment>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let mut j = Journal::create(&root, ident(), StaticKey::new([3u8; 32]), rotate).unwrap();
+    let sink = seals.clone();
+    j.set_seal_hook(Box::new(move |s| sink.lock().unwrap().push(s.clone())));
+    for i in 0..5u64 {
+        j.append(Body::Event(EventRec {
+            at: i,
+            frame: format!("e{i}").into_bytes(),
+        }))
+        .unwrap();
+    }
+    j.commit().unwrap();
+
+    let seals = seals.lock().unwrap();
+    assert_eq!(seals.len(), 2, "5 records at max 2/segment roll twice");
+    let mut prev = GENESIS_PREV;
+    for (i, s) in seals.iter().enumerate() {
+        assert_eq!(s.segment, i as u64);
+        assert_eq!(s.id, ident(), "the sealed segment's own header identity");
+        assert_eq!(s.records, 2);
+        assert_eq!(s.prev_blake3, prev, "the chain link threads");
+        // The reported content hash IS the sealed file's blake3 (the content address a
+        // publisher uploads under).
+        let bytes = std::fs::read(&s.path).unwrap();
+        assert_eq!(
+            Hash(s.segment_blake3),
+            daemon_vhc_proto::blake3_hash(&bytes),
+            "segment_blake3 is the complete sealed file's hash"
+        );
+        prev = s.segment_blake3;
+    }
+}
+
+/// The [`RotatePolicy::max_open`] age bound (the archive recovery-point cadence): a non-empty
+/// segment older than the bound rolls on the next append; an EMPTY segment never rolls on time
+/// alone (no content-free chain churn).
+#[test]
+fn the_age_bound_rolls_a_stale_nonempty_segment_but_never_an_empty_one() {
+    use std::sync::atomic::AtomicU64 as Counter;
+    use std::sync::Arc;
+
+    let dir = tempdir();
+    let root = dir.join("journal");
+    let rotate = RotatePolicy {
+        max_records: 1_000,
+        max_open: Some(std::time::Duration::from_millis(30)),
+    };
+    let rolls = Arc::new(Counter::new(0));
+
+    let mut j = Journal::create(&root, ident(), StaticKey::new([3u8; 32]), rotate).unwrap();
+    let n = rolls.clone();
+    j.set_seal_hook(Box::new(move |_| {
+        n.fetch_add(1, Ordering::Relaxed);
+    }));
+
+    // An empty segment aged past the bound: the next append must land in it, not roll it.
+    std::thread::sleep(std::time::Duration::from_millis(40));
+    j.append(Body::Clock(daemon_vhc_observe::journal::record::ClockRec {
+        now: 1,
+    }))
+    .unwrap();
+    assert_eq!(
+        rolls.load(Ordering::Relaxed),
+        0,
+        "an empty segment never rolls on age"
+    );
+
+    // The segment is now non-empty; once aged, the NEXT append seals it first.
+    std::thread::sleep(std::time::Duration::from_millis(40));
+    j.append(Body::Clock(daemon_vhc_observe::journal::record::ClockRec {
+        now: 2,
+    }))
+    .unwrap();
+    assert_eq!(
+        rolls.load(Ordering::Relaxed),
+        1,
+        "a stale non-empty segment seals before the next append"
+    );
+    assert_eq!(j.current_segment(), 1);
+}
+
+/// The founding identity is segment 0's header identity, surviving both a reopen and a
+/// live-upgrade seam ([`Journal::roll_to_identity`]) — the archive chain scope is the SERIES',
+/// not the current span's.
+#[test]
+fn the_founding_identity_survives_reopen_and_the_upgrade_seam() {
+    let dir = tempdir();
+    let root = dir.join("journal");
+
+    {
+        let mut j = Journal::create(
+            &root,
+            ident(),
+            StaticKey::new([3u8; 32]),
+            RotatePolicy::default(),
+        )
+        .unwrap();
+        j.append(Body::Clock(daemon_vhc_observe::journal::record::ClockRec {
+            now: 1,
+        }))
+        .unwrap();
+        j.commit().unwrap();
+    }
+
+    // The seam: continue the series under a successor identity.
+    let successor = ExecIdentity {
+        instance: 8,
+        epoch: 2,
+        ..ident()
+    };
+    {
+        let mut j = Journal::open_continuation(
+            &root,
+            successor.clone(),
+            StaticKey::new([3u8; 32]),
+            RotatePolicy::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(*j.id(), successor, "the live identity is the successor's");
+        assert_eq!(
+            *j.founding_id(),
+            ident(),
+            "the founding identity stays the series founder's across the seam"
+        );
+        j.append(Body::Clock(daemon_vhc_observe::journal::record::ClockRec {
+            now: 2,
+        }))
+        .unwrap();
+        j.commit().unwrap();
+    }
+
+    // And across a plain reopen after the seam.
+    let j = Journal::open(
+        &root,
+        successor.clone(),
+        StaticKey::new([3u8; 32]),
+        RotatePolicy::default(),
+    )
+    .unwrap();
+    assert_eq!(*j.founding_id(), ident());
 }

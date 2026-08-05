@@ -24,6 +24,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod archive;
 pub mod bytes;
 pub mod canonical;
 pub mod capability;
@@ -49,6 +50,9 @@ pub mod sign;
 pub mod transition;
 pub mod version;
 
+pub use archive::{
+    ArchiveChainSlot, ArchiveHeadBody, ArchiveHeadDecision, ArchiveHeadError, ArchiveHeadRecord,
+};
 pub use bytes::{Hash, IrohId, PeerId, Root, Seed, Signature, StateDigest};
 pub use canonical::{from_canonical_slice, to_canonical_vec};
 pub use capability::{Capability, CapabilitySet};

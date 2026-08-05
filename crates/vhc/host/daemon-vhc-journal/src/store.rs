@@ -25,19 +25,53 @@ use super::segment::{scan_file, ScanResult, SegmentHeader, SegmentWriter, GENESI
 use super::sidecar::{KeyProvider, SidecarStore};
 use super::{JournalError, JournalPaths};
 
-/// Host-configurable segment rotation policy (§8.2: segments roll at a size/record threshold).
+/// Host-configurable segment rotation policy (§8.2: segments roll at a size/record threshold,
+/// and optionally at an age bound — the archive **recovery-point cadence**).
 #[derive(Clone, Copy, Debug)]
 pub struct RotatePolicy {
     /// Roll (seal + start a new segment) once a segment reaches this many records.
     pub max_records: u64,
+    /// Roll a non-empty segment once it has been open this long (checked on append — a quiet
+    /// journal has nothing new to protect, so it never rolls on time alone). `None` disables
+    /// the age bound. This is what keeps the remote reconstruction point from going stale
+    /// behind a large record count: the sealed-segment publisher only ever sees sealed
+    /// segments, so the open segment's age bounds the recovery-point lag.
+    pub max_open: Option<std::time::Duration>,
 }
 
 impl Default for RotatePolicy {
     fn default() -> Self {
         // A conservative default; hosts tune it. Kept small enough that tests exercise rotation.
-        Self { max_records: 1024 }
+        Self {
+            max_records: 1024,
+            max_open: None,
+        }
     }
 }
+
+/// One sealed segment, as reported to the seal hook the instant [`Journal::roll`] seals it —
+/// everything an incremental archive publisher needs to publish exactly this segment and its
+/// attested head, with no directory scan.
+#[derive(Clone, Debug)]
+pub struct SealedSegment {
+    /// The execution identity in the sealed segment's header (the identity span that wrote it —
+    /// NOT necessarily the journal's current identity at a live-upgrade seam).
+    pub id: ExecIdentity,
+    /// The sealed segment's 0-based ordinal in the series.
+    pub segment: u64,
+    /// The sealed segment file's path.
+    pub path: std::path::PathBuf,
+    /// The complete-file BLAKE3 — the segment's content address (§8.2 chain link).
+    pub segment_blake3: [u8; 32],
+    /// The previous segment's complete-file BLAKE3 ([`GENESIS_PREV`] at segment 0).
+    pub prev_blake3: [u8; 32],
+    /// The number of records the segment carries (excluding the seal frame).
+    pub records: u64,
+}
+
+/// The seal hook: invoked synchronously inside [`Journal::roll`] immediately after the seal
+/// barrier lands. Implementations must be cheap and non-blocking (hand off to a channel).
+pub type SealHook = Box<dyn FnMut(&SealedSegment) + Send>;
 
 /// A crash-safe, segmented, append-only journal for one run-instance (§8).
 pub struct Journal<K: KeyProvider> {
@@ -53,6 +87,19 @@ pub struct Journal<K: KeyProvider> {
     /// The current instantiation counter (nonce input for sidecars, §8.5). Advanced by the host on
     /// each (re-)instantiation; A1's substrate defaults it to 0 and lets the caller set it.
     instantiation_counter: u64,
+    /// The identity written into the CURRENT segment's header (lags [`Journal::id`] between a
+    /// `roll_to_identity` identity change and the roll itself — the sealed segment reports the
+    /// identity that actually wrote it).
+    current_header_id: ExecIdentity,
+    /// The current segment's `prev_blake3` chain link (what the seal hook reports).
+    current_prev: [u8; 32],
+    /// When the current segment was opened (the [`RotatePolicy::max_open`] age clock).
+    opened_at: std::time::Instant,
+    /// The identity in SEGMENT 0's header — the series' **founding identity** (the archive chain
+    /// scope; constant across live-upgrade seams).
+    founding_id: ExecIdentity,
+    /// The incremental-publication seam: invoked on every seal (see [`SealHook`]).
+    on_seal: Option<SealHook>,
 }
 
 impl<K: KeyProvider + Clone> Journal<K> {
@@ -81,7 +128,7 @@ impl<K: KeyProvider + Clone> Journal<K> {
         let sidecars = SidecarStore::open(paths.sidecars(), id.clone(), key)?;
         Ok(Self {
             paths,
-            id,
+            id: id.clone(),
             writer,
             current_segment: 0,
             next_ord: 0,
@@ -89,6 +136,11 @@ impl<K: KeyProvider + Clone> Journal<K> {
             sidecars,
             seq_high: BTreeMap::new(),
             instantiation_counter: 0,
+            current_header_id: id.clone(),
+            current_prev: GENESIS_PREV,
+            opened_at: std::time::Instant::now(),
+            founding_id: id,
+            on_seal: None,
         })
     }
 
@@ -113,7 +165,7 @@ impl<K: KeyProvider + Clone> Journal<K> {
         let recovery = Self::recover(&paths, &ords)?;
         let sidecars = SidecarStore::open(paths.sidecars(), id.clone(), key)?;
 
-        let (writer, current_segment) = if recovery.last_sealed {
+        let (writer, current_segment, current_header_id, current_prev) = if recovery.last_sealed {
             // Last segment is immutable; start the next one, chaining off its complete-file hash.
             let next = recovery.last_ordinal + 1;
             let header = SegmentHeader {
@@ -122,7 +174,7 @@ impl<K: KeyProvider + Clone> Journal<K> {
                 prev_blake3: recovery.last_file_blake3,
             };
             let writer = SegmentWriter::create(paths.segment(next), &header)?;
-            (writer, next)
+            (writer, next, id.clone(), recovery.last_file_blake3)
         } else {
             // Re-open the last (unsealed) segment for continued appends; truncate its torn tail.
             let intact = &recovery.last_intact_bytes;
@@ -131,7 +183,12 @@ impl<K: KeyProvider + Clone> Journal<K> {
                 intact,
                 recovery.last_records,
             )?;
-            (writer, recovery.last_ordinal)
+            (
+                writer,
+                recovery.last_ordinal,
+                recovery.last_header_id,
+                recovery.last_prev_blake3,
+            )
         };
 
         Ok(Self {
@@ -144,6 +201,11 @@ impl<K: KeyProvider + Clone> Journal<K> {
             sidecars,
             seq_high: recovery.seq_high,
             instantiation_counter: 0,
+            current_header_id,
+            current_prev,
+            opened_at: std::time::Instant::now(),
+            founding_id: recovery.founding_id,
+            on_seal: None,
         })
     }
 
@@ -157,6 +219,9 @@ impl<K: KeyProvider + Clone> Journal<K> {
         let mut last_file_blake3 = GENESIS_PREV;
         let mut last_records = 0u64;
         let mut last_intact_bytes = Vec::new();
+        let mut founding_id = None;
+        let mut last_header_id = None;
+        let mut last_prev_blake3 = GENESIS_PREV;
 
         for (idx, &ord) in ords.iter().enumerate() {
             let scan: ScanResult = scan_file(paths.segment(ord))?;
@@ -170,6 +235,9 @@ impl<K: KeyProvider + Clone> Journal<K> {
                 return Err(JournalError::ChainBroken(format!(
                     "segment {ord} prev_blake3 does not match the previous segment's hash"
                 )));
+            }
+            if idx == 0 {
+                founding_id = Some(scan.header.id.clone());
             }
             let is_last = idx + 1 == ords.len();
             // A non-last segment MUST be sealed (a mid-chain unsealed segment means the chain forked).
@@ -192,18 +260,25 @@ impl<K: KeyProvider + Clone> Journal<K> {
                     *e = (*e).max(p.seq);
                 }
             }
-            expected_prev = scan.complete_file_blake3;
             if is_last {
                 last_ordinal = ord;
                 last_sealed = scan.sealed;
                 last_file_blake3 = scan.complete_file_blake3;
                 last_records = scan.records.len() as u64;
+                last_header_id = Some(scan.header.id.clone());
+                last_prev_blake3 = expected_prev;
                 // Re-read the intact prefix bytes so a reopen can seed the hasher + truncate the tail.
                 let mut bytes = std::fs::read(paths.segment(ord))?;
                 bytes.truncate(scan.durable_len as usize);
                 last_intact_bytes = bytes;
             }
+            expected_prev = scan.complete_file_blake3;
         }
+
+        // `ords` is non-empty on every recover() path, so both identities were captured.
+        let founding_id = founding_id
+            .ok_or_else(|| JournalError::ChainBroken("recover on an empty segment list".into()))?;
+        let last_header_id = last_header_id.unwrap_or_else(|| founding_id.clone());
 
         Ok(Recovery {
             next_ord,
@@ -213,6 +288,9 @@ impl<K: KeyProvider + Clone> Journal<K> {
             last_file_blake3,
             last_records,
             last_intact_bytes,
+            founding_id,
+            last_header_id,
+            last_prev_blake3,
         })
     }
 
@@ -357,12 +435,25 @@ impl<K: KeyProvider + Clone> Journal<K> {
         self.sidecars.get(sref, ord, self.instantiation_counter)
     }
 
-    /// Seal the current segment cleanly + start the next one (§8.2). The seal is a §8.4 commit barrier.
+    /// Seal the current segment cleanly + start the next one (§8.2). The seal is a §8.4 commit
+    /// barrier. Fires the seal hook (when armed) the moment the seal lands — the incremental
+    /// archive-publication seam.
     ///
     /// # Errors
     /// [`JournalError`] on seal/create failure.
     pub fn roll(&mut self) -> Result<(), JournalError> {
+        let records = self.writer.records();
         let file_hash = self.writer.seal()?;
+        if let Some(hook) = self.on_seal.as_mut() {
+            hook(&SealedSegment {
+                id: self.current_header_id.clone(),
+                segment: self.current_segment,
+                path: self.paths.segment(self.current_segment),
+                segment_blake3: file_hash,
+                prev_blake3: self.current_prev,
+                records,
+            });
+        }
         let next = self.current_segment + 1;
         let header = SegmentHeader {
             id: self.id.clone(),
@@ -371,7 +462,22 @@ impl<K: KeyProvider + Clone> Journal<K> {
         };
         self.writer = SegmentWriter::create(self.paths.segment(next), &header)?;
         self.current_segment = next;
+        self.current_header_id = self.id.clone();
+        self.current_prev = file_hash;
+        self.opened_at = std::time::Instant::now();
         Ok(())
+    }
+
+    /// Arm the seal hook (see [`SealHook`]). At most one; re-arming replaces.
+    pub fn set_seal_hook(&mut self, hook: SealHook) {
+        self.on_seal = Some(hook);
+    }
+
+    /// The identity in segment 0's header — the series' founding identity (the archive chain
+    /// scope: constant across live-upgrade seams, unlike [`Journal::id`]).
+    #[must_use]
+    pub fn founding_id(&self) -> &ExecIdentity {
+        &self.founding_id
     }
 
     /// The live-upgrade seam (§8.1/§10.3): CONTINUE this journal — one file series — under a new
@@ -385,12 +491,32 @@ impl<K: KeyProvider + Clone> Journal<K> {
     /// The caller writes the incoming incarnation's own tag-0 run-header as the new span's first
     /// record (the driver does this at instantiation).
     ///
+    /// An EMPTY current segment (e.g. the successor a terminal tail-seal opened) is re-headered
+    /// in place under the incoming identity instead of sealed: a content-free segment sealed
+    /// under the retired identity would demand an attested head from a key the successor does
+    /// not hold, for records that do not exist. Same ordinal, same chain link — the series stays
+    /// intact.
+    ///
     /// # Errors
     /// [`JournalError`] on seal/create failure.
     pub fn roll_to_identity(&mut self, id: ExecIdentity) -> Result<(), JournalError> {
         self.id = id.clone();
-        self.sidecars.set_identity(id);
-        self.roll()?;
+        self.sidecars.set_identity(id.clone());
+        if self.writer.records() == 0 {
+            let header = SegmentHeader {
+                id: id.clone(),
+                segment: self.current_segment,
+                prev_blake3: self.current_prev,
+            };
+            // Replace the content-free file: only a header (no records) exists at this ordinal,
+            // and the recreate writes the same ordinal + chain link under the new identity.
+            std::fs::remove_file(self.paths.segment(self.current_segment))?;
+            self.writer = SegmentWriter::create(self.paths.segment(self.current_segment), &header)?;
+            self.current_header_id = id;
+            self.opened_at = std::time::Instant::now();
+        } else {
+            self.roll()?;
+        }
         self.seq_high.clear();
         Ok(())
     }
@@ -400,6 +526,10 @@ impl<K: KeyProvider + Clone> Journal<K> {
     /// a fresh segment carrying the incoming identity. Refuses on an empty directory — a seam
     /// continues an existing log; a fresh incarnation uses [`Journal::open`].
     ///
+    /// `on_seal` is armed BEFORE the seam roll: the retiring span's final segment seals right
+    /// here, and its seal must reach the archive publisher like every other (the head chain is
+    /// dense — a swallowed seam seal would wedge publication at the next ordinal).
+    ///
     /// # Errors
     /// [`JournalError`] on a broken chain, an empty directory, or filesystem failure.
     pub fn open_continuation(
@@ -407,6 +537,7 @@ impl<K: KeyProvider + Clone> Journal<K> {
         id: ExecIdentity,
         key: K,
         rotate: RotatePolicy,
+        on_seal: Option<SealHook>,
     ) -> Result<Self, JournalError> {
         let paths = JournalPaths::open(&root)?;
         if paths.existing_segments()?.is_empty() {
@@ -417,12 +548,25 @@ impl<K: KeyProvider + Clone> Journal<K> {
             ));
         }
         let mut journal = Self::open(root, id.clone(), key, rotate)?;
+        if let Some(hook) = on_seal {
+            journal.set_seal_hook(hook);
+        }
         journal.roll_to_identity(id)?;
         Ok(journal)
     }
 
     fn maybe_rotate(&mut self) -> Result<(), JournalError> {
-        if self.writer.records() >= self.rotate.max_records {
+        let records = self.writer.records();
+        let over_count = records >= self.rotate.max_records;
+        // The age bound only ever seals a NON-empty segment (an empty roll would churn the chain
+        // with content-free segments), and only on append — a quiet journal never rolls on time
+        // alone (it has nothing new to protect).
+        let over_age = records > 0
+            && self
+                .rotate
+                .max_open
+                .is_some_and(|max| self.opened_at.elapsed() >= max);
+        if over_count || over_age {
             self.roll()?;
         }
         Ok(())
@@ -471,4 +615,7 @@ struct Recovery {
     last_file_blake3: [u8; 32],
     last_records: u64,
     last_intact_bytes: Vec<u8>,
+    founding_id: ExecIdentity,
+    last_header_id: ExecIdentity,
+    last_prev_blake3: [u8; 32],
 }

@@ -90,7 +90,10 @@ fn oracle_parity_over_journal_substrate() {
         dir.join("j"),
         ident(),
         StaticKey::new([5u8; 32]),
-        RotatePolicy { max_records: 4 },
+        RotatePolicy {
+            max_records: 4,
+            ..RotatePolicy::default()
+        },
     )
     .unwrap();
     record_capture(&mut journal, &ident(), &capture).expect("record capture onto journal");
@@ -110,7 +113,10 @@ fn oracle_parity_over_journal_substrate() {
         dir.join("j"),
         ident(),
         StaticKey::new([5u8; 32]),
-        RotatePolicy { max_records: 4 },
+        RotatePolicy {
+            max_records: 4,
+            ..RotatePolicy::default()
+        },
     )
     .unwrap();
     let report_reopened =

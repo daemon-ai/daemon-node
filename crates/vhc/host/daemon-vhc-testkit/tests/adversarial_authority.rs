@@ -195,6 +195,7 @@ fn drive_and_archive(
         StaticKey::new([7u8; 32]),
         RotatePolicy {
             max_records: 10_000,
+            ..RotatePolicy::default()
         },
     )
     .expect("journal create");

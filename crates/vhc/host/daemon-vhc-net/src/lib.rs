@@ -34,6 +34,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod archive_store;
 pub mod artifact;
 /// A blake3-keyed, on-disk, size-bounded content cache (spec §8/§10.6) — the persistent
 /// half of the artifact/shard cache the fleet warms once and never re-downloads.
@@ -77,6 +78,7 @@ pub mod mock_r2;
 #[cfg(feature = "harness")]
 pub mod ws_relay;
 
+pub use archive_store::{ArchiveHeadStore, FsArchiveHeadStore, HttpArchiveHeadStore};
 pub use artifact::{ArtifactCache, ArtifactRef, ArtifactResolver, ArtifactScheme};
 pub use content_cache::ContentCache;
 pub use content_store::FsContentStore;

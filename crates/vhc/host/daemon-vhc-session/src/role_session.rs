@@ -81,6 +81,10 @@ const TICK: Duration = Duration::from_millis(50);
 /// telemetry; it also fires once at session end for the post-mortem.
 const PLANE_HEALTH_EVERY: Duration = Duration::from_secs(60);
 
+/// The bounded end-of-session wait for the archive publisher's in-flight tail. Not load-bearing:
+/// a miss is republished by the next incarnation's startup reconciliation.
+const ARCHIVE_DRAIN: Duration = Duration::from_secs(30);
+
 /// A transport-plane counter snapshot (the WS half of the deaf-path instrumentation), reported
 /// through [`RoleProviders::plane_stats`] by transports that keep delivery-boundary counters.
 /// Transport-agnostic by design: the session never links the WS client.
@@ -113,6 +117,10 @@ pub struct RoleProviders {
     /// Transport-plane counter access (the deaf-path instrumentation), when the bound transport
     /// keeps them (the live WS plane does; loopback/test planes pass `None`).
     pub plane_stats: Option<Arc<dyn Fn() -> ControlPlaneStats + Send + Sync>>,
+    /// The archive-head slot store (incremental authenticated archive publication, architecture
+    /// §4.4). `None` on planes without an archive surface (loopback/in-process seats) — the
+    /// session then runs no publisher.
+    pub archive_heads: Option<Arc<dyn daemon_vhc_net::ArchiveHeadStore>>,
 }
 
 /// Everything a role task binds, moved into the session at spawn. Construction is the caller's
@@ -156,6 +164,11 @@ pub struct RoleSessionSpec {
     /// only on harness/test seats that bypass the admission funnel; the production join always
     /// records them.
     pub admitted_quotas: Option<AdmittedQuotas>,
+    /// The archive-publication half of a durable journal home (the seal-hook stream + chain
+    /// coordinates). `None` on referenceless / in-memory seats: no durable chain, nothing to
+    /// publish. Paired with [`RoleProviders::archive_heads`] — both present spawns the
+    /// incremental publisher.
+    pub archive: Option<crate::archive::ArchiveSpec>,
 }
 
 /// A throttle level (the owner's GPU-governor lever, forwarded verbatim by the worker loop).
@@ -305,12 +318,39 @@ impl RoleHandle {
 /// exactly one terminal [`Event::RunTerminated`].
 pub fn spawn_role(
     run_label: String,
-    spec: RoleSessionSpec,
+    mut spec: RoleSessionSpec,
     events: mpsc::UnboundedSender<Event>,
 ) -> RoleHandle {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let generation = Arc::new(AtomicU64::new(spec.run.identity.instance));
     let label = run_label.clone();
+    // The incremental archive publisher (architecture §4.4): both halves present — a durable
+    // journal home streaming seals AND an archive-head store to attest into — spawns the chain
+    // publisher beside the session. The signer-binding list starts with this incarnation's
+    // certified identity; a live module switch pushes the successor's, so every head attests
+    // under the SEALING span's certificate. Publication is crash-safe by reconciliation (the
+    // publisher's startup scan republishes anything a crash swallowed), so the end-of-session
+    // drain below is bounded, not load-bearing.
+    let signer_bindings = Arc::new(std::sync::Mutex::new(vec![crate::archive::SignerBinding {
+        signing_seed: spec.run.signing_seed,
+        certificate: spec.own_cert.clone(),
+    }]));
+    let archive_publisher = match (spec.archive.take(), spec.providers.archive_heads.clone()) {
+        (Some(archive), Some(heads)) => {
+            let journal_dir = archive.journal_dir.clone();
+            let task = crate::archive::spawn_archive_publisher(
+                run_label.clone(),
+                Hash(spec.run.identity.run_id),
+                spec.run.identity.role.clone(),
+                archive,
+                heads,
+                spec.providers.payloads.clone(),
+                signer_bindings.clone(),
+            );
+            Some((journal_dir, task))
+        }
+        _ => None,
+    };
     let task = {
         let generation = generation.clone();
         tokio::spawn(async move {
@@ -322,12 +362,29 @@ pub fn spawn_role(
                 round: 0,
                 generation: generation.load(Ordering::SeqCst),
             });
-            let outcome = run_role(&label, spec, &events, cmd_rx, &generation).await;
+            let outcome =
+                run_role(&label, spec, &events, cmd_rx, &generation, &signer_bindings).await;
             let _ = events.send(Event::RunTerminated {
                 run_id: label,
                 generation: generation.load(Ordering::SeqCst),
                 outcome,
             });
+            // Drain the archive publisher, bounded. The run's sinks are gone (run_role
+            // returned); releasing the registry's stream handle is what actually closes the
+            // seal channel — then only the in-flight upload tail remains. A deadline miss is
+            // not a loss: the next incarnation's reconciliation republishes from disk.
+            if let Some((journal_dir, publisher)) = archive_publisher {
+                crate::journal_home::DurableSink::release_seal_stream(&journal_dir);
+                if tokio::time::timeout(ARCHIVE_DRAIN, publisher)
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!(
+                        "archive publisher did not drain within the deadline; \
+                         reconciliation covers the tail"
+                    );
+                }
+            }
         })
     };
     RoleHandle {
@@ -384,6 +441,7 @@ async fn run_role(
     events: &mpsc::UnboundedSender<Event>,
     mut commands: mpsc::UnboundedReceiver<RoleCommand>,
     generation: &Arc<AtomicU64>,
+    signer_bindings: &Arc<std::sync::Mutex<Vec<crate::archive::SignerBinding>>>,
 ) -> TerminalOutcome {
     let RoleSessionSpec {
         module,
@@ -398,6 +456,7 @@ async fn run_role(
         drain_deadline,
         restore,
         mut admitted_quotas,
+        archive: _, // taken by `spawn_role` (the publisher runs beside the session)
     } = spec;
 
     let mut identity = run_cfg.identity.clone();
@@ -596,6 +655,14 @@ async fn run_role(
                         // release the hard gate first.
                         current.pump.release();
                         paused = false;
+                        // The successor's signer-binding material, captured before the binding
+                        // moves: on activation the archive publisher must attest the new span's
+                        // seals under the NEW certificate (the retiring span's final segment
+                        // rolls under the old one, which stays in the list).
+                        let switch_signer = crate::archive::SignerBinding {
+                            signing_seed: binding.signing_seed,
+                            certificate: binding.own_cert.clone(),
+                        };
                         match perform_switch(
                             &worker,
                             &engine,
@@ -630,6 +697,10 @@ async fn run_role(
                                 identity = current.identity.clone();
                                 own_sender = current.own_sender;
                                 admitted_quotas = quotas.or(admitted_quotas);
+                                signer_bindings
+                                    .lock()
+                                    .expect("signer bindings mutex")
+                                    .push(switch_signer);
                                 generation.store(identity.instance, Ordering::SeqCst);
                                 held.clear(); // held frames belong to the retired epoch's scope
                                 let _ = events.send(Event::ModuleSwitched {

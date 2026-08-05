@@ -206,10 +206,48 @@ None of these blocks C0 or C1.
     verdict + plane-health counters), runbook §5.4 plane-liveness diagnosis. Known
     pre-existing: cloud `seat.test.ts` has 4 failures on clean HEAD (seat-lease v2 fixture
     drift, predates this phase; convergence work, Phase 8).
-- **Not claimed** (recorded): offline consensus replay from a sealed archive
-  (`publish_journal_archive()` has no product callers), general archive backfill,
-  in-session exact-frame loss repair, coordinator crash reconstruction, §5.3 standby
-  failover. These are the remaining pre-C2 phases (§8).
+- **Pre-C2 hardening — Phase 3 LANDED (2026-08-05): incremental authenticated archive
+  publication.**
+  - **Wire contract** (`daemon-vhc-proto::archive`): `ArchiveHeadBody`/`ArchiveHeadRecord`
+    (domain `daemon-vhc/archive-head/1.0.0`) — the signed per-seal chain-extension claim,
+    chain-scoped `(run, role, base identity, chain_instance = founding incarnation)`, with
+    successor linking (`predecessor` = the prior chain's terminal head by content address)
+    and offline verification (certificate chain to the genesis-trusted bases).
+    `ArchiveChainSlot::fold` is the normative structural fold: dense linked extension,
+    byte-identical idempotent republish, typed non-extending refusal = fork evidence.
+  - **Journal substrate** (`daemon-vhc-journal`): `RotatePolicy.max_open` (production 5 min
+    — the recovery-point cadence; age only ever rolls a NON-empty segment, on append),
+    `SealHook`/`SealedSegment` fired at every seal, series `founding_id` tracked across
+    reopen and the live-upgrade seam, seam hook armed BEFORE the seam roll (the retiring
+    span's final seal streams too), an empty segment re-headers instead of sealing
+    content-free under a retired identity.
+  - **Publisher** (`daemon-vhc-session::archive::spawn_archive_publisher`): spawned by
+    `spawn_role` beside every session whose journal home is durable AND whose providers
+    carry a head store; startup reconciliation (republish sealed-but-unpublished from
+    disk; resolve the succession link), per-seal upload (bytes → content plane, then the
+    attested head), capped-backoff retries on transient store faults, typed abort on fork
+    evidence; heads attest under the SEALING span's certificate (the switch pushes the
+    successor's `SignerBinding`); bounded end-of-session drain (not load-bearing —
+    reconciliation covers a missed tail).
+  - **Stores** (`daemon-vhc-net::archive_store`): `ArchiveHeadStore` trait;
+    `HttpArchiveHeadStore` (registry routes, same credential as the WS plane);
+    `FsArchiveHeadStore` (`<run state dir>/archive/heads/`, fold re-applied on open).
+    Segment bytes ride the EXISTING content plane (R2/fs) — no new byte surface.
+  - **Cloud surface** (`daemon-cloud` `apps/vhc`): `PUT /runs/:id/archive/head`,
+    `GET /runs/:id/archive/heads` → `RunCoordinatorDO` archive slots; the TS fold is a
+    faithful port (Rust authoritative), untrusted-storage posture identical to
+    roster/seat. Vitest suites: shared fold parity + DO route/byte-echo/fork regressions.
+  - **Regressions (Rust)**: proto fold + authorization unit tests; journal seal-hook /
+    age-bound / founding-identity crash tests; publisher live-stream + crash-reconcile +
+    seam-attestation integration tests; net fs-store persistence. Journal, net, session
+    (108-test integration suite), observe: all green.
+  - Docs moved with the change: ABI **§8.8** ([AR-1]..[AR-6]), runbook §3.4 "where the
+    archive comes from", architecture-spec divergence note updated (§5.3 publication is
+    now product).
+- **Not claimed** (recorded): GREEN replay assembly from the product archive (the xtask
+  pull into the §3.4 layout — Phase 4), general archive backfill, in-session exact-frame
+  loss repair, coordinator crash reconstruction, §5.3 standby failover. These are the
+  remaining pre-C2 phases (§8).
 - C0: green and pinned. C1: **green on hardware** (this boundary). Freeze/C2: the only
   rung left — needs the Windows 5090 seat joined in and the pre-C2 workstream scoped.
 - Program archive: frozen and locked read-only 2026-07-27.
@@ -235,9 +273,11 @@ All four answer ssh (verified 2026-08-04). Next actions (in order):
    sequential): ~~Phase 1 cadence contract + typed storage taxonomy~~ DONE (§7).
    ~~Phase 2 deaf-path instrumentation + root cause~~ DONE (§7: relay-first DO, server
    Binary heartbeat, client deafness verdict, plane_health surface, live churn
-   regression). Next: Phase 3 incremental authenticated archive publication, then
-   Phases 4–6 (replay assembly → sandboxed coordinator reconstruction → disk custody),
-   then C1.5; plus the registry Byzantine posture owner decision (§6).
+   regression). ~~Phase 3 incremental authenticated archive publication~~ DONE (§7:
+   proto archive contract, seal-hook publisher, head stores, cloud archive slots,
+   ABI §8.8). Next: Phase 4 GREEN replay assembly from the product archive, then
+   Phases 5–6 (sandboxed coordinator reconstruction → disk custody), then C1.5; plus
+   the registry Byzantine posture owner decision (§6).
 4. Bring the Windows 5090 seat into a three-box run (its worker lane builds with
    `vhc-net,wgpu-spirv`; native DX12 verdict is already green).
 5. Freeze; memoized preflight; run C2; evidence closure; human-signed master merge.

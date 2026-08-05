@@ -85,7 +85,10 @@ fn build_archived(fx: Fixture) -> Archived {
         ident(),
         StaticKey::new([7u8; 32]),
         // Small threshold so the run spans several sealed segments (the chain the archive signs).
-        RotatePolicy { max_records: 8 },
+        RotatePolicy {
+            max_records: 8,
+            ..RotatePolicy::default()
+        },
     )
     .expect("journal create");
 

@@ -22,8 +22,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use daemon_vhc_net::{
-    ContentStore, ControlPlane, FsContentStore, HttpPresignClient, R2Store, ReconnectConfig, RunId,
-    WsAuth, WsConfig, WsControlPlane,
+    ArchiveHeadStore, ContentStore, ControlPlane, FsArchiveHeadStore, FsContentStore,
+    HttpArchiveHeadStore, HttpPresignClient, R2Store, ReconnectConfig, RunId, WsAuth, WsConfig,
+    WsControlPlane,
 };
 
 use crate::journal_home;
@@ -266,8 +267,13 @@ pub async fn build_role_providers(
         }
     };
 
-    // -- payload + artifact planes: content-addressed, R2 or the run's fs store ----------------
-    let stores: Arc<dyn ContentStore> = match &creds.presign_base {
+    // -- payload + artifact + archive-head planes: R2/registry or the run's fs stores ----------
+    // The archive-head plane rides the same duality as the content stores (§4.4): a cloud
+    // credential set gets the registry's archive-head slot; a local run gets the filesystem slot
+    // under the run's state home. Both apply the same normative structural fold.
+    let (stores, archive_heads): (Arc<dyn ContentStore>, Arc<dyn ArchiveHeadStore>) = match &creds
+        .presign_base
+    {
         Some(base) if !base.is_empty() => {
             tracing::debug!(run = inputs.run_label, presign_base = %base, "live attach: presigned R2 content plane");
             let egress =
@@ -278,31 +284,62 @@ pub async fn build_role_providers(
             )
             .map_err(|e| PlaneError::transport("payload", format!("presign egress client: {e}")))?;
             let presign = presign_client(presign_egress, base, &auth);
-            Arc::new(R2Store::new(presign, egress, RunId::new(inputs.run_label)))
+            let heads_egress = daemon_egress::EgressClient::new(
+                daemon_egress::EgressConfig::default(),
+            )
+            .map_err(|e| PlaneError::transport("payload", format!("archive egress client: {e}")))?;
+            // The archive-head slot lives on the coordinator/gateway base (the registry), not
+            // the presign service; it carries the same credential as the WS plane.
+            let heads =
+                archive_head_client(heads_egress, &ws_base, RunId::new(inputs.run_label), &auth);
+            (
+                Arc::new(R2Store::new(presign, egress, RunId::new(inputs.run_label))),
+                Arc::new(heads),
+            )
         }
         _ => {
             // The node-delivered payload-plane override wins (a shared single-host root, so
             // multi-process peers serve each other's content); else the run's own state dir.
+            let root = journal_home::run_dir_from_env();
             let dir = match journal_home::payload_dir_from_env() {
                 Some(shared) => journal_home::payload_dir(&shared, inputs.run_label),
                 None => {
-                    let root = journal_home::run_dir_from_env().ok_or_else(|| {
+                    let root = root.as_deref().ok_or_else(|| {
                         PlaneError::selection(
                             "payload",
                             "no presign base and no run-state root reference (the fs content store \
                              needs the node-delivered run dir)",
                         )
                     })?;
-                    journal_home::payload_dir(&root, inputs.run_label)
+                    journal_home::payload_dir(root, inputs.run_label)
                 }
             };
             tracing::debug!(run = inputs.run_label, dir = %dir.display(), "live attach: filesystem content plane");
-            Arc::new(FsContentStore::open(&dir).map_err(|e| {
+            let store = FsContentStore::open(&dir).map_err(|e| {
                 PlaneError::transport(
                     "payload",
                     format!("fs content store {}: {e}", dir.display()),
                 )
-            })?)
+            })?;
+            // The filesystem archive-head slot roots under the run's own state home (the run dir
+            // is per-node — heads are this node's publication record, unlike shared payloads).
+            let heads_dir = {
+                let root = root.as_deref().ok_or_else(|| {
+                    PlaneError::selection(
+                        "payload",
+                        "no presign base and no run-state root reference (the fs archive-head \
+                         store needs the node-delivered run dir)",
+                    )
+                })?;
+                journal_home::archive_heads_dir(root, inputs.run_label)
+            };
+            let heads = FsArchiveHeadStore::open(&heads_dir).await.map_err(|e| {
+                PlaneError::transport(
+                    "payload",
+                    format!("fs archive-head store {}: {e}", heads_dir.display()),
+                )
+            })?;
+            (Arc::new(store), Arc::new(heads))
         }
     };
 
@@ -311,6 +348,7 @@ pub async fn build_role_providers(
         payloads: stores.clone(),
         artifacts: stores,
         plane_stats: Some(plane_stats),
+        archive_heads: Some(archive_heads),
     })
 }
 
@@ -323,6 +361,23 @@ fn ws_auth(spec: &WsAuthSpec) -> WsAuth {
             org_id: org_id.clone(),
             actor: actor.clone(),
         },
+    }
+}
+
+/// An [`HttpArchiveHeadStore`] for `base` carrying the same credential the WS plane uses.
+fn archive_head_client(
+    egress: daemon_egress::EgressClient,
+    base: &str,
+    run: RunId,
+    auth: &WsAuthSpec,
+) -> HttpArchiveHeadStore {
+    let client = HttpArchiveHeadStore::new(egress, base.to_string(), run);
+    match auth {
+        WsAuthSpec::None => client,
+        WsAuthSpec::Bearer(token) => client.with_bearer(token.clone()),
+        WsAuthSpec::Internal { org_id, actor } => {
+            client.with_internal(org_id.clone(), actor.clone())
+        }
     }
 }
 

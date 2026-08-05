@@ -33,8 +33,26 @@ use daemon_vhc_journal::record::{
     ExecIdentity, ExecutionGrantRec, InitRec, InstantiationRec, RunHeader, SignedFrameRec,
     SnapshotRec, TerminalRec, TimerArmRec, TimerCancelRec, TrapInfo,
 };
-use daemon_vhc_journal::{format_version, Journal, JournalError, RotatePolicy, StaticKey};
+use daemon_vhc_journal::{
+    format_version, Journal, JournalError, RotatePolicy, SealedSegment, StaticKey,
+};
 use daemon_vhc_proto::Hash;
+
+/// The archive **recovery-point cadence** ([`RotatePolicy::max_open`]): a non-empty segment
+/// older than this seals on the next append, so the remote reconstruction point can never go
+/// stale behind a large record count (architecture §4.4). Five minutes bounds the crash-loss
+/// window to one cadence of live records while keeping segment churn negligible.
+pub const RECOVERY_POINT_MAX_OPEN: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The production rotate policy: the substrate's record threshold plus the recovery-point age
+/// bound.
+#[must_use]
+fn production_rotate_policy() -> RotatePolicy {
+    RotatePolicy {
+        max_open: Some(RECOVERY_POINT_MAX_OPEN),
+        ..RotatePolicy::default()
+    }
+}
 
 /// The environment variable through which the node hands a worker subprocess the run-state root
 /// (a path reference — never secret material), mirroring the identity-store delivery.
@@ -84,6 +102,15 @@ pub fn payload_dir(root: &Path, run_label: &str) -> PathBuf {
     run_state_dir(root, run_label).join("payload")
 }
 
+/// The run's filesystem archive-head store root: `<root>/<blake3(label)>/archive/heads` — shared
+/// across incarnations like the payload plane (a chain slot is keyed by base+role+instance
+/// INSIDE the store; the directory is run-scoped so a successor incarnation can read its
+/// predecessor's published tip for succession linking).
+#[must_use]
+pub fn archive_heads_dir(root: &Path, run_label: &str) -> PathBuf {
+    run_state_dir(root, run_label).join("archive").join("heads")
+}
+
 /// The per-incarnation **state-store spill directory** (design §8.1):
 /// `<root>/<blake3(label)>/<role>-<incarnation>/state`. The host state store spills canonical
 /// det-lane chunk bytes here (content-addressed) so the retained roots live on disk rather than
@@ -97,6 +124,16 @@ pub fn state_dir(root: &Path, run_label: &str, role: &str, incarnation: u64) -> 
         .join(format!("{role}-{incarnation}"))
         .join("state")
 }
+
+/// The process-local seal-stream registry, keyed by the journal series' root directory. A live
+/// module switch's seam continuation reopens the SAME file series after the retiring sink
+/// dropped ([`DurableSink::open_continuation`]); the successor re-arms its predecessor's seal
+/// hook from here, so the archive publisher's stream survives the seam without threading a
+/// channel through the switch plumbing. One entry per armed series; entries whose receiving
+/// publisher is gone are pruned on the next touch.
+static SEAL_STREAMS: std::sync::Mutex<
+    std::collections::BTreeMap<PathBuf, tokio::sync::mpsc::UnboundedSender<SealedSegment>>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 /// The durable [`JournalSink`]: the §8 crash-safe segmented [`Journal`] adapted onto the
 /// driver's dependency-inverted sink seam. Open-or-recover semantics: a fresh incarnation
@@ -130,9 +167,54 @@ impl DurableSink {
             dir,
             id.clone(),
             StaticKey::new(sidecar_key),
-            RotatePolicy::default(),
+            production_rotate_policy(),
         )?;
         Ok(Self { journal, id })
+    }
+
+    /// Arm the incremental archive-publication seam: every sealed segment is handed to `tx` the
+    /// instant its seal barrier lands (the [`daemon_vhc_journal::SealHook`]); the receiver is
+    /// the session's archive publisher. A closed receiver drops seals silently (publication is
+    /// reconciled from the on-disk chain at the next startup, never lost). The sender is also
+    /// registered in [`SEAL_STREAMS`], so a live-upgrade seam's continuation re-arms the same
+    /// stream automatically.
+    pub fn arm_seal_hook(&mut self, tx: tokio::sync::mpsc::UnboundedSender<SealedSegment>) {
+        {
+            let mut streams = SEAL_STREAMS.lock().expect("seal-stream registry");
+            streams.retain(|_, sender| !sender.is_closed());
+            streams.insert(self.root().to_path_buf(), tx.clone());
+        }
+        self.journal.set_seal_hook(Box::new(move |sealed| {
+            let _ = tx.send(sealed.clone());
+        }));
+    }
+
+    /// The seal stream a predecessor registered for this series, if its publisher is still
+    /// receiving (the [`Self::open_continuation`] half of the seam).
+    fn registered_seal_stream(
+        dir: &Path,
+    ) -> Option<tokio::sync::mpsc::UnboundedSender<SealedSegment>> {
+        let mut streams = SEAL_STREAMS.lock().expect("seal-stream registry");
+        streams.retain(|_, sender| !sender.is_closed());
+        streams.get(dir).cloned()
+    }
+
+    /// Release the seal stream registered for `dir` (the end-of-session half of the seam): the
+    /// registry's sender is the one strong handle that outlives the sinks, so dropping it —
+    /// after the run's last sink is gone — is what closes the publisher's stream and lets it
+    /// drain to completion. Idempotent.
+    pub fn release_seal_stream(dir: &Path) {
+        SEAL_STREAMS
+            .lock()
+            .expect("seal-stream registry")
+            .remove(dir);
+    }
+
+    /// The founding incarnation of this journal's segment series (segment 0's header identity) —
+    /// the archive chain scope's `chain_instance` (constant across live-upgrade seams).
+    #[must_use]
+    pub fn founding_instance(&self) -> u64 {
+        self.journal.founding_id().instance
     }
 
     /// Open the journal at the **live-upgrade seam** (§8.1/§10.3): the retired incarnation's
@@ -160,11 +242,20 @@ impl DurableSink {
             instance: identity.instance,
             module: Hash(identity.module),
         };
+        // The seam continues the predecessor's archive publication: the hook is handed in ahead
+        // of the seam roll, so the retiring span's final seal (which lands INSIDE this open)
+        // reaches the same publisher — and every later seal under the new identity follows.
+        let hook = Self::registered_seal_stream(dir).map(|tx| {
+            Box::new(move |sealed: &SealedSegment| {
+                let _ = tx.send(sealed.clone());
+            }) as daemon_vhc_journal::SealHook
+        });
         let journal = Journal::open_continuation(
             dir,
             id.clone(),
             StaticKey::new(sidecar_key),
-            RotatePolicy::default(),
+            production_rotate_policy(),
+            hook,
         )?;
         Ok(Self { journal, id })
     }
@@ -473,7 +564,13 @@ impl JournalSink for DurableSink {
                 }),
             }))
             .map(|_| ())
-            .map_err(sink_err)
+            .map_err(sink_err)?;
+        // The terminal TAIL SEAL: a run's last records must be archivable, so the span that
+        // holds the signing key seals its own tail (and the seal hook publishes it) instead of
+        // leaving an unsealed segment only a later identity could seal — whose head that
+        // identity's key could never attest. The successor the roll opens stays EMPTY; a
+        // continuation seam re-headers it in place ([`Journal::roll_to_identity`]).
+        self.journal.roll().map(|_| ()).map_err(sink_err)
     }
 }
 

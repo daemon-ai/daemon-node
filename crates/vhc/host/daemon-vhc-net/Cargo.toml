@@ -73,6 +73,8 @@ wiremock = { workspace = true }
 # to exercise the opaque byte planes. The net LIBRARY never links the schema crates — it carries
 # opaque signed frames (dep-check-enforced); this dev edge is harness authoring only.
 daemon-vhc-sdk-consensus = { workspace = true }
+# Test-only: throwaway roots for the fs archive-head store's reopen regressions.
+tempfile = "3"
 
 [features]
 # Off by default: the default workspace gate builds no iroh. B2 implements `iroh_gossip.rs`

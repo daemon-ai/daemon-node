@@ -76,6 +76,7 @@ fn in_process_providers() -> RoleProviders {
         payloads: Arc::new(daemon_vhc_net::MemoryContentStore::new()),
         artifacts: Arc::new(daemon_vhc_net::MemoryContentStore::new()),
         plane_stats: None,
+        archive_heads: None,
     }
 }
 
@@ -137,7 +138,7 @@ async fn join_live(
         .into());
     }
     let binding = backend::role_binding(resolved, genesis, run_id, incarnation)?;
-    let journal = journal_sink(run_id, &binding.run.identity)?;
+    let (journal, archive) = journal_sink(run_id, &binding.run.identity)?;
     let keystore = daemon_vhc_session::keystore::VhcKeystore::from_env()
         .map_err(|e| format!("identity store: {e}"))?;
     let announcement =
@@ -220,6 +221,7 @@ async fn join_live(
         drain_deadline: DRAIN_DEADLINE,
         restore,
         admitted_quotas: binding.quotas,
+        archive,
     })
 }
 
@@ -227,15 +229,25 @@ async fn join_live(
 /// (`DAEMON_VHC_RUN_DIR`, ABI §8) when the run-state root reference is present — a journal that
 /// cannot open refuses the join typed (a run that cannot journal must not run, §8.4) — else the
 /// in-memory sink (the referenceless in-process smoke seat / unit tests).
+///
+/// A durable home also arms the incremental archive-publication seam (architecture §4.4) and
+/// returns its [`ArchiveSpec`] half — the seal-hook stream plus the chain coordinates the
+/// session's archive publisher binds. The in-memory sink has no durable chain: no spec.
 fn journal_sink(
     run_label: &str,
     identity: &daemon_vhc_host::run::RunIdentity,
-) -> Result<Box<dyn daemon_vhc_host::run::JournalSink>, String> {
+) -> Result<
+    (
+        Box<dyn daemon_vhc_host::run::JournalSink>,
+        Option<daemon_vhc_session::archive::ArchiveSpec>,
+    ),
+    String,
+> {
     use daemon_vhc_session::journal_home::{self, DurableSink};
     use daemon_vhc_session::keystore::VhcKeystore;
 
     let Some(root) = journal_home::run_dir_from_env() else {
-        return Ok(Box::new(daemon_vhc_host::run::MemorySink::new()));
+        return Ok((Box::new(daemon_vhc_host::run::MemorySink::new()), None));
     };
     // The sidecar encryption key comes from the node-provided identity store (a path reference —
     // key material never rides the command wire).
@@ -245,9 +257,16 @@ fn journal_sink(
         .journal_sidecar_key()
         .map_err(|e| format!("journal home: sidecar key: {e}"))?;
     let dir = journal_home::journal_dir(&root, run_label, &identity.role, identity.instance);
-    let sink = DurableSink::open(&dir, identity, *key.bytes())
+    let mut sink = DurableSink::open(&dir, identity, *key.bytes())
         .map_err(|e| format!("journal home: open {}: {e}", dir.display()))?;
-    Ok(Box::new(sink))
+    let (seal_tx, seals) = tokio::sync::mpsc::unbounded_channel();
+    sink.arm_seal_hook(seal_tx);
+    let archive = daemon_vhc_session::archive::ArchiveSpec {
+        seals,
+        journal_dir: dir,
+        chain_instance: sink.founding_instance(),
+    };
+    Ok((Box::new(sink), Some(archive)))
 }
 
 #[tokio::main]
@@ -774,13 +793,14 @@ async fn main() {
                 if in_process_plane_selected() {
                     match backend::role_binding(resolved, genesis, &run_id, expected.incarnation) {
                         Ok(binding) => {
-                            let journal = match journal_sink(&run_id, &binding.run.identity) {
-                                Ok(sink) => sink,
-                                Err(detail) => {
-                                    send(&writer, &worker_error(&detail)).await;
-                                    continue;
-                                }
-                            };
+                            let (journal, archive) =
+                                match journal_sink(&run_id, &binding.run.identity) {
+                                    Ok(parts) => parts,
+                                    Err(detail) => {
+                                        send(&writer, &worker_error(&detail)).await;
+                                        continue;
+                                    }
+                                };
                             // The measured backend selection materialized (no fallback: an
                             // unavailable admitted backend refuses the join typed).
                             let engine = match backend::engine_for_join(
@@ -808,6 +828,10 @@ async fn main() {
                                 drain_deadline: DRAIN_DEADLINE,
                                 restore: None,
                                 admitted_quotas: binding.quotas,
+                                // The in-process plane has no archive-head store; the seal
+                                // stream (when durable) is dropped and the on-disk chain
+                                // remains the local record.
+                                archive,
                             };
                             let handle = spawn_role(run_id.clone(), spec, role_events.clone());
                             roles.insert(run_id, handle);

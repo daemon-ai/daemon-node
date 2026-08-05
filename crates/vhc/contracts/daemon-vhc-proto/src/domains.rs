@@ -80,6 +80,12 @@ pub const SEAT_RELEASE_DOMAIN: &str = "daemon-vhc/seat-release/2.0.0";
 /// signature can never be replayed as any other signed object, and vice versa.
 pub const ROSTER_RECORD_DOMAIN: &str = "daemon-vhc/roster-record/1.0.0";
 
+/// Domain-separation tag bound into every **archive head record** preimage (the incremental
+/// journal-archive publication contract, architecture §4.4): the signed claim that one sealed
+/// journal segment extends its chain. Distinct from the roster/seat/cert/frame domains so an
+/// archive-head signature can never be replayed as any other signed object, and vice versa.
+pub const ARCHIVE_HEAD_DOMAIN: &str = "daemon-vhc/archive-head/1.0.0";
+
 /// Domain-separation tag folded into every corpus **shard identity** (the chunk-addressed data
 /// contract): `shard_hash = blake3(domain ++ u64le(chunk_size) ++ u64le(token_count) ++
 /// u64le(byte_len) ++ c_0 ++ … ++ c_{n-1})` where `c_i = blake3(chunk_i bytes)`. The fold — not

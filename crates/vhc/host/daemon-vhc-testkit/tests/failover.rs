@@ -352,6 +352,7 @@ fn standby_resumes_from_archive_plus_journal_tail_byte_identically() {
         StaticKey::new([7u8; 32]),
         RotatePolicy {
             max_records: 10_000,
+            ..RotatePolicy::default()
         }, // explicit rolls below control the seal points
     )
     .expect("journal create");

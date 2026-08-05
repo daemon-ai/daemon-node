@@ -294,6 +294,20 @@ round.
 oracle); `payloads/` is required for the digest-from-payloads re-verification; `peers/` is optional
 (absent → the per-peer agreement section is empty, the consensus oracle still runs).
 
+#### Where the archive comes from (the product path)
+
+Segments and heads are published **live, per seal**, by every role session with a durable journal
+home (ABI §8.8): segment bytes ride the run's content plane (presigned R2 / the shared filesystem
+store) at their BLAKE3 address; each seal's attested head record lands on the registry's archive
+slot (`PUT /runs/:id/archive/head`, snapshot via `GET /runs/:id/archive/heads`) — or, on a
+registry-less run, under `<run state dir>/archive/heads/`. The registry applies the structural
+dense-chain fold only (idempotent republish; a non-extending head is refused typed — fork
+evidence); the assembler verifies every head's signature + certificate chain against the
+genesis-trusted bases while pulling the layout above together. The rotation policy's five-minute
+age bound is the recovery-point cadence: a live run's remote archive trails its journal by at
+most one open segment span. Segments seal only on roll/terminal — an aborted process's unsealed
+tail is recovered, sealed and republished by the next incarnation's startup reconciliation.
+
 ### 3.5 The per-round digest on the product API
 
 The per-round det-state digest each peer produces (§5.6 of the architecture) is surfaced on the node

@@ -93,11 +93,13 @@ fn rig(wasm: &[u8], role: &str, config: Vec<u8>) -> Rig {
             payloads: payloads.clone(),
             artifacts: artifacts.clone(),
             plane_stats: None,
+            archive_heads: None,
         },
         journal: Box::new(sink.clone()),
         drain_deadline: Duration::from_secs(10),
         restore: None,
         admitted_quotas: None,
+        archive: None,
     };
     let own_sender = certified.sender().0;
     Rig {

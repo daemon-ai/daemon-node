@@ -1901,6 +1901,53 @@ Three replay tiers (architecture §3.6); this document fixes the **input-replay 
 - The journal-soak invariant (refactor invariant 6) activates with A1: every tier-1/2 run records a
   journal and the input-replay verifier runs against it in CI.
 
+### 8.8 Incremental authenticated archive publication (normative)
+
+The durable journal's sealed segments are the run's archive material; the ceremony's replay
+verdict (runbook §3.4) and coordinator reconstruction both consume them remotely. Publication is
+**incremental and per-seal** — never a whole-directory sweep on the product path.
+
+- **[AR-1] Chain identity.** A journal chain is one sealed-segment series of one on-disk journal
+  home, scoped `(run, role, base identity, chain_instance)`. `chain_instance` is the **founding
+  incarnation**: the incarnation that created segment 0. A live-upgrade seam (§8.1/§10.3)
+  CONTINUES the series — later identity spans publish under the founding instance, and each head
+  names the span (`instance`/`epoch`/`module`) that sealed its segment. A fresh incarnation after
+  a restart opens a NEW home — a new chain; its founding head links the predecessor chain's last
+  published attested head by content address (`predecessor`; `None` on the first chain).
+- **[AR-2] Per-seal publication.** On every segment seal (the journal roll hook) the publisher
+  uploads exactly the newly sealed segment to the content plane (its complete-file BLAKE3 — the
+  §8.2 chain link — is its content address), then publishes an **archive head record**: the
+  signed claim "segment N of this chain has address H, extending P", carrying the sealing span's
+  run-key certificate (§12.3). Signed by the sealing span's per-run key — across a live-upgrade
+  seam the retiring span's final segment attests under the retiring certificate, the successor's
+  under its own.
+- **[AR-3] Recovery-point cadence.** The rotation policy MUST carry a time bound beside the
+  record bound (`RotatePolicy.max_open`; production 5 minutes) so the remote reconstruction
+  point cannot go stale behind a large record count. The age bound only ever rolls a NON-empty
+  segment, and only on append — a quiet journal never churns content-free segments. A terminal
+  outcome seals the active tail (the final segment publishes with the run's end).
+- **[AR-4] The store is untrusted; the fold is structural.** A conforming head store applies the
+  normative structural fold (`daemon-vhc-proto` `ArchiveChainSlot::fold`; the registry mirrors
+  it): dense ordinals from 0, `prev_hash` linkage, byte-identical idempotent republish at a
+  stored height, typed refusal of everything else. It never verifies signatures and never judges
+  authority — readers authorize every fetched head themselves (certificate chain to a
+  genesis-trusted base). Two signed heads at one height that do not extend one another are
+  portable **fork evidence**; the refusal carries the stored tip so either side can extract it.
+- **[AR-5] Crash-safe by reconciliation.** The publisher reconciles at startup: it reads the
+  store's tip for its chain and republishes every sealed-but-unpublished segment from disk (a
+  crash between a seal and its acknowledgment re-sends; the fold's idempotence absorbs it). The
+  end-of-session drain is bounded and NOT load-bearing — a missed tail republishes at the next
+  incarnation's reconciliation.
+- **[AR-6] Scope.** Every role session with a durable journal home publishes — the coordinator
+  chain is the consensus-critical one; trainer chains ride the same identity scheme (their
+  journals and peer digest transcripts are replay/evidence inputs). A referenceless (in-memory)
+  seat has no durable chain and publishes nothing.
+
+Wire shapes: `ArchiveHeadBody`/`ArchiveHeadRecord`/`ArchiveHeadDecision` in `daemon-vhc-proto`
+(domain `daemon-vhc/archive-head/1.0.0`); transport `PUT {base}/runs/:id/archive/head`,
+`GET {base}/runs/:id/archive/heads` (canonical CBOR; 200 accepted/already-stored, 409 typed
+refusal), or the filesystem store under `<run state dir>/archive/heads/`.
+
 ---
 
 ## 9. `claim()`, the two-instance model, and admission

@@ -27,13 +27,14 @@ companion, the deferral is explicit.
 **The archived program architecture doc is a TARGET where it diverges.** The frozen
 `daemon-vhc-architecture.md` (archived under the program docs) reads as current in places where
 it is aspirational; the tracked specs here are authoritative for what exists. Known divergences:
-its §5.3 journal-archive publication and standby coordinator failover have no product callers
-(coordinator crash reconstruction is a named pre-C2 workstream); in-session transport
-sequence-gap recovery is typed-retryable rejoin, not archive backfill (transport repair, semantic
-catch-up, and module/journal reconstruction are three distinct recovery invariants that will
-eventually share one durable archive substrate); and the seat lease is scheme v2 — a leadership
-term separate from the execution incarnation (ABI §12.4 [SEAT-1]) — superseding any
-`token == incarnation` framing.
+standby coordinator failover has no product caller (coordinator crash reconstruction is a named
+pre-C2 workstream); in-session transport sequence-gap recovery is typed-retryable rejoin, not
+archive backfill (transport repair, semantic catch-up, and module/journal reconstruction are
+three distinct recovery invariants that share the durable archive substrate of ABI §8.8 as it
+lands); and the seat lease is scheme v2 — a leadership term separate from the execution
+incarnation (ABI §12.4 [SEAT-1]) — superseding any `token == incarnation` framing. Its §5.3
+journal-archive publication IS now product: every role session with a durable journal home runs
+the incremental per-seal publisher (ABI §8.8; runbook §3.4).
 
 **Naming.** This spec uses the subsystem's new name, **vhc**; the shipping code is still named
 `swarm` (`daemon-swarm-*` crates, `SwarmApi`, `daemon-train`). Shipping code is cited by its real
