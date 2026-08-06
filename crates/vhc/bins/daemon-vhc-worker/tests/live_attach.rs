@@ -382,7 +382,8 @@ async fn two_workers_exchange_certified_frames_over_the_live_ws_plane() {
         presign_base: None, // the filesystem content store under the run-state root
         peer_certs: Vec::new(), // trust arrives ON the plane, as distribution records
         seat_grant: None,   // no seat in this lane (the term floor starts ungoverned)
-        secret_ref: None,   // unauthenticated local relay lane
+        reconstruct: None,
+        secret_ref: None, // unauthenticated local relay lane
         expires_at_ms: 0,
         restore: None,
     };

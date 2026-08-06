@@ -1469,10 +1469,19 @@ pub(crate) fn role_binding(
         // det-lane roots (≈14.65 GiB at the ceremony tier) live on disk, not the memory-floor
         // peer's unified RAM. Absent a run-state home (ephemeral/dev), the store keeps its
         // resident RAM backing.
+        //
+        // Scoped by `run_id` — the SAME label the journal home is scoped by (`journal_sink` in
+        // main.rs) — never the genesis's human label. Hashing a different string here put every
+        // run's spill in a second scope the node could not map to a run row, so reconciliation
+        // ("unknown scopes are untouchable"), the safe wipe, AND per-run quota attribution all
+        // missed the very bytes that dominate a trainer's footprint: the c15 fleet accumulated
+        // ~50 GiB of exactly these label-scoped spill orphans, and M4's custodian refused a
+        // 119 KB journal write while the quota was consumed by spills it charged to scopes no
+        // tool could reclaim.
         run.state_dir = daemon_vhc_session::journal_home::run_dir_from_env().map(|root| {
             daemon_vhc_session::journal_home::state_dir(
                 &root,
-                &genesis.env.run.run_label,
+                run_id,
                 &genesis.worker_role,
                 incarnation,
             )
@@ -1594,7 +1603,11 @@ pub(crate) async fn assess_switch(
         refusal_code: code.map(str::to_string),
         admitted_tuple: None,
     };
-    let run_label = genesis.env.run.run_label.clone();
+    // The run's storage/presign label is the genesis run-id HEX — the same label every other
+    // per-run surface (journal home, payload plane, presign namespace) is scoped by — never the
+    // human display label (hashing that instead is the spill-orphan defect in miniature: a
+    // second scope no other surface can map back to the run).
+    let run_label = genesis.frozen.run_id().to_hex().to_string();
     let bytes = match resolve_switch_module(&run_label, target.new_module).await {
         Ok(bytes) => bytes,
         Err(reason) => return Ok(ineligible(reason, Some("SwitchTargetUnresolvable"))),

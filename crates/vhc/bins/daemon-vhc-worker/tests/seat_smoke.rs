@@ -385,6 +385,7 @@ async fn coordinator_seat_claim_launch_and_trainer_lease_resolve() {
         // The winner's own grant rides its credentials ([SEAT-1] v2 grant distribution): the
         // session re-verifies, primes its term floor, and announces it on-plane.
         seat_grant: Some(lease.clone()),
+        reconstruct: None,
         secret_ref: None,
         expires_at_ms: 0,
         restore: None,
@@ -444,6 +445,7 @@ async fn coordinator_seat_claim_launch_and_trainer_lease_resolve() {
         // and the AUTHORIZED grant (so the trainer's term floor governs the coordinator slot).
         peer_certs: vec![authorized.certificate.clone()],
         seat_grant: Some(stored.clone()),
+        reconstruct: None,
         secret_ref: None,
         expires_at_ms: 0,
         restore: None,
