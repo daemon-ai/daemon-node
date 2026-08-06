@@ -221,9 +221,15 @@ pub async fn build_role_providers(
         }),
     )
     .await?;
-    ws.add_resubscribe_frame(inputs.own_cert_announcement);
-    if let Some(grant) = inputs.seat_grant_announcement {
-        ws.add_resubscribe_frame(grant);
+    // The session's standing distribution records (per-run certificate announcement + seat
+    // grant) are pinned on EVERY control plane's anti-entropy path — WS resubscribe frames here,
+    // gossip pinned re-floods below. One plane being deaf must never leave this sender
+    // uncertifiable to peers listening on the other (the c15-20260806a wedge).
+    let cert_announcement = inputs.own_cert_announcement;
+    let grant_announcement = inputs.seat_grant_announcement;
+    ws.add_resubscribe_frame(cert_announcement.clone());
+    if let Some(grant) = &grant_announcement {
+        ws.add_resubscribe_frame(grant.clone());
     }
     let ws = Arc::new(ws);
     // The deaf-path instrumentation seam: the session reads the WS plane's delivery-boundary
@@ -253,6 +259,10 @@ pub async fn build_role_providers(
             #[cfg(feature = "live-iroh")]
             {
                 let gossip = connect_iroh(iroh, creds.genesis_hash, inputs.keystore).await?;
+                gossip.add_resubscribe_frame(cert_announcement.clone());
+                if let Some(grant) = &grant_announcement {
+                    gossip.add_resubscribe_frame(grant.clone());
+                }
                 Arc::new(daemon_vhc_net::DualPlane::pair(ws, gossip))
             }
             #[cfg(not(feature = "live-iroh"))]

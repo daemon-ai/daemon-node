@@ -175,6 +175,7 @@ async fn rebroadcast_refloods_without_duplicate_delivery() {
         enabled: true,
         interval: Duration::from_millis(150),
         ring_capacity: 8,
+        ..RebroadcastConfig::default()
     };
     let nodes = build_mesh(2, rebroadcast).await;
     let mut sub1 = nodes[1].subscribe();
@@ -192,6 +193,58 @@ async fn rebroadcast_refloods_without_duplicate_delivery() {
             .await
             .is_none(),
         "rebroadcasts re-flood the gossip layer but the app Deduper drops duplicate deliveries"
+    );
+}
+
+/// The pinned-frame anti-entropy regression (c15-20260806a class): a peer that was NOT in the
+/// mesh when a standing distribution record (a cert announcement) was first flooded — late topic
+/// join, or its other control plane deaf — still converges via the periodic pinned re-flood,
+/// and a peer that already delivered the record never sees a duplicate.
+#[tokio::test(flavor = "multi_thread")]
+async fn pinned_resubscribe_frame_reaches_late_joiner() {
+    let rebroadcast = RebroadcastConfig {
+        enabled: false, // isolate the pinned path from the delivery-assurance ring
+        resubscribe_interval: Duration::from_millis(150),
+        ..RebroadcastConfig::default()
+    };
+
+    // A two-node mesh; node 0 pins + floods its announcement while node 2 does not exist yet.
+    let mut nodes = vec![
+        connect_node(1, rebroadcast.clone()).await,
+        connect_node(2, rebroadcast.clone()).await,
+    ];
+    wire_roster(&nodes).await;
+    wait_for_mesh(&nodes, 1).await;
+    let mut sub1 = nodes[1].subscribe();
+
+    let announcement = signed_heartbeat_bytes(&signing_key(1), 42);
+    nodes[0].add_resubscribe_frame(announcement.clone());
+    nodes[0].publish(&announcement).await.expect("publish");
+    assert_eq!(
+        recv_timeout(&mut sub1, DELIVER).await.as_deref(),
+        Some(&announcement[..]),
+        "the in-mesh peer receives the initial flood"
+    );
+
+    // The late joiner missed the initial flood entirely; only the pinned re-flood can reach it.
+    nodes.push(connect_node(3, rebroadcast).await);
+    wire_roster(&nodes).await;
+    wait_for_mesh(&nodes, 1).await;
+    let mut sub_late = nodes[2].subscribe();
+    assert_eq!(
+        recv_timeout(&mut sub_late, Duration::from_secs(5))
+            .await
+            .as_deref(),
+        Some(&announcement[..]),
+        "the late joiner converges on the pinned anti-entropy re-flood"
+    );
+
+    // The in-mesh peer's Deduper drops every re-flood: no duplicate delivery.
+    assert!(
+        recv_timeout(&mut sub1, Duration::from_millis(700))
+            .await
+            .is_none(),
+        "pinned re-floods never duplicate-deliver to a peer that already holds the record"
     );
 }
 

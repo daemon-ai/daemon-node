@@ -56,6 +56,9 @@ use crate::VhcNetError;
 const MAX_MESSAGE_SIZE: usize = 4096;
 /// The rebroadcast-frame nonce width (little-endian `u64`).
 const NONCE_LEN: usize = 8;
+/// Nonce floor for pinned resubscribe frames — keeps their outer bytes disjoint from the
+/// delivery-assurance ring's nonce range (which starts at 0 and bumps per re-flood).
+const RESUBSCRIBE_NONCE_BASE: u64 = 1 << 32;
 /// Bootstrap-neighbor cap adopted from Psyche's `ensure_gossip_connected`
 /// (`shared/client/src/client.rs:773`): only add enough peers to reach this many gossip neighbors.
 const MAX_BOOTSTRAP_PEERS: usize = 3;
@@ -69,6 +72,11 @@ pub struct RebroadcastConfig {
     pub interval: Duration,
     /// How many recent messages to keep in the rebroadcast ring.
     pub ring_capacity: usize,
+    /// The pinned-frame re-announce cadence (see [`IrohGossip::add_resubscribe_frame`]): the
+    /// anti-entropy tick for standing distribution records (per-run certificates, seat grants)
+    /// that must eventually reach every peer, including ones that join the topic late or whose
+    /// other plane is deaf. Matches the WS plane's resubscribe re-announce cadence.
+    pub resubscribe_interval: Duration,
 }
 
 impl Default for RebroadcastConfig {
@@ -77,6 +85,7 @@ impl Default for RebroadcastConfig {
             enabled: true,
             interval: Duration::from_secs(10),
             ring_capacity: 32,
+            resubscribe_interval: Duration::from_secs(60),
         }
     }
 }
@@ -131,6 +140,9 @@ struct Shared {
     ring: VecDeque<(Vec<u8>, u64)>,
     /// Cap on `ring`.
     ring_capacity: usize,
+    /// Pinned frames re-flooded on every anti-entropy tick for the life of the plane — never
+    /// evicted, unlike the `ring` (see [`IrohGossip::add_resubscribe_frame`]).
+    resubscribe: Vec<(Vec<u8>, u64)>,
     /// Current direct gossip neighbors (tracked from `NeighborUp`/`NeighborDown` for the roster cap).
     neighbors: HashSet<EndpointId>,
     /// Our own endpoint id (never dial/self-count).
@@ -254,9 +266,17 @@ impl IrohGossip {
             ring_capacity: config.rebroadcast.ring_capacity.max(1),
             neighbors: HashSet::new(),
             self_id,
+            resubscribe: Vec::new(),
         }));
 
-        let mut tasks = vec![tokio::spawn(receive_loop(receiver, shared.clone()))];
+        let mut tasks = vec![
+            tokio::spawn(receive_loop(receiver, shared.clone())),
+            tokio::spawn(resubscribe_loop(
+                sender.clone(),
+                shared.clone(),
+                config.rebroadcast.resubscribe_interval,
+            )),
+        ];
         if config.rebroadcast.enabled {
             tasks.push(tokio::spawn(rebroadcast_loop(
                 sender.clone(),
@@ -282,6 +302,23 @@ impl IrohGossip {
     #[must_use]
     pub fn node_id(&self) -> [u8; 32] {
         self.node_id
+    }
+
+    /// Pin an already-signed frame for periodic anti-entropy re-flooding (the gossip analogue of
+    /// the WS plane's `add_resubscribe_frame`): standing distribution records — the session's
+    /// per-run certificate announcement and seat grant — are re-broadcast with a fresh nonce every
+    /// [`RebroadcastConfig::resubscribe_interval`], for the life of the plane. Unlike the
+    /// delivery-assurance `ring`, pinned frames are never evicted: a peer that joins the topic
+    /// late, or whose OTHER control plane is deaf (the c15-20260806a class: a WS subscriber
+    /// dropped from the DO fan-out never saw the one-shot cert announce, so every frame from
+    /// this sender stayed `UncertifiedSender` for the whole run), converges on the next tick.
+    /// Receivers that already hold the record drop the re-flood in their content-hash [`Deduper`].
+    pub fn add_resubscribe_frame(&self, frame: Vec<u8>) {
+        let mut sh = self.shared.lock().expect("gossip shared lock");
+        // Start well clear of the ring's nonce range so a payload present in both never produces
+        // byte-identical outer frames (which iroh-gossip would dedupe into a skipped re-flood).
+        let nonce = RESUBSCRIBE_NONCE_BASE + sh.resubscribe.len() as u64;
+        sh.resubscribe.push((frame, nonce));
     }
 
     /// Our own dialable [`IrohPeer`] (endpoint id + currently-bound sockets + configured relay), for
@@ -545,6 +582,37 @@ async fn rebroadcast_loop(sender: GossipSender, shared: Arc<Mutex<Shared>>, inte
         // A send error means the topic/endpoint is gone; the loop will be aborted on shutdown.
         if sender.broadcast(frame.into()).await.is_err() {
             break;
+        }
+    }
+}
+
+/// The pinned-frame anti-entropy loop: every tick, re-flood EVERY resubscribe frame (see
+/// [`IrohGossip::add_resubscribe_frame`]) with a bumped nonce. Unlike [`rebroadcast_loop`] this
+/// walks the whole pinned set each tick — the set is tiny (a cert announcement + optionally a
+/// seat grant) and each record is the difference between a peer certifying this sender or
+/// refusing every frame it emits.
+async fn resubscribe_loop(sender: GossipSender, shared: Arc<Mutex<Shared>>, interval: Duration) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Skip the immediate first tick: the frames were flooded at publish time by the caller.
+    ticker.tick().await;
+    loop {
+        ticker.tick().await;
+        let frames: Vec<Vec<u8>> = {
+            let mut sh = shared.lock().expect("gossip shared lock");
+            sh.resubscribe
+                .iter_mut()
+                .map(|(payload, nonce)| {
+                    *nonce = nonce.wrapping_add(1);
+                    frame_bytes(*nonce, payload)
+                })
+                .collect()
+        };
+        for frame in frames {
+            // A send error means the topic/endpoint is gone; the loop is aborted on shutdown.
+            if sender.broadcast(frame.into()).await.is_err() {
+                return;
+            }
         }
     }
 }

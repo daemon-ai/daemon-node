@@ -167,30 +167,23 @@ fn heartbeat_frame(seq: u64) -> Vec<u8> {
 }
 
 /// A server heartbeat is consumed by the plane (liveness bookkeeping + counters) and never
-/// reaches a subscriber; a regular frame alone never arms the deafness deadline.
+/// reaches a subscriber. The deafness deadline is kept long here so this test exercises only
+/// the consumption semantics (arming/cycling is covered below).
 #[tokio::test(flavor = "multi_thread")]
 async fn ws_heartbeat_is_consumed_never_fanned_out() {
     let coord = MockWsCoordinator::start().await;
     let mut rc = fast_reconnect();
-    rc.binary_silence_deadline = Duration::from_millis(400);
+    rc.binary_silence_deadline = Duration::from_secs(30);
     let plane = coord.client("run-hb", WsAuth::None, rc).await;
     coord.wait_peers(1).await;
     let mut sub = plane.subscribe();
 
-    // A regular frame delivers to the subscriber but must NOT arm the deafness deadline: well
-    // past the 400 ms deadline the plane is still on its first connection (quiet phases on a
-    // pre-heartbeat server never trigger reconnect cycling).
+    // A regular frame delivers to the subscriber.
     let frame = signed_heartbeat_bytes(&signing_key(4), 1);
     coord.broadcast(frame.clone());
     assert_eq!(
         recv_timeout(&mut sub, DELIVER).await.as_deref(),
         Some(frame.as_slice())
-    );
-    tokio::time::sleep(Duration::from_millis(900)).await;
-    assert_eq!(
-        plane.connect_count(),
-        1,
-        "a regular frame must not arm the deafness deadline"
     );
 
     // A heartbeat is counted and consumed — the subscriber never sees it.
@@ -206,18 +199,20 @@ async fn ws_heartbeat_is_consumed_never_fanned_out() {
     assert!(recv_timeout(&mut sub, GRACE).await.is_none());
 }
 
-/// The deaf-fan-out regression: once a server heartbeat armed the expected-progress deadline,
-/// Binary silence past it forces a reconnect + resubscribe even though the socket itself stays
-/// healthy (the relay keeps answering Pings throughout — Pong is never delivery evidence).
+/// The deaf-fan-out regression (run-i/run-k class): Binary silence past the expected-progress
+/// deadline forces a reconnect + resubscribe even though the socket itself stays healthy (the
+/// relay keeps answering Pings throughout — Pong is never delivery evidence). The deadline is
+/// armed at connect, so the fresh connection cycles again on continued total silence, and the
+/// plane stabilizes as soon as delivery resumes.
 #[tokio::test(flavor = "multi_thread")]
-async fn ws_binary_silence_after_heartbeat_forces_deaf_reconnect() {
+async fn ws_binary_silence_forces_deaf_reconnect() {
     let coord = MockWsCoordinator::start().await;
     let mut rc = fast_reconnect();
     rc.binary_silence_deadline = Duration::from_millis(400);
     let plane = coord.client("run-deaf", WsAuth::None, rc).await;
     coord.wait_peers(1).await;
 
-    // Arm the deadline with one heartbeat, then go Binary-silent (the deaf fan-out).
+    // Deliver one heartbeat, then go Binary-silent (the deaf fan-out).
     coord.broadcast(heartbeat_frame(1));
     wait_until(Duration::from_secs(2), || {
         plane.stats().heartbeats_received >= 1
@@ -231,17 +226,46 @@ async fn ws_binary_silence_after_heartbeat_forces_deaf_reconnect() {
         "counted as a deaf cycle"
     );
 
-    // The fresh connection is unarmed (no heartbeat arrived on it), so the plane does not keep
-    // cycling — and a post-reconnect broadcast still reaches the subscriber.
-    let stable = plane.connect_count();
-    tokio::time::sleep(Duration::from_millis(900)).await;
-    assert_eq!(
-        plane.connect_count(),
-        stable,
-        "no reconnect cycling while the new connection is unarmed"
-    );
+    // A post-reconnect broadcast still reaches the subscriber.
+    coord.wait_peers(1).await;
     let mut sub = plane.subscribe();
     let frame = signed_heartbeat_bytes(&signing_key(5), 2);
+    coord.broadcast(frame.clone());
+    assert_eq!(
+        recv_timeout(&mut sub, DELIVER).await.as_deref(),
+        Some(frame.as_slice())
+    );
+}
+
+/// The deaf-FROM-BIRTH regression (c15-20260806a class): a subscriber whose socket receives
+/// NOTHING — not even the heartbeat that would have armed a heartbeat-gated deadline, because
+/// the arming signal rides the very fan-out that is broken — must still detect deafness and
+/// cycle. The deadline is armed at connect, so total silence from the first instant forces the
+/// reconnect, and delivery works once the fan-out recovers.
+#[tokio::test(flavor = "multi_thread")]
+async fn ws_deaf_from_birth_socket_reconnects() {
+    let coord = MockWsCoordinator::start().await;
+    let mut rc = fast_reconnect();
+    rc.binary_silence_deadline = Duration::from_millis(400);
+    let plane = coord.client("run-birth-deaf", WsAuth::None, rc).await;
+    coord.wait_peers(1).await;
+
+    // The server sends nothing at all: no heartbeat ever arrives, yet the plane must cycle.
+    wait_until(Duration::from_secs(5), || plane.connect_count() >= 2).await;
+    assert!(
+        plane.stats().deaf_reconnects >= 1,
+        "total silence from connect is a deaf cycle"
+    );
+    assert_eq!(
+        plane.stats().heartbeats_received,
+        0,
+        "no heartbeat ever arrived — the deadline must not depend on one"
+    );
+
+    // Once the fan-out delivers, the subscriber receives normally.
+    coord.wait_peers(1).await;
+    let mut sub = plane.subscribe();
+    let frame = signed_heartbeat_bytes(&signing_key(6), 3);
     coord.broadcast(frame.clone());
     assert_eq!(
         recv_timeout(&mut sub, DELIVER).await.as_deref(),

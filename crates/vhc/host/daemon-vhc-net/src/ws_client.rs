@@ -89,11 +89,13 @@ pub struct ReconnectConfig {
     pub max_backoff: Duration,
     /// Consecutive failed dial attempts before giving up (`None` = retry forever).
     pub max_attempts: Option<u32>,
-    /// The Binary-silence (deafness) deadline: armed by the FIRST server heartbeat on a
-    /// connection, refreshed by every Binary; silence past this span forces a reconnect +
-    /// resubscribe (see [`HEARTBEAT_PREFIX`]). Default 75 s — three missed 20 s server
-    /// heartbeats plus jitter. A pre-heartbeat server never arms it (no false cycling in quiet
-    /// phases).
+    /// The Binary-silence (deafness) deadline: armed at CONNECT, refreshed by every Binary
+    /// (heartbeat or frame); silence past this span forces a reconnect + resubscribe (see
+    /// [`HEARTBEAT_PREFIX`]). Default 75 s — three missed 20 s server heartbeats plus jitter.
+    /// The server's Binary-heartbeat contract is what makes arming-at-connect sound: a healthy
+    /// fan-out always delivers SOMETHING within the deadline, so total silence means this
+    /// subscriber is deaf (arming on the first heartbeat instead leaves a deaf-from-birth
+    /// socket — one whose arming heartbeat rides the broken fan-out itself — undetected forever).
     pub binary_silence_deadline: Duration,
 }
 
@@ -442,13 +444,18 @@ async fn serve(
     keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     keepalive.tick().await; // consume the immediate first tick — the connect itself proves liveness
     let mut last_inbound = tokio::time::Instant::now();
-    // The Binary-silence (deafness) watermark: `None` until the FIRST server HEARTBEAT arrives on
-    // THIS connection — the heartbeat is the server's explicit cadence promise, so only it may
-    // arm the deadline (a pre-heartbeat server, or one that delivers a frame and then goes
-    // legitimately quiet, never arms it — no blind-timer reconnect cycling). Once armed, EVERY
-    // Binary refreshes it (frames prove delivery just as well). Pongs deliberately do NOT touch
-    // it: socket liveness is not delivery (the run-i/run-k deaf-fan-out class).
-    let mut last_binary: Option<tokio::time::Instant> = None;
+    // The Binary-silence (deafness) watermark: armed at CONNECT and refreshed by EVERY Binary
+    // (heartbeat or frame — both prove the fan-out delivers to this socket). The product DO's
+    // Binary heartbeat contract (`HEARTBEAT_PREFIX`, at least one per interval while sockets are
+    // connected) makes Binary arrival the expected-progress signal from the first instant: a
+    // socket that receives NOTHING within the deadline is indistinguishable from one dropped
+    // from the fan-out set, so it is cycled. Arming on the first heartbeat instead was observed
+    // live (c15-20260806a) to leave a deaf-FROM-BIRTH subscriber undetectable forever: the
+    // heartbeat that would arm the deadline rides the very fan-out that is broken (hb=0 for the
+    // life of the socket), so the defense never engaged and the peer stayed uncertifiable for
+    // the whole run. Pongs deliberately do NOT touch the watermark: socket liveness is not
+    // delivery (the run-i/run-k deaf-fan-out class).
+    let mut last_binary = tokio::time::Instant::now();
 
     loop {
         tokio::select! {
@@ -467,18 +474,16 @@ async fn serve(
                 // silence past it means this subscriber is no longer being delivered to (dropped
                 // from the fan-out set, or the dissemination path is wedged) even though the
                 // socket answers Pings. Reconnect + resubscribe is the recovery.
-                if let Some(at) = last_binary {
-                    if at.elapsed() >= reconnect.binary_silence_deadline {
-                        let mut sh = shared.lock().expect("ws shared lock");
-                        sh.stats.deaf_reconnects = sh.stats.deaf_reconnects.saturating_add(1);
-                        drop(sh);
-                        tracing::warn!(
-                            silent = ?at.elapsed(),
-                            "ws control plane deaf: socket alive but no Binary within the \
-                             expected-progress deadline; reconnecting + resubscribing"
-                        );
-                        return ServeOutcome::Disconnected;
-                    }
+                if last_binary.elapsed() >= reconnect.binary_silence_deadline {
+                    let mut sh = shared.lock().expect("ws shared lock");
+                    sh.stats.deaf_reconnects = sh.stats.deaf_reconnects.saturating_add(1);
+                    drop(sh);
+                    tracing::warn!(
+                        silent = ?last_binary.elapsed(),
+                        "ws control plane deaf: socket alive but no Binary within the \
+                         expected-progress deadline; reconnecting + resubscribing"
+                    );
+                    return ServeOutcome::Disconnected;
                 }
                 if write.send(Message::Ping(Vec::new().into())).await.is_err() {
                     return ServeOutcome::Disconnected;
@@ -510,10 +515,8 @@ async fn serve(
                 last_inbound = tokio::time::Instant::now();
                 match inbound {
                     Some(Ok(Message::Binary(payload))) => {
-                        // Refresh only once armed; arming is the heartbeat's alone (below).
-                        if last_binary.is_some() {
-                            last_binary = Some(tokio::time::Instant::now());
-                        }
+                        // Every Binary refreshes the deafness watermark (delivery proven).
+                        last_binary = tokio::time::Instant::now();
                         {
                             let mut sh = shared.lock().expect("ws shared lock");
                             sh.stats.binary_received = sh.stats.binary_received.saturating_add(1);
@@ -522,9 +525,8 @@ async fn serve(
                         if payload.len() >= HEARTBEAT_PREFIX.len()
                             && payload[..HEARTBEAT_PREFIX.len()] == HEARTBEAT_PREFIX[..]
                         {
-                            // A server heartbeat: arms/refreshes the deafness deadline and is
-                            // counted; never fanned out to subscribers.
-                            last_binary = Some(tokio::time::Instant::now());
+                            // A server heartbeat: counted, never fanned out to subscribers
+                            // (the watermark refresh above already covered it).
                             let mut sh = shared.lock().expect("ws shared lock");
                             sh.stats.heartbeats_received =
                                 sh.stats.heartbeats_received.saturating_add(1);
