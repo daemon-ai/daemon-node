@@ -1966,6 +1966,23 @@ verdict (runbook §3.4) and coordinator reconstruction both consume them remotel
   fast path (replay only the post-anchor tail); otherwise the full lineage replays from
   genesis — correct by policy determinism, bounded by the archived history.
 
+- **[AR-9] Local custody: archive-then-prune with a re-openable anchored chain.** Local segment
+  files are reclaimed ONLY under the full dependency closure: the segment is durably archived
+  ([AR-2]) with its attested head stored, it sits outside the recovery horizon (the newest
+  `horizon` archived segments stay local; `0` disables pruning), and every sidecar it references
+  is either reclaimed with it or still referenced by a retained segment. The facts are persisted
+  in a per-chain custody ledger (`custody.cbor`, atomic replace) written on head acknowledgment —
+  prune decisions are crash-safe re-reads of the ledger, never inferences from "not running".
+  Only a contiguous PREFIX is ever pruned (a mid-chain hole is locally unverifiable). Because a
+  pruned chain no longer starts at genesis, the pruner records a **chain anchor**
+  (`chain-anchor.cbor`, written atomically BEFORE each segment file delete): the first retained
+  ordinal and the archived predecessor's complete-file hash. Recovery (§8.2) verifies the first
+  retained segment against the anchor instead of `GENESIS_PREV`, skips leftover files below the
+  anchor (crash-window prune debris, proven archived by construction), and REFUSES a missing
+  anchored first segment (damage, not pruning) and an anchored chain with no retained segments
+  (re-creating from genesis would fork the archived history). The unsealed tail is never prune
+  material — it is the successor's reconstruction input ([AR-8]).
+
 Wire shapes: `ArchiveHeadBody`/`ArchiveHeadRecord`/`ArchiveHeadDecision` in `daemon-vhc-proto`
 (domain `daemon-vhc/archive-head/1.0.0`); transport `PUT {base}/runs/:id/archive/head`,
 `GET {base}/runs/:id/archive/heads` (canonical CBOR; 200 accepted/already-stored, 409 typed

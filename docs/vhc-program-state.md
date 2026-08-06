@@ -99,7 +99,7 @@ None of these blocks C0 or C1.
 
 ## 7. Current state (rewrite this section at every boundary)
 
-- Integration trunk: `vhc-integration` at `24293e06`, clean. The One-Lifecycle/Two-Identities
+- Integration trunk: `vhc-integration` at `6d8c0713` (Phase 6 boundary), clean. The One-Lifecycle/Two-Identities
   wave is fully landed and field-proven:
   - **One join transaction** (restart, retry, CLI join, fault recovery share one driver):
     explicit `Starting` state, `Running` only on observed readiness, run-attributed
@@ -305,6 +305,43 @@ None of these blocks C0 or C1.
     conflicting-heads typed refusals (node, `tests/service.rs`).
   - Docs moved with the change: ABI §8.8 [AR-7]/[AR-8]; runbook §5.5 coordinator crash
     drill.
+- **Pre-C2 hardening — Phase 6 LANDED (2026-08-06): central disk custody (ABI §8.8 [AR-9];
+  wire v45).**
+  - **The custodian** (`daemon-vhc-custody`, new crate): ONE per filesystem root
+    (per-process registry, canonicalized), atomic reserve→write→commit with an OS
+    free-space floor, a global quota, per-run scope quotas, and an emergency margin only
+    `Critical` writes (seals, terminals, snapshot bodies, segment headers, archive heads)
+    may draw on — sealing always lands. Ambient attachment via `DAEMON_VHC_CUSTODY_ROOT`
+    + `DAEMON_VHC_DISK_{RESERVE,QUOTA,RUN_QUOTA,EMERGENCY}_MB` /
+    `DAEMON_VHC_DISK_PRUNE_HORIZON_SEGMENTS` (exported to workers from `[vhc.storage]`;
+    config reference regenerated). Custodied write paths: journal appends charge their
+    exact framed size; spill, payload and archive-head stores reserve before writing.
+    The node's resume gate asks the custodian's pressure state
+    (`Nominal | Warn | RefuseNew`); the owner ledger carries `run_quota_mb`.
+  - **Bounded local storage** ([AR-9]): the archive publisher records archive facts in
+    the persisted per-chain custody ledger (`custody.cbor`) on every acknowledged head
+    and prunes proven-archived segments outside the recovery horizon (default 4),
+    sidecar dependency closure respected, contiguous-prefix only. A pruned chain stays
+    re-openable through the **chain anchor** (`chain-anchor.cbor`, written atomically
+    BEFORE each delete): recovery verifies the first retained segment against the
+    archived predecessor's hash, skips crash-window debris, refuses a missing anchored
+    segment. This un-broke the live module switch's seam re-open (found by the gate:
+    the pruner ate the prefix, `open_continuation` refused its own chain) — and every
+    restart over a pruned chain. The switch exchange also left the 30 s chatty watchdog
+    for `deadline_ms + assess_timeout` (quiesce may legitimately consume the full drain
+    ceiling; the migrate is assess-class silent compute).
+  - **Reconciliation** (`daemon-vhc-node::reclaim`): at service start, superseded
+    incarnation dirs are reclaimed IFF their ledger proves every segment archived (the
+    newest incarnation is never touched — it is the [AR-8] reconstruction input;
+    unknown scopes never reclaimed). Best-effort, loud, never blocks boot.
+  - **Wire v45 operator surface**: `VhcDiskUsage` (free/used/quota/reserve/emergency,
+    pressure, per-run rows split recoverable vs archived-evidence; orphans flagged) and
+    `VhcDiskWipe` (identity-preserving safe wipe: refuses a live run and a standing
+    joined intent typed; evidence planes only on explicit request; the identity
+    keystore always survives). CLI: `daemon-cli vhc disk` / `vhc wipe`. CDDL +
+    conformance + `WireVersion::CURRENT = 45`.
+  - **Gate GREEN end to end** (det + t2 + node + acceptance incl. `module_switch_live`
+    and `three_node_training`; 3776 s). Boundary commit `6d8c0713`.
 - **Not claimed** (recorded): general archive backfill, in-session exact-frame
   loss repair, §5.3 standby failover, and cross-chain (restart-succession) replay in the
   OFFLINE oracle — `xtask vhc-replay` still certifies a single uninterrupted chain and
@@ -340,8 +377,12 @@ All four answer ssh (verified 2026-08-04). Next actions (in order):
    ABI §8.8). ~~Phase 4 GREEN replay assembly~~ DONE (§7: `assemble_archive` +
    `vhc-archive-pull` + product `vhc-replay`, end-to-end gate GREEN). ~~Phase 5
    sandboxed coordinator reconstruction~~ DONE (§7: node-verified head lineage +
-   worker sandbox replay + rewired `CheckpointStale`, [AR-7]/[AR-8]). Next: Phase 6
-   disk custody, then C1.5; plus the registry Byzantine posture owner decision (§6).
+   worker sandbox replay + rewired `CheckpointStale`, [AR-7]/[AR-8]). ~~Phase 6 disk
+   custody~~ DONE (§7: custodian + custody ledger + anchored prune [AR-9] +
+   reconciliation + wire-v45 disk surface, gate GREEN, `6d8c0713`). Next: Phase 7,
+   the targeted C1.5 two-box run (re-provision profiles + re-run fit probes first —
+   the worker rebuild changed the sealed backend revision); plus the registry
+   Byzantine posture owner decision (§6).
 4. Bring the Windows 5090 seat into a three-box run (its worker lane builds with
    `vhc-net,wgpu-spirv`; native DX12 verdict is already green).
 5. Freeze; memoized preflight; run C2; evidence closure; human-signed master merge.
