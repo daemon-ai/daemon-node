@@ -331,7 +331,9 @@ fn classify(req: &ApiRequest) -> Coverage {
         | VhcResume { .. }
         | VhcSetPolicy { .. }
         | VhcSwitchModule { .. }
-        | VhcHardwareReport => NotSessionTouching,
+        | VhcHardwareReport
+        | VhcDiskUsage
+        | VhcDiskWipe { .. } => NotSessionTouching,
         ProfileList
         | ProfileGet { .. }
         | ProfileCreate { .. }

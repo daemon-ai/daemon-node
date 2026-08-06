@@ -11,7 +11,7 @@
 use std::collections::BTreeMap;
 
 use crate::messages::{
-    Attestation, BatchWindow, Commitment, RecordEntry, RoundRecord, ThroughputClass,
+    Attestation, BatchWindow, Commitment, RecordEntry, RoundOpen, RoundRecord, ThroughputClass,
 };
 use daemon_vhc_proto::{IrohId, PeerId, Seed, StateDigest};
 use serde::{Deserialize, Serialize};
@@ -142,6 +142,13 @@ pub struct RoundState {
     pub record: Option<RoundRecord>,
     /// Set when two peers report divergent digests for this round (§6.4).
     pub desync: bool,
+    /// The `RoundOpen` exactly as flooded when this slot opened (§6.5 rejoin catch-up). A round
+    /// open is otherwise a one-shot flood: a trainer whose session churned across it (coordinator
+    /// outage, REPLACE re-admission, late-join restore) can fold every retained record and still
+    /// wait forever for an open that is never re-emitted — the c15b post-reconstruction livelock.
+    /// Retained verbatim (not rebuilt) so the re-publish is bit-identical: the roster digest and
+    /// deadline are frozen at open time and must not drift with later roster churn.
+    pub open: Option<RoundOpen>,
 }
 
 impl RoundState {
@@ -160,6 +167,7 @@ impl RoundState {
             digests: BTreeMap::new(),
             record: None,
             desync: false,
+            open: None,
         }
     }
 

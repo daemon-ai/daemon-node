@@ -376,6 +376,85 @@ fn proto7_k_absences_drops_and_proto10_rejoin() {
     );
 }
 
+// ----- §6.5 rejoin catch-up: standing RoundOpen + idempotent duplicate join -----
+
+/// The c15b post-reconstruction livelock: a trainer whose session churned across a round's
+/// one-shot `RoundOpen` flood (coordinator crash + REPLACE re-admission) re-announces the same
+/// Join it always sends. Refusing it `DuplicatePeer` starved it of the replay-forward: it folded
+/// nothing, waited for an open that is never re-flooded, and died on the witness timeout, on
+/// every retry. A healthy member's re-join must be an idempotent catch-up — retained committed
+/// records, ascending, then the standing open of the active round — with roster and pending
+/// untouched.
+#[test]
+fn rejoin_of_active_member_replays_records_and_standing_open() {
+    let ks = keys(2);
+    let coord = key(200);
+    let state = to_first_round(base_config(), &ks);
+    // Commit round 0 so the ring retains a record; round 1 opens.
+    let (state, _) = complete_round(state, &ks, &coord, 0, 7);
+    assert_eq!(state.round, 1);
+    assert_eq!(state.phase, Phase::RoundTrain);
+    let roster_before = state.roster.len();
+    let expected_open = state
+        .rounds
+        .get(1)
+        .and_then(|rs| rs.open.clone())
+        .expect("the active round retains its open");
+
+    // The same peer re-joins mid-round (session replacement).
+    let (state, out) = tick(state, Input::Message(join_msg(&ks[0])));
+    assert_eq!(state.roster.len(), roster_before, "roster untouched");
+    assert!(state.pending.is_empty(), "no duplicate pending entry");
+    assert!(out
+        .iter()
+        .any(|o| matches!(o, Output::Note(Notice::Admitted(_)))));
+    let msgs = publishes(&out);
+    assert!(
+        msgs.iter()
+            .any(|m| matches!(m, VhcMessage::RoundRecord(rr) if rr.round == 0)),
+        "the retained committed record is re-published"
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| matches!(m, VhcMessage::RoundOpen(ro) if *ro == expected_open)),
+        "the standing open of the active round is re-published verbatim"
+    );
+}
+
+/// A NEW peer joining mid-round is staged pending (roster frozen for the epoch) — and still
+/// receives the standing open, bit-identical to the original flood (deadline and roster digest
+/// frozen at open time, never rebuilt from post-churn state).
+#[test]
+fn mid_round_join_receives_the_standing_open_verbatim() {
+    let ks = keys(2);
+    let mut state = new_state(base_config());
+    for k in &ks {
+        let (s, _) = tick(state, Input::Message(join_msg(k)));
+        state = s;
+    }
+    let (s, _) = tick(state, Input::Clock(1));
+    let (mut state, out) = tick(s, Input::Clock(11));
+    assert_eq!(state.phase, Phase::RoundTrain);
+    let original_open = publishes(&out)
+        .into_iter()
+        .find_map(|m| match m {
+            VhcMessage::RoundOpen(ro) => Some(ro.clone()),
+            _ => None,
+        })
+        .expect("the round open flood");
+
+    let late = key(9);
+    let (s, out) = tick(state, Input::Message(join_msg(&late)));
+    state = s;
+    assert_eq!(state.pending.len(), 1, "mid-round joiner staged pending");
+    assert!(
+        publishes(&out)
+            .iter()
+            .any(|m| matches!(m, VhcMessage::RoundOpen(ro) if *ro == original_open)),
+        "the standing open is re-published verbatim to the mid-round joiner"
+    );
+}
+
 #[test]
 fn proto7_straggle_within_window_not_dropped() {
     let mut cfg = base_config();

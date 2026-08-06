@@ -21,7 +21,9 @@ use daemon_vhc_proto::{blake3_hash, commit_set, Hash, PeerId, Seed, VhcProtoVers
 use crate::authority::Authorized;
 use crate::coordinator::admission::{admit, JoinCandidate};
 use crate::coordinator::commit::{all_committed, all_evidenced, committed_entries};
-use crate::coordinator::io::{ControlAction, ControlRequest, Input, Notice, Output, Rejection};
+use crate::coordinator::io::{
+    AdmissionReject, ControlAction, ControlRequest, Input, Notice, Output, Rejection,
+};
 use crate::coordinator::state::{ClientState, CoordinatorState, Member, Phase, RoundState};
 
 /// Advance the coordinator by one input. Pure: no I/O, no clock read, no signing.
@@ -238,6 +240,18 @@ fn on_join(
         &state.pending,
         &cand,
     ) {
+        // An active member re-joining is a SESSION REPLACEMENT, not a protocol error: the peer's
+        // run identity persists across worker incarnations (one lifecycle, two identities), so a
+        // trainer whose session churned (coordinator outage, REPLACE re-admission, late-join
+        // restore) re-announces the same Join it always sends until it observes a round. Refusing
+        // it as a duplicate starved exactly that rejoiner of the replay-forward below — it folded
+        // nothing, waited for a round open that is never re-flooded, and died on the witness
+        // timeout, forever (the c15b post-reconstruction livelock). Roster and pending stay
+        // untouched (the membership is already correct); the rejoiner only needs catch-up.
+        Err(AdmissionReject::DuplicatePeer) => {
+            out.push(Output::Note(Notice::Admitted(signer)));
+            replay_forward(state, out);
+        }
         Err(reason) => out.push(Output::Reject(Rejection::Admission(reason))),
         Ok(()) => {
             let m = Member::joining(signer, j.iroh_id, j.class, state.epoch);
@@ -255,27 +269,46 @@ fn on_join(
                 state.pending.push(m);
             }
             out.push(Output::Note(Notice::Admitted(signer)));
-            // Replay-forward for a rejoiner (architecture: "a rejoiner replays forward from the
-            // freshest reachable checkpoint"): re-publish the retained ring's committed records,
-            // ascending, so a restorer whose resync watermark lags the live round folds the gap
-            // instead of ending `StaleRestore` (ABI §4.5 code 3) — rounds committed while it was
-            // detached are otherwise never re-delivered on the live-only control plane, and a
-            // restore that outlasts a round leaves every retry exactly as stale (the C1 relay
-            // churn drill's livelock). Bounded by the ring ([`NUM_STORED_ROUNDS`], the same bound
-            // payload retention is validated against at authoring); idempotent fleet-wide — every
-            // peer at/below its own watermark skips a re-emitted record by the resync guard.
-            // Deterministic: the records are frozen state, the emission is a pure function of
-            // (state, join), and replay re-derives it (I1).
-            let mut retained: Vec<&RoundRecord> = state
-                .rounds
-                .slots
-                .iter()
-                .filter_map(|rs| rs.record.as_ref())
-                .collect();
-            retained.sort_by_key(|r| r.round);
-            for record in retained {
-                out.push(Output::publish(VhcMessage::RoundRecord(record.clone())));
-            }
+            replay_forward(state, out);
+        }
+    }
+}
+
+/// Replay-forward for a (re)joiner (architecture: "a rejoiner replays forward from the freshest
+/// reachable checkpoint"): re-publish the retained ring's committed records, ascending, then the
+/// standing `RoundOpen` of the currently-active round (if any).
+///
+/// The records let a restorer whose resync watermark lags the live round fold the gap instead of
+/// ending `StaleRestore` (ABI §4.5 code 3) — rounds committed while it was detached are otherwise
+/// never re-delivered on the live-only control plane, and a restore that outlasts a round leaves
+/// every retry exactly as stale (the C1 relay churn drill's livelock). The standing open closes
+/// the other half of the same gap: an open is a one-shot flood, so a peer whose session was born
+/// after it (post-crash reconstruction, REPLACE re-admission) folds every record and then waits
+/// forever for round N+1's open — it must be re-delivered, verbatim, on the join that proves the
+/// peer is listening again (the c15b livelock). Bounded by the ring ([`NUM_STORED_ROUNDS`], the
+/// same bound payload retention is validated against at authoring); idempotent fleet-wide — every
+/// peer at/below its own watermark skips a re-emitted record by the resync guard, and a trainer
+/// that already planned the open round skips the re-delivered open by its open watermark.
+/// Deterministic: records and the retained open are frozen state, the emission is a pure function
+/// of (state, join), and replay re-derives it (I1).
+fn replay_forward(state: &CoordinatorState, out: &mut Vec<Output>) {
+    let mut retained: Vec<&RoundRecord> = state
+        .rounds
+        .slots
+        .iter()
+        .filter_map(|rs| rs.record.as_ref())
+        .collect();
+    retained.sort_by_key(|r| r.round);
+    for record in retained {
+        out.push(Output::publish(VhcMessage::RoundRecord(record.clone())));
+    }
+    if state.phase.is_round_active() {
+        if let Some(ro) = state
+            .rounds
+            .get(state.round)
+            .and_then(|rs| rs.open.as_ref())
+        {
+            out.push(Output::publish(VhcMessage::RoundOpen(ro.clone())));
         }
     }
 }
@@ -554,6 +587,11 @@ fn open_round(state: &mut CoordinatorState, out: &mut Vec<Output>) {
         batch,
         deadline_unix_s: state.now_s + state.config.round_train_max_s,
     };
+    // Retain the open verbatim in the slot: it is re-published to rejoiners (§6.5 replay-forward)
+    // and must be bit-identical to the original flood, not rebuilt from post-churn state.
+    if let Some(s) = state.rounds.get_mut(state.round) {
+        s.open = Some(ro.clone());
+    }
     out.push(Output::publish(VhcMessage::RoundOpen(ro)));
 }
 

@@ -845,6 +845,11 @@ struct LiveState {
     manifest_op: Option<u64>,
     /// Whether a round has been observed (stops the periodic Join/Heartbeat re-announce).
     admitted: bool,
+    /// The highest round this peer has PLANNED (fetches kicked off). The coordinator re-publishes
+    /// the standing `RoundOpen` to every (re)joiner (§6.5 replay-forward) and the re-publish is a
+    /// broadcast — every already-planned peer receives it too, and re-planning an already-trained
+    /// round would double-apply its gradient step. At/below this watermark an open is a no-op.
+    last_open_round: Option<u64>,
     pending_open: Option<PendingOpen>,
     /// The in-flight periodic checkpoint export walk (one at a time; a boundary that fires
     /// while one is in flight skips its cadence slot rather than queueing).
@@ -863,6 +868,7 @@ impl LiveState {
             corpus: None,
             manifest_op: None,
             admitted: false,
+            last_open_round: None,
             pending_open: None,
             pending_ckpt: None,
             ckpt_puts: std::collections::BTreeSet::new(),
@@ -2464,6 +2470,13 @@ fn run_module(mut cfg: GuestCfg, restored: Option<RestoredRefs>) -> u32 {
                             // in-flight open means this peer is already stalled and sits the
                             // round out (the ladder catches it up at the next record).
                             l.admitted = true;
+                            // A re-delivered standing open (the coordinator replays it to every
+                            // (re)joiner, and the replay is a broadcast) at/below the planning
+                            // watermark is a no-op: this peer already planned — and possibly
+                            // trained — that round; re-planning would double-apply its step.
+                            if l.last_open_round.is_some_and(|r| round <= r) {
+                                continue;
+                            }
                             let Some(corpus) = l.corpus.as_ref() else {
                                 continue; // manifest not ready — sit the round out
                             };
@@ -2473,6 +2486,7 @@ fn run_module(mut cfg: GuestCfg, restored: Option<RestoredRefs>) -> u32 {
                             let Some(open) = plan_open_fetches(corpus, &ro, &round_cfg) else {
                                 return OUTCOME_ROUND_WINDOW_UNPLANNABLE;
                             };
+                            l.last_open_round = Some(round);
                             l.pending_open = Some(open);
                             continue;
                         }
