@@ -39,8 +39,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use daemon_vhc_host::run::{
-    start_run_migrating, DeliverVerdict, MemorySink, MigrationInput, RunConfig, RunEnd,
-    RunIdentity, SnapshotCapture,
+    start_run_migrating, DeliverVerdict, MemorySink, MigrationInput, OpOutcome, PumpHandle, Run,
+    RunConfig, RunEnd, RunIdentity, SnapshotCapture,
 };
 use daemon_vhc_host::{select_driver, EngineConfig, Worker};
 use daemon_vhc_journal::{scan_bytes, scan_file, Body, JournalPaths};
@@ -417,9 +417,19 @@ fn replay_capture(
     let pump = run.pump.clone();
 
     // Deliver the recovered frames verbatim (original senders/seqs), back-pressuring on
-    // SpoolFull/SenderQuota per §4.7 — never dropping, bounded per stall.
+    // SpoolFull/SenderQuota per §4.7 — never dropping, bounded per stall. Capability ops the
+    // guest issues along the way are failed promptly (`fail_pending_ops`), and a guest thread
+    // that ENDS mid-replay surfaces its own end at once — a dead guest can never drain the
+    // queue, so waiting out the stall ceiling would report the symptom and mask the cause
+    // (observed live, c15-20260806b: the un-serviced availability `payload_get` queue crossed
+    // the `grant-bound.n` outstanding-op ceiling, the guest trapped GrantViolation, and every
+    // retry burned the full ceiling before reporting a frame-consumption stall).
     const STALL_CEILING: std::time::Duration = std::time::Duration::from_secs(60);
     for frame in frames {
+        fail_pending_ops(&pump);
+        if run.is_finished() {
+            return Err(guest_end_mid_replay(run));
+        }
         let deadline = std::time::Instant::now() + STALL_CEILING;
         loop {
             match pump
@@ -434,6 +444,10 @@ fn replay_capture(
             {
                 DeliverVerdict::Accepted => break,
                 DeliverVerdict::SpoolFull | DeliverVerdict::SenderQuota => {
+                    fail_pending_ops(&pump);
+                    if run.is_finished() {
+                        return Err(guest_end_mid_replay(run));
+                    }
                     if std::time::Instant::now() >= deadline {
                         return Err(sandbox("replay spool never drained (back-pressure)".into()));
                     }
@@ -451,13 +465,20 @@ fn replay_capture(
     // before the Quiesce is observed — the exported state covers the whole recovered stream.
     let deadline = std::time::Instant::now() + STALL_CEILING;
     while pump.pending_frames() > 0 {
+        fail_pending_ops(&pump);
+        if run.is_finished() {
+            return Err(guest_end_mid_replay(run));
+        }
         if std::time::Instant::now() >= deadline {
-            return Err(sandbox(
-                "the reconstruction instance never consumed the recovered frames".into(),
-            ));
+            return Err(sandbox(format!(
+                "the reconstruction instance never consumed the recovered frames \
+                 ({} still pending at the stall ceiling)",
+                pump.pending_frames()
+            )));
         }
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
+    fail_pending_ops(&pump);
 
     // Quiesce → export (§10.2).
     pump.quiesce(daemon_vhc_abi::QUIESCE_REASON_UPGRADE, spec.deadline_ms)
@@ -476,4 +497,48 @@ fn replay_capture(
     }
     pump.snapshot_capture()
         .ok_or_else(|| sandbox("the reconstruction instance staged no snapshot".into()))
+}
+
+/// Fail every capability op the sandbox guest has issued, promptly and typed.
+///
+/// The replay is HERMETIC by design: the sandbox instance's only inputs are the recovered
+/// journal frames — consensus finality for every closed round rides the journaled records
+/// (its own attested `RoundRecord` publications fold back in as frames), which is exactly the
+/// equivalence the D2 replay oracle proves. A capability op at replay (the quorum coordinator's
+/// availability-check `payload_get` per Commitment, §6.4 I6) is therefore NOT re-serviced
+/// against the content plane: a re-fetch could not change any closed round (the record is
+/// already folded), it would couple crash-recovery latency to payload sizes and re-introduce
+/// remote failure modes mid-join, and by module policy a failed fetch is simply "no evidence".
+///
+/// The completions must still be DELIVERED: an op left un-answered occupies the
+/// `grant-bound.n` outstanding-op ceiling, and a long recovered lineage crosses it — observed
+/// live (c15-20260806b, round 9, two trainers): the 17th un-serviced availability check
+/// trapped the guest `GrantViolation` mid-replay, on every retry, until the run went terminal.
+fn fail_pending_ops(pump: &PumpHandle) {
+    for (op, _request) in pump.take_op_requests() {
+        // A completion refused by the pump (guest already gone) is moot — the guest-end check
+        // at the call sites surfaces that path.
+        let _ = pump.complete_op(
+            op,
+            OpOutcome::Failed {
+                code: daemon_vhc_abi::COMP_ERR_STORE_REFUSED,
+                detail: "reconstruction sandbox: capability ops are not serviced at replay \
+                         (a failed availability fetch is no evidence)"
+                    .into(),
+            },
+        );
+    }
+}
+
+/// The guest thread ended while frames were still being replayed: surface ITS end — the
+/// drain stall is the symptom, the guest's own trap/outcome is the cause.
+fn guest_end_mid_replay(run: Run) -> ReconstructError {
+    match run.wait() {
+        Ok(end) => ReconstructError::Sandbox(format!(
+            "the reconstruction instance ended mid-replay: {end:?}"
+        )),
+        Err(e) => ReconstructError::Sandbox(format!(
+            "the reconstruction instance faulted mid-replay: {e}"
+        )),
+    }
 }

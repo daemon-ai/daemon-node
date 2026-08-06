@@ -511,6 +511,84 @@ async fn crash_restart_reconstructs_through_the_product_path_and_resumes_byte_id
     }
 }
 
+/// Re-author the coordinator config with `verify_availability` ENABLED — the ceremony fleet's
+/// shape (`ceremony_coordinator_config`), which the fixture-authoring default leaves off.
+fn with_verify_availability(config: &[u8]) -> Vec<u8> {
+    let mut v: Value = ciborium::de::from_reader(config).expect("config decodes");
+    let Value::Map(entries) = &mut v else {
+        panic!("coordinator config is a map");
+    };
+    for (k, val) in entries.iter_mut() {
+        if k == &Value::from("verify_availability") {
+            *val = Value::Bool(true);
+        }
+    }
+    to_canonical_vec(&v).expect("config re-encodes")
+}
+
+/// The c15-20260806b regression: a coordinator whose config enables availability verification
+/// (coordinator-as-storage-client, §6.4 I6 — the fleet ceremony's shape) issues one
+/// `payload_get` per replayed Commitment. The reconstruction sandbox services no capability
+/// providers, so those ops must be completed promptly (failed, typed): an un-answered queue
+/// crosses the `max_outstanding` op ceiling (16) and traps the guest `GrantViolation`
+/// mid-replay — which surfaced live only as a frame-consumption stall after the full stall
+/// ceiling, on every join retry, until the run went terminal. Twenty commitments
+/// (10 rounds x 2 workers) cross the ceiling; the reconstruction must still complete and
+/// stand at the next un-opened round.
+#[tokio::test(flavor = "multi_thread")]
+async fn availability_checked_lineage_reconstructs_past_the_op_ceiling() {
+    const ROUNDS: u64 = 10;
+    let rig = rig();
+    let config = with_verify_availability(&rig.spec.config_bytes);
+    let root = tempdir();
+    let script = build_script(&rig.worker_keys, 0..ROUNDS);
+    let chain_instance = write_crashed_journal(
+        &root,
+        rig.spec.run_id,
+        rig.spec.module_hash,
+        &script,
+        script.len() * 2 / 3,
+    );
+    let segments = Arc::new(MemoryContentStore::new());
+    let heads = publish_prefix(
+        &root,
+        rig.spec.run_id,
+        rig.spec.module_hash,
+        &rig.base_key,
+        chain_instance,
+        segments.clone(),
+        &root.join("heads"),
+    )
+    .await;
+    assert!(!heads.is_empty(), "the sealed prefix published");
+
+    let store: Arc<dyn ContentStore> = segments;
+    let capture = reconstruct_coordinator(
+        ReconstructSpec {
+            heads,
+            run_id: rig.spec.run_id,
+            trusted: vec![rig.base_id],
+            role: "coordinator".into(),
+            run_label: RUN_LABEL.into(),
+            journal_root: Some(root),
+            module: rig.wasm.clone(),
+            config,
+            grants: phase_a_grants(),
+            incarnation: 1,
+            restore: None,
+            deadline_ms: 60_000,
+        },
+        store,
+    )
+    .await
+    .expect("an availability-checking lineage reconstructs past the op ceiling");
+    let state = coordinator_state_from_capture(&capture).expect("exported state decodes");
+    assert_eq!(
+        state.round, ROUNDS,
+        "the reconstructed state stands at the next un-opened round"
+    );
+}
+
 /// Fork evidence never reconstructs: two attested heads at the same height that do not extend
 /// one another refuse typed at the worker's re-verification (§8.8 [AR-4]) — reconstruction is
 /// the LAST place a fork may be papered over.
