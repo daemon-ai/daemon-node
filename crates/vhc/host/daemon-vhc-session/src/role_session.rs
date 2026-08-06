@@ -1679,8 +1679,25 @@ async fn relay_egress(
     cursors.published = published.len();
 
     for (op, request) in pump.take_op_requests() {
-        tracing::trace!(op, request = %op_kind(&request), "egress: servicing capability op");
+        let kind = op_kind(&request);
+        tracing::trace!(op, request = %kind, "egress: servicing capability op");
+        let started = std::time::Instant::now();
         service_op(pump, providers, op, request, events, generation).await?;
+        let elapsed = started.elapsed();
+        // The op-service latency floor: a guest whose round plan issues a SERIAL op chain runs
+        // at 1/latency ops per second, so a per-op service time in the tens of milliseconds is
+        // a run-level stall in the making (the c15c round-0 crawl: ~100 ms per op — a presign
+        // round-trip plus a whole-shard fetch per tiny range read — read as ~10 ops/s with an
+        // idle accelerator). Voiced per op above the floor so the NEXT crawl is diagnosed from
+        // the session log, not reconstructed from journal forensics.
+        if elapsed >= std::time::Duration::from_millis(25) {
+            tracing::debug!(
+                op,
+                request = %kind,
+                ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+                "slow capability op service"
+            );
+        }
     }
 
     let metrics = pump.metrics();
