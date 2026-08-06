@@ -193,6 +193,11 @@ fn chain_dir(role: &str, base: &PeerId, chain_instance: u64) -> String {
 pub struct FsArchiveHeadStore {
     root: ContainedRoot,
     slots: Arc<tokio::sync::Mutex<BTreeMap<String, ArchiveChainSlot>>>,
+    /// The ambient disk custodian + charge scope (Phase 6). Heads are tiny and
+    /// consensus-critical — [`daemon_vhc_custody::WriteClass::Critical`]: refusing head
+    /// publication at quota would wedge the very archive-then-prune reclaim that relieves the
+    /// pressure.
+    custody: Option<(Arc<daemon_vhc_custody::DiskCustodian>, String)>,
 }
 
 impl FsArchiveHeadStore {
@@ -202,6 +207,7 @@ impl FsArchiveHeadStore {
     /// [`VhcNetError::Transport`] if the root cannot be opened or a persisted head is unreadable
     /// (a corrupt store must refuse loudly, not silently fork a chain).
     pub async fn open(root: &Path) -> Result<Self, VhcNetError> {
+        let custody = daemon_vhc_custody::ambient_for(root);
         let contained = ContainedRoot::open(root)
             .map_err(|e| VhcNetError::Transport(format!("open archive head root: {e}")))?;
         let mut slots: BTreeMap<String, ArchiveChainSlot> = BTreeMap::new();
@@ -255,6 +261,7 @@ impl FsArchiveHeadStore {
         Ok(Self {
             root: contained,
             slots: Arc::new(tokio::sync::Mutex::new(slots)),
+            custody,
         })
     }
 }
@@ -273,6 +280,25 @@ impl ArchiveHeadStore for FsArchiveHeadStore {
         if matches!(decision, ArchiveHeadDecision::Accepted) {
             let bytes = to_canonical_vec(record)
                 .map_err(|e| VhcNetError::Transport(format!("encode archive head: {e}")))?;
+            let reservation = match &self.custody {
+                None => None,
+                Some((custodian, scope)) => {
+                    match custodian.reserve(
+                        scope,
+                        bytes.len() as u64,
+                        daemon_vhc_custody::WriteClass::Critical,
+                    ) {
+                        Ok(r) => Some(r),
+                        Err(refusal) => {
+                            slot.heads.pop();
+                            return Err(VhcNetError::Transport(format!(
+                                "archive head custody: {}",
+                                refusal.to_io()
+                            )));
+                        }
+                    }
+                }
+            };
             let rel = format!("{chain}/{}.head", record.body.segment);
             if let Err(e) = self.root.write(Path::new(&rel), &bytes).await {
                 // The fold advanced but the durable write failed: roll the slot back so the
@@ -281,6 +307,9 @@ impl ArchiveHeadStore for FsArchiveHeadStore {
                 return Err(VhcNetError::Transport(format!(
                     "write archive head {rel}: {e}"
                 )));
+            }
+            if let Some(r) = reservation {
+                r.commit();
             }
         }
         Ok(decision)

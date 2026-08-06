@@ -3661,6 +3661,7 @@ dependencies = [
  "daemon-tool-vision",
  "daemon-tool-web",
  "daemon-transport",
+ "daemon-vhc-custody",
  "daemon-vhc-node",
  "daemon-vhc-resource",
  "daemon-vhc-session",
@@ -4924,6 +4925,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "daemon-vhc-custody"
+version = "0.0.1"
+dependencies = [
+ "libc",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "daemon-vhc-det"
 version = "0.0.1"
 
@@ -4962,6 +4972,7 @@ dependencies = [
  "cubecl-runtime",
  "cudarc 0.19.8",
  "daemon-vhc-abi",
+ "daemon-vhc-custody",
  "daemon-vhc-guest-build",
  "daemon-vhc-observe",
  "daemon-vhc-proto",
@@ -4988,6 +4999,7 @@ dependencies = [
  "ciborium",
  "crc32c",
  "daemon-vhc-abi",
+ "daemon-vhc-custody",
  "daemon-vhc-proto",
  "serde",
  "serde_bytes",
@@ -5002,6 +5014,7 @@ dependencies = [
  "ciborium",
  "daemon-core",
  "daemon-egress",
+ "daemon-vhc-custody",
  "daemon-vhc-proto",
  "daemon-vhc-sdk-consensus",
  "futures",
@@ -5029,8 +5042,10 @@ dependencies = [
  "ciborium",
  "daemon-api",
  "daemon-vhc-abi",
+ "daemon-vhc-custody",
  "daemon-vhc-guest-build",
  "daemon-vhc-host",
+ "daemon-vhc-journal",
  "daemon-vhc-net",
  "daemon-vhc-proto",
  "daemon-vhc-session",
@@ -5167,6 +5182,7 @@ dependencies = [
  "ciborium",
  "daemon-egress",
  "daemon-vhc-abi",
+ "daemon-vhc-custody",
  "daemon-vhc-guest-build",
  "daemon-vhc-host",
  "daemon-vhc-journal",

@@ -375,6 +375,16 @@ async fn serve_vhc(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse> {
             api.vhc_hardware_report().await,
             ApiResponse::VhcHardwareReport,
         ),
+        ApiRequest::VhcDiskUsage => {
+            ok_or_err(api.vhc_disk_usage().await, ApiResponse::VhcDiskUsage)
+        }
+        ApiRequest::VhcDiskWipe {
+            run_id,
+            include_evidence,
+        } => ok_or_err(
+            api.vhc_disk_wipe(run_id, include_evidence).await,
+            ApiResponse::VhcDiskWipe,
+        ),
         _ => return None,
     })
 }

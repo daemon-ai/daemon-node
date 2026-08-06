@@ -619,6 +619,65 @@ mod tests {
         assert_eq!(Trap::from(codec).code, TrapCode::BadModule);
     }
 
+    /// Phase 6: a journal whose home lives under the exported custody root reserves every write
+    /// with the disk custodian — a per-run quota refuses a Normal append TYPED (the exhaustion
+    /// class, exactly what the storage gate consumes), while the recovery-critical terminal
+    /// pair is quota-exempt and still lands. The env pair is what the node exports to workers;
+    /// other tests' journals live outside this root, so the ambient attachment never touches
+    /// them.
+    #[test]
+    fn custodied_journal_refuses_normal_writes_at_quota_but_seals_terminal() {
+        use daemon_vhc_host::run::StorageFault;
+
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var(
+            daemon_vhc_custody::CUSTODY_ROOT_ENV,
+            root.path().as_os_str(),
+        );
+        // A 1 MiB per-run quota, no floor (the quota is the subject on a roomy test host).
+        std::env::set_var(daemon_vhc_custody::DISK_RUN_QUOTA_MB_ENV, "1");
+        std::env::set_var(daemon_vhc_custody::DISK_RESERVE_MB_ENV, "0");
+        std::env::set_var(daemon_vhc_custody::DISK_EMERGENCY_MB_ENV, "0");
+
+        let jdir = journal_dir(root.path(), "run-quota", "trainer", 1);
+        let mut sink = DurableSink::open(&jdir, &identity(), [0x33; 32]).expect("journal");
+        sink.run_header(
+            2 << 16,
+            &[("vhc".into(), 2)],
+            false,
+            b"m",
+            b"c",
+            b"g",
+            daemon_vhc_host::run::RunHeaderResources::Declared(b"cl"),
+            b"ch",
+            b"d",
+        )
+        .unwrap();
+
+        // Fill past the 1 MiB scope quota with Normal event records, expecting the typed
+        // refusal (never a raw mid-write ENOSPC, never BadModule).
+        let big = vec![0u8; 256 * 1024];
+        let mut refused = None;
+        for i in 0..8 {
+            if let Err(e) = sink.event(i, &big) {
+                refused = Some(e);
+                break;
+            }
+        }
+        let err = refused.expect("the 1 MiB scope quota refuses within 8 x 256 KiB events");
+        assert_eq!(err.fault, Some(StorageFault::Exhausted), "typed exhaustion");
+
+        // The terminal pair is WriteClass::Critical: quota-exempt, so the run's last records
+        // and the tail seal still land (a refused recovery stream would fork the run).
+        sink.terminal(0, Some(2), None)
+            .expect("terminal + tail seal land past the quota");
+
+        std::env::remove_var(daemon_vhc_custody::CUSTODY_ROOT_ENV);
+        std::env::remove_var(daemon_vhc_custody::DISK_RUN_QUOTA_MB_ENV);
+        std::env::remove_var(daemon_vhc_custody::DISK_RESERVE_MB_ENV);
+        std::env::remove_var(daemon_vhc_custody::DISK_EMERGENCY_MB_ENV);
+    }
+
     #[test]
     fn layout_paths_hash_the_label_and_key_the_incarnation() {
         let root = Path::new("/state/vhc/runs");

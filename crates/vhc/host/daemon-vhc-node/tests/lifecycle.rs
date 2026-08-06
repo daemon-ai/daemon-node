@@ -146,6 +146,7 @@ fn service_over(
         budget: None,
         worker_factory: None,
         identity_dir: None,
+        run_dir: None,
         seat_directory: None,
     }));
     svc.bind_self();
@@ -673,6 +674,7 @@ async fn restart_assesses_the_fresh_child_before_it_joins() {
         budget: None,
         worker_factory: None,
         identity_dir: None,
+        run_dir: None,
         seat_directory: None,
     }));
     svc.bind_self();
@@ -809,6 +811,7 @@ async fn reconverge_adopts_a_drifted_admitted_tuple() {
         budget: None,
         worker_factory: None,
         identity_dir: None,
+        run_dir: None,
         seat_directory: None,
     }));
     svc.bind_self();
@@ -952,6 +955,7 @@ async fn resume_refusal_leaves_the_run_paused() {
         }),
         worker_factory: None,
         identity_dir: None,
+        run_dir: None,
         seat_directory: None,
     }));
     svc.bind_self();

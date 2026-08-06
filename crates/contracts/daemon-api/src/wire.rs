@@ -320,6 +320,15 @@ pub enum ApiRequest {
     },
     /// [`VhcApi::vhc_hardware_report`].
     VhcHardwareReport,
+    /// [`VhcApi::vhc_disk_usage`] (wire v45).
+    VhcDiskUsage,
+    /// [`VhcApi::vhc_disk_wipe`] (wire v45): the identity-preserving safe wipe.
+    VhcDiskWipe {
+        /// The run whose local state is wiped.
+        run_id: String,
+        /// Also wipe archived evidence (payload + archive planes); default keeps it.
+        include_evidence: bool,
+    },
     /// [`ProfileApi::profile_list`].
     ProfileList,
     /// [`ProfileApi::profile_get`].
@@ -1448,6 +1457,10 @@ pub enum ApiResponse {
     VhcHardwareReport(VhcHardwareReport),
     /// A consumed module-upgrade record's switch outcome (wire v43).
     VhcSwitchOutcome(VhcSwitchOutcome),
+    /// The disk-custody report for the VHC runs root (wire v45).
+    VhcDiskUsage(VhcDiskUsage),
+    /// A safe wipe's outcome (wire v45).
+    VhcDiskWipe(VhcDiskWipeOutcome),
     /// A profile listing (the active default marked).
     Profiles(Vec<ProfileInfo>),
     /// One profile's full spec, or `None` if unknown / no active default (profile_get).
@@ -2441,20 +2454,20 @@ mod auth_contract_tests {
     }
 
     /// The contract wire version (`daemon_common::WireVersion::CURRENT`, mirrored by
-    /// [`crate::API_WIRE_VERSION`]) is pinned to the sealed surface: v44 (the additive per-round
-    /// `VhcEvent::RoundOutcome.digest` + `VhcRunDetail.last_round_digest` — surfacing the det-state
-    /// digest the node previously dropped — on top of v43's `VhcSwitchModule` request +
-    /// `VhcSwitchOutcome` response, v42's `VhcHardwareReport.shared_mb` UMA-spillover mirror, v41's
-    /// crash-consent surface, and v40's `VhcApi` surface). Distinct from the transport-envelope
+    /// [`crate::API_WIRE_VERSION`]) is pinned to the sealed surface: v45 (the additive vhc
+    /// disk-custody surface — `VhcDiskUsage` report + identity-preserving `VhcDiskWipe` — on top
+    /// of v44's per-round det-state digest, v43's `VhcSwitchModule` request + `VhcSwitchOutcome`
+    /// response, v42's `VhcHardwareReport.shared_mb` UMA-spillover mirror, v41's crash-consent
+    /// surface, and v40's `VhcApi` surface). Distinct from the transport-envelope
     /// [`WIRE_VERSION`] above (= 2), which these additive rungs did not touch. Bumping the contract
     /// version is a deliberate act — this assertion is the gate.
     #[test]
-    fn contract_wire_version_is_v44() {
+    fn contract_wire_version_is_v45() {
         assert_eq!(
             daemon_common::WireVersion::CURRENT,
-            daemon_common::WireVersion(44)
+            daemon_common::WireVersion(45)
         );
-        assert_eq!(crate::API_WIRE_VERSION, daemon_common::WireVersion(44));
+        assert_eq!(crate::API_WIRE_VERSION, daemon_common::WireVersion(45));
     }
 
     /// The `api/<N>` feature string is formatted from the API mirror version (never hardcoded)

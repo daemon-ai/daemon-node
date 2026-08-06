@@ -16,8 +16,10 @@
 #![allow(clippy::disallowed_methods)]
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use daemon_vhc_abi::READBACK_INLINE_MAX;
+use daemon_vhc_custody::{DiskCustodian, Reservation, WriteClass};
 use daemon_vhc_proto::blake3_hash;
 
 use super::record::{Body, ExecIdentity, PublishRec, ReadBackRec, Record, SidecarRef};
@@ -100,6 +102,48 @@ pub struct Journal<K: KeyProvider> {
     founding_id: ExecIdentity,
     /// The incremental-publication seam: invoked on every seal (see [`SealHook`]).
     on_seal: Option<SealHook>,
+    /// The ambient disk custodian + charge scope (Phase 6), attached at open when the journal
+    /// root lives under [`daemon_vhc_custody::CUSTODY_ROOT_ENV`]. `None` = uncustodied (tests,
+    /// non-VHC embedders) — every reservation is a no-op.
+    custody: Option<(Arc<DiskCustodian>, String)>,
+}
+
+/// The reserved margin for segment bookkeeping writes whose exact size is not worth
+/// pre-encoding (a segment header at create, the tag-17 seal frame at roll) — both are
+/// [`WriteClass::Critical`]: sealing the active journal must always succeed during pressure
+/// handling, and a roll that cannot open its successor wedges the recovery stream.
+const SEGMENT_OVERHEAD_BYTES: u64 = 4096;
+
+/// The sidecar envelope margin above the plaintext (encryption tag + header + the
+/// content-address filename's directory entry) reserved per §8.5 sidecar write.
+const SIDECAR_OVERHEAD_BYTES: u64 = 128;
+
+/// Reserve `bytes` against the ambient custodian (no-op when uncustodied). A refusal surfaces
+/// as [`JournalError::Io`] with the typed exhaustion kind ([`daemon_vhc_custody::CustodyRefusal::to_io`]),
+/// so the durable-sink seam classifies it `HostStorageExhausted` — never `BadModule`.
+fn reserve_with(
+    custody: &Option<(Arc<DiskCustodian>, String)>,
+    bytes: u64,
+    class: WriteClass,
+) -> Result<Option<Reservation>, JournalError> {
+    match custody {
+        None => Ok(None),
+        Some((custodian, scope)) => custodian
+            .reserve(scope, bytes, class)
+            .map(Some)
+            .map_err(|refusal| JournalError::Io(refusal.to_io())),
+    }
+}
+
+/// The write class of one record body: the recovery-critical records — the terminal pair
+/// (tag 11) and the checkpoint/upgrade snapshot anchor (tag 10) — may draw into the emergency
+/// margin and are quota-exempt (refusing them trades a bounded overrun for a forked run);
+/// everything else is a [`WriteClass::Normal`] durable write.
+fn class_of(body: &Body) -> WriteClass {
+    match body {
+        Body::Terminal(_) | Body::Snapshot(_) => WriteClass::Critical,
+        _ => WriteClass::Normal,
+    }
 }
 
 impl<K: KeyProvider + Clone> Journal<K> {
@@ -119,12 +163,17 @@ impl<K: KeyProvider + Clone> Journal<K> {
                 "create called on a non-empty journal directory; use open".into(),
             ));
         }
+        let custody = daemon_vhc_custody::ambient_for(paths.root());
         let header = SegmentHeader {
             id: id.clone(),
             segment: 0,
             prev_blake3: GENESIS_PREV,
         };
+        let reservation = reserve_with(&custody, SEGMENT_OVERHEAD_BYTES, WriteClass::Critical)?;
         let writer = SegmentWriter::create(paths.segment(0), &header)?;
+        if let Some(r) = reservation {
+            r.commit();
+        }
         let sidecars = SidecarStore::open(paths.sidecars(), id.clone(), key)?;
         Ok(Self {
             paths,
@@ -141,6 +190,7 @@ impl<K: KeyProvider + Clone> Journal<K> {
             opened_at: std::time::Instant::now(),
             founding_id: id,
             on_seal: None,
+            custody,
         })
     }
 
@@ -159,11 +209,21 @@ impl<K: KeyProvider + Clone> Journal<K> {
         let paths = JournalPaths::open(root)?;
         let ords = paths.existing_segments()?;
         if ords.is_empty() {
+            // A pruned chain that lost ALL its retained segments is damage, not a fresh start:
+            // re-creating segment 0 here would fork the anchored (archived) history.
+            if crate::ChainAnchor::load(&paths)?.is_some() {
+                return Err(JournalError::ChainBroken(
+                    "an anchored (pruned) chain has no retained segments; refusing to re-create \
+                     from genesis"
+                        .into(),
+                ));
+            }
             return Self::create(paths.root(), id, key, rotate);
         }
 
         let recovery = Self::recover(&paths, &ords)?;
         let sidecars = SidecarStore::open(paths.sidecars(), id.clone(), key)?;
+        let custody = daemon_vhc_custody::ambient_for(paths.root());
 
         let (writer, current_segment, current_header_id, current_prev) = if recovery.last_sealed {
             // Last segment is immutable; start the next one, chaining off its complete-file hash.
@@ -173,7 +233,11 @@ impl<K: KeyProvider + Clone> Journal<K> {
                 segment: next,
                 prev_blake3: recovery.last_file_blake3,
             };
+            let reservation = reserve_with(&custody, SEGMENT_OVERHEAD_BYTES, WriteClass::Critical)?;
             let writer = SegmentWriter::create(paths.segment(next), &header)?;
+            if let Some(r) = reservation {
+                r.commit();
+            }
             (writer, next, id.clone(), recovery.last_file_blake3)
         } else {
             // Re-open the last (unsealed) segment for continued appends; truncate its torn tail.
@@ -206,12 +270,44 @@ impl<K: KeyProvider + Clone> Journal<K> {
             opened_at: std::time::Instant::now(),
             founding_id: recovery.founding_id,
             on_seal: None,
+            custody,
         })
     }
 
     /// Walk every segment in order, verifying the chain + reconciling recovery state (§8.2/§8.4).
+    ///
+    /// A pruned chain (archive-then-prune reclaimed the archived prefix) anchors at its
+    /// [`ChainAnchor`](crate::ChainAnchor) instead of genesis: leftover files below the anchor are
+    /// skipped (prune debris — proven archived before the anchor advanced past them), the first
+    /// retained segment's `prev_blake3` verifies against the anchor's recorded predecessor hash,
+    /// and a MISSING anchored first segment refuses (that is damage, not pruning).
     fn recover(paths: &JournalPaths, ords: &[u64]) -> Result<Recovery, JournalError> {
-        let mut expected_prev = GENESIS_PREV;
+        let anchor = crate::ChainAnchor::load(paths)?;
+        let (ords, mut expected_prev) = match &anchor {
+            Some(a) => {
+                let retained: Vec<u64> =
+                    ords.iter().copied().filter(|o| *o >= a.first_ord).collect();
+                match retained.first() {
+                    Some(first) if *first == a.first_ord => (retained, a.prev_blake3),
+                    Some(first) => {
+                        return Err(JournalError::ChainBroken(format!(
+                            "the chain anchor names segment {} as the first retained segment, \
+                             but the earliest present is {first}",
+                            a.first_ord
+                        )));
+                    }
+                    None => {
+                        return Err(JournalError::ChainBroken(format!(
+                            "the chain anchor names segment {} as the first retained segment, \
+                             but no segment at or above it exists",
+                            a.first_ord
+                        )));
+                    }
+                }
+            }
+            None => (ords.to_vec(), GENESIS_PREV),
+        };
+        let ords = &ords[..];
         let mut next_ord = 0u64;
         let mut seq_high: BTreeMap<u64, u64> = BTreeMap::new();
         let mut last_ordinal = 0u64;
@@ -328,12 +424,23 @@ impl<K: KeyProvider + Clone> Journal<K> {
     /// Append a record (write, not necessarily commit — §8.4 rule 3/4). Rotates the segment first if
     /// the rotation threshold is reached. Returns the assigned ordinal.
     ///
+    /// Every append reserves its EXACT framed byte count with the ambient disk custodian before
+    /// the bytes touch disk (Phase 6): a write either fits or refuses typed — never a raw
+    /// `ENOSPC` discovered mid-write. Recovery-critical records ([`class_of`]) may draw into the
+    /// emergency margin.
+    ///
     /// # Errors
-    /// [`JournalError`] on rotate/encode/write failure.
+    /// [`JournalError`] on rotate/encode/write failure, or a typed capacity refusal.
     pub fn append(&mut self, body: Body) -> Result<u64, JournalError> {
         self.maybe_rotate()?;
         let ord = self.next_ord;
-        self.writer.append(&Record::new(ord, body))?;
+        let class = class_of(&body);
+        let framed = SegmentWriter::encode(&Record::new(ord, body))?;
+        let reservation = reserve_with(&self.custody, framed.len() as u64, class)?;
+        self.writer.append_framed(&framed)?;
+        if let Some(r) = reservation {
+            r.commit();
+        }
         self.next_ord += 1;
         Ok(ord)
     }
@@ -406,9 +513,19 @@ impl<K: KeyProvider + Clone> Journal<K> {
                 sidecar: None,
             })
         } else {
+            // The sidecar is the BULK write of the pair — reserve the plaintext plus the
+            // encryption envelope margin before it lands.
+            let sidecar_reservation = reserve_with(
+                &self.custody,
+                value.len() as u64 + SIDECAR_OVERHEAD_BYTES,
+                WriteClass::Normal,
+            )?;
             let sref: SidecarRef =
                 self.sidecars
                     .put(ord, self.instantiation_counter, seg, value)?;
+            if let Some(r) = sidecar_reservation {
+                r.commit();
+            }
             Body::ReadBack(ReadBackRec {
                 src,
                 kind,
@@ -417,7 +534,12 @@ impl<K: KeyProvider + Clone> Journal<K> {
                 sidecar: Some(sref),
             })
         };
-        self.writer.append(&Record::new(ord, body))?;
+        let framed = SegmentWriter::encode(&Record::new(ord, body))?;
+        let reservation = reserve_with(&self.custody, framed.len() as u64, WriteClass::Normal)?;
+        self.writer.append_framed(&framed)?;
+        if let Some(r) = reservation {
+            r.commit();
+        }
         self.next_ord += 1;
         Ok(ord)
     }
@@ -442,6 +564,10 @@ impl<K: KeyProvider + Clone> Journal<K> {
     /// # Errors
     /// [`JournalError`] on seal/create failure.
     pub fn roll(&mut self) -> Result<(), JournalError> {
+        // One Critical margin covers the pair of bookkeeping writes a roll performs (the seal
+        // frame + the successor's header): sealing must always succeed during pressure handling.
+        let reservation =
+            reserve_with(&self.custody, SEGMENT_OVERHEAD_BYTES, WriteClass::Critical)?;
         let records = self.writer.records();
         let file_hash = self.writer.seal()?;
         if let Some(hook) = self.on_seal.as_mut() {
@@ -461,6 +587,9 @@ impl<K: KeyProvider + Clone> Journal<K> {
             prev_blake3: file_hash,
         };
         self.writer = SegmentWriter::create(self.paths.segment(next), &header)?;
+        if let Some(r) = reservation {
+            r.commit();
+        }
         self.current_segment = next;
         self.current_header_id = self.id.clone();
         self.current_prev = file_hash;
@@ -510,8 +639,15 @@ impl<K: KeyProvider + Clone> Journal<K> {
             };
             // Replace the content-free file: only a header (no records) exists at this ordinal,
             // and the recreate writes the same ordinal + chain link under the new identity.
+            // Net-zero capacity (a header replaces a header) — reserve the margin anyway so the
+            // recreate is governed like every other segment-file creation.
+            let reservation =
+                reserve_with(&self.custody, SEGMENT_OVERHEAD_BYTES, WriteClass::Critical)?;
             std::fs::remove_file(self.paths.segment(self.current_segment))?;
             self.writer = SegmentWriter::create(self.paths.segment(self.current_segment), &header)?;
+            if let Some(r) = reservation {
+                r.commit();
+            }
             self.current_header_id = id;
             self.opened_at = std::time::Instant::now();
         } else {

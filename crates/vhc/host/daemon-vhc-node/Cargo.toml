@@ -22,6 +22,12 @@ daemon-vhc-abi = { workspace = true }
 daemon-api = { workspace = true }
 # The frozen worker protocol (Event/Command/Hardware/Eligibility) + the `[vhc]` config type.
 daemon-vhc-session = { workspace = true }
+# The central disk custodian (Phase 6): the storage gate's resume authorization asks the
+# run-state root's custodian (pressure/quota), not a bare free-space probe.
+daemon-vhc-custody = { workspace = true }
+# The journal SUBSTRATE (schema-free segments): startup orphan reconciliation proves a dead
+# incarnation's chain archived (custody ledger + a cheap empty-tail scan) before reclaiming it.
+daemon-vhc-journal = { workspace = true }
 # Run discovery + frozen-envelope fetch (A1): the `RegistryClient` (registry `GET /runs`,
 # envelope presign+GET+blake3-verify) the `EgressRunDiscovery` seam wraps, so the join flow runs the
 # worker's real §6.5 `AssessRun` before `JoinRun`. Default (no-iroh, no-ws) build — discovery rides

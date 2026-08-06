@@ -23,6 +23,10 @@ path = "src/lib.rs"
 [dependencies]
 # Canonical CBOR + blake3 hashes (the §8.2 chain, §8.5 content addresses).
 daemon-vhc-proto = { workspace = true }
+# The central disk custodian (Phase 6): every durable journal write reserves its exact byte count
+# before it lands (ambient attachment via DAEMON_VHC_CUSTODY_ROOT — uncustodied when unset).
+# Schema-free and dependency-light like this crate; the pairing is deliberate.
+daemon-vhc-custody = { workspace = true }
 # The journal record grammar + framing constants (§8.2/§8.3/§8.5): JOURNAL_CDDL is authoritative;
 # the abi crate stays dep-free / dual-compiled, so the Rust record types + codec live here (host).
 daemon-vhc-abi = { workspace = true }

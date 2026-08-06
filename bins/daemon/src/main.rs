@@ -3068,6 +3068,37 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
                 // 300 s) — distinct from the 30 s chatty-op watchdog, so a GPU-lane / first-join
                 // seed-init assess is never killed as a false transport fault (the RTX 5090 STOP).
                 let assess_timeout = std::time::Duration::from_secs(cfg.vhc.assess_timeout_secs);
+                // The disk-custody sizing (`[vhc.storage]`, Phase 6), delivered to workers over
+                // the environment like every other path reference: the durable write planes
+                // (journal, spill, payload cache, archive heads) attach to the run-state root's
+                // custodian ambiently and reserve every write against it.
+                let custody_env: Vec<(String, String)> = vec![
+                    (
+                        daemon_vhc_custody::CUSTODY_ROOT_ENV.to_string(),
+                        run_dir.display().to_string(),
+                    ),
+                    (
+                        daemon_vhc_custody::DISK_RESERVE_MB_ENV.to_string(),
+                        cfg.vhc.storage.reserve_mb.to_string(),
+                    ),
+                    (
+                        daemon_vhc_custody::DISK_QUOTA_MB_ENV.to_string(),
+                        cfg.vhc.storage.quota_mb.to_string(),
+                    ),
+                    (
+                        daemon_vhc_custody::DISK_RUN_QUOTA_MB_ENV.to_string(),
+                        cfg.vhc.storage.run_quota_mb.to_string(),
+                    ),
+                    (
+                        daemon_vhc_custody::DISK_EMERGENCY_MB_ENV.to_string(),
+                        cfg.vhc.storage.emergency_mb.to_string(),
+                    ),
+                    (
+                        daemon_vhc_custody::DISK_PRUNE_HORIZON_ENV.to_string(),
+                        cfg.vhc.storage.prune_horizon_segments.to_string(),
+                    ),
+                ];
+                let custody_env_for_factory = custody_env.clone();
                 let worker_cfg = |path: &str| {
                     let mut wc = daemon_vhc_supervisor::TrainClientConfig::new(path);
                     wc.assess_timeout = assess_timeout;
@@ -3089,6 +3120,7 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
                             dir.display().to_string(),
                         ));
                     }
+                    wc.env.extend(custody_env.iter().cloned());
                     wc.env.extend(presign_env.iter().cloned());
                     wc
                 };
@@ -3124,6 +3156,7 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
                             dir.display().to_string(),
                         ));
                     }
+                    wc.env.extend(custody_env_for_factory.iter().cloned());
                     wc.env.extend(presign_env_for_factory.iter().cloned());
                     Arc::new(daemon_vhc_supervisor::TrainSupervisor::new(wc))
                         as Arc<dyn daemon_vhc_node::WorkerControl>
@@ -3254,6 +3287,9 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
                         // (D-P8): it mints keys, issues certificates under the base identity, and
                         // writes credential records the worker resolves by reference.
                         identity_dir: Some(identity_dir.clone()),
+                        // The run-state root doubles as the disk custodian's governed root
+                        // (Phase 6): resume authorization + usage reporting.
+                        run_dir: Some(run_dir.clone()),
                         seat_directory,
                     },
                 ));

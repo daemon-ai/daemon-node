@@ -285,6 +285,7 @@ async fn own_base_stale_roster_repairs_the_floor_and_the_join_restarts_once() {
         budget: None,
         worker_factory: None,
         identity_dir: Some(identity.path().to_path_buf()),
+        run_dir: None,
         seat_directory: None,
     });
 
@@ -336,6 +337,7 @@ async fn foreign_base_stale_roster_fails_closed_and_adopts_no_floor() {
         budget: None,
         worker_factory: None,
         identity_dir: Some(identity.path().to_path_buf()),
+        run_dir: None,
         seat_directory: None,
     });
 

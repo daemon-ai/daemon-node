@@ -260,6 +260,28 @@ pub(crate) enum VhcCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Show the disk custodian's report for the VHC runs root (`VhcDiskUsage`, wire v45):
+    /// free space, ledgered usage, quota/reserve/emergency envelope, pressure state, and the
+    /// per-run breakdown by reclaim class (recoverable state vs archived evidence).
+    Disk {
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Safely wipe one run's local state (`VhcDiskWipe`, wire v45). Refuses while the run is
+    /// live or holds a standing joined intent. Wipes recoverable state (journal + spill);
+    /// archived evidence (payload + archive planes) survives unless `--evidence`. The identity
+    /// keystore (`base.key`) always survives.
+    Wipe {
+        /// The run whose local state is wiped.
+        run_id: String,
+        /// Also wipe archived evidence (payload + archive planes).
+        #[arg(long)]
+        evidence: bool,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Print this node's base-identity PeerId (hex) by reading the LOCAL vhc keystore — NO wire
     /// call, so it works with the node stopped (the preflight identity-collection step).
     Identity {

@@ -63,6 +63,9 @@ daemon-tool-fs = { workspace = true }
 # feature). Verified via `cargo tree` when this edge first landed (archived in the engineering
 # ledgers under docs/specs/).
 daemon-vhc-session = { workspace = true }
+# The central disk custodian (Phase 6): the node exports the custody root + sizing to workers
+# over the environment (the env-var names live with the crate).
+daemon-vhc-custody = { workspace = true }
 # The node-side vhc-training service + worker supervisor, bound onto the assembled node post-`Arc`
 # at boot (via `NodeApiImpl::with_vhc`) only when `[vhc] enabled = true` (spec §10.4). Taken as a
 # workspace dependency like the other internal crates. Does not pull burn/wasmtime/iroh onto the

@@ -305,6 +305,7 @@ async fn joined_service(
         budget: None,
         worker_factory: None,
         identity_dir: Some(identity_dir.to_path_buf()),
+        run_dir: None,
         seat_directory: None,
     }));
     svc.vhc_join(

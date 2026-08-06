@@ -1088,6 +1088,13 @@ vhc-event = vhc-event-phase
             / vhc-event-contribution
             / vhc-event-warning
             / vhc-event-error
+; wire v45: the disk-custody surface. One row per run scope, bytes split by reclaim class
+; (recoverable journal+spill vs archived-evidence payload+archive); `run_id` absent for an
+; orphaned scope. The wipe outcome names what was deliberately preserved (identity keystore
+; always; the archive plane unless evidence was explicitly included).
+vhc-disk-scope = { ? "run_id": tstr, "scope": tstr, "recoverable_mb": uint64, "evidence_mb": uint64, "active": bool }
+vhc-disk-usage = { "root": tstr, "free_mb": uint64, "used_mb": uint64, "quota_mb": uint64, "reserve_mb": uint64, "emergency_mb": uint64, "pressure": tstr, "scopes": [* vhc-disk-scope] }
+vhc-disk-wipe-outcome = { "run_id": tstr, "reclaimed_mb": uint64, "wiped_evidence": bool, "preserved": [* tstr] }
 ; custom-provider (write model): a user-named, persisted OpenAI-compatible provider generalizing
 ; Daemon Cloud. Projected by the node into a provider-descriptor for the catalog read.
 ; `-t` suffix: the enum rule name would otherwise collide with the `custom-provider`.`source` map
@@ -1451,6 +1458,8 @@ request-vhc-resume = { "VhcResume": { "run_id": tstr, "op_id": tstr } }
 request-vhc-switch-module = { "VhcSwitchModule": { "run_id": tstr, "upgrade_record": byte-array, "op_id": tstr } }
 request-vhc-set-policy = { "VhcSetPolicy": { "policy": vhc-policy } }
 request-vhc-hardware-report = "VhcHardwareReport"
+request-vhc-disk-usage = "VhcDiskUsage"   ; wire v45
+request-vhc-disk-wipe = { "VhcDiskWipe": { "run_id": tstr, "include_evidence": bool } }   ; wire v45
 request-models = { "Models": { ? "after": (tstr / null) } }
 request-model-current = { "ModelCurrent": { "profile": (tstr / null) } }
 request-provider-catalog = "ProviderCatalog"
@@ -1747,6 +1756,8 @@ api-request = request-submit
             / request-vhc-switch-module
             / request-vhc-set-policy
             / request-vhc-hardware-report
+            / request-vhc-disk-usage
+            / request-vhc-disk-wipe
             / request-models
             / request-model-current
             / request-provider-catalog
@@ -1927,6 +1938,8 @@ response-model-inspect = { "ModelInspect": gguf-info }
 response-vhc-runs = { "VhcRuns": [* vhc-run-summary] }
 response-vhc-run-detail = { "VhcRunDetail": (vhc-run-detail / null) }
 response-vhc-hardware-report = { "VhcHardwareReport": vhc-hardware-report }
+response-vhc-disk-usage = { "VhcDiskUsage": vhc-disk-usage }   ; wire v45
+response-vhc-disk-wipe = { "VhcDiskWipe": vhc-disk-wipe-outcome }   ; wire v45
 ; wire v43: the consumed upgrade record's switch outcome (activated / refused / left).
 vhc-switch-outcome-activated = { "Activated": { "epoch": uint64, "module_hash": tstr, "retries": uint } }
 vhc-switch-outcome-refused = { "Refused": { "reason": tstr } }
@@ -2069,6 +2082,8 @@ api-response = response-ok
              / response-vhc-runs
              / response-vhc-run-detail
              / response-vhc-hardware-report
+             / response-vhc-disk-usage
+             / response-vhc-disk-wipe
              / response-vhc-switch-outcome
              / response-profiles
              / response-profile

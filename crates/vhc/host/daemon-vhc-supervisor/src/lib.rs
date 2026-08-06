@@ -405,8 +405,15 @@ impl TrainSupervisor {
             deadline_ms,
             admitted_tuple: admitted_tuple.map(Box::new),
         };
+        // The switch transaction is compute-bound and mostly SILENT, like assess: the worker
+        // quiesces at a round boundary (up to `deadline_ms` of legitimate waiting — the node's
+        // drain ceiling defaults to the same 30 s as the chatty-op watchdog), then fetches,
+        // compiles, and migrates into the new module without emitting intermediate events. The
+        // chatty `op_timeout` would kill that healthy transaction mid-flight, so the reply window
+        // is the transaction's own drain bound plus the assess-class compute window.
+        let window = Duration::from_millis(deadline_ms) + self.inner.cfg.assess_timeout;
         let res = self
-            .exchange(cmd, |ev| match ev {
+            .exchange_with_timeout(cmd, window, |ev| match ev {
                 Event::ModuleSwitched {
                     epoch,
                     module,

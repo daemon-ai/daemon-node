@@ -156,13 +156,14 @@ pub fn required_capability(req: &ApiRequest) -> RequiredAccess {
         // toggles): discovery/detail/hardware are control-plane reads; join/leave/pause/resume/
         // set-policy move the node's durable participation intent and are node-wide control-plane
         // writes (operator tier).
-        VhcRunList | VhcRunDetail { .. } | VhcHardwareReport => C::ControlRead,
+        VhcRunList | VhcRunDetail { .. } | VhcHardwareReport | VhcDiskUsage => C::ControlRead,
         VhcJoin { .. }
         | VhcLeave { .. }
         | VhcPause { .. }
         | VhcResume { .. }
         | VhcSwitchModule { .. }
-        | VhcSetPolicy { .. } => C::ControlWrite,
+        | VhcSetPolicy { .. }
+        | VhcDiskWipe { .. } => C::ControlWrite,
 
         // -- serve_profile: profiles + skills (versioned) + personas (wire v36) -----------------
         ProfileList

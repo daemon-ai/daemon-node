@@ -39,6 +39,9 @@ use crate::VhcNetError;
 pub struct FsContentStore {
     root: ContainedRoot,
     lock: Arc<tokio::sync::RwLock<()>>,
+    /// The ambient disk custodian + charge scope (Phase 6): a first-time object reserves its
+    /// bytes before it lands; an idempotent re-put of a present object charges nothing.
+    custody: Option<(Arc<daemon_vhc_custody::DiskCustodian>, String)>,
 }
 
 impl FsContentStore {
@@ -47,11 +50,13 @@ impl FsContentStore {
     /// # Errors
     /// [`VhcNetError::Transport`] if the root cannot be opened/created.
     pub fn open(root: &Path) -> Result<Self, VhcNetError> {
+        let custody = daemon_vhc_custody::ambient_for(root);
         let root = ContainedRoot::open(root)
             .map_err(|e| VhcNetError::Transport(format!("open content store root: {e}")))?;
         Ok(Self {
             root,
             lock: Arc::new(tokio::sync::RwLock::new(())),
+            custody,
         })
     }
 
@@ -65,11 +70,44 @@ impl FsContentStore {
 impl ContentStore for FsContentStore {
     async fn put_content(&self, bytes: &[u8]) -> Result<ContentHash, VhcNetError> {
         let hash = blake3_hash(bytes);
+        let rel = Self::object_rel(&hash);
         let _w = self.lock.write().await;
+        // An object already at its address is the idempotent re-put: same bytes by
+        // construction, nothing to write, nothing to charge.
+        if self
+            .root
+            .symlink_metadata(Path::new(&rel))
+            .await
+            .is_ok_and(|m| !m.is_dir)
+        {
+            return Ok(hash);
+        }
+        // Reserve before the bytes land (Phase 6): a payload that does not fit refuses typed,
+        // never a raw mid-write ENOSPC.
+        let reservation = match &self.custody {
+            None => None,
+            Some((custodian, scope)) => Some(
+                custodian
+                    .reserve(
+                        scope,
+                        bytes.len() as u64,
+                        daemon_vhc_custody::WriteClass::Normal,
+                    )
+                    .map_err(|refusal| {
+                        VhcNetError::Transport(format!(
+                            "content store custody: {}",
+                            refusal.to_io()
+                        ))
+                    })?,
+            ),
+        };
         self.root
-            .write(Path::new(&Self::object_rel(&hash)), bytes)
+            .write(Path::new(&rel), bytes)
             .await
             .map_err(|e| VhcNetError::Transport(format!("write content object: {e}")))?;
+        if let Some(r) = reservation {
+            r.commit();
+        }
         Ok(hash)
     }
 

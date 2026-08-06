@@ -24,6 +24,9 @@ path = "src/bin/daemon-vhc-probe.rs"
 
 [dependencies]
 daemon-vhc-proto = { workspace = true }
+# The central disk custodian (Phase 6): the state-store spill reserves its chunk bytes before
+# they land and discharges evictions (ambient attachment via DAEMON_VHC_CUSTODY_ROOT).
+daemon-vhc-custody = { workspace = true }
 # The host side of the three-object resource model. Admission is one of the composition planner's four
 # callers (`[DI-10]`: authoring validation, node admission, sealed-binary conformance, ceremony
 # preflight), and the funnel composes the Physical Claim it authorizes rather than carrying a second

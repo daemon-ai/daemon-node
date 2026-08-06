@@ -791,7 +791,15 @@ impl WireVersion {
     /// subscription. One additive event field + one additive optional response field + their CDDL
     /// rules; strict-equal `is_compatible` still holds; clients feature-detect via the `api/44`
     /// Hello feature.
-    pub const CURRENT: Self = Self(44);
+    ///
+    /// (v45) additive vhc disk-custody surface — `VhcDiskUsage` (the disk custodian's ledger for
+    /// the VHC runs root: free space, committed usage, quota/reserve/emergency envelope, pressure
+    /// state, per-run breakdown by reclaim class) and `VhcDiskWipe` (the identity-preserving safe
+    /// wipe: refuses live runs, always spares the identity keystore, wipes archived evidence only
+    /// on explicit request), answering with the typed outcome. Two additive request arms + two
+    /// additive response arms + their CDDL rules; strict-equal `is_compatible` still holds;
+    /// clients feature-detect via the `api/45` Hello feature.
+    pub const CURRENT: Self = Self(45);
 
     /// The version this build speaks (alias for [`WireVersion::CURRENT`]).
     pub fn current() -> Self {

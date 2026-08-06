@@ -132,6 +132,68 @@ pub struct VhcHardwareReport {
     pub throughput_class: String,
 }
 
+/// One run scope's disk-custody row (wire v45): the bytes the disk custodian ledgers under the
+/// scope's run-state directory, split by reclaim class so an operator sees exactly what a wipe
+/// would touch — recoverable state (journal segments + spill, rebuildable from the archive) vs
+/// archived evidence (payload + archive planes, the authenticated product).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VhcDiskScope {
+    /// The run label when the node can map the scope back to a known run row; absent for an
+    /// orphaned scope (state on disk with no surviving run row).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    /// The on-disk scope directory name (the hashed run-state key).
+    pub scope: String,
+    /// Recoverable-state bytes in MiB (journal + spill): safe to wipe, rebuildable from archive.
+    pub recoverable_mb: u64,
+    /// Archived-evidence bytes in MiB (payload + archive planes): wiped only on explicit request.
+    pub evidence_mb: u64,
+    /// Whether the run is live right now (a wipe refuses while live).
+    pub active: bool,
+}
+
+/// The node's disk-custody report (wire v45, `vhc_disk_usage`): the custodian's ledger for the
+/// VHC runs root — probed free space, committed usage, the configured envelope (quota / OS-floor
+/// reserve / emergency sealing margin), the derived pressure state, and the per-run breakdown.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VhcDiskUsage {
+    /// The custodied runs root.
+    pub root: String,
+    /// Probed free bytes on the root's filesystem, in MiB.
+    pub free_mb: u64,
+    /// Committed bytes in the custodian's ledger, in MiB.
+    pub used_mb: u64,
+    /// The configured global quota in MiB (`0` = unbounded).
+    pub quota_mb: u64,
+    /// The configured OS free-space floor in MiB.
+    pub reserve_mb: u64,
+    /// The configured emergency sealing margin in MiB.
+    pub emergency_mb: u64,
+    /// The derived pressure state (`nominal` | `warn` | `refuse_new`).
+    pub pressure: String,
+    /// Per-run-scope custody rows (largest first).
+    pub scopes: Vec<VhcDiskScope>,
+}
+
+/// One safe wipe's outcome (wire v45, `vhc_disk_wipe`). The wipe NEVER touches the identity
+/// keystore (`base.key` and the per-run signing keys live outside the runs root), and it wipes
+/// archived evidence only when explicitly asked.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VhcDiskWipeOutcome {
+    /// The wiped run.
+    pub run_id: String,
+    /// Bytes reclaimed, in MiB.
+    pub reclaimed_mb: u64,
+    /// Whether archived evidence (payload + archive planes) was wiped too.
+    pub wiped_evidence: bool,
+    /// What the wipe deliberately preserved (operator-facing, e.g. `identity/base.key`,
+    /// `archive plane`).
+    pub preserved: Vec<String>,
+}
+
 /// The per-run contribution ledger (spec §10.3 `vhc_contrib`): what this node's GPU did for a run.
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -455,6 +517,24 @@ pub trait VhcApi: Send + Sync {
     /// This node's training-capability report (probe results + active lanes).
     async fn vhc_hardware_report(&self) -> Result<VhcHardwareReport, ApiError> {
         Err(ApiError::Unsupported("vhc_hardware_report".into()))
+    }
+
+    /// The disk-custody report for the VHC runs root (wire v45): free space, ledgered usage,
+    /// the configured envelope, pressure, and the per-run breakdown by reclaim class.
+    async fn vhc_disk_usage(&self) -> Result<VhcDiskUsage, ApiError> {
+        Err(ApiError::Unsupported("vhc_disk_usage".into()))
+    }
+
+    /// Safely wipe one run's local state (wire v45). Refuses while the run is live. Wipes
+    /// recoverable state (journal + spill) always; wipes archived evidence (payload + archive
+    /// planes) only when `include_evidence`. Never touches the identity keystore — `base.key`
+    /// survives every wipe.
+    async fn vhc_disk_wipe(
+        &self,
+        _run_id: String,
+        _include_evidence: bool,
+    ) -> Result<VhcDiskWipeOutcome, ApiError> {
+        Err(ApiError::Unsupported("vhc_disk_wipe".into()))
     }
 
     /// Subscribe to run events (all runs when `run_id` is `None`, else one run). Rides the existing

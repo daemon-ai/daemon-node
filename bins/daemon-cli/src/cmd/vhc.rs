@@ -139,6 +139,12 @@ pub(super) async fn run(client: &ApiClient, cmd: VhcCmd) -> anyhow::Result<()> {
             ack(&resp, json, "resumed", &run_id, &op_id)
         }
         VhcCmd::Hardware { json } => hardware(client, json).await,
+        VhcCmd::Disk { json } => disk(client, json).await,
+        VhcCmd::Wipe {
+            run_id,
+            evidence,
+            json,
+        } => wipe(client, run_id, evidence, json).await,
         VhcCmd::Identity { state_dir, json } => identity(state_dir, json),
     }
 }
@@ -249,6 +255,69 @@ async fn hardware(client: &ApiClient, json: bool) -> anyhow::Result<()> {
         }
         ApiResponse::Error(e) => anyhow::bail!("vhc hardware: {e}"),
         other => anyhow::bail!("unexpected response to VhcHardwareReport: {other:?}"),
+    }
+}
+
+async fn disk(client: &ApiClient, json: bool) -> anyhow::Result<()> {
+    match client.call(ApiRequest::VhcDiskUsage).await? {
+        ApiResponse::VhcDiskUsage(usage) => {
+            if json {
+                println!("{}", serde_json::to_string_pretty(&usage)?);
+            } else {
+                println!(
+                    "root={} free_mb={} used_mb={} quota_mb={} reserve_mb={} emergency_mb={} pressure={}",
+                    usage.root,
+                    usage.free_mb,
+                    usage.used_mb,
+                    usage.quota_mb,
+                    usage.reserve_mb,
+                    usage.emergency_mb,
+                    usage.pressure,
+                );
+                for s in &usage.scopes {
+                    println!(
+                        "  {}  recoverable_mb={} evidence_mb={} active={} scope={}",
+                        s.run_id.as_deref().unwrap_or("(orphan)"),
+                        s.recoverable_mb,
+                        s.evidence_mb,
+                        s.active,
+                        s.scope,
+                    );
+                }
+            }
+            Ok(())
+        }
+        ApiResponse::Error(e) => anyhow::bail!("vhc disk: {e}"),
+        other => anyhow::bail!("unexpected response to VhcDiskUsage: {other:?}"),
+    }
+}
+
+async fn wipe(
+    client: &ApiClient,
+    run_id: String,
+    include_evidence: bool,
+    json: bool,
+) -> anyhow::Result<()> {
+    match client
+        .call(ApiRequest::VhcDiskWipe {
+            run_id: run_id.clone(),
+            include_evidence,
+        })
+        .await?
+    {
+        ApiResponse::VhcDiskWipe(outcome) => {
+            if json {
+                println!("{}", serde_json::to_string_pretty(&outcome)?);
+            } else {
+                println!(
+                    "wiped {}  reclaimed_mb={} evidence_wiped={} preserved={:?}",
+                    outcome.run_id, outcome.reclaimed_mb, outcome.wiped_evidence, outcome.preserved,
+                );
+            }
+            Ok(())
+        }
+        ApiResponse::Error(e) => anyhow::bail!("vhc wipe: {e}"),
+        other => anyhow::bail!("unexpected response to VhcDiskWipe: {other:?}"),
     }
 }
 

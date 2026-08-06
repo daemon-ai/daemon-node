@@ -117,6 +117,12 @@ impl JournalPaths {
         self.root.join("sidecars")
     }
 
+    /// The chain-anchor file's path (see [`ChainAnchor`]).
+    #[must_use]
+    pub fn anchor(&self) -> PathBuf {
+        self.root.join(CHAIN_ANCHOR_FILE)
+    }
+
     /// The segment ordinals present on disk, ascending.
     ///
     /// # Errors
@@ -137,6 +143,74 @@ impl JournalPaths {
         }
         ords.sort_unstable();
         Ok(ords)
+    }
+}
+
+/// The chain-anchor file's name, beside the segment files in the journal root.
+pub const CHAIN_ANCHOR_FILE: &str = "chain-anchor.cbor";
+
+/// The local chain's PRUNED-PREFIX anchor (Phase 6 archive-then-prune).
+///
+/// A chain whose archived prefix was locally reclaimed no longer starts at segment 0, so recovery
+/// cannot anchor `prev_blake3` verification at [`segment::GENESIS_PREV`]. The pruner records,
+/// ATOMICALLY BEFORE each segment file is deleted, where the retained chain now starts and what
+/// the (archived, locally absent) predecessor's complete-file hash was. Recovery then:
+///
+/// * skips leftover segment files below [`first_ord`](Self::first_ord) (a crash between the
+///   anchor write and the file delete leaves one; it is proven archived, or the pruner would
+///   never have advanced the anchor past it),
+/// * verifies the first retained segment's `prev_blake3` against
+///   [`prev_blake3`](Self::prev_blake3) instead of `GENESIS_PREV`,
+/// * refuses (chain broken) when the anchored first segment itself is missing — that is real
+///   damage, not prune debris.
+///
+/// Absent anchor = never pruned = the chain must start at genesis, exactly as before.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ChainAnchor {
+    /// The lowest segment ordinal that must exist locally.
+    pub first_ord: u64,
+    /// The complete-file blake3 of segment `first_ord - 1` (the pruned predecessor) — what the
+    /// first retained segment's header `prev_blake3` must equal.
+    pub prev_blake3: [u8; 32],
+}
+
+impl ChainAnchor {
+    /// Load the anchor beside the segments (`None` when the chain was never pruned).
+    ///
+    /// # Errors
+    /// [`JournalError`] on an unreadable or undecodable anchor file (a corrupt anchor must refuse
+    /// loudly — guessing an anchor would let a damaged chain verify).
+    pub fn load(paths: &JournalPaths) -> Result<Option<Self>, JournalError> {
+        match fs::read(paths.anchor()) {
+            Ok(bytes) => {
+                let anchor = daemon_vhc_proto::from_canonical_slice(&bytes)
+                    .map_err(|e| JournalError::Codec(format!("chain anchor decode: {e}")))?;
+                Ok(Some(anchor))
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Persist the anchor atomically (tmp → rename, file + directory barriers): the pruner calls
+    /// this BEFORE deleting the segment file it anchors past, so a torn prune is always
+    /// re-scannable.
+    ///
+    /// # Errors
+    /// [`JournalError`] on an encode or filesystem failure.
+    pub fn store(&self, paths: &JournalPaths) -> Result<(), JournalError> {
+        let bytes = daemon_vhc_proto::to_canonical_vec(self)
+            .map_err(|e| JournalError::Codec(format!("chain anchor encode: {e}")))?;
+        let target = paths.anchor();
+        let tmp = target.with_extension("cbor.tmp");
+        {
+            let mut f = fs::File::create(&tmp)?;
+            io::Write::write_all(&mut f, &bytes)?;
+            f.sync_all()?;
+        }
+        fs::rename(&tmp, &target)?;
+        fsync_dir(paths.root())?;
+        Ok(())
     }
 }
 

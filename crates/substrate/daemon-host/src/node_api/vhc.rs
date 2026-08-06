@@ -92,6 +92,24 @@ impl VhcApi for NodeApiImpl {
         }
     }
 
+    async fn vhc_disk_usage(&self) -> Result<daemon_api::VhcDiskUsage, ApiError> {
+        match self.vhc.get() {
+            Some(s) => s.vhc_disk_usage().await,
+            None => Err(ApiError::Unsupported("vhc_disk_usage".into())),
+        }
+    }
+
+    async fn vhc_disk_wipe(
+        &self,
+        run_id: String,
+        include_evidence: bool,
+    ) -> Result<daemon_api::VhcDiskWipeOutcome, ApiError> {
+        match self.vhc.get() {
+            Some(s) => s.vhc_disk_wipe(run_id, include_evidence).await,
+            None => Err(ApiError::Unsupported("vhc_disk_wipe".into())),
+        }
+    }
+
     async fn vhc_subscribe(&self, run_id: Option<String>) -> Result<VhcEventStream, ApiError> {
         match self.vhc.get() {
             Some(s) => s.vhc_subscribe(run_id).await,

@@ -77,6 +77,9 @@ pub struct SpillStore {
     /// A per-store counter for unique temp names (atomic tmp→rename), so a torn write is never
     /// observed at the content address even if the same object is re-written.
     tmp_seq: AtomicU64,
+    /// The ambient disk custodian + charge scope (Phase 6): every spilled chunk reserves its
+    /// bytes before it lands, and an evicted chunk discharges them. `None` = uncustodied.
+    custody: Option<(std::sync::Arc<daemon_vhc_custody::DiskCustodian>, String)>,
 }
 
 impl SpillStore {
@@ -87,9 +90,11 @@ impl SpillStore {
     pub fn open(root: impl AsRef<Path>) -> std::io::Result<Self> {
         let root = root.as_ref().to_path_buf();
         std::fs::create_dir_all(&root)?;
+        let custody = daemon_vhc_custody::ambient_for(&root);
         Ok(Self {
             root,
             tmp_seq: AtomicU64::new(0),
+            custody,
         })
     }
 
@@ -107,12 +112,29 @@ impl SpillStore {
         if path.exists() {
             return Ok(());
         }
+        // Reserve before the bytes land (Phase 6): a spill that does not fit refuses typed
+        // (`HostStorageExhausted` at the state-store seam), never a raw mid-write ENOSPC.
+        let reservation = match &self.custody {
+            None => None,
+            Some((custodian, scope)) => Some(
+                custodian
+                    .reserve(
+                        scope,
+                        bytes.len() as u64,
+                        daemon_vhc_custody::WriteClass::Normal,
+                    )
+                    .map_err(|refusal| refusal.to_io())?,
+            ),
+        };
         let seq = self.tmp_seq.fetch_add(1, Ordering::Relaxed);
         let tmp = self
             .root
             .join(format!("{}.tmp-{seq}", Hash(*hash).to_hex()));
         std::fs::write(&tmp, bytes)?;
         std::fs::rename(&tmp, &path)?;
+        if let Some(r) = reservation {
+            r.commit();
+        }
         Ok(())
     }
 
@@ -138,9 +160,15 @@ impl SpillStore {
     }
 
     /// Remove one chunk object (retention eviction / torn-fold GC). A missing object is not an
-    /// error — eviction is idempotent.
+    /// error — eviction is idempotent. A custodied removal discharges the reclaimed bytes.
     pub fn remove(&self, hash: &[u8; 32]) {
-        let _ = std::fs::remove_file(self.object_path(hash));
+        let path = self.object_path(hash);
+        let reclaimed = std::fs::symlink_metadata(&path).map(|m| m.len()).ok();
+        if std::fs::remove_file(&path).is_ok() {
+            if let (Some(bytes), Some((custodian, scope))) = (reclaimed, &self.custody) {
+                custodian.discharge(scope, bytes);
+            }
+        }
     }
 }
 
@@ -178,6 +206,43 @@ mod tests {
             SpillReadError::Missing
         ));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Phase 6: a spill rooted under the exported custody root reserves every chunk against the
+    /// per-run quota (Normal class) and refuses TYPED at exhaustion; an eviction discharges the
+    /// bytes, so capacity actually returns. Other tests' spills live outside the custody root
+    /// and stay uncustodied.
+    #[test]
+    fn custodied_spill_refuses_at_quota_and_discharges_on_eviction() {
+        let custody_root = tmp_root("custody-root");
+        std::fs::create_dir_all(&custody_root).unwrap();
+        std::env::set_var(daemon_vhc_custody::CUSTODY_ROOT_ENV, &custody_root);
+        std::env::set_var(daemon_vhc_custody::DISK_RUN_QUOTA_MB_ENV, "1");
+        std::env::set_var(daemon_vhc_custody::DISK_RESERVE_MB_ENV, "0");
+        std::env::set_var(daemon_vhc_custody::DISK_EMERGENCY_MB_ENV, "0");
+
+        let store = SpillStore::open(custody_root.join("run-scope/trainer-1/state")).unwrap();
+        let chunk = vec![0x5Au8; 700 * 1024];
+        let h1 = blake3_hash(&chunk).0;
+        store.write(&h1, &chunk).unwrap();
+        // A second 700 KiB chunk overflows the 1 MiB scope quota: typed refusal.
+        let chunk2 = vec![0xA5u8; 700 * 1024];
+        let h2 = blake3_hash(&chunk2).0;
+        let err = store.write(&h2, &chunk2).unwrap_err();
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::QuotaExceeded,
+            "typed, not raw ENOSPC"
+        );
+        // Eviction discharges the ledger; the refused chunk now fits.
+        store.remove(&h1);
+        store.write(&h2, &chunk2).unwrap();
+
+        std::env::remove_var(daemon_vhc_custody::CUSTODY_ROOT_ENV);
+        std::env::remove_var(daemon_vhc_custody::DISK_RUN_QUOTA_MB_ENV);
+        std::env::remove_var(daemon_vhc_custody::DISK_RESERVE_MB_ENV);
+        std::env::remove_var(daemon_vhc_custody::DISK_EMERGENCY_MB_ENV);
+        let _ = std::fs::remove_dir_all(&custody_root);
     }
 
     #[test]

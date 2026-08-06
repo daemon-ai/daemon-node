@@ -17,8 +17,9 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use daemon_api::{
-    ApiError, NodeEvent, VhcApi, VhcCapabilities, VhcEligibility, VhcEvent, VhcEventStream,
-    VhcHardwareReport, VhcLeaveMode, VhcPolicy, VhcPolicyMode, VhcRunDetail, VhcRunSummary,
+    ApiError, NodeEvent, VhcApi, VhcCapabilities, VhcDiskScope, VhcDiskUsage, VhcDiskWipeOutcome,
+    VhcEligibility, VhcEvent, VhcEventStream, VhcHardwareReport, VhcLeaveMode, VhcPolicy,
+    VhcPolicyMode, VhcRunDetail, VhcRunSummary,
 };
 use daemon_vhc_abi::{AbiRefusalCode, RESERVATION_DEVICE_BYTES_KEY, RESERVATION_HOST_BYTES_KEY};
 use daemon_vhc_session::config::VhcConfig;
@@ -372,6 +373,11 @@ pub struct VhcServiceParts {
     /// credentials, no node-minted identity) — the worker's mandatory-tuple check then refuses a
     /// live join, which is exactly right off the production boot path.
     pub identity_dir: Option<std::path::PathBuf>,
+    /// The run-state root (`<data_dir>/vhc/runs` — the same path the node exports to workers as
+    /// `DAEMON_VHC_RUN_DIR`/`DAEMON_VHC_CUSTODY_ROOT`). `Some` ⇒ the node opens the root's disk
+    /// custodian for resume authorization (the storage gate) + usage reporting. `None` (tests /
+    /// headless) leaves storage-gated runs to the bare free-space fallback.
+    pub run_dir: Option<std::path::PathBuf>,
     /// The registry seat-slot directory (architecture §6.3; D-P9). `Some` + `[vhc] seat_claim` +
     /// an identity store ⇒ the resident seat keeper covers every joined run whose admitted role
     /// is the configured seat role (claim on boot, heartbeat at the lease cadence, fenced release
@@ -408,6 +414,22 @@ struct InstanceEntry {
     worker: Arc<dyn WorkerControl>,
 }
 
+/// The custodian sizing derived from `[vhc.storage]` — the SAME derivation the worker applies
+/// to the exported environment (`CustodyConfig::from_env`), so the node's resume-authorization
+/// custodian and the workers' write-path custodians judge one policy.
+fn custody_config(
+    storage: &daemon_vhc_session::config::StorageConfig,
+) -> daemon_vhc_custody::CustodyConfig {
+    const MIB: u64 = 1024 * 1024;
+    daemon_vhc_custody::CustodyConfig {
+        quota_bytes: (storage.quota_mb > 0).then(|| storage.quota_mb.saturating_mul(MIB)),
+        scope_quota_bytes: (storage.run_quota_mb > 0)
+            .then(|| storage.run_quota_mb.saturating_mul(MIB)),
+        reserve_bytes: storage.reserve_mb.saturating_mul(MIB),
+        emergency_bytes: storage.emergency_mb.saturating_mul(MIB),
+    }
+}
+
 /// The node-side vhc-training service.
 pub struct VhcService {
     config: VhcConfig,
@@ -432,6 +454,8 @@ pub struct VhcService {
     /// The identity keystore directory (D-P8 credential + per-run cert authorship); `None`
     /// disables node-side authorship (tests / headless).
     identity_dir: Option<std::path::PathBuf>,
+    /// The run-state root ([`VhcServiceParts::run_dir`]) — the disk custodian's governed root.
+    run_dir: Option<std::path::PathBuf>,
     /// The resident coordinator seat keeper (present only when the owner enabled coordinator
     /// duty AND a seat directory + identity store are wired).
     seat: Option<crate::seat_keeper::SeatKeeper>,
@@ -496,6 +520,7 @@ impl VhcService {
             co_trainers: Mutex::new(BTreeMap::new()),
             worker_factory: parts.worker_factory,
             identity_dir: parts.identity_dir,
+            run_dir: parts.run_dir,
             seat,
             seat_read,
             events_tx,
@@ -674,6 +699,11 @@ impl VhcService {
         // with the node, so worker teardown is definitionally observed. Only then is the
         // reconvergence set read (a repaired `completed` never rejoins).
         self.store.repair_pending_releases()?;
+        // Manifest-driven orphan reconciliation (Phase 6): reclaim superseded incarnation dirs
+        // the custody ledgers prove archived — BEFORE any join mints a fresh incarnation (the
+        // newest dir per role is the reconstruction input and is never touched). Best-effort:
+        // reconciliation trouble is loud but never blocks the boot.
+        self.reconcile_run_state_dirs();
         let intents = self.store.active_intents()?;
         let mut rejoined = 0;
         for run in &intents {
@@ -702,6 +732,46 @@ impl VhcService {
             self.emit_changed(None);
         }
         Ok(rejoined)
+    }
+
+    /// The startup orphan-reconciliation pass ([`crate::reclaim`]): superseded incarnation
+    /// directories whose custody ledgers prove full archival are reclaimed; everything retained
+    /// is logged with its reason. No-op without a wired runs root.
+    fn reconcile_run_state_dirs(&self) {
+        let Some(root) = &self.run_dir else {
+            return;
+        };
+        let known: std::collections::BTreeSet<String> = match self.store.list_runs() {
+            Ok(runs) => runs
+                .iter()
+                .map(|r| blake3::hash(r.run_id.as_bytes()).to_hex().to_string())
+                .collect(),
+            Err(e) => {
+                tracing::warn!(error = %e, "orphan reconciliation skipped: run rows unreadable");
+                return;
+            }
+        };
+        let custodian =
+            daemon_vhc_custody::DiskCustodian::for_root(root, custody_config(&self.config.storage))
+                .ok();
+        match crate::reclaim::reconcile_orphans(root, &known, custodian.as_ref()) {
+            Ok(report) => {
+                if report.incarnations > 0 || report.spills_only > 0 {
+                    tracing::info!(
+                        incarnations = report.incarnations,
+                        spills_only = report.spills_only,
+                        bytes = report.bytes,
+                        "orphan reconciliation reclaimed superseded run state"
+                    );
+                }
+                for (dir, reason) in &report.retained {
+                    tracing::debug!(dir, reason, "orphan reconciliation retained");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "orphan reconciliation pass failed");
+            }
+        }
     }
 
     /// Spawn the resident coordinator seat keeper loop (requires [`bind_self`](Self::bind_self)):
@@ -929,20 +999,32 @@ impl VhcService {
         Ok(reconverged)
     }
 
-    /// The interim storage gate's free-space check: open when the node-state filesystem (probed
-    /// at the identity dir — the durable state root) clears the configured reserve floor.
-    /// `reserve_mb = 0` disables the gate; a node without an identity dir has no probeable state
-    /// root, so the gate cannot hold. The probe's 0-on-failure maps to CLOSED — a state root
-    /// that cannot answer a space query is not one to redispatch onto.
+    /// The storage gate's resume-authorization check (Phase 6): open when the run-state root's
+    /// disk CUSTODIAN confirms capacity — the floor clears AND the quotas admit new work
+    /// (`Pressure::RefuseNew` holds the gate; the pre-custodian bare free-space probe held only
+    /// on the floor). `reserve_mb = 0` with no quota disables the gate. A node without a wired
+    /// run-state root falls back to the interim identity-dir free-space probe; a root that
+    /// cannot answer a capacity query maps to CLOSED — not one to redispatch onto.
     fn storage_gate_open(&self) -> bool {
-        let reserve_mb = self.config.storage.reserve_mb;
-        if reserve_mb == 0 {
+        let storage = &self.config.storage;
+        if storage.reserve_mb == 0 && storage.quota_mb == 0 && storage.run_quota_mb == 0 {
+            return true;
+        }
+        if let Some(root) = &self.run_dir {
+            return match daemon_vhc_custody::DiskCustodian::for_root(root, custody_config(storage))
+            {
+                Ok(custodian) => custodian.pressure() != daemon_vhc_custody::Pressure::RefuseNew,
+                Err(_) => false,
+            };
+        }
+        // Interim fallback (headless / test wiring without a runs root): the bare floor probe.
+        if storage.reserve_mb == 0 {
             return true;
         }
         let Some(dir) = &self.identity_dir else {
             return true;
         };
-        daemon_vhc_session::host_disk_free_mb(dir) >= reserve_mb
+        daemon_vhc_session::host_disk_free_mb(dir) >= storage.reserve_mb
     }
 
     /// The ONE join transaction for every non-owner-initiated entry (restart, retry, resume
@@ -1461,7 +1543,11 @@ impl VhcService {
                 },
                 ..ClaimTiers::default()
             },
-            disk_bytes: 0,
+            // The run's disk footprint is bounded by the per-run custody quota (Phase 6), so
+            // that is the honest figure the owner's disk ledger reserves. An unbounded run
+            // quota (0) charges nothing — the ledger cannot price a reservation the custodian
+            // does not bound (the free-space floor still protects the host).
+            disk_bytes: self.config.storage.run_quota_mb.saturating_mul(1024 * 1024),
             net_up_bps: 0,
             net_down_bps: 0,
             duty_pct,
@@ -3576,6 +3662,122 @@ impl VhcApi for VhcService {
         Ok(hardware_report(hw))
     }
 
+    async fn vhc_disk_usage(&self) -> Result<VhcDiskUsage, ApiError> {
+        const MIB: u64 = 1024 * 1024;
+        let Some(root) = &self.run_dir else {
+            return Err(ApiError::Unsupported("vhc_disk_usage: no runs root".into()));
+        };
+        let custodian =
+            daemon_vhc_custody::DiskCustodian::for_root(root, custody_config(&self.config.storage))
+                .map_err(|e| ApiError::Other(format!("disk custodian: {e}")))?;
+        let usage = custodian.usage();
+        // Map on-disk scopes back to run labels + liveness; walk the DISK for the rows (the
+        // ledger is per-process; the disk is the operator's truth).
+        let runs = self
+            .store
+            .list_runs()
+            .map_err(|e| VhcError::from(e).to_api())?;
+        let label_by_scope: BTreeMap<String, String> = runs
+            .iter()
+            .map(|r| {
+                (
+                    blake3::hash(r.run_id.as_bytes()).to_hex().to_string(),
+                    r.run_id.clone(),
+                )
+            })
+            .collect();
+        let live_scopes: std::collections::BTreeSet<String> = {
+            let instances = self.instances.lock().unwrap();
+            instances
+                .keys()
+                .map(|label| blake3::hash(label.as_bytes()).to_hex().to_string())
+                .collect()
+        };
+        let mut scopes: Vec<VhcDiskScope> = crate::reclaim::scope_rows(root)
+            .into_iter()
+            .map(|(scope, split)| VhcDiskScope {
+                run_id: label_by_scope.get(&scope).cloned(),
+                active: live_scopes.contains(&scope),
+                scope,
+                recoverable_mb: split.recoverable.div_ceil(MIB),
+                evidence_mb: split.evidence.div_ceil(MIB),
+            })
+            .collect();
+        scopes.sort_by(|a, b| {
+            (b.recoverable_mb + b.evidence_mb).cmp(&(a.recoverable_mb + a.evidence_mb))
+        });
+        Ok(VhcDiskUsage {
+            root: usage.root,
+            free_mb: usage.free_bytes / MIB,
+            used_mb: usage.used_bytes.div_ceil(MIB),
+            quota_mb: usage.quota_bytes / MIB,
+            reserve_mb: usage.reserve_bytes / MIB,
+            emergency_mb: usage.emergency_bytes / MIB,
+            pressure: match usage.pressure {
+                daemon_vhc_custody::Pressure::Nominal => "nominal".into(),
+                daemon_vhc_custody::Pressure::Warn => "warn".into(),
+                daemon_vhc_custody::Pressure::RefuseNew => "refuse_new".into(),
+            },
+            scopes,
+        })
+    }
+
+    async fn vhc_disk_wipe(
+        &self,
+        run_id: String,
+        include_evidence: bool,
+    ) -> Result<VhcDiskWipeOutcome, ApiError> {
+        const MIB: u64 = 1024 * 1024;
+        let Some(root) = &self.run_dir else {
+            return Err(ApiError::Unsupported("vhc_disk_wipe: no runs root".into()));
+        };
+        // Refuse while the run is live or the node still intends to run it: a wipe under a
+        // standing joined intent would race the very reconstruction the journal feeds.
+        if self.instances.lock().unwrap().contains_key(&run_id) {
+            return Err(ApiError::Conflict(format!(
+                "run `{run_id}` is live; leave or pause it before wiping"
+            )));
+        }
+        let intents = self
+            .store
+            .active_intents()
+            .map_err(|e| VhcError::from(e).to_api())?;
+        if intents.iter().any(|r| r.run_id == run_id) {
+            return Err(ApiError::Conflict(format!(
+                "run `{run_id}` holds a standing joined intent; leave it before wiping"
+            )));
+        }
+        let scope = blake3::hash(run_id.as_bytes()).to_hex().to_string();
+        let outcome = crate::reclaim::wipe_scope(&root.join(&scope), include_evidence)
+            .map_err(|e| ApiError::Other(format!("wipe `{run_id}`: {e}")))?;
+        // Keep the custodian's ledger honest about what left the disk.
+        if let Ok(custodian) =
+            daemon_vhc_custody::DiskCustodian::for_root(root, custody_config(&self.config.storage))
+        {
+            if include_evidence {
+                custodian.forget_scope(&scope);
+            } else {
+                custodian.discharge(&scope, outcome.bytes);
+            }
+        }
+        tracing::info!(
+            run = run_id,
+            bytes = outcome.bytes,
+            evidence = outcome.wiped_evidence,
+            "safe wipe reclaimed run state"
+        );
+        let mut preserved = vec!["identity keystore (base.key + run keys)".to_string()];
+        if !include_evidence {
+            preserved.push("archive planes (payload + heads)".to_string());
+        }
+        Ok(VhcDiskWipeOutcome {
+            run_id,
+            reclaimed_mb: outcome.bytes.div_ceil(MIB),
+            wiped_evidence: outcome.wiped_evidence,
+            preserved,
+        })
+    }
+
     async fn vhc_subscribe(&self, run_id: Option<String>) -> Result<VhcEventStream, ApiError> {
         let rx = self.events_tx.subscribe();
         let stream = BroadcastStream::new(rx).filter_map(move |res| {
@@ -4053,6 +4255,7 @@ mod arbitration_tests {
             budget: Some(budget),
             worker_factory: Some(Arc::new(|| Arc::new(NoopWorker) as Arc<dyn WorkerControl>)),
             identity_dir: None,
+            run_dir: None,
             seat_directory: None,
         })
     }
@@ -4452,5 +4655,112 @@ mod storage_gate_tests {
 
         svc.config.storage.reserve_mb = 0;
         assert!(svc.storage_gate_open(), "reserve 0 disables the gate");
+    }
+
+    /// Phase 6: with a wired run-state root the gate asks the CUSTODIAN, not the bare probe —
+    /// a global quota already consumed by on-disk run state reads `RefuseNew` and holds the
+    /// gate (the pre-custodian floor check would have opened it: the disk has plenty of free
+    /// space); raising the quota opens it. This is the resume-authorization contract: a
+    /// storage-gated run redispatches only when the custodian confirms capacity.
+    #[test]
+    // Test-only fixture writes inside the test's own temp root — not a production fs path.
+    #[allow(clippy::disallowed_methods)]
+    fn the_storage_gate_asks_the_custodian_when_a_runs_root_is_wired() {
+        let mut svc = coordinator_trainer_service(OwnerBudget::unbounded());
+        let root = tempfile::tempdir().expect("tempdir");
+        // Pre-existing run state the open-time walk seeds the ledger with.
+        std::fs::create_dir_all(root.path().join("scope-a/trainer-1/journal")).unwrap();
+        std::fs::write(
+            root.path().join("scope-a/trainer-1/journal/segment"),
+            vec![0u8; 3 * 1024 * 1024],
+        )
+        .unwrap();
+        svc.run_dir = Some(root.path().to_path_buf());
+        svc.config.storage.reserve_mb = 0;
+        svc.config.storage.emergency_mb = 0;
+        svc.config.storage.quota_mb = 2; // 2 MiB quota, 3 MiB already used → RefuseNew
+        assert!(
+            !svc.storage_gate_open(),
+            "an exhausted quota holds the gate even with free disk space"
+        );
+
+        // NOTE: the per-root custodian is a process singleton whose FIRST opener's config
+        // wins, so the relaxed policy needs a fresh root (exactly what a reconfigured node
+        // restart does).
+        let roomy = tempfile::tempdir().expect("tempdir");
+        svc.run_dir = Some(roomy.path().to_path_buf());
+        svc.config.storage.quota_mb = 64;
+        assert!(
+            svc.storage_gate_open(),
+            "a clear quota + floor opens the gate"
+        );
+    }
+
+    /// The wire-v45 disk surface: the usage report maps scopes back to run labels and splits
+    /// bytes by reclaim class; the safe wipe refuses a live run, refuses a standing joined
+    /// intent, then reclaims recoverable state while the archive planes and everything outside
+    /// the runs root (the identity keystore) survive — evidence goes only on explicit request.
+    #[tokio::test]
+    // Test-only fixture writes inside the test's own temp root — not a production fs path.
+    #[allow(clippy::disallowed_methods)]
+    async fn the_disk_surface_reports_by_reclaim_class_and_wipes_identity_preservingly() {
+        let mut svc = coordinator_trainer_service(OwnerBudget::unbounded());
+        let root = tempfile::tempdir().expect("tempdir");
+        svc.run_dir = Some(root.path().to_path_buf());
+        svc.config.storage.reserve_mb = 0;
+        svc.config.storage.emergency_mb = 0;
+
+        seed_joined_run(&svc, "run-w", 1);
+        let scope = blake3::hash(b"run-w").to_hex().to_string();
+        let scope_path = root.path().join(&scope);
+        std::fs::create_dir_all(scope_path.join("trainer-1/journal")).unwrap();
+        std::fs::write(
+            scope_path.join("trainer-1/journal/segment"),
+            vec![1u8; 2 * 1024 * 1024],
+        )
+        .unwrap();
+        std::fs::create_dir_all(scope_path.join("payload")).unwrap();
+        std::fs::write(scope_path.join("payload/blob"), vec![2u8; 1024 * 1024]).unwrap();
+
+        let usage = svc.vhc_disk_usage().await.expect("usage report");
+        let row = usage
+            .scopes
+            .iter()
+            .find(|s| s.scope == scope)
+            .expect("the run's scope row");
+        assert_eq!(row.run_id.as_deref(), Some("run-w"), "scope maps to label");
+        assert!(row.active, "the live instance marks the row active");
+        assert_eq!(row.recoverable_mb, 2);
+        assert_eq!(row.evidence_mb, 1);
+
+        // Live ⇒ refused; intent standing ⇒ refused.
+        let live = svc.vhc_disk_wipe("run-w".into(), false).await;
+        assert!(matches!(live, Err(ApiError::Conflict(_))), "{live:?}");
+        svc.instances.lock().unwrap().remove("run-w");
+        let intent = svc.vhc_disk_wipe("run-w".into(), false).await;
+        assert!(matches!(intent, Err(ApiError::Conflict(_))), "{intent:?}");
+
+        // Left ⇒ the default wipe takes recoverable state, spares the evidence planes.
+        svc.store
+            .set_desired_state("run-w", DesiredState::Left)
+            .unwrap();
+        let outcome = svc.vhc_disk_wipe("run-w".into(), false).await.unwrap();
+        assert_eq!(outcome.reclaimed_mb, 2);
+        assert!(!outcome.wiped_evidence);
+        assert!(!scope_path.join("trainer-1").exists());
+        assert!(scope_path.join("payload/blob").exists(), "evidence spared");
+        assert!(
+            outcome.preserved.iter().any(|p| p.contains("base.key")),
+            "the identity guarantee is named: {:?}",
+            outcome.preserved
+        );
+
+        // The explicit evidence wipe finishes the job; idempotent thereafter.
+        let evidence = svc.vhc_disk_wipe("run-w".into(), true).await.unwrap();
+        assert_eq!(evidence.reclaimed_mb, 1);
+        assert!(evidence.wiped_evidence);
+        assert!(!scope_path.exists());
+        let rerun = svc.vhc_disk_wipe("run-w".into(), true).await.unwrap();
+        assert_eq!(rerun.reclaimed_mb, 0);
     }
 }

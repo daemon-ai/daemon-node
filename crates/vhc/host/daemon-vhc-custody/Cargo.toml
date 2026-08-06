@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# SPDX-FileCopyrightText: 2026 Jarrad Hope
+
+[package]
+name = "daemon-vhc-custody"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The CENTRAL DISK CUSTODIAN (architecture resource doctrine; pre-C2 Phase 6): one custodian per
+# filesystem root, atomic capacity reservation for every durable VHC write path (journal
+# segments + sidecars, state spill, payload cache, archive heads), global + per-scope quotas, a
+# reserved-free-space floor, an emergency sealing reserve, and derived pressure states. This
+# crate is deliberately schema-free and dependency-light (like `daemon-vhc-journal`): bytes,
+# paths, and OS free-space scalars only — no round vocabulary, no run semantics. Producers
+# (journal / host / net / session) link it; policy (quota sizes, resume authorization) is the
+# node's business.
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[lints]
+workspace = true

@@ -33,6 +33,7 @@ pub mod assess;
 pub mod attach;
 pub mod backend;
 pub mod config;
+pub mod custody;
 pub mod distribution;
 pub mod identity;
 pub mod journal_home;

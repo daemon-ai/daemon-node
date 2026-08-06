@@ -226,24 +226,44 @@ impl Default for RetryConfig {
     }
 }
 
-/// The interim storage-gate configuration (`[vhc.storage]`): a run that failed with
-/// `HostStorageExhausted` (ENOSPC/quota — the typed storage taxonomy) is redispatched only once
-/// the node-state filesystem shows at least `reserve_mb` of free space. The gate never consumes
-/// the retry budget while it holds — a full disk is a capacity condition to wait out, not a
-/// crash loop to escalate. The Phase 6 disk custodian (atomic reservation, quotas, pressure
-/// states) replaces this check as the resume authority; the config key stays.
+/// The disk-custody configuration (`[vhc.storage]`; Phase 6 — the central disk custodian's
+/// sizing policy). The node derives a `daemon_vhc_custody::CustodyConfig` from this section
+/// for its own runs-root custodian (resume authorization + reporting) and exports the same
+/// sizing to every worker over the environment (`DAEMON_VHC_CUSTODY_ROOT` +
+/// `DAEMON_VHC_DISK_*_MB`), where the durable write planes (journal, spill, payload cache,
+/// archive heads) attach ambiently and reserve every write.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct StorageConfig {
-    /// Minimum free space (MiB) on the node-state filesystem before a storage-gated run is
-    /// redispatched. `0` disables the gate (storage failures then retry like any recoverable
-    /// fault).
+    /// The host free-space floor (MiB): no VHC write may take the run-state filesystem's free
+    /// space below this, and a storage-gated run is redispatched only when the custodian
+    /// confirms capacity. `0` disables the floor and the resume gate.
     pub reserve_mb: u64,
+    /// The global VHC disk quota (MiB) across every run on this node's run-state root.
+    /// `0` = unbounded (the floor still holds).
+    pub quota_mb: u64,
+    /// The per-run disk quota (MiB), charged per run-state directory. `0` = unbounded.
+    pub run_quota_mb: u64,
+    /// The emergency margin (MiB) above the floor, reachable only by the recovery-critical
+    /// stream (journal seals, the terminal pair, the checkpoint snapshot anchor) — so sealing
+    /// and the in-flight checkpoint always have room during pressure handling.
+    pub emergency_mb: u64,
+    /// The archive-then-prune recovery horizon (SEGMENTS): a sealed segment is locally pruned
+    /// once it is durably archived (bytes at the content plane + attested head stored) AND at
+    /// least this many archived segments lie above it — the newest N stay local so
+    /// reconstruction/replay starts warm. `0` = never prune (retain everything locally).
+    pub prune_horizon_segments: u64,
 }
 
 impl Default for StorageConfig {
     fn default() -> Self {
-        Self { reserve_mb: 2_048 }
+        Self {
+            reserve_mb: 2_048,
+            quota_mb: 0,
+            run_quota_mb: 0,
+            emergency_mb: 256,
+            prune_horizon_segments: daemon_vhc_custody::DEFAULT_PRUNE_HORIZON_SEGMENTS,
+        }
     }
 }
 

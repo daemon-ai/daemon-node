@@ -55,6 +55,9 @@ daemon-vhc-proto = { workspace = true }
 # module under the host runtime) reads its stop-reason + candidate-driver constants. A contracts
 # crate (links neither sdk/* nor host/*), so the session→abi edge is direction-safe.
 daemon-vhc-abi = { workspace = true }
+# The central disk custodian (Phase 6): the archive-then-prune pass discharges reclaimed bytes
+# from the ambient custodian's ledger (the same scope the journal writes charged).
+daemon-vhc-custody = { workspace = true }
 # The consensus SDK layer (round message schemas, assignment math, the pure coordinator `tick`,
 # the typed checkpoint manifest + attestation vocabulary). OPTIONAL, enabled only by the
 # `harness` feature: every consumer (`engine`, `checkpoint`, `upgrade`, `coordinator_shell`,

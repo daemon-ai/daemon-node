@@ -47,9 +47,9 @@ pub use op_context::{current_op_id, with_op_id};
 
 pub mod vhc;
 pub use vhc::{
-    VhcApi, VhcCapabilities, VhcContribution, VhcEligibility, VhcEvent, VhcEventStream,
-    VhcHardwareReport, VhcLeaveMode, VhcPolicy, VhcPolicyMode, VhcRunDetail, VhcRunSummary,
-    VhcSwitchOutcome,
+    VhcApi, VhcCapabilities, VhcContribution, VhcDiskScope, VhcDiskUsage, VhcDiskWipeOutcome,
+    VhcEligibility, VhcEvent, VhcEventStream, VhcHardwareReport, VhcLeaveMode, VhcPolicy,
+    VhcPolicyMode, VhcRunDetail, VhcRunSummary, VhcSwitchOutcome,
 };
 
 pub mod profile;

@@ -233,6 +233,15 @@ fn vhc_requests_validate() {
             },
         ),
         ("VhcHardwareReport", ApiRequest::VhcHardwareReport),
+        // wire v45: the disk-custody surface.
+        ("VhcDiskUsage", ApiRequest::VhcDiskUsage),
+        (
+            "VhcDiskWipe",
+            ApiRequest::VhcDiskWipe {
+                run_id: "run-1".into(),
+                include_evidence: false,
+            },
+        ),
     ];
     for (label, req) in cases {
         valid("api-request", &enc(&req), label);
@@ -289,6 +298,47 @@ fn vhc_responses_validate() {
             "VhcSwitchOutcome(Left)",
             ApiResponse::VhcSwitchOutcome(VhcSwitchOutcome::Left {
                 reason: "migrate budget exhausted".into(),
+            }),
+        ),
+        // wire v45: the disk-custody surface (a labeled row + an orphaned scope row).
+        (
+            "VhcDiskUsage",
+            ApiResponse::VhcDiskUsage(daemon_api::VhcDiskUsage {
+                root: "/var/lib/daemon/vhc/runs".into(),
+                free_mb: 101_376,
+                used_mb: 2_048,
+                quota_mb: 8_192,
+                reserve_mb: 10_240,
+                emergency_mb: 64,
+                pressure: "nominal".into(),
+                scopes: vec![
+                    daemon_api::VhcDiskScope {
+                        run_id: Some("run-1".into()),
+                        scope: "1d".repeat(32),
+                        recoverable_mb: 1_024,
+                        evidence_mb: 512,
+                        active: true,
+                    },
+                    daemon_api::VhcDiskScope {
+                        run_id: None,
+                        scope: "2a".repeat(32),
+                        recoverable_mb: 512,
+                        evidence_mb: 0,
+                        active: false,
+                    },
+                ],
+            }),
+        ),
+        (
+            "VhcDiskWipe",
+            ApiResponse::VhcDiskWipe(daemon_api::VhcDiskWipeOutcome {
+                run_id: "run-1".into(),
+                reclaimed_mb: 1_024,
+                wiped_evidence: false,
+                preserved: vec![
+                    "identity keystore (base.key + run keys)".into(),
+                    "archive planes (payload + heads)".into(),
+                ],
             }),
         ),
     ];

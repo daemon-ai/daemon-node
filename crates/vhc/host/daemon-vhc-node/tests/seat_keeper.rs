@@ -180,6 +180,7 @@ async fn keeper_claims_renews_and_releases_on_pause() {
         budget: None,
         worker_factory: None,
         identity_dir: Some(identity.path().to_path_buf()),
+        run_dir: None,
         seat_directory: Some(directory.clone()),
     }));
     svc.bind_self();
@@ -313,6 +314,7 @@ async fn shutdown_releases_the_held_seat_fenced() {
         budget: None,
         worker_factory: None,
         identity_dir: Some(identity.path().to_path_buf()),
+        run_dir: None,
         seat_directory: Some(directory.clone()),
     }));
     svc.bind_self();
@@ -487,6 +489,7 @@ async fn join_runs_the_coordinator_role_at_the_seat_lease_incarnation() {
         budget: None,
         worker_factory: None,
         identity_dir: Some(identity.path().to_path_buf()),
+        run_dir: None,
         seat_directory: Some(directory.clone()),
     }));
     svc.bind_self();
@@ -578,6 +581,7 @@ async fn join_stands_down_to_trainer_when_a_live_incumbent_holds() {
         budget: None,
         worker_factory: None,
         identity_dir: Some(identity.path().to_path_buf()),
+        run_dir: None,
         seat_directory: Some(directory.clone()),
     }));
     svc.bind_self();

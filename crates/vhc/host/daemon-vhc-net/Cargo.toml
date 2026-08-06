@@ -10,6 +10,9 @@ path = "src/lib.rs"
 
 [dependencies]
 daemon-vhc-proto = { workspace = true }
+# The central disk custodian (Phase 6): the filesystem content store reserves payload bytes
+# before they land; the archive-head store reserves its (Critical) head slots.
+daemon-vhc-custody = { workspace = true }
 # `ContainedRoot` (openat2 RESOLVE_BENEATH|NO_SYMLINKS) is the sanctioned fs surface: the
 # `FsPayloadStore` is rooted at one so peer-supplied key components can never escape the store root
 # (the workspace-wide clippy fs ban points here).

@@ -192,6 +192,7 @@ fn rig_with_needs(budget: OwnerBudget, needs: &[i64]) -> Rig {
         budget: Some(budget),
         worker_factory: Some(factory),
         identity_dir: None,
+        run_dir: None,
         seat_directory: None,
     }));
     svc.bind_self();
@@ -349,6 +350,7 @@ async fn restart_reconverges_through_the_arbiter_and_reports_refusals_loud() {
             budget: Some(colocation_budget()),
             worker_factory: Some(factory),
             identity_dir: None,
+            run_dir: None,
             seat_directory: None,
         }));
         svc.bind_self();
@@ -395,6 +397,7 @@ async fn restart_reconverges_through_the_arbiter_and_reports_refusals_loud() {
             budget: Some(shrunk),
             worker_factory: Some(factory),
             identity_dir: None,
+            run_dir: None,
             seat_directory: None,
         }));
         svc.bind_self();
@@ -489,6 +492,7 @@ async fn admitted_charge_equals_assess_claim_totals() {
         budget: Some(budget),
         worker_factory: Some(factory),
         identity_dir: None,
+        run_dir: None,
         seat_directory: None,
     }));
     svc.bind_self();
@@ -566,6 +570,7 @@ async fn admitted_charge_equals_the_composed_reservation_and_prefers_it_over_dec
         budget: Some(budget),
         worker_factory: Some(factory),
         identity_dir: None,
+        run_dir: None,
         seat_directory: None,
     }));
     svc.bind_self();

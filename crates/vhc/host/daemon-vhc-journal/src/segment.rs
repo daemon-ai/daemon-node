@@ -286,15 +286,32 @@ impl SegmentWriter {
     /// # Errors
     /// [`JournalError::Codec`] if the record cannot be encoded; [`JournalError::Io`] on write failure.
     pub fn append(&mut self, record: &Record) -> Result<(), JournalError> {
+        let framed = Self::encode(record)?;
+        self.append_framed(&framed)
+    }
+
+    /// Encode one record to its on-disk framed bytes — the exact byte count an append will
+    /// write, so a capacity custodian can reserve it before the write (the [`super::Journal`]'s
+    /// reservation seam) without encoding twice.
+    ///
+    /// # Errors
+    /// [`JournalError::Codec`] if the record cannot be encoded.
+    pub fn encode(record: &Record) -> Result<Vec<u8>, JournalError> {
+        frame(&record.to_canonical()?)
+    }
+
+    /// Append pre-encoded framed bytes (the [`Self::encode`] product).
+    ///
+    /// # Errors
+    /// [`JournalError::Io`] on write failure or a sealed segment.
+    pub fn append_framed(&mut self, framed: &[u8]) -> Result<(), JournalError> {
         if self.sealed {
             return Err(JournalError::Io(io::Error::other(
                 "append to a sealed segment",
             )));
         }
-        let cbor = record.to_canonical()?;
-        let framed = frame(&cbor)?;
-        self.file.write_all(&framed)?;
-        self.hasher.update(&framed);
+        self.file.write_all(framed)?;
+        self.hasher.update(framed);
         self.records += 1;
         Ok(())
     }

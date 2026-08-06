@@ -173,6 +173,21 @@ pub fn spawn_archive_publisher(
     bindings: Arc<Mutex<Vec<SignerBinding>>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        // The persisted custody ledger (Phase 6): archive facts recorded per acknowledged head,
+        // consumed by archive-then-prune here and by the node's orphan reconciliation. A ledger
+        // that cannot load leaves custody bookkeeping off for the session (publication itself is
+        // unaffected) — pruning without its facts would be guessing.
+        let ledger = match crate::custody::CustodyLedger::load(&spec.journal_dir) {
+            Ok(l) => Some(l),
+            Err(e) => {
+                tracing::error!(
+                    dir = %spec.journal_dir.display(),
+                    error = %e,
+                    "custody ledger unreadable; archive-then-prune disabled for this session"
+                );
+                None
+            }
+        };
         let mut publisher = Publisher {
             run_label,
             run_id,
@@ -185,6 +200,8 @@ pub fn spawn_archive_publisher(
             round_claim: spec.round_claim,
             published_tip: None,
             predecessor: None,
+            ledger,
+            prune_horizon: daemon_vhc_custody::prune_horizon_from_env(),
         };
         let mut seals = spec.seals;
         if !publisher.reconcile().await {
@@ -221,6 +238,11 @@ struct Publisher {
     /// The predecessor chain's terminal head address (segment 0's succession link), resolved
     /// during reconciliation.
     predecessor: Option<Hash>,
+    /// The persisted custody ledger (Phase 6): archive facts + prune facts for this chain.
+    /// `None` = an unreadable ledger; bookkeeping disabled, publication unaffected.
+    ledger: Option<crate::custody::CustodyLedger>,
+    /// The archive-then-prune recovery horizon (segments; `0` = never prune).
+    prune_horizon: u64,
 }
 
 impl Publisher {
@@ -488,6 +510,7 @@ impl Publisher {
                         "archive segment + attested head published"
                     );
                     self.published_tip = Some(sealed.segment);
+                    self.record_and_prune(sealed);
                     return true;
                 }
                 Ok(ArchiveHeadDecision::RejectedNonExtending {
@@ -527,6 +550,49 @@ impl Publisher {
                     backoff(attempt).await;
                     attempt += 1;
                 }
+            }
+        }
+    }
+
+    /// Phase 6 bookkeeping after an acknowledged publish: record the archive facts in the
+    /// persisted custody ledger, then run one archive-then-prune pass (the dependency closure +
+    /// recovery horizon live in [`crate::custody`]). Best-effort: a bookkeeping failure is loud
+    /// but never blocks publication — the ledger is re-derivable from the head store, and an
+    /// unpruned segment is a bounded cost, not a correctness fault.
+    fn record_and_prune(&mut self, sealed: &SealedSegment) {
+        let Some(ledger) = self.ledger.as_mut() else {
+            return;
+        };
+        if let Err(e) =
+            ledger.record_archived(sealed.segment, Hash(sealed.segment_blake3), sealed.records)
+        {
+            tracing::warn!(
+                run = self.run_label,
+                segment = sealed.segment,
+                error = %e,
+                "custody ledger persist failed; archive facts not recorded"
+            );
+            return;
+        }
+        match crate::custody::prune_archived(&self.journal_dir, ledger, self.prune_horizon) {
+            Ok(outcome) if outcome.bytes > 0 => {
+                tracing::info!(
+                    run = self.run_label,
+                    role = self.role,
+                    segments = outcome.segments,
+                    sidecars = outcome.sidecars,
+                    bytes = outcome.bytes,
+                    horizon = self.prune_horizon,
+                    "archive-then-prune reclaimed local journal bytes"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    run = self.run_label,
+                    error = %e,
+                    "archive-then-prune pass failed; local bytes retained"
+                );
             }
         }
     }

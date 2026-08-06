@@ -150,6 +150,7 @@ fn service(config: VhcConfig, worker: Arc<FakeWorker>, feed: Option<NodeFeed>) -
         budget: None,
         worker_factory: None,
         identity_dir: None,
+        run_dir: None,
         seat_directory: None,
     })
 }
@@ -193,6 +194,7 @@ async fn join_persists_and_reload_reconverges() {
             budget: None,
             worker_factory: None,
             identity_dir: None,
+            run_dir: None,
             seat_directory: None,
         });
         svc.vhc_join("run-a".into(), policy(), "op-a".into())
@@ -221,6 +223,7 @@ async fn join_persists_and_reload_reconverges() {
             budget: None,
             worker_factory: None,
             identity_dir: None,
+            run_dir: None,
             seat_directory: None,
         });
         let rejoined = svc.start().await.unwrap();
@@ -492,6 +495,7 @@ async fn join_discovers_fetches_envelope_and_assesses() {
         budget: None,
         worker_factory: None,
         identity_dir: None,
+        run_dir: None,
         seat_directory: None,
     });
 
@@ -551,6 +555,7 @@ async fn join_refuses_a_coordinator_outside_the_allowlist() {
         budget: None,
         worker_factory: None,
         identity_dir: None,
+        run_dir: None,
         seat_directory: None,
     });
 
@@ -712,6 +717,7 @@ async fn join_refuses_a_checkpoint_too_stale_for_the_retained_horizon() {
         budget: None,
         worker_factory: None,
         identity_dir: None,
+        run_dir: None,
         seat_directory: None,
     });
     let err = svc
@@ -738,6 +744,7 @@ async fn join_refuses_a_checkpoint_too_stale_for_the_retained_horizon() {
         budget: None,
         worker_factory: None,
         identity_dir: None,
+        run_dir: None,
         seat_directory: None,
     });
     svc.vhc_join("run-fresh".into(), policy(), "op".into())
@@ -947,6 +954,7 @@ async fn join_refuses_a_trainer_stale_against_the_verified_archive_head() {
         budget: None,
         worker_factory: None,
         identity_dir: None,
+        run_dir: None,
         seat_directory: None,
     });
     let err = svc
@@ -979,6 +987,7 @@ async fn join_refuses_a_trainer_stale_against_the_verified_archive_head() {
         budget: None,
         worker_factory: None,
         identity_dir: None,
+        run_dir: None,
         seat_directory: None,
     });
     svc.vhc_join("run-archive-fresh".into(), policy(), "op".into())
@@ -1014,6 +1023,7 @@ async fn join_refuses_conflicting_archive_heads_typed() {
         budget: None,
         worker_factory: None,
         identity_dir: None,
+        run_dir: None,
         seat_directory: None,
     });
     let err = svc
