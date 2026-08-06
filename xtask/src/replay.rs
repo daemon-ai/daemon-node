@@ -8,11 +8,17 @@
 //! verdict:
 //!
 //! 1. **Consensus re-derivation (sandboxed).** The pinned coordinator module is driven inside the
-//!    real host sandbox ([`SandboxedCoordinator`]) — consensus NEVER runs natively — over the
-//!    archived driving inputs recovered from the sealed record segments; every archived
-//!    `RoundRecord` must re-derive byte-identically, and every committed digest must recompute from
-//!    the content-addressed payloads alone ([`replay_consensus_from_archive`], which internally runs
-//!    the input-replay oracle `replay_from_state` and the payload/set-commitment re-verification).
+//!    real host sandbox — consensus NEVER runs natively — over the archived driving inputs
+//!    recovered from the sealed record segments; every archived `RoundRecord` must re-derive
+//!    byte-identically, and every committed digest must recompute from the content-addressed
+//!    payloads alone. The lane is picked by the journal's form
+//!    ([`records_are_wire_form`]): a PRODUCTION archive carries the session's §12.1 wire frames
+//!    and is re-driven through the host replay engine (`daemon_vhc_host::run::replay`) from the
+//!    recorded event stream — an archive holds the sealed prefix of a possibly-live run, so a
+//!    replay that consumes every recorded event and stops (`ScriptExhausted`) is as green as a
+//!    recorded terminal outcome, provided every published decision was reproduced; a HARNESS
+//!    archive records SDK types directly and replays through
+//!    [`replay_consensus_from_verified_archive`] ([`SandboxedCoordinator`]).
 //! 2. **Per-peer digest agreement.** Each peer's recorded per-round det-state digest is compared
 //!    across peers; a round where any peer's digest differs from the round quorum is a disagreement,
 //!    and the earliest such round is the first divergence.
@@ -50,10 +56,15 @@ use anyhow::{bail, Context, Result};
 use serde::Serialize;
 
 use daemon_vhc_observe::journal::archive::{ChainHead, RecordArchive};
+use daemon_vhc_observe::journal::verifier::{
+    run_replay, ExpectedDecision, GuestUnderReplay, PayloadSource, ReplayOutcome, ReplayPlan,
+    ReplayStep,
+};
 use daemon_vhc_observe::{
-    coordinator_lineage, envelope_trusted_bases, replay_consensus_from_verified_archive,
-    verify_chains, AuthorityConfig, ConsensusReplayError, ReplayError, ReplicationPolicy,
-    RetentionPolicy,
+    coordinator_lineage, envelope_trusted_bases, extract_wire_capture, records_are_wire_form,
+    recover_chain_from_verified_heads, replay_consensus_from_verified_archive, verify_chains,
+    verify_committed_payloads, AuthorityConfig, Body, ConsensusReplayError, RecoveredChain,
+    ReplayError, ReplicationPolicy, RetentionPolicy,
 };
 use daemon_vhc_proto::archive::ArchiveHeadRecord;
 use daemon_vhc_proto::genesis::GenesisEnvelope;
@@ -182,7 +193,7 @@ fn verify_archive(args: &Args) -> Result<ReplayVerdict> {
         coord_hash.to_hex(),
         coord_artifact.blake3.to_hex()
     );
-    let sandbox = SandboxedCoordinator::new(coord_wasm);
+    let sandbox = SandboxedCoordinator::new(coord_wasm.clone());
 
     // -- the published archive-head records (ABI §8.8): authorize + select the lineage ----------
     let heads_bytes = std::fs::read(dir.join("heads.cbor"))
@@ -256,31 +267,35 @@ fn verify_archive(args: &Args) -> Result<ReplayVerdict> {
         payloads.insert(hash, bytes);
     }
 
-    // -- oracle mode: sandboxed consensus re-derivation + digest-from-payloads -------------------
-    let consensus =
-        match replay_consensus_from_verified_archive(&sandbox, &archive, &heads, &payloads) {
-            Ok(report) => ConsensusVerdict {
-                agree: true,
-                segments_verified: report.segments_verified,
-                records_recovered: report.records_recovered,
-                rounds_verified: report.replay.rounds_verified,
-                payload_entries_verified: report.payload_entries_verified,
-                first_divergence_round: None,
-                detail: None,
-            },
-            Err(e) => {
-                let round = divergence_round(&e);
-                ConsensusVerdict {
-                    agree: false,
-                    segments_verified: 0,
-                    records_recovered: 0,
-                    rounds_verified: 0,
-                    payload_entries_verified: 0,
-                    first_divergence_round: round,
-                    detail: Some(e.to_string()),
-                }
+    // -- oracle mode: consensus re-verification, through the journal form the chain carries ------
+    //
+    // HARNESS-form archives (SDK types journaled directly, event-driven clock) re-derive through
+    // the frames-only sandboxed consensus oracle. PRODUCTION archives journal the §12.1 wire
+    // forms and the FULL delivered-event stream (wall-clock timer ticks + completion order are
+    // recorded nondeterministic inputs), so they re-verify through the §8.7 worker input-replay
+    // engine: the pinned module is re-driven from the recorded events with `payload_get` answered
+    // from the archive's content-addressed payload set, every recorded publish must reproduce
+    // bit-exactly, and every committed digest must recompute from the payloads alone.
+    let consensus = match recover_chain_from_verified_heads(&archive, &heads) {
+        Ok(chain) if records_are_wire_form(&chain.records) => {
+            wire_consensus_verdict(&coord_wasm, &chain, &payloads)
+        }
+        Ok(_) => {
+            match replay_consensus_from_verified_archive(&sandbox, &archive, &heads, &payloads) {
+                Ok(report) => ConsensusVerdict {
+                    agree: true,
+                    segments_verified: report.segments_verified,
+                    records_recovered: report.records_recovered,
+                    rounds_verified: report.replay.rounds_verified,
+                    payload_entries_verified: report.payload_entries_verified,
+                    first_divergence_round: None,
+                    detail: None,
+                },
+                Err(e) => red_verdict(divergence_round(&e), e.to_string()),
             }
-        };
+        }
+        Err(e) => red_verdict(divergence_round(&e), e.to_string()),
+    };
 
     // -- oracle mode: per-peer digest agreement (the G-2 transcript) -----------------------------
     let per_peer = per_peer_verdict(dir)?;
@@ -302,6 +317,219 @@ fn divergence_round(e: &ConsensusReplayError) -> Option<u64> {
         | ConsensusReplayError::SetCommitmentMismatch { round } => Some(*round),
         ConsensusReplayError::Replay(ReplayError::Diverged(d)) => Some(d.round),
         _ => None,
+    }
+}
+
+/// A red consensus verdict carrying its typed reason.
+fn red_verdict(first_divergence_round: Option<u64>, detail: String) -> ConsensusVerdict {
+    ConsensusVerdict {
+        agree: false,
+        segments_verified: 0,
+        records_recovered: 0,
+        rounds_verified: 0,
+        payload_entries_verified: 0,
+        first_divergence_round,
+        detail: Some(detail),
+    }
+}
+
+/// The PRODUCTION-archive consensus verdict: §8.7 input replay of the coordinator chain
+/// (bit-exact decision reproduction) + digest-from-payloads re-verification of every published
+/// `RoundRecord`.
+fn wire_consensus_verdict(
+    coord_wasm: &[u8],
+    chain: &RecoveredChain,
+    payloads: &BTreeMap<Hash, Vec<u8>>,
+) -> ConsensusVerdict {
+    match wire_input_replay(coord_wasm, chain, payloads) {
+        Ok((rounds_verified, payload_entries_verified)) => ConsensusVerdict {
+            agree: true,
+            segments_verified: chain.segments_verified,
+            records_recovered: chain.records.len() as u64,
+            rounds_verified,
+            payload_entries_verified,
+            first_divergence_round: None,
+            detail: None,
+        },
+        Err(e) => red_verdict(None, e.to_string()),
+    }
+}
+
+/// Re-drive the archived coordinator journal through the §8.7 input-replay engine and re-verify
+/// the committed digests from the payloads. Returns `(round records verified, payload entries
+/// verified)`.
+fn wire_input_replay(
+    coord_wasm: &[u8],
+    chain: &RecoveredChain,
+    payloads: &BTreeMap<Hash, Vec<u8>>,
+) -> Result<(u64, u64)> {
+    use daemon_vhc_host::run::{replay, ReplayEnd, ReplayScript, RunIdentity};
+    use daemon_vhc_host::{EngineConfig, Worker};
+
+    let capture = extract_wire_capture(&chain.records);
+    let header = capture
+        .header
+        .as_ref()
+        .context("production journal carries no tag-0 run header")?;
+    anyhow::ensure!(
+        header.module.0 == *blake3::hash(coord_wasm).as_bytes(),
+        "the journal's recorded module {} is not the genesis-pinned coordinator",
+        header.module.to_hex()
+    );
+
+    // -- the replay script: the recorded nondeterministic inputs, split by answering mechanism --
+    let mut script = ReplayScript::default();
+    for record in &chain.records {
+        match &record.body {
+            Body::Event(e) => script.events.push_back((e.at, e.frame.clone())),
+            Body::ReadBack(r) => {
+                anyhow::ensure!(
+                    r.sidecar.is_none(),
+                    "record {}: sidecar-referenced read-back values are not supported by the \
+                     archive replay (no sidecar key material rides a product archive)",
+                    record.ord
+                );
+                let value = r.value.clone().unwrap_or_default();
+                if r.kind >= 128 {
+                    // The retired bridge's reserved journal kinds: never re-fed.
+                } else if r.kind == u64::from(daemon_vhc_abi::READBACK_KIND_STREAM_BYTES) {
+                    script.stream_bytes.push_back((r.src, value));
+                } else if r.kind == u64::from(daemon_vhc_abi::READBACK_KIND_TENSOR_EXPORT) {
+                    script.tensor_exports.push_back((r.src, value));
+                } else if r.kind == u64::from(daemon_vhc_abi::READBACK_KIND_STATE_SEAL) {
+                    script.state_seals.push_back((r.src, value));
+                } else {
+                    script.readbacks.push_back((r.src, r.kind, value));
+                }
+            }
+            Body::Clock(c) => script.clocks.push_back(c.now),
+            Body::TimerArm(t) => script.timer_arms.push_back((t.id, t.delay)),
+            Body::TimerCancel(t) => script.timer_cancels.push_back((t.id, t.status)),
+            Body::DeviceProfile(d) => script.device_profiles.push_back(d.profile.clone()),
+            _ => {}
+        }
+    }
+    script.identity = Some(RunIdentity {
+        run_id: header.run_id.0,
+        epoch: header.epoch,
+        role: header.role.clone(),
+        instance: header.instance,
+        module: header.module.0,
+    });
+    // The §8.7 content-addressed re-fetch table: `payload_get` completions materialize their
+    // buffers from the archive's payload objects.
+    script.payloads = payloads.iter().map(|(h, b)| (h.0, b.clone())).collect();
+    // The archive carries the SEALED prefix only (never a live unsealed tail), so the recorded
+    // stream legitimately ends before the guest does — a prefix replay, not a divergence.
+    script.stop_at_exhaustion = true;
+
+    // -- re-drive the module; the journal's own publishes are the oracle -------------------------
+    let worker =
+        Worker::new(EngineConfig::default()).map_err(|e| anyhow::anyhow!("engine: {e}"))?;
+    let replayed = replay(&worker, coord_wasm, &header.config, &header.grants, script)
+        .map_err(|e| anyhow::anyhow!("input replay: {e}"))?;
+    match &replayed.end {
+        // A recorded outcome (the run terminated inside the archived prefix) or the clean end of
+        // a prefix replay (the archive stops at its last sealed segment) both close the drive;
+        // everything else is a real finding.
+        ReplayEnd::Outcome(_) | ReplayEnd::ScriptExhausted => {}
+        other => bail!("the replayed coordinator did not reach a recorded outcome: {other:?}"),
+    }
+    let plan = ReplayPlan::from_records(&chain.records);
+    let mut guest = ReplayedDecisions::new(&replayed, &plan);
+    match run_replay(&plan, &mut guest, &NoSidecars) {
+        ReplayOutcome::Pass { .. } => {}
+        other => bail!("input replay decision verdict: {other:?}"),
+    }
+
+    // -- digests from payloads alone: every committed entry + every set commitment ---------------
+    let rounds = capture.round_records();
+    let (payload_entries_verified, _) = verify_committed_payloads(rounds.iter().copied(), payloads)
+        .map_err(|e| anyhow::anyhow!("digest re-verification: {e}"))?;
+    Ok((rounds.len() as u64, payload_entries_verified))
+}
+
+/// The §8.7 `GuestUnderReplay` seam over the host replay's slice-attributed decisions: the run
+/// already happened synchronously (`replay` — a replay can never block, every input is in the
+/// journal), so delivery here walks the per-slice groups in recorded order. Ordinals are clerical
+/// (journal bookkeeping the replay cannot know); decisions carry the recorded ord so equality
+/// judges the substance: channel, seq, payload hash.
+struct ReplayedDecisions {
+    per_event: Vec<Vec<(u64, u64, [u8; 32])>>, // (channel, seq, payload_hash) per slice
+    next_event: usize,
+    expected_ords: Vec<u64>,
+    next_ord: usize,
+}
+
+impl ReplayedDecisions {
+    fn new(run: &daemon_vhc_host::run::ReplayedRun, plan: &ReplayPlan) -> Self {
+        let mut per_event = vec![Vec::new(); run.events_delivered];
+        for d in &run.decisions {
+            per_event[d.event_index.min(run.events_delivered.saturating_sub(1))].push((
+                d.channel,
+                d.seq,
+                d.payload_hash,
+            ));
+        }
+        let expected_ords = plan
+            .expected
+            .iter()
+            .map(|e| match e {
+                ExpectedDecision::Publish { ord, .. } => *ord,
+                _ => 0, // non_exhaustive: future decision kinds carry their own ords
+            })
+            .collect();
+        Self {
+            per_event,
+            next_event: 0,
+            expected_ords,
+            next_ord: 0,
+        }
+    }
+}
+
+impl GuestUnderReplay for ReplayedDecisions {
+    fn deliver_event(&mut self, _ord: u64, _at: u64, _frame: &[u8]) -> Vec<ExpectedDecision> {
+        let group = self
+            .per_event
+            .get(self.next_event)
+            .cloned()
+            .unwrap_or_default();
+        self.next_event += 1;
+        group
+            .into_iter()
+            .map(|(channel, seq, hash)| {
+                let ord = self
+                    .expected_ords
+                    .get(self.next_ord)
+                    .copied()
+                    .unwrap_or_default();
+                self.next_ord += 1;
+                ExpectedDecision::Publish {
+                    ord,
+                    channel,
+                    seq,
+                    hash: Hash(hash),
+                }
+            })
+            .collect()
+    }
+
+    fn supply_import(&mut self, _step: &ReplayStep) {
+        // Inputs were consumed by the synchronous host replay from the same journal.
+    }
+}
+
+/// Product archives carry no sidecar key material; an oversize read-back would have been refused
+/// while building the script, so a sidecar fetch here would itself be a finding.
+struct NoSidecars;
+impl PayloadSource for NoSidecars {
+    fn fetch(
+        &self,
+        _sref: &daemon_vhc_observe::journal::record::SidecarRef,
+        _ord: u64,
+    ) -> Option<Vec<u8>> {
+        None
     }
 }
 

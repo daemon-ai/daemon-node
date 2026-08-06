@@ -93,6 +93,12 @@ pub struct ReplayScript {
     /// when the run had no state contract; a replayed guest calling `state_open` then traps
     /// exactly as the recording did.
     pub state_chunk_size: u64,
+    /// Treat the recorded event stream's exhaustion as the replay's END ([`ReplayEnd::ScriptExhausted`])
+    /// instead of a divergence. A COMPLETE journal ends with the guest's own terminal (a pull past
+    /// the script is a genuine divergence — the default); an ARCHIVED PREFIX of a still-running
+    /// run (the §8.8 sealed-segment archive never carries the live unsealed tail) legitimately
+    /// ends mid-stream, and the verdict covers every recorded decision up to that point.
+    pub stop_at_exhaustion: bool,
 }
 
 impl ReplayScript {
@@ -164,6 +170,9 @@ pub enum ReplayEnd {
     Diverged(String),
     /// The guest trapped for a non-divergence reason (wasm fault, missing export, …).
     Trapped(String),
+    /// The recorded event stream ended before the guest did — the clean end of a PREFIX replay
+    /// (only produced under [`ReplayScript::stop_at_exhaustion`]).
+    ScriptExhausted,
 }
 
 /// The observable product of a replayed run.
@@ -250,6 +259,9 @@ fn hex8(hash: &[u8; 32]) -> String {
 }
 
 const DIVERGENCE_MARKER: &str = "replay divergence: ";
+/// The `stop_at_exhaustion` unwind marker: the guest pulled past the recorded stream and the
+/// script says that is the clean end of a prefix replay, not a divergence.
+const EXHAUSTION_MARKER: &str = "replay script exhausted (prefix end)";
 
 fn mem_of(caller: &mut Caller<'_, ReplayHost>) -> Result<Memory, wasmtime::Error> {
     caller
@@ -311,7 +323,13 @@ fn dispatch(
             let frame = match host.pending_event.take() {
                 Some(f) => f,
                 None => host.script.events.pop_front().ok_or_else(|| {
-                    diverged("guest pulled an event beyond the recorded stream (tag 1 exhausted)")
+                    if host.script.stop_at_exhaustion {
+                        wasmtime::Error::msg(EXHAUSTION_MARKER)
+                    } else {
+                        diverged(
+                            "guest pulled an event beyond the recorded stream (tag 1 exhausted)",
+                        )
+                    }
                 })?,
             };
             if deliver_span(caller, &frame.1.clone(), ptr, cap, results)? {
@@ -1203,6 +1221,9 @@ pub fn replay_migrating(
     };
     let classify = |e: &wasmtime::Error| -> ReplayEnd {
         let msg = format!("{e:#}");
+        if msg.contains(EXHAUSTION_MARKER) {
+            return ReplayEnd::ScriptExhausted;
+        }
         match msg.find(DIVERGENCE_MARKER) {
             Some(i) => ReplayEnd::Diverged(msg[i + DIVERGENCE_MARKER.len()..].to_string()),
             None => ReplayEnd::Trapped(msg),

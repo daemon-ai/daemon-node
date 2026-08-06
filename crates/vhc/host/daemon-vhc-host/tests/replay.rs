@@ -312,3 +312,60 @@ fn missing_recorded_input_is_a_replay_divergence() {
         other => panic!("expected Diverged, got {other:?}"),
     }
 }
+
+/// Truncate a recorded journal right after its last publish — the shape of a PRODUCT archive,
+/// which carries the sealed prefix of a still-running run and never the live unsealed tail.
+fn truncate_after_last_publish(entries: &[SinkEntry]) -> Vec<SinkEntry> {
+    let last_publish = entries
+        .iter()
+        .rposition(|e| matches!(e, SinkEntry::Publish { .. }))
+        .expect("a publish was recorded");
+    assert!(
+        last_publish + 1 < entries.len(),
+        "records exist past the last publish (the guest kept running)"
+    );
+    entries[..=last_publish].to_vec()
+}
+
+/// A prefix replay (`stop_at_exhaustion`) of an archived, still-running run ends
+/// [`ReplayEnd::ScriptExhausted`] — a clean end, with every decision recorded before the cut
+/// reproduced bit-for-bit. The §8.8 archive-verdict semantics: sealed segments never carry the
+/// live tail, so exhausting the recorded stream is the verdict boundary, not a divergence.
+#[test]
+fn prefix_replay_of_a_truncated_journal_ends_script_exhausted_with_all_decisions() {
+    let wasm = guest("toy_averager");
+    let (entries, _) = record(&wasm, vec![3u8], 6, 3, |_| {});
+    let prefix = truncate_after_last_publish(&entries);
+
+    let worker = Worker::new(EngineConfig::default()).expect("engine");
+    let mut script = ReplayScript::from_entries(&prefix);
+    script.identity = Some(identity_for(&wasm, 6));
+    script.stop_at_exhaustion = true;
+    let replayed = replay(&worker, &wasm, &[3u8], &[], script).expect("replay harness");
+    assert_eq!(replayed.end, ReplayEnd::ScriptExhausted);
+
+    let plan = ReplayPlan::from_records(&to_records(&prefix));
+    let mut guest = ReplayedDecisions::new(&replayed, &plan);
+    match run_replay(&plan, &mut guest, &NoSidecars) {
+        ReplayOutcome::Pass { decisions } => assert_eq!(decisions, 3),
+        other => panic!("expected Pass, got {other:?}"),
+    }
+}
+
+/// The same truncated journal WITHOUT `stop_at_exhaustion` stays a typed divergence: a COMPLETE
+/// journal's guest ends itself, so a pull past the stream is a genuine finding by default.
+#[test]
+fn a_truncated_journal_without_the_prefix_flag_is_still_a_divergence() {
+    let wasm = guest("toy_averager");
+    let (entries, _) = record(&wasm, vec![3u8], 7, 3, |_| {});
+    let prefix = truncate_after_last_publish(&entries);
+
+    let worker = Worker::new(EngineConfig::default()).expect("engine");
+    let mut script = ReplayScript::from_entries(&prefix);
+    script.identity = Some(identity_for(&wasm, 7));
+    let replayed = replay(&worker, &wasm, &[3u8], &[], script).expect("replay harness");
+    match replayed.end {
+        ReplayEnd::Diverged(msg) => assert!(msg.contains("tag 1 exhausted"), "{msg}"),
+        other => panic!("expected Diverged, got {other:?}"),
+    }
+}

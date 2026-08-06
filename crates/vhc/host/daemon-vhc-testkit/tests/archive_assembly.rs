@@ -331,8 +331,30 @@ fn product_archive_assembles_and_replays_green() {
         rt.block_on(content_store.get_content(hash))
             .map_err(|e| e.to_string())
     };
-    let report = assemble_archive(&out, frozen.bytes(), published, &mut fetch)
-        .expect("assembly verifies + writes the layout");
+    // The registry serves the SIGNED wire form (`SignedEnvelope { bytes, signature, signer }`);
+    // the assembler must verify + unwrap it to the frozen inner bytes (the c15d pull failed
+    // exactly here — the wire form was decoded directly as the inner envelope). Assemble from
+    // the wire form (the production shape), then re-assemble from the bare inner bytes into a
+    // second layout and hold both reports to the same verdict (the back-compat seam).
+    let wire = to_canonical_vec(&daemon_vhc_proto::SignedEnvelope {
+        bytes: frozen.bytes().to_vec(),
+        signature: *frozen.signature(),
+        signer: *frozen.signer(),
+    })
+    .expect("encode signed envelope wire");
+    let report = assemble_archive(&out, &wire, published.clone(), &mut fetch)
+        .expect("assembly verifies + writes the layout from the signed wire form");
+    let inner_out = tempdir();
+    let inner_report = assemble_archive(&inner_out, frozen.bytes(), published, &mut fetch)
+        .expect("assembly verifies + writes the layout from the bare inner bytes");
+    assert_eq!(inner_report.run_id, report.run_id);
+    assert_eq!(inner_report.chains_verified, report.chains_verified);
+    assert_eq!(inner_report.payloads_written, report.payloads_written);
+    assert_eq!(
+        std::fs::read(out.join("envelope.cbor")).expect("wire-form layout envelope"),
+        frozen.bytes(),
+        "the layout carries the frozen INNER bytes whichever form arrived"
+    );
     assert_eq!(report.run_id, run_id);
     assert_eq!(report.chains_verified, 1);
     assert_eq!(report.coordinator_lineage, vec![0]);

@@ -33,14 +33,14 @@
 use std::collections::BTreeMap;
 
 use daemon_vhc_proto::{blake3_hash, commit_set, from_canonical_slice, Hash, PeerId};
-use daemon_vhc_sdk_consensus::messages::{SignedMessage, VhcMessage};
+use daemon_vhc_sdk_consensus::messages::{RoundRecord, SignedMessage, VhcMessage};
 
 use daemon_vhc_sdk_consensus::coordinator::{CoordinatorState, Input};
 
 use crate::replay::{replay_from_state, CoordinatorSandbox, ReplayError, ReplayReport};
 
 use super::archive::{AttestedHead, RecordArchive};
-use super::record::{Body, Record};
+use super::record::{Body, Record, RunHeader};
 use super::segment::scan_bytes;
 
 /// A successful consensus replay: everything a third party re-verified from archive + payloads.
@@ -184,6 +184,160 @@ pub fn extract_consensus_capture(
         inputs,
         published,
     })
+}
+
+/// One authoritative wire frame (a tag-12 record) with its inner [`VhcMessage`] decoded — a
+/// PRODUCTION journal's driving input (the live relay verified the signature above the pump
+/// before journaling; the segment carrying it is head-attested — reader-side re-verification
+/// rides the chain walk, not per-frame signatures).
+#[derive(Clone, Debug)]
+pub struct WireFrame {
+    /// The channel the frame arrived on.
+    pub channel: u64,
+    /// The per-sender sequence number.
+    pub seq: u64,
+    /// The frame sender identity.
+    pub sender: PeerId,
+    /// The decoded module-authored payload.
+    pub message: VhcMessage,
+}
+
+/// One published decision (a tag-4 record) with its inner [`VhcMessage`] decoded.
+#[derive(Clone, Debug)]
+pub struct WirePublish {
+    /// The channel published on.
+    pub channel: u64,
+    /// The durable channel-scoped sequence number.
+    pub seq: u64,
+    /// blake3 of the guest payload bytes.
+    pub hash: Hash,
+    /// The decoded published payload.
+    pub message: VhcMessage,
+}
+
+/// A PRODUCTION (§8.3 wire-form) record stream's consensus projection: the tag-0 run header, the
+/// tag-12 authoritative frames, and the tag-4 published decisions — each wire frame's inner
+/// `VhcMessage` decoded structurally from the §12.1 `[envelope, payload, sig]` form.
+///
+/// The harness-form counterpart is [`ConsensusCapture`] ([`extract_consensus_capture`]): harness
+/// journals record SDK types directly, production journals record the session wire forms. Use
+/// [`records_are_wire_form`] to pick.
+#[derive(Debug, Default)]
+pub struct WireCapture {
+    /// The tag-0 run header (identity + admitted config/grants bytes, verbatim), if present.
+    pub header: Option<Box<RunHeader>>,
+    /// The tag-12 authoritative frames whose payload decodes as a [`VhcMessage`], in record order.
+    pub frames: Vec<WireFrame>,
+    /// The tag-4 publishes whose payload decodes as a [`VhcMessage`], in record order.
+    pub published: Vec<WirePublish>,
+}
+
+impl WireCapture {
+    /// The published `RoundRecord`s, in publication order — the consensus decisions a verifier
+    /// re-checks (digest-from-payloads via [`verify_committed_payloads`]).
+    #[must_use]
+    pub fn round_records(&self) -> Vec<&RoundRecord> {
+        self.published
+            .iter()
+            .filter_map(|p| match &p.message {
+                VhcMessage::RoundRecord(r) => Some(r),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+/// Whether a recovered record stream is a PRODUCTION journal (wire form), judged structurally
+/// from its first frame-carrying record (tag-4 publish or inline tag-12 frame): the session
+/// writes §12.1 `[envelope, payload, sig]` CBOR *arrays*, while harness captures journal the SDK
+/// [`SignedMessage`] struct — a CBOR *map*. A stream with no frames yet (a bare prefix) falls
+/// back to the tag-0 run header, which only the production session writes unaccompanied.
+#[must_use]
+pub fn records_are_wire_form(records: &[Record]) -> bool {
+    let mut saw_header = false;
+    for record in records {
+        match &record.body {
+            Body::RunHeader(_) => saw_header = true,
+            Body::Publish(p) => return frame_is_wire_shaped(&p.frame),
+            Body::SignedFrame(sf) => {
+                if let Some(frame) = &sf.frame {
+                    return frame_is_wire_shaped(frame);
+                }
+            }
+            _ => {}
+        }
+    }
+    saw_header
+}
+
+/// Whether `frame` has the §12.1 signed wire SHAPE (`[envelope, payload, sig]` with byte-string
+/// payload) — independent of whether the payload decodes as a [`VhcMessage`].
+fn frame_is_wire_shaped(frame: &[u8]) -> bool {
+    let Ok(v) = ciborium::de::from_reader::<ciborium::value::Value, _>(frame) else {
+        return false;
+    };
+    let ciborium::value::Value::Array(parts) = v else {
+        return false;
+    };
+    matches!(parts.get(1), Some(ciborium::value::Value::Bytes(_)))
+}
+
+/// Project a PRODUCTION record stream into its [`WireCapture`]. A tag-12/tag-4 frame whose
+/// payload is not a decodable [`VhcMessage`] is skipped (structurally foreign evidence — the
+/// reconstruction path's discipline), never an error: the input-replay oracle re-feeds the raw
+/// event stream separately, so nothing is lost to this projection.
+#[must_use]
+pub fn extract_wire_capture(records: &[Record]) -> WireCapture {
+    let mut capture = WireCapture::default();
+    for record in records {
+        match &record.body {
+            Body::RunHeader(h) => {
+                if capture.header.is_none() {
+                    capture.header = Some(h.clone());
+                }
+            }
+            Body::SignedFrame(sf) => {
+                let Some(frame) = &sf.frame else {
+                    continue; // evidence-by-reference (Phase D) carries no inline bytes
+                };
+                let Some(message) = wire_frame_message(frame) else {
+                    continue;
+                };
+                capture.frames.push(WireFrame {
+                    channel: sf.channel,
+                    seq: sf.seq,
+                    sender: PeerId(sf.sender.0),
+                    message,
+                });
+            }
+            Body::Publish(p) => {
+                let Some(message) = wire_frame_message(&p.frame) else {
+                    continue;
+                };
+                capture.published.push(WirePublish {
+                    channel: p.channel,
+                    seq: p.seq,
+                    hash: p.hash,
+                    message,
+                });
+            }
+            _ => {}
+        }
+    }
+    capture
+}
+
+/// Decode a §12.1 signed wire frame's (`[envelope, payload, sig]`) inner payload as a
+/// [`VhcMessage`] — structural CBOR, never a round schema over the outer frame.
+fn wire_frame_message(frame: &[u8]) -> Option<VhcMessage> {
+    let v: ciborium::value::Value = ciborium::de::from_reader(frame).ok()?;
+    let ciborium::value::Value::Array(parts) = v else {
+        return None;
+    };
+    let ciborium::value::Value::Bytes(payload) = parts.into_iter().nth(1)? else {
+        return None;
+    };
+    from_canonical_slice::<VhcMessage>(&payload).ok()
 }
 
 /// What the archive chain walk recovered: the verified sealed-segment count and the §8.3 records
@@ -359,9 +513,36 @@ fn replay_consensus_over_chain(
     )?;
 
     // -- 4. digests from payloads alone: every committed entry + every set commitment ------------
+    let (payload_entries_verified, set_commitments_verified) =
+        verify_committed_payloads(replay.records.iter(), payloads)?;
+
+    Ok(ConsensusReplayReport {
+        segments_verified: count,
+        records_recovered,
+        replay,
+        payload_entries_verified,
+        set_commitments_verified,
+    })
+}
+
+/// The digest-from-payloads re-verification (step 4 of the module contract), over ANY source of
+/// round records — the sandboxed re-derivation above, or a production archive's published records
+/// after the input-replay oracle proved them bit-reproducible. Every committed `(peer, hash,
+/// size)` entry must re-verify against the supplied content-addressed bytes, and every record's
+/// set commitment must recompute from those pairs alone (§6.4 I3/I6).
+///
+/// Returns `(payload entries verified, set commitments verified)`.
+///
+/// # Errors
+/// The typed [`ConsensusReplayError::MissingPayload`] / [`ConsensusReplayError::PayloadMismatch`]
+/// / [`ConsensusReplayError::SetCommitmentMismatch`] — an incomplete verification is never a pass.
+pub fn verify_committed_payloads<'a>(
+    records: impl Iterator<Item = &'a RoundRecord>,
+    payloads: &BTreeMap<Hash, Vec<u8>>,
+) -> Result<(u64, u64), ConsensusReplayError> {
     let mut payload_entries_verified = 0u64;
     let mut set_commitments_verified = 0u64;
-    for record in &replay.records {
+    for record in records {
         let mut pairs: Vec<(PeerId, Hash)> = Vec::new();
         for entry in record.inline.iter().flatten() {
             let bytes = payloads
@@ -398,12 +579,190 @@ fn replay_consensus_over_chain(
         }
         set_commitments_verified += 1;
     }
+    Ok((payload_entries_verified, set_commitments_verified))
+}
 
-    Ok(ConsensusReplayReport {
-        segments_verified: count,
-        records_recovered,
-        replay,
-        payload_entries_verified,
-        set_commitments_verified,
-    })
+#[cfg(test)]
+mod tests {
+    use daemon_vhc_proto::{commit_set, to_canonical_vec, Hash, PeerId, Seed, StateDigest};
+    use daemon_vhc_sdk_consensus::messages::{Digest, Locator, RoundRecord, VhcMessage};
+
+    use super::super::record::{Body, EventRec, PublishRec, Record, RunHeader, SignedFrameRec};
+    use super::{extract_wire_capture, records_are_wire_form};
+
+    /// A §12.1 signed wire frame around a canonical `VhcMessage` payload: `[envelope, payload,
+    /// sig]` — the outer structure the session writes, with fixture envelope/signature bytes (the
+    /// capture never judges them; segment attestation carries the authenticity).
+    fn wire_frame(msg: &VhcMessage) -> Vec<u8> {
+        let payload = to_canonical_vec(msg).expect("encode payload");
+        let v = ciborium::value::Value::Array(vec![
+            ciborium::value::Value::Map(vec![(
+                ciborium::value::Value::Text("seq".into()),
+                ciborium::value::Value::Integer(1.into()),
+            )]),
+            ciborium::value::Value::Bytes(payload),
+            ciborium::value::Value::Bytes(vec![0u8; 64]),
+        ]);
+        let mut out = Vec::new();
+        ciborium::ser::into_writer(&v, &mut out).expect("encode frame");
+        out
+    }
+
+    fn fixture_header() -> Box<RunHeader> {
+        Box::new(RunHeader {
+            run_id: Hash([0xAA; 32]),
+            epoch: 0,
+            role: "coordinator".into(),
+            instance: 38,
+            module: Hash([0xC0; 32]),
+            abi: 2 << 16,
+            worlds: std::collections::BTreeMap::new(),
+            bridge: false,
+            manifest: Vec::new(),
+            config: vec![0x01],
+            grants: vec![0x02],
+            claim: None,
+            resource_plan: None,
+            resource_plan_hash: None,
+            physical_estimate: None,
+            physical_estimate_hash: None,
+            aggregate_estimate: None,
+            aggregate_estimate_hash: None,
+            execution_grant: None,
+            execution_grant_hash: None,
+            channels: Vec::new(),
+            device: Vec::new(),
+            format: 1,
+        })
+    }
+
+    /// The wire-form judgment is STRUCTURAL — the first frame-carrying record's CBOR shape — so
+    /// a harness journal that also writes a run header (the archive-assembly fixture does) is
+    /// still judged harness; only a frameless prefix falls back to the header.
+    #[test]
+    fn wire_form_is_judged_by_frame_shape_not_the_run_header() {
+        let digest = VhcMessage::Digest(Digest {
+            round: 1,
+            digest: StateDigest([0xD1; 16]),
+        });
+        // Harness form: header + a tag-4 whose frame is the SDK SignedMessage (a CBOR map).
+        let mut map = Vec::new();
+        ciborium::ser::into_writer(
+            &ciborium::value::Value::Map(vec![(
+                ciborium::value::Value::Text("version".into()),
+                ciborium::value::Value::Integer(1.into()),
+            )]),
+            &mut map,
+        )
+        .expect("encode map frame");
+        let harness = [
+            Record::new(0, Body::RunHeader(fixture_header())),
+            Record::new(
+                1,
+                Body::Publish(PublishRec {
+                    channel: 0,
+                    seq: 0,
+                    hash: Hash([0x44; 32]),
+                    frame: map,
+                }),
+            ),
+        ];
+        assert!(!records_are_wire_form(&harness));
+
+        // Production form: the same stream with a §12.1 `[envelope, payload, sig]` frame.
+        let production = [
+            Record::new(0, Body::RunHeader(fixture_header())),
+            Record::new(
+                1,
+                Body::Publish(PublishRec {
+                    channel: 0,
+                    seq: 0,
+                    hash: Hash([0x44; 32]),
+                    frame: wire_frame(&digest),
+                }),
+            ),
+        ];
+        assert!(records_are_wire_form(&production));
+
+        // A frameless prefix: only the header can testify.
+        let prefix = [Record::new(0, Body::RunHeader(fixture_header()))];
+        assert!(records_are_wire_form(&prefix));
+        let empty: [Record; 0] = [];
+        assert!(!records_are_wire_form(&empty));
+        let events_only = [Record::new(
+            0,
+            Body::Event(EventRec {
+                at: 0,
+                frame: vec![0x82, 0x00, 0x00],
+            }),
+        )];
+        assert!(!records_are_wire_form(&events_only));
+    }
+
+    /// The wire capture decodes tag-12 frames and tag-4 publishes through the `[envelope,
+    /// payload, sig]` structure, keeps the header, skips structurally foreign frames, and
+    /// projects the published `RoundRecord`s.
+    #[test]
+    fn wire_capture_decodes_frames_and_publishes_and_skips_foreign_bytes() {
+        let peer = PeerId([0x11; 32]);
+        let digest = VhcMessage::Digest(Digest {
+            round: 3,
+            digest: StateDigest([0xD1; 16]),
+        });
+        let record_msg = VhcMessage::RoundRecord(RoundRecord {
+            round: 3,
+            set: commit_set(&[]).commitment(),
+            drops: Vec::new(),
+            next_seed: Seed([0x5E; 32]),
+            set_locator: Locator::StoreKey("record-set".into()),
+            inline: Some(Vec::new()),
+        });
+        let records = [
+            Record::new(0, Body::RunHeader(fixture_header())),
+            Record::new(
+                1,
+                Body::SignedFrame(SignedFrameRec {
+                    channel: 0,
+                    seq: 7,
+                    sender: Hash(peer.0),
+                    frame: Some(wire_frame(&digest)),
+                    evidence: None,
+                }),
+            ),
+            // Structurally foreign evidence: never a capture input, never an error.
+            Record::new(
+                2,
+                Body::SignedFrame(SignedFrameRec {
+                    channel: 0,
+                    seq: 8,
+                    sender: Hash(peer.0),
+                    frame: Some(vec![0xFF, 0x00]),
+                    evidence: None,
+                }),
+            ),
+            Record::new(
+                3,
+                Body::Publish(PublishRec {
+                    channel: 0,
+                    seq: 0,
+                    hash: Hash([0x44; 32]),
+                    frame: wire_frame(&record_msg),
+                }),
+            ),
+        ];
+
+        let capture = extract_wire_capture(&records);
+        let header = capture.header.as_ref().expect("header kept");
+        assert_eq!(
+            (header.instance, header.config.as_slice()),
+            (38, &[0x01][..])
+        );
+        assert_eq!(capture.frames.len(), 1, "the foreign frame is skipped");
+        assert_eq!((capture.frames[0].sender, capture.frames[0].seq), (peer, 7));
+        assert!(matches!(capture.frames[0].message, VhcMessage::Digest(d) if d.round == 3));
+        assert_eq!(capture.published.len(), 1);
+        let rounds = capture.round_records();
+        assert_eq!(rounds.len(), 1);
+        assert_eq!(rounds[0].round, 3);
+    }
 }

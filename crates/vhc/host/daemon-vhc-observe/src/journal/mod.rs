@@ -38,9 +38,11 @@ pub use assemble::{
     AssembleReport, VerifiedChain,
 };
 pub use consensus::{
-    extract_consensus_capture, recover_chain_from_archive, recover_chain_from_verified_heads,
-    replay_consensus_from_archive, replay_consensus_from_verified_archive, ConsensusCapture,
-    ConsensusReplayError, ConsensusReplayReport, RecoveredChain,
+    extract_consensus_capture, extract_wire_capture, records_are_wire_form,
+    recover_chain_from_archive, recover_chain_from_verified_heads, replay_consensus_from_archive,
+    replay_consensus_from_verified_archive, verify_committed_payloads, ConsensusCapture,
+    ConsensusReplayError, ConsensusReplayReport, RecoveredChain, WireCapture, WireFrame,
+    WirePublish,
 };
 pub use daemon_vhc_journal::{
     format_version, scan_bytes, scan_file, Body, ExecIdentity, Journal, JournalError, JournalPaths,

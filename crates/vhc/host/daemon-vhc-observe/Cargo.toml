@@ -34,6 +34,10 @@ daemon-vhc-journal = { workspace = true }
 # The journal framing constants + `JOURNAL_CDDL` the grammar-conformance suite validates against.
 daemon-vhc-abi = { workspace = true }
 serde = { workspace = true }
+# Structural decoding of the §12.1 signed wire frames a PRODUCTION journal records (tag-12/tag-4:
+# `[envelope, payload, sig]`) — the wire-form capture extracts the inner `VhcMessage` payload
+# without ever giving the outer frame a schema (the reconstruction path's discipline).
+ciborium = { workspace = true }
 # Node-side tool: observe uses std freely (std::io message-log framing) and follows its scaffold's
 # `thiserror` errors. It is NOT on the wasm32 substrate path (proto + coordinator stay wasm-clean).
 thiserror = { workspace = true }
@@ -42,8 +46,6 @@ thiserror = { workspace = true }
 # Journal grammar conformance: encode each record and validate it against `daemon_vhc_abi::JOURNAL_CDDL`
 # under the same validator + exact pin the proto/daemon-api conformance suites use.
 cddl-cat = "=0.7.1"
-# The grammar suite hand-builds CBOR value trees to probe encode/decode edges.
-ciborium = { workspace = true }
 # The replay-oracle tests re-derive consensus inside the real `coordinator-quorum` module through
 # the session crate's `SandboxedCoordinator` (consensus never runs natively, even in these
 # tests). A dev-only edge; session depends on observe normally, so this is a dev-dependency cycle

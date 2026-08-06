@@ -39,8 +39,10 @@ use std::io::Write as _;
 use std::path::Path;
 
 use daemon_vhc_proto::archive::ArchiveHeadRecord;
-use daemon_vhc_proto::genesis::GenesisEnvelope;
-use daemon_vhc_proto::{blake3_hash, from_canonical_slice, to_canonical_vec, Hash, PeerId};
+use daemon_vhc_proto::genesis::{FrozenGenesis, GenesisEnvelope};
+use daemon_vhc_proto::{
+    blake3_hash, from_canonical_slice, to_canonical_vec, Hash, PeerId, SignedEnvelope,
+};
 
 // The reader-side chain verification moved to the wire-contract crate (the node's join
 // transaction makes the same judgment without linking this oracle crate); re-exported here so
@@ -51,7 +53,7 @@ pub use daemon_vhc_proto::archive::{
 use daemon_vhc_sdk_consensus::coordinator::Input;
 use daemon_vhc_sdk_consensus::messages::VhcMessage;
 
-use super::consensus::extract_consensus_capture;
+use super::consensus::{extract_consensus_capture, extract_wire_capture, records_are_wire_form};
 use super::record::{Body, Record};
 use super::segment::scan_bytes;
 
@@ -137,6 +139,19 @@ pub fn assemble_archive(
     fetch: &mut ContentFetch<'_>,
 ) -> Result<AssembleReport, AssembleError> {
     // -- the envelope: run id, trusted bases, the pinned coordinator module ----------------------
+    // The registry serves the SIGNED wire form (`SignedEnvelope { bytes, signature, signer }` —
+    // the same object the node's assess path decodes), while the §3.4 layout and the RunId are
+    // defined over the frozen INNER bytes. Unwrap-and-verify the wire form when that is what
+    // arrived (author signature + envelope validation via `FrozenGenesis::open`); accept the
+    // bare inner bytes unchanged (fixtures, pre-registry archives).
+    let inner_bytes: Vec<u8> = match from_canonical_slice::<SignedEnvelope>(envelope_bytes) {
+        Ok(signed) => FrozenGenesis::open(signed.bytes, signed.signature, signed.signer)
+            .map_err(|e| AssembleError::Envelope(format!("signed wire form: {e}")))?
+            .bytes()
+            .to_vec(),
+        Err(_) => envelope_bytes.to_vec(),
+    };
+    let envelope_bytes = inner_bytes.as_slice();
     let envelope: GenesisEnvelope =
         from_canonical_slice(envelope_bytes).map_err(|e| AssembleError::Envelope(e.to_string()))?;
     let run_id = blake3_hash(envelope_bytes);
@@ -229,15 +244,47 @@ pub fn assemble_archive(
             }
         }
     }
-    let capture = extract_consensus_capture(&lineage_records)
-        .map_err(|e| AssembleError::Codec(e.to_string()))?;
-
-    // Committed payload hashes: every inline entry of every published RoundRecord.
+    // Committed payload hashes (every inline entry of every published RoundRecord) and per-peer
+    // digest transcripts (every authoritative Digest frame), read through the journal form the
+    // lineage actually carries: PRODUCTION journals record §12.1 wire frames (tag-12/tag-4),
+    // harness journals record SDK types directly.
     let mut payload_hashes: BTreeSet<Hash> = BTreeSet::new();
-    for sm in &capture.published {
-        if let VhcMessage::RoundRecord(record) = &sm.payload {
-            for entry in record.inline.iter().flatten() {
-                payload_hashes.insert(entry.hash);
+    let mut by_peer: BTreeMap<PeerId, BTreeMap<u64, [u8; 16]>> = BTreeMap::new();
+    if records_are_wire_form(&lineage_records) {
+        let capture = extract_wire_capture(&lineage_records);
+        for publish in &capture.published {
+            if let VhcMessage::RoundRecord(record) = &publish.message {
+                for entry in record.inline.iter().flatten() {
+                    payload_hashes.insert(entry.hash);
+                }
+            }
+        }
+        for frame in &capture.frames {
+            if let VhcMessage::Digest(digest) = &frame.message {
+                by_peer
+                    .entry(frame.sender)
+                    .or_default()
+                    .insert(digest.round, digest.digest.0);
+            }
+        }
+    } else {
+        let capture = extract_consensus_capture(&lineage_records)
+            .map_err(|e| AssembleError::Codec(e.to_string()))?;
+        for sm in &capture.published {
+            if let VhcMessage::RoundRecord(record) = &sm.payload {
+                for entry in record.inline.iter().flatten() {
+                    payload_hashes.insert(entry.hash);
+                }
+            }
+        }
+        for input in &capture.inputs {
+            if let Input::Message(sm) = input {
+                if let VhcMessage::Digest(digest) = &sm.payload {
+                    by_peer
+                        .entry(sm.signer)
+                        .or_default()
+                        .insert(digest.round, digest.digest.0);
+                }
             }
         }
     }
@@ -249,19 +296,6 @@ pub fn assemble_archive(
             &bytes,
         )?;
         payloads_written += 1;
-    }
-
-    // Per-peer digest transcripts: every signed Digest in the recorded driving inputs.
-    let mut by_peer: BTreeMap<PeerId, BTreeMap<u64, [u8; 16]>> = BTreeMap::new();
-    for input in &capture.inputs {
-        if let Input::Message(sm) = input {
-            if let VhcMessage::Digest(digest) = &sm.payload {
-                by_peer
-                    .entry(sm.signer)
-                    .or_default()
-                    .insert(digest.round, digest.digest.0);
-            }
-        }
     }
     let mut peer_transcripts = 0u64;
     for (peer, rounds) in &by_peer {
