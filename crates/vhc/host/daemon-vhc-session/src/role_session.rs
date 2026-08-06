@@ -526,23 +526,7 @@ async fn run_role(
         &worker, &module, run_cfg, journal, restore,
     ) {
         Ok(r) => r,
-        // The admitted execution backend cannot serve right now (the device disappeared or
-        // shrank since assess, its runtime is unstaged, or the process device-compute slot is
-        // occupied): a RECOVERABLE environment fault — the node reassesses against the live
-        // device inventory and reconverges — never a quiet CPU run, never terminal.
-        Err(daemon_vhc_host::run::RunError::BackendUnavailable(reason)) => {
-            return TerminalOutcome::FailedRetryable {
-                reason: format!("execution backend unavailable at run start: {reason}"),
-            }
-        }
-        Err(e) => {
-            return TerminalOutcome::FailedTerminal {
-                reason: format!(
-                    "run start{}: {e}",
-                    if restoring { " (restore)" } else { "" }
-                ),
-            }
-        }
+        Err(e) => return classify_run_start_error(&e, restoring),
     };
     let pump = run.pump.clone();
 
@@ -2231,6 +2215,41 @@ fn classify_natural_end(
 /// substrate (permission / corruption / device) is terminal for this node until an operator
 /// repairs it — and NEITHER is ever attributed to the module. Everything else is a
 /// module/admission fault (terminal).
+/// Classify a run-START failure ([`daemon_vhc_host::run::RunError`]) into its terminal outcome.
+///
+/// - `BackendUnavailable` is a RECOVERABLE environment fault (the device disappeared or shrank
+///   since assess, its runtime is unstaged, or the process device-compute slot is occupied):
+///   the node reassesses against the live device inventory and reconverges — never a quiet CPU
+///   run, never terminal.
+/// - A journal sink refused for CAPACITY (`ENOSPC` / custody quota — e.g. the very first
+///   run-header write) is the storage-gated recoverable class, exactly as it is mid-run: the
+///   node redispatches once the custodian confirms capacity (whose gate reclaims proven orphans
+///   first). Classifying this terminal is how a box that merely filled its quota burned its run
+///   identity. A FAILED substrate (permission / corruption / device) stays terminal via the
+///   catch-all.
+/// - Everything else is terminal: the artifacts were already admitted, so a module that cannot
+///   even instantiate is not a transient environment fault.
+fn classify_run_start_error(
+    e: &daemon_vhc_host::run::RunError,
+    restoring: bool,
+) -> TerminalOutcome {
+    use daemon_vhc_host::run::{RunError, StorageFault};
+    let restore_tag = if restoring { " (restore)" } else { "" };
+    match e {
+        RunError::BackendUnavailable(reason) => TerminalOutcome::FailedRetryable {
+            reason: format!("execution backend unavailable at run start: {reason}"),
+        },
+        RunError::Sink(sink) if sink.fault == Some(StorageFault::Exhausted) => {
+            TerminalOutcome::FailedStorage {
+                reason: format!("host storage exhausted at run start{restore_tag}: {sink}"),
+            }
+        }
+        _ => TerminalOutcome::FailedTerminal {
+            reason: format!("run start{restore_tag}: {e}"),
+        },
+    }
+}
+
 fn classify_trap(trap: &daemon_vhc_host::trap::Trap) -> TerminalOutcome {
     match trap.code {
         TrapCode::BudgetMemory
@@ -2522,6 +2541,42 @@ mod tests {
             }
             other => panic!("a failed substrate is terminal, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn run_start_storage_exhaustion_classifies_storage_gated_not_terminal() {
+        use daemon_vhc_host::run::{RunError, SinkError, StorageFault};
+        // The c15c regression: the FIRST journal write of a fresh incarnation (the run header)
+        // refused by the disk custodian's quota. That is a capacity condition — the storage-gated
+        // recoverable class — and classifying it terminal burned the run identity of a box whose
+        // disk merely filled with its own reclaimable predecessors.
+        let quota = RunError::Sink(SinkError::storage(
+            StorageFault::Exhausted,
+            "journal io error: vhc disk quota exceeded",
+        ));
+        match classify_run_start_error(&quota, false) {
+            TerminalOutcome::FailedStorage { reason } => {
+                assert!(
+                    reason.contains("host storage exhausted at run start"),
+                    "the reason names the class and the seam: {reason}"
+                );
+            }
+            other => panic!("a run-start quota refusal is storage-gated, got {other:?}"),
+        }
+        // A FAILED substrate (permission/corruption/device) at the same seam stays terminal.
+        let failed = RunError::Sink(SinkError::storage(
+            StorageFault::Failed,
+            "journal io error: permission denied",
+        ));
+        assert!(matches!(
+            classify_run_start_error(&failed, false),
+            TerminalOutcome::FailedTerminal { .. }
+        ));
+        // The backend-unavailable arm keeps its recoverable class through the refactor.
+        assert!(matches!(
+            classify_run_start_error(&RunError::BackendUnavailable("device gone".into()), false),
+            TerminalOutcome::FailedRetryable { .. }
+        ));
     }
 
     #[test]

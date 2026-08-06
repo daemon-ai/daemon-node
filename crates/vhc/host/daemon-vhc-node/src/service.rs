@@ -940,7 +940,7 @@ impl VhcService {
             // and never blocks the rest of the pass. The Phase 6 custodian replaces this check
             // as the resume authority.
             if run.storage_gated {
-                if self.storage_gate_open() {
+                if self.storage_gate_open_reclaiming() {
                     self.store.set_storage_gated(&run.run_id, false)?;
                 } else {
                     let due_at = now_ms() + retry.max_backoff_ms as i64;
@@ -997,6 +997,20 @@ impl VhcService {
             }
         }
         Ok(reconverged)
+    }
+
+    /// The storage gate with RECLAIM-BEFORE-REFUSE: a held gate first runs the manifest-driven
+    /// orphan reconciliation (the same startup pass — superseded incarnations' spills are
+    /// reclaimable unconditionally, proven-archived journals go entirely; the reclaimed bytes
+    /// discharge the shared per-root custody ledger) and re-checks. A box sitting on gigabytes
+    /// of its OWN superseded attempts must never wait on an operator to clear space the
+    /// manifests prove reclaimable — that is exactly how a quota-refused run once accumulated a
+    /// dozen orphaned incarnations and died terminal on a healthy disk.
+    fn storage_gate_open_reclaiming(&self) -> bool {
+        self.storage_gate_open() || {
+            self.reconcile_run_state_dirs();
+            self.storage_gate_open()
+        }
     }
 
     /// The storage gate's resume-authorization check (Phase 6): open when the run-state root's
@@ -4693,6 +4707,54 @@ mod storage_gate_tests {
         assert!(
             svc.storage_gate_open(),
             "a clear quota + floor opens the gate"
+        );
+    }
+
+    /// Reclaim-before-refuse (the c15c M4 regression): a storage gate held by a quota that is
+    /// consumed by the run's OWN superseded incarnations must run the manifest-driven orphan
+    /// reconciliation and re-check — never park the run behind an operator when the manifests
+    /// prove the space reclaimable. The newest incarnation (the reconstruction input) survives.
+    #[test]
+    // Test-only fixture writes inside the test's own temp root — not a production fs path.
+    #[allow(clippy::disallowed_methods)]
+    fn a_held_gate_reclaims_proven_orphans_before_refusing() {
+        let mut svc = coordinator_trainer_service(OwnerBudget::unbounded());
+        let root = tempfile::tempdir().expect("tempdir");
+        svc.run_dir = Some(root.path().to_path_buf());
+        svc.config.storage.reserve_mb = 0;
+        svc.config.storage.emergency_mb = 0;
+        svc.config.storage.quota_mb = 2; // 2 MiB quota
+
+        // A persisted run row makes the scope KNOWN (reconciliation never touches unknowns).
+        seed_joined_run(&svc, "run-g", 2);
+        let scope = blake3::hash(b"run-g").to_hex().to_string();
+        let scope_path = root.path().join(&scope);
+        // trainer-1: superseded, journal absent (vacuously archived) — a 3 MiB dead spill.
+        std::fs::create_dir_all(scope_path.join("trainer-1/state")).unwrap();
+        std::fs::write(
+            scope_path.join("trainer-1/state/chunk"),
+            vec![0u8; 3 * 1024 * 1024],
+        )
+        .unwrap();
+        // trainer-2: the newest incarnation — the reconstruction input, never reclaimed.
+        std::fs::create_dir_all(scope_path.join("trainer-2/journal")).unwrap();
+        std::fs::write(scope_path.join("trainer-2/journal/keep"), vec![1u8; 64]).unwrap();
+
+        assert!(
+            !svc.storage_gate_open(),
+            "the superseded spill holds the quota-exhausted gate"
+        );
+        assert!(
+            svc.storage_gate_open_reclaiming(),
+            "reconciliation reclaims the proven orphan and the gate opens"
+        );
+        assert!(
+            !scope_path.join("trainer-1").exists(),
+            "the superseded incarnation was reclaimed"
+        );
+        assert!(
+            scope_path.join("trainer-2/journal/keep").exists(),
+            "the newest incarnation survives"
         );
     }
 

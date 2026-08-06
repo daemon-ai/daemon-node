@@ -42,12 +42,21 @@
 //! Like every other [`ContentStore`] seat, this one serves the keyed bytes **verbatim**: the run
 //! pump is the arbiter (plain hash for whole artifacts, the registered covering-chunk hashes for
 //! chunk-addressed shards), because the requested address is not always the object's plain blake3 —
-//! a corpus shard is keyed by its domain-separated chunk FOLD. That is also why the cache is only
-//! populated for objects whose bytes DO hash to the requested key: [`ContentCache`] blake3-verifies
-//! every entry against its key by design, and a fold-keyed shard cannot honour that invariant.
-//! Fold-keyed objects are therefore served from the store on each fetch and never cached here —
-//! recorded rather than silently skipped (the fleet's shards are ~2 MiB apiece; the cache-warm path
-//! for them is the prefetch mode's CHUNK-keyed staging).
+//! a corpus shard is keyed by its domain-separated chunk FOLD. That is also why the ON-DISK cache is
+//! only populated for objects whose bytes DO hash to the requested key: [`ContentCache`]
+//! blake3-verifies every entry against its key by design, and a fold-keyed shard cannot honour that
+//! invariant.
+//!
+//! Fold-keyed objects get an **in-process verbatim LRU** instead ([`FoldLru`]). Serving them
+//! store-fresh on every fetch was a live-run outage, not a conservative choice: a trainer's
+//! round-0 fetch plan issues thousands of tiny per-sequence range reads, each of which the session
+//! seat services by fetching the WHOLE covering shard — so an uncached shard meant one full HTTP
+//! round-trip (~100 ms) per ~2 KiB guest read, a ~10 ops/s crawl with the accelerator idle. The
+//! trust argument is unchanged by the cache: this seat serves VERBATIM in every case and the pump
+//! verifies the covering chunks against the registered chunk map, so a cached-but-wrong shard
+//! fails exactly as a fetched-but-wrong one would. The LRU is bounded ([`FOLD_LRU_BUDGET`]) and
+//! process-local; the durable cache-warm path for shards remains the prefetch mode's CHUNK-keyed
+//! staging.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -74,6 +83,51 @@ const PINNED_FETCH_BACKOFF: Duration = Duration::from_millis(250);
 /// The backoff ceiling between pinned-artifact attempts.
 const PINNED_FETCH_MAX_BACKOFF: Duration = Duration::from_secs(2);
 
+/// The in-process fold-keyed LRU's byte budget. Sized for shard locality, not the whole corpus:
+/// a round's fetch plan strides a handful of ~2 MiB shards at a time, and the budget must stay
+/// small enough never to distort a worker's admitted memory envelope on a modest box.
+const FOLD_LRU_BUDGET: usize = 64 * 1024 * 1024;
+
+/// A minimal byte-bounded LRU for pinned fold-keyed objects (see the module docs for why the
+/// blake3-keyed [`ContentCache`] cannot hold them). Entries are whole shard objects; lookups
+/// refresh recency; inserts evict from the least-recent end until the budget holds. An object
+/// larger than the whole budget is simply not cached.
+#[derive(Debug, Default)]
+struct FoldLru {
+    /// `(key, bytes)` in recency order — least recent at the front.
+    entries: std::collections::VecDeque<(ContentHash, Vec<u8>)>,
+    bytes: usize,
+}
+
+impl FoldLru {
+    fn get(&mut self, hash: &ContentHash) -> Option<Vec<u8>> {
+        let pos = self.entries.iter().position(|(h, _)| h == hash)?;
+        let entry = self.entries.remove(pos).expect("position just located");
+        let bytes = entry.1.clone();
+        self.entries.push_back(entry);
+        Some(bytes)
+    }
+
+    fn insert(&mut self, hash: ContentHash, bytes: &[u8]) {
+        if bytes.len() > FOLD_LRU_BUDGET {
+            return;
+        }
+        if let Some(pos) = self.entries.iter().position(|(h, _)| h == &hash) {
+            let (_, old) = self.entries.remove(pos).expect("position just located");
+            self.bytes -= old.len();
+        }
+        self.bytes += bytes.len();
+        self.entries.push_back((hash, bytes.to_vec()));
+        while self.bytes > FOLD_LRU_BUDGET {
+            let (_, evicted) = self
+                .entries
+                .pop_front()
+                .expect("a positive byte tally implies an entry");
+            self.bytes -= evicted.len();
+        }
+    }
+}
+
 /// A [`ContentStore`] that resolves the run's genesis-pinned artifacts at the urls the envelope
 /// commits, cache-first, and delegates every other content address to the payload plane.
 ///
@@ -84,6 +138,9 @@ pub struct PinnedArtifactStore {
     pinned: BTreeMap<ContentHash, String>,
     resolver: ArtifactResolver,
     cache: Option<ContentCache>,
+    /// The in-process LRU for pinned FOLD-keyed objects (chunk-addressed shards) — the class the
+    /// blake3-keyed on-disk cache refuses by invariant. See the module docs.
+    fold_lru: std::sync::Mutex<FoldLru>,
     /// The committed-payload plane (`payload/<blake3>`): the fallback, and the put seat.
     content: Arc<dyn ContentStore>,
 }
@@ -112,6 +169,7 @@ impl PinnedArtifactStore {
             pinned,
             resolver,
             cache,
+            fold_lru: std::sync::Mutex::new(FoldLru::default()),
             content,
         }
     }
@@ -167,18 +225,30 @@ impl ContentStore for PinnedArtifactStore {
                 return Ok(bytes);
             }
         }
+        // The fold-keyed class the disk cache cannot hold: served from the in-process LRU when
+        // warm — the seam that turns a round-0 plan of thousands of per-sequence reads into one
+        // HTTP fetch per shard instead of one per read.
+        if let Some(bytes) = self.fold_lru.lock().expect("fold lru lock").get(hash) {
+            return Ok(bytes);
+        }
         match self.fetch_pinned(hash, url).await {
             Ok(bytes) => {
-                // Cache only what the cache can honour its own blake3-keyed invariant for (see the
-                // module docs): a fold-keyed shard's bytes do not hash to its artifact id.
-                if let Some(cache) = &self.cache {
-                    if &blake3_hash(&bytes) == hash {
+                // The disk cache holds only what honours its blake3-keyed invariant (see the
+                // module docs): a fold-keyed shard's bytes do not hash to its artifact id, so
+                // that class warms the in-process LRU instead.
+                if &blake3_hash(&bytes) == hash {
+                    if let Some(cache) = &self.cache {
                         // A cache write failure must never fail a fetch whose verified bytes are
                         // already in hand — the next fetch simply re-downloads. (This crate carries
                         // no unconditional tracing dep; the cache's own health is an operator
                         // property of the cache dir, not of this run.)
                         let _ = cache.insert(hash, &bytes).await;
                     }
+                } else {
+                    self.fold_lru
+                        .lock()
+                        .expect("fold lru lock")
+                        .insert(*hash, &bytes);
                 }
                 Ok(bytes)
             }
@@ -286,6 +356,52 @@ mod tests {
             matches!(err, VhcNetError::PayloadMiss(_) | VhcNetError::Fetch(_)),
             "got {err:?}"
         );
+    }
+
+    /// The round-0 crawl regression: a fold-keyed shard fetched once is served from the
+    /// in-process LRU afterwards — never one whole-shard HTTP round-trip per tiny guest range
+    /// read. Proven by evicting the object from the store after the first fetch: a warm LRU
+    /// still serves it, so the second fetch cannot have gone to the wire.
+    #[tokio::test]
+    async fn a_fold_keyed_shard_is_served_from_the_lru_after_the_first_fetch() {
+        let mock = MockR2::start().await;
+        let shard = vec![9u8; 4096];
+        // A fold identity: deliberately NOT `blake3(shard)` — the disk-cacheable class this is
+        // not.
+        let fold = ContentHash([0x3c; 32]);
+        let key = format!("runs/run-x/corpus/{}.bin", fold.to_hex());
+        mock.seed(&key, shard.clone());
+
+        let pinned = BTreeMap::from([(fold, format!("r2://corpus/{}.bin", fold.to_hex()))]);
+        let store = store_over(&mock, "run-x", pinned, Arc::new(MemoryContentStore::new()));
+        assert_eq!(store.get_content(&fold).await.unwrap(), shard);
+        mock.evict(&key);
+        assert_eq!(
+            store.get_content(&fold).await.unwrap(),
+            shard,
+            "the warm LRU serves the shard after the store dropped it"
+        );
+    }
+
+    /// The LRU stays inside its byte budget: entries evict least-recent-first, and a re-read
+    /// refreshes recency.
+    #[test]
+    fn the_fold_lru_evicts_least_recent_within_its_budget() {
+        let mut lru = FoldLru::default();
+        let a = ContentHash([1; 32]);
+        let b = ContentHash([2; 32]);
+        let c = ContentHash([3; 32]);
+        let chunk = vec![0u8; FOLD_LRU_BUDGET / 2];
+        lru.insert(a, &chunk);
+        lru.insert(b, &chunk);
+        assert!(lru.get(&a).is_some(), "two halves fit");
+        // `a` was just refreshed, so the third insert evicts `b`.
+        lru.insert(c, &chunk);
+        assert!(lru.get(&b).is_none(), "least-recent evicted");
+        assert!(lru.get(&a).is_some() && lru.get(&c).is_some());
+        // An oversized object is refused outright, disturbing nothing.
+        lru.insert(ContentHash([4; 32]), &vec![0u8; FOLD_LRU_BUDGET + 1]);
+        assert!(lru.get(&a).is_some() && lru.get(&c).is_some());
     }
 
     /// The cache-warm property: a whole-object artifact fetched once is served from the on-disk
