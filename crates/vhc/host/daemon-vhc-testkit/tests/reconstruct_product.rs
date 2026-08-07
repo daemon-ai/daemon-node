@@ -526,18 +526,21 @@ fn with_verify_availability(config: &[u8]) -> Vec<u8> {
     to_canonical_vec(&v).expect("config re-encodes")
 }
 
-/// The c15-20260806b regression: a coordinator whose config enables availability verification
-/// (coordinator-as-storage-client, §6.4 I6 — the fleet ceremony's shape) issues one
-/// `payload_get` per replayed Commitment. The reconstruction sandbox services no capability
-/// providers, so those ops must be completed promptly (failed, typed): an un-answered queue
-/// crosses the `max_outstanding` op ceiling (16) and traps the guest `GrantViolation`
-/// mid-replay — which surfaced live only as a frame-consumption stall after the full stall
-/// ceiling, on every join retry, until the run went terminal. Twenty commitments
-/// (10 rounds x 2 workers) cross the ceiling; the reconstruction must still complete and
-/// stand at the next un-opened round.
+/// The c15-20260806b/g regression: a coordinator whose config enables availability
+/// verification (coordinator-as-storage-client, §6.4 I6 — the fleet ceremony's shape) issues
+/// one `payload_get` per replayed Commitment. The reconstruction sandbox services no
+/// capability providers; ops are completed promptly as typed failures AND the sandbox lifts
+/// the `max_outstanding` ceiling (`max_outstanding_ops = 0`), because prompt completion
+/// alone is a scheduling race: the host-side drain is polled, while the guest folds the
+/// spooled lineage synchronously and can burst one `payload_get` per Commitment past any
+/// poll cadence (c15-20260806b: the un-serviced queue crossed 16; c15-20260806g head 12:
+/// the fold burst outran the 2ms drain and trapped `GrantViolation` on every retry until
+/// the run went terminal). Eighty commitments (40 rounds x 2 workers) cross the default
+/// ceiling many times over; the reconstruction must still complete and stand at the next
+/// un-opened round.
 #[tokio::test(flavor = "multi_thread")]
 async fn availability_checked_lineage_reconstructs_past_the_op_ceiling() {
-    const ROUNDS: u64 = 10;
+    const ROUNDS: u64 = 40;
     let rig = rig();
     let config = with_verify_availability(&rig.spec.config_bytes);
     let root = tempdir();

@@ -400,12 +400,24 @@ fn replay_capture(
     };
     let signing_seed =
         *blake3::hash(&[&spec.run_id.0[..], b"reconstruct-sandbox"].concat()).as_bytes();
-    let run_cfg = RunConfig::new(
+    let mut run_cfg = RunConfig::new(
         identity,
         signing_seed,
         spec.config.clone(),
         spec.grants.clone(),
     );
+    // The outstanding-op ceiling is LIFTED for the sandbox (`0` = unbounded). The ceiling
+    // protects the host's async runtime from runaway live-service concurrency — but this
+    // instance's ops are never serviced, only failed (`fail_pending_ops`), so the bound
+    // protects nothing here and turns replay into a scheduling race: the drain is host-side
+    // POLLING, while the guest folds the spooled lineage back-to-back and can issue one
+    // availability `payload_get` per Commitment faster than any poll cadence — observed live
+    // (c15-20260806g, head 12: the fold burst crossed 16 outstanding between two 2ms drains
+    // and trapped `GrantViolation` mid-replay on every retry, despite the prompt-failure
+    // drain landing for c15-20260806b). The guest still sees the ADMITTED grants bytes
+    // unchanged; only the host-side enforcement bound is inapplicable to the hermetic
+    // throwaway.
+    run_cfg.max_outstanding_ops = 0;
     let run = start_run_migrating(
         &engine,
         &spec.module,
@@ -510,10 +522,14 @@ fn replay_capture(
 /// already folded), it would couple crash-recovery latency to payload sizes and re-introduce
 /// remote failure modes mid-join, and by module policy a failed fetch is simply "no evidence".
 ///
-/// The completions must still be DELIVERED: an op left un-answered occupies the
-/// `grant-bound.n` outstanding-op ceiling, and a long recovered lineage crosses it — observed
-/// live (c15-20260806b, round 9, two trainers): the 17th un-serviced availability check
-/// trapped the guest `GrantViolation` mid-replay, on every retry, until the run went terminal.
+/// The completions must still be DELIVERED — the guest's own bookkeeping
+/// (`pending_availability`) and the pump's op table drain only through completions, and a
+/// guest awaiting evidence it will never receive quiesces against a non-empty outstanding
+/// set. Note the ceiling itself is lifted for the sandbox (`max_outstanding_ops = 0` at
+/// construction): completing ops promptly is necessary but NOT sufficient against the
+/// `GrantViolation` trap, because this drain is polled host-side while the guest's fold
+/// burst is synchronous (observed live twice: c15-20260806b round 9, the un-serviced queue;
+/// c15-20260806g head 12, the fold burst outrunning a 2ms drain cadence).
 fn fail_pending_ops(pump: &PumpHandle) {
     for (op, _request) in pump.take_op_requests() {
         // A completion refused by the pump (guest already gone) is moot — the guest-end check
