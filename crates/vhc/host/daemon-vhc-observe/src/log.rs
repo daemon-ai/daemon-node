@@ -44,6 +44,8 @@ pub enum MessageKind {
     Heartbeat,
     /// [`VhcMessage::CheckpointAttestation`] (Phase E cold join).
     CheckpointAttestation,
+    /// [`VhcMessage::Finished`] (the coordinator's terminal completion decision).
+    Finished,
 }
 
 impl MessageKind {
@@ -61,6 +63,7 @@ impl MessageKind {
             VhcMessage::Join(_) => Self::Join,
             VhcMessage::Heartbeat(_) => Self::Heartbeat,
             VhcMessage::CheckpointAttestation(_) => Self::CheckpointAttestation,
+            VhcMessage::Finished(_) => Self::Finished,
         }
     }
 }
@@ -79,6 +82,8 @@ pub fn round_of(m: &VhcMessage) -> Option<u64> {
         VhcMessage::Heartbeat(x) => Some(x.round),
         VhcMessage::CheckpointAttestation(x) => Some(x.round),
         VhcMessage::Join(_) => None,
+        // `Finished.rounds` is a count (the run committed rounds `0..rounds`), not a round id.
+        VhcMessage::Finished(_) => None,
     }
 }
 

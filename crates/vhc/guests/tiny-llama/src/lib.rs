@@ -2354,6 +2354,12 @@ fn run_module(mut cfg: GuestCfg, restored: Option<RestoredRefs>) -> u32 {
     let mut quiesce: Option<QuiesceWalk> = None;
     // A harness RoundOpen that arrives before the async init boot completes waits here.
     let mut deferred_open: Option<RoundOpen> = None;
+    // The coordinator announced completion (`VhcMessage::Finished`): exit 0 once every in-flight
+    // walk and op drains. The trainer does not know the stop condition (it lives in the
+    // coordinator's config), so this frame is its ONLY way to learn the run is over — without it
+    // a completed run leaves every trainer parked in `next_event` waiting for a round that will
+    // never open (the c15d closure wedge).
+    let mut finished = false;
 
     // Live mode boots by fetching the genesis-pinned corpus manifest (everything else waits on
     // it: chunk registration precedes any shard range fetch, and the Join announcement waits so
@@ -2543,6 +2549,9 @@ fn run_module(mut cfg: GuestCfg, restored: Option<RestoredRefs>) -> u32 {
                         } else {
                             pending_records.insert(pending_round, pending);
                         }
+                    }
+                    VhcMessage::Finished(_) => {
+                        finished = true;
                     }
                     _ => {}
                 }
@@ -2891,6 +2900,28 @@ fn run_module(mut cfg: GuestCfg, restored: Option<RestoredRefs>) -> u32 {
                 // Anything else (an import ack, a released op) is event-loop noise.
             }
             _ => {}
+        }
+        // The announced completion's exit point: everything in flight has drained (the
+        // coordinator publishes `Finished` a full cooldown after the last RoundRecord, so a
+        // healthy peer is already idle and exits on the frame itself). Same deliberate-leak
+        // shutdown discipline as Stop (§7.3) — outcome 0 classifies the session Completed.
+        if finished
+            && export.is_none()
+            && quiesce.is_none()
+            && pending_records.is_empty()
+            && pending_commit.is_empty()
+            && !driver.ingest_in_flight()
+            && {
+                let c = core.borrow();
+                c.ingest_walk.is_none() && c.update_walk.is_none()
+            }
+            && live
+                .as_ref()
+                .is_none_or(|l| l.pending_open.is_none() && l.pending_ckpt.is_none())
+        {
+            std::mem::forget(driver);
+            std::mem::forget(core);
+            return 0;
         }
     }
 }

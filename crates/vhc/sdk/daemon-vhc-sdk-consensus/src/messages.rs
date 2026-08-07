@@ -252,6 +252,19 @@ pub struct Heartbeat {
     pub ready: Option<bool>,
 }
 
+/// `Finished` — the coordinator's terminal decision: the run's stop condition is met and no
+/// further round will open (§6.2). Published (signed, on the records channel) like `RoundOpen` /
+/// `RoundRecord` — never an advisory note — because two consumers act on it: every trainer exits
+/// cleanly on receipt (it does not know the stop condition; that lives in the coordinator's
+/// config), and the host classifies the session `Completed`. Without it a completed run idles
+/// forever with the trainers parked waiting for a round that will never open (defect: the c15d
+/// closure wedge).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Finished {
+    /// Rounds committed by the completed run (the run committed rounds `0..rounds`).
+    pub rounds: u64,
+}
+
 /// The externally-tagged union of every control-plane message.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VhcMessage {
@@ -276,6 +289,9 @@ pub enum VhcMessage {
     /// Peer attests a typed checkpoint (Phase E cold join; appended additively — existing
     /// variants' wire encodings are untouched).
     CheckpointAttestation(CheckpointAttestation),
+    /// Coordinator announces the run completed (terminal; appended additively — a legacy peer's
+    /// decode fails structurally and it ignores the frame, §5.2).
+    Finished(Finished),
 }
 
 /// The signed preimage: the exact bytes an ed25519 signature covers.

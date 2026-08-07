@@ -447,6 +447,20 @@ impl Coordinator {
         self.pump.clone()
     }
 
+    /// Join the guest thread WITHOUT sending a host stop — the wait for a run that ends of its
+    /// own accord (the coordinator returns outcome 0 after publishing its terminal `Finished`
+    /// decision; a run that never finishes never returns, so callers bound this externally).
+    ///
+    /// # Errors
+    /// A `String` if the guest thread fails.
+    pub fn wait_end(mut self) -> Result<RunEnd, String> {
+        self.run
+            .take()
+            .expect("run present")
+            .wait()
+            .map_err(|e| format!("coordinator guest thread: {e}"))
+    }
+
     /// Stop the coordinator cleanly and join its guest thread.
     ///
     /// # Errors

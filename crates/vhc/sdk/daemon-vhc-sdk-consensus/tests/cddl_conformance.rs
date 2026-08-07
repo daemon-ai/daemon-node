@@ -14,9 +14,9 @@ use daemon_vhc_proto::merkle::commit_set;
 use daemon_vhc_proto::version::VHC_PROTO_VERSION;
 use daemon_vhc_proto::{to_canonical_vec, SigningKey};
 use daemon_vhc_sdk_consensus::messages::{
-    Attestation, BatchWindow, Commitment, Digest, Heartbeat, Join, Locator, RecordEntry, RoundOpen,
-    RoundRecord, SignedMessage, StorageReceipt, Straggle, StraggleStatus, ThroughputClass,
-    VhcMessage,
+    Attestation, BatchWindow, Commitment, Digest, Finished, Heartbeat, Join, Locator, RecordEntry,
+    RoundOpen, RoundRecord, SignedMessage, StorageReceipt, Straggle, StraggleStatus,
+    ThroughputClass, VhcMessage,
 };
 
 const CDDL: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/daemon-vhc.cddl"));
@@ -108,6 +108,7 @@ fn all_sample_messages() -> Vec<VhcMessage> {
             round: 42,
             ready: None,
         }),
+        VhcMessage::Finished(Finished { rounds: 24 }),
     ]
 }
 
@@ -152,7 +153,11 @@ fn heartbeat_ready_flag_cddl_conforms_and_roundtrips() {
 #[test]
 fn round_messages_cddl_conformance() {
     let messages = all_sample_messages();
-    assert_eq!(messages.len(), 9, "seven round messages + join + heartbeat");
+    assert_eq!(
+        messages.len(),
+        10,
+        "seven round messages + join + heartbeat + finished"
+    );
     for payload in messages {
         validate("signed-message", &signed(payload));
     }

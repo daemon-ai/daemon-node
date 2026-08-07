@@ -102,6 +102,14 @@ heartbeat = {
   ? "ready": bool,          ; optional model-readiness signal during Warmup (§6.2; additive)
 }
 
+; ----- the terminal completion decision (§6.2; additive) -----
+; Published by the coordinator on entering Finished: trainers exit on it (the stop condition
+; lives in the coordinator's config) and the host classifies the run Completed. `rounds` is a
+; COUNT — the run committed rounds 0..rounds.
+finished = {
+  "rounds": uint,
+}
+
 ; ----- the externally-tagged message union -----
 vhc-message = { "RoundOpen": round-open }
               / { "Commitment": commitment }
@@ -112,6 +120,7 @@ vhc-message = { "RoundOpen": round-open }
               / { "Straggle": straggle }
               / { "Join": join }
               / { "Heartbeat": heartbeat }
+              / { "Finished": finished }
 
 ; ----- the signed wire frame (everything on the wire is one of these) -----
 signed-message = {

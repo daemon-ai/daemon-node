@@ -2711,7 +2711,9 @@ rule 1 — "daemon-vhc-proto stays algorithm-free: no assignment math, no round 
   meaning.
 - **[OWN-2] Round vocabulary — `daemon-vhc-sdk-consensus` (the SDK schema layer).** The round
   message schemas (`RoundOpen`, `Commitment`, `Attestation`, `StorageReceipt`, `RoundRecord`,
-  `Digest`, `Straggle`, `Join`, `Heartbeat`, `CheckpointAttestation`, the externally-tagged
+  `Digest`, `Straggle`, `Join`, `Heartbeat`, `CheckpointAttestation`, `Finished` — the
+  coordinator's published terminal completion decision: trainers exit on it and the host
+  classifies the run `Completed` — the externally-tagged
   `VhcMessage` union and its `SignedMessage` control frame), the round state-digest schedule
   (`derive_schedule`/`digest_state`), the committed-set object (`RecordSet` /
   `record-set.cbor`), and their authoritative CDDL (`daemon-vhc.cddl`, validated by the

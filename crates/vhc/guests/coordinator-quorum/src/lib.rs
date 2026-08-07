@@ -42,7 +42,7 @@ use daemon_vhc_sdk::migrate::{
 };
 use daemon_vhc_sdk::module::{GuestModule, ModuleDecl};
 use daemon_vhc_sdk_consensus::coordinator::{
-    tick, tick_authenticated, CoordinatorState, Input, Output,
+    tick, tick_authenticated, CoordinatorState, Input, Output, Phase,
 };
 use daemon_vhc_sdk_consensus::messages::{RecordEntry, StorageReceipt};
 use daemon_vhc_sdk_consensus::VhcMessage;
@@ -372,6 +372,13 @@ impl GuestModule for Coordinator {
                 // Advisory / unknown-but-delivered events: ignore (only unknown TAGS fail closed,
                 // which the SDK `next_event` decoder already enforces, §5.2).
                 _ => {}
+            }
+            // Terminal: the state machine reached `Finished` (stop condition met; the signed
+            // `Finished` decision was published by the `emit` above) — a completed run RETURNS,
+            // it does not idle its timer forever waiting for a host stop (the c15d closure
+            // wedge). Outcome 0 classifies the session Completed.
+            if self.state.phase == Phase::Finished {
+                return 0;
             }
         }
     }

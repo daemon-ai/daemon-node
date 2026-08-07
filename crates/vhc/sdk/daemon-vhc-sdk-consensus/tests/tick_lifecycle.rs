@@ -175,13 +175,23 @@ fn proto9_stop_tokens_finishes_run() {
     }
     assert_eq!(state.phase, Phase::Cooldown, "stop → Cooldown");
 
-    // Cooldown timeout → Finished.
+    // Cooldown timeout → Finished. The completion is a PUBLISHED, signed decision (the trainers
+    // exit on it and the host classifies the run Completed) — an advisory note alone dies in the
+    // guest wrapper and a completed run idles forever (the c15d closure wedge).
+    let rounds_done = state.rounds_done;
     let now = state.now_s + cfg_cooldown() + 1;
     let (s, out) = tick(state, Input::Clock(now));
     assert_eq!(s.phase, Phase::Finished);
     assert!(out
         .iter()
         .any(|o| matches!(o, Output::Note(Notice::Finished))));
+    assert!(
+        out.iter().any(|o| matches!(
+            o,
+            Output::Publish(m) if matches!(**m, VhcMessage::Finished(f) if f.rounds == rounds_done)
+        )),
+        "the completion must be PUBLISHED (carrying the committed-round count), not only noted"
+    );
 }
 
 fn cfg_cooldown() -> u64 {

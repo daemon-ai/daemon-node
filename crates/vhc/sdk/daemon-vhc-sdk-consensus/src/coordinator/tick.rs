@@ -10,8 +10,8 @@
 //! rule ([`crate::commit`]) consumes only signed evidence (I6).
 
 use crate::messages::{
-    Attestation, BatchWindow, Commitment, Digest, Heartbeat, Join, Locator, RoundOpen, RoundRecord,
-    SignedMessage, StorageReceipt, Straggle, VhcMessage,
+    Attestation, BatchWindow, Commitment, Digest, Finished, Heartbeat, Join, Locator, RoundOpen,
+    RoundRecord, SignedMessage, StorageReceipt, Straggle, VhcMessage,
 };
 use crate::{global_batch_at, select_committee};
 use daemon_vhc_proto::envelope::StopCondition;
@@ -176,7 +176,7 @@ fn dispatch_payload(
         VhcMessage::Straggle(s) => on_straggle(state, signer, s),
         VhcMessage::Heartbeat(h) => on_heartbeat(state, out, signer, h),
         VhcMessage::CheckpointAttestation(ca) => on_checkpoint_attestation(state, out, &ca),
-        VhcMessage::RoundOpen(_) | VhcMessage::RoundRecord(_) => {
+        VhcMessage::RoundOpen(_) | VhcMessage::RoundRecord(_) | VhcMessage::Finished(_) => {
             out.push(Output::Reject(Rejection::UnexpectedMessage));
         }
     }
@@ -676,6 +676,13 @@ fn finalize_round(state: &mut CoordinatorState, out: &mut Vec<Output>) {
 fn exit_cooldown(state: &mut CoordinatorState, out: &mut Vec<Output>) {
     if stop_reached(state) {
         change_phase(state, out, Phase::Finished);
+        // The completion is a PUBLISHED decision, not only an advisory note: the trainers exit
+        // on it (they do not know the stop condition) and the host classifies the run Completed.
+        // A note alone dies in the guest wrapper and the finished run idles forever (the c15d
+        // closure wedge).
+        out.push(Output::publish(VhcMessage::Finished(Finished {
+            rounds: state.rounds_done,
+        })));
         out.push(Output::Note(Notice::Finished));
         return;
     }

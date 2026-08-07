@@ -670,7 +670,13 @@ Uninitialized → WaitingForMembers → Warmup → (RoundTrain ⇄ RoundWitness)
 - **Termination**: `[data].stop` (tokens or rounds) is the `Finished` trigger, evaluated at
   round boundaries; `Paused` is an operator state — only the run author / org admins may
   pause or resume (coordinator-authenticated intent, §11.1), and peers treat it like an idle
-  `WaitingForMembers`.
+  `WaitingForMembers`. On entering `Finished` the coordinator **publishes a signed
+  `Finished{rounds}` decision** on the records channel and its module run returns outcome 0
+  (`Completed`): the stop condition lives only in the coordinator's config, so this published
+  decision is how every trainer learns the run is over — each exits 0 on receipt once its
+  in-flight work drains, and the hosts classify the sessions `Completed`. An advisory-only
+  completion (a note that never leaves the module) is a defect: the run idles forever with
+  trainers parked waiting for a round that will never open.
 - Rounds **overlap transport, never application** (§6.4 invariant I2): while training round N,
   peers already fetch round-N commitments as they gossip; `da_ingest_updates` runs at the round
   boundary as a barrier. A ring of stored round state (4, Psyche's `NUM_STORED_ROUNDS`) absorbs
