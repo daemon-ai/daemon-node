@@ -1080,3 +1080,49 @@ async fn checkpoint_pointers_are_role_and_kind_scoped() {
         .unwrap()
         .is_none());
 }
+
+/// Defect 8 of the c15g drill: per-seat trainer roles share one restore FAMILY. The elected
+/// slot publisher uploads the identical deterministic state on behalf of every seat, so a
+/// crashed seat restores from a SIBLING seat's fresher live pointer — exact-role scoping left
+/// `trainer-1` on its own round-4 pointer while `trainer-0`'s round-8 pointer stood published,
+/// and every rejoin refused `CheckpointStale` (fence 4 vs head 12, horizon 4) although a
+/// horizon-reachable restore source existed.
+#[tokio::test]
+async fn checkpoint_restore_reads_across_the_seat_family() {
+    let d = CheckpointDiscovery::default();
+    let live_hash = "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262";
+
+    // The c15g shape: alternating slot election left seat 0 with the freshest live pointer.
+    RunDiscovery::publish_checkpoint(&d, "run-seat", "trainer-1", "live", 4, "dd", 2048)
+        .await
+        .unwrap();
+    RunDiscovery::publish_checkpoint(&d, "run-seat", "trainer-0", "live", 8, live_hash, 2048)
+        .await
+        .unwrap();
+    RunDiscovery::publish_checkpoint(&d, "run-seat", "coordinator", "live", 12, "cc", 512)
+        .await
+        .unwrap();
+
+    // The rejoining seat 1 restores from seat 0's fresher pointer (same family), and the
+    // coordinator's even fresher pointer never crosses the family boundary.
+    let pointer = RunDiscovery::fetch_checkpoint(&d, "run-seat", "trainer-1")
+        .await
+        .unwrap()
+        .expect("a family pointer is published");
+    assert_eq!(pointer.role, "trainer-0");
+    assert_eq!(pointer.round, 8);
+    assert_eq!(pointer.hash, live_hash);
+
+    // The coordinator stays its own family.
+    let coord = RunDiscovery::fetch_checkpoint(&d, "run-seat", "coordinator")
+        .await
+        .unwrap()
+        .expect("a coordinator pointer is published");
+    assert_eq!(coord.round, 12);
+
+    // A seat-suffixed role of a DIFFERENT family never reads trainer pointers.
+    assert!(RunDiscovery::fetch_checkpoint(&d, "run-seat", "verifier-0")
+        .await
+        .unwrap()
+        .is_none());
+}

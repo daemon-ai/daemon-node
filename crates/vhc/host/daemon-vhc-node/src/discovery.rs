@@ -80,10 +80,11 @@ pub trait RunDiscovery: Send + Sync {
     }
 
     /// Resolve `role`'s best restore pointer for this run (spec §9; the late-join restore
-    /// input): the freshest LIVE pointer for the role, falling back to the freshest DRAIN
-    /// pointer — a drain snapshot never shadows a fresher live restore source, and another
-    /// role's pointer is never consulted. `None` when the role has no pointer (a fresh start).
-    /// Default `None` (no registry state).
+    /// input): the freshest LIVE pointer across the role's FAMILY (per-seat siblings publish
+    /// identical deterministic state — [`best_restore_pointer`]), falling back to the freshest
+    /// DRAIN pointer — a drain snapshot never shadows a fresher live restore source, and a
+    /// pointer outside the family (a different role kind) is never consulted. `None` when the
+    /// family has no pointer (a fresh start). Default `None` (no registry state).
     async fn fetch_checkpoint(
         &self,
         run_id: &str,
@@ -131,16 +132,36 @@ pub trait RunDiscovery: Send + Sync {
     }
 }
 
-/// The role-scoped restore preference (spec §9): the freshest `live` pointer, else the freshest
-/// `drain` pointer, over the run's published `(role, kind)` slots.
+/// The role FAMILY a checkpoint pointer restores across: authored per-seat roles
+/// (`trainer-0`, `trainer-1`, …) share one family (`trainer`) because the deterministic-state
+/// contract makes their sealed families IDENTICAL at every round boundary — the elected slot
+/// publisher uploads on behalf of every seat, so any seat restores from any seat's pointer.
+/// A role without a seat suffix is its own family (`coordinator`, legacy `trainer`).
+fn role_family(role: &str) -> &str {
+    match role.rsplit_once('-') {
+        Some((family, seat)) if !seat.is_empty() && seat.bytes().all(|b| b.is_ascii_digit()) => {
+            family
+        }
+        _ => role,
+    }
+}
+
+/// The family-scoped restore preference (spec §9): the freshest `live` pointer, else the
+/// freshest `drain` pointer, over the run's published `(role, kind)` slots — matching by role
+/// FAMILY ([`role_family`]), not exact role name. Exact-role matching was the c15g defect-8
+/// wedge: with per-seat trainer roles and alternating publisher election, a crashed seat's OWN
+/// pointer is up to 2× the cadence stale while a sibling seat's fresh pointer (the identical
+/// deterministic state) sits unread — every rejoin refused `CheckpointStale` although a
+/// horizon-reachable restore source was published.
 pub fn best_restore_pointer(
     pointers: &[CheckpointPointer],
     role: &str,
 ) -> Option<CheckpointPointer> {
+    let family = role_family(role);
     let of_kind = |kind: &str| {
         pointers
             .iter()
-            .filter(|p| p.role == role && p.kind == kind)
+            .filter(|p| role_family(&p.role) == family && p.kind == kind)
             .max_by_key(|p| p.round)
             .cloned()
     };

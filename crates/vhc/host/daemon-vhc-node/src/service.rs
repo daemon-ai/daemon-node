@@ -3005,10 +3005,12 @@ impl VhcService {
     }
 
     /// Resolve the late-join checkpoint restore for a run (spec §9): the registry's best
-    /// pointer FOR THIS ROLE — the freshest live pointer, else the freshest drain snapshot;
-    /// another role's pointer is never consulted for the restore itself — decoded to the wire
-    /// restore form (`None` = fresh start / no discovery / nothing published for the role). A
-    /// malformed pointer hash is dropped (fresh start), never a hard join failure.
+    /// pointer FOR THIS ROLE FAMILY — the freshest live pointer across the per-seat siblings
+    /// (the elected slot publisher uploads the IDENTICAL deterministic state on behalf of every
+    /// seat: [`crate::discovery::best_restore_pointer`]), else the freshest drain snapshot; a
+    /// pointer outside the family is never consulted for the restore itself — decoded to the
+    /// wire restore form (`None` = fresh start / no discovery / nothing published for the
+    /// family). A malformed pointer hash is dropped (fresh start), never a hard join failure.
     ///
     /// **Join-time cadence-vs-ring reachability** (the recovery-honesty check): a restorer
     /// replays forward across the coordinator's retained record ring
