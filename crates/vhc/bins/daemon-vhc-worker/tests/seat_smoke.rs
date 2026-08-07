@@ -101,6 +101,7 @@ fn genesis_wire(trusted_bases: &[PeerId]) -> (Vec<u8>, [u8; 32]) {
         // of the composed claim, and an authored minimum beside a composed one is a second
         // authority over the same question, which authoring refuses.
         device_min: daemon_vhc_proto::DeviceMinimums::default(),
+        identity: None,
     };
     let mut roles = BTreeMap::new();
     roles.insert(COORD_ROLE.to_string(), role_entry("coordinator"));

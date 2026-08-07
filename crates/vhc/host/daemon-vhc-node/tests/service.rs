@@ -833,6 +833,7 @@ fn frozen_genesis_wire(base: &daemon_vhc_proto::SigningKey) -> (Vec<u8>, daemon_
         config: ciborium::value::Value::Map(vec![]),
         grants: daemon_vhc_proto::RoleGrants::default(),
         device_min: daemon_vhc_proto::DeviceMinimums::default(),
+        identity: None,
         execution: Some(
             daemon_vhc_proto::RoleExecutionRequirements::fixture_over_trivial_plan(vec![
                 "cpu".to_string()

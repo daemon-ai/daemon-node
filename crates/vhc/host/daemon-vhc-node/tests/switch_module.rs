@@ -238,6 +238,7 @@ fn build_scenario(worker: &Worker, frames: u64) -> (Scenario, TransitionChain) {
                 config: ciborium::value::Value::Map(vec![]),
                 grants: role_grants(4096),
                 device_min: DeviceMinimums::default(),
+                identity: None,
             },
         );
     }

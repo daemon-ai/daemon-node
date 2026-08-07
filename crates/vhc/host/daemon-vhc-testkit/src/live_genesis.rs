@@ -370,6 +370,7 @@ pub fn live_genesis(spec: &LiveGenesisSpec<'_>) -> LiveGenesis {
             config: coord_config,
             grants: control_channel(BTreeSet::new()),
             device_min: daemon_vhc_proto::DeviceMinimums::default(),
+            identity: None,
         },
     );
     roles.insert(
@@ -390,6 +391,7 @@ pub fn live_genesis(spec: &LiveGenesisSpec<'_>) -> LiveGenesis {
             ),
             grants: control_channel(granted),
             device_min: daemon_vhc_proto::DeviceMinimums::default(),
+            identity: None,
         },
     );
 

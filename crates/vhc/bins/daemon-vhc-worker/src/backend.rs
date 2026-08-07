@@ -155,12 +155,30 @@ async fn resolve_genesis_run(
             }
             label.to_string()
         }
-        None => env
-            .roles
-            .iter()
-            .find(|(_, r)| r.lane != "coordinator")
-            .map(|(name, _)| name.clone())
-            .ok_or("genesis envelope has no non-coordinator role (validate should have refused)")?,
+        None => {
+            // Fail-closed against a SEATED role set (defect 6): identity-bound roles carry
+            // per-seat plan identities, and the map-order default would hand every undirected
+            // joiner the same first seat — the aliasing the binding exists to prevent. Seat
+            // selection is the node's (it holds the identity keystore); the worker refuses.
+            if env
+                .roles
+                .values()
+                .any(|r| r.lane != "coordinator" && r.identity.is_some())
+            {
+                return Err(
+                    "the genesis authors identity-bound seats; an undirected join cannot pick \
+                     one (the node selects the seat bound to its base identity)"
+                        .to_string(),
+                );
+            }
+            env.roles
+                .iter()
+                .find(|(_, r)| r.lane != "coordinator")
+                .map(|(name, _)| name.clone())
+                .ok_or(
+                    "genesis envelope has no non-coordinator role (validate should have refused)",
+                )?
+        }
     };
     let role = &env.roles[&worker_role];
     let config = frozen

@@ -31,7 +31,7 @@ use std::time::Duration;
 
 use ciborium::value::Value;
 use daemon_vhc_proto::envelope::Access;
-use daemon_vhc_proto::{to_canonical_vec, Hash, SigningKey};
+use daemon_vhc_proto::{peer_id, to_canonical_vec, Hash, PeerId, SigningKey};
 
 use daemon_vhc_supervisor::{TrainClientConfig, TrainSupervisor};
 
@@ -285,6 +285,12 @@ fn seed_state_contract() -> daemon_vhc_proto::genesis::StateContract {
 /// `DAEMON_TRAIN_MODULE` override substitutes (the explicit dev/node-controlled module source
 /// inside the signed path — assess never fetches the coordinator module).
 fn genesis_wire(run_label: &str, config: Value) -> Vec<u8> {
+    genesis_wire_seated(run_label, config, None)
+}
+
+/// [`genesis_wire`] with an optional SEAT BINDING on the trainer role (defect 6: an
+/// identity-bound role authored for one participant's base identity).
+fn genesis_wire_seated(run_label: &str, config: Value, seat: Option<PeerId>) -> Vec<u8> {
     use daemon_vhc_proto::genesis::{
         ChannelDecl, Identities, RoleEntry, RoleGrants, RunSection, SnapshotArtifact,
         TransportSelection, GENESIS_SCHEMA_MAJOR,
@@ -343,6 +349,7 @@ fn genesis_wire(run_label: &str, config: Value) -> Vec<u8> {
             // members of the composed estimate, and an authored minimum beside a composed one is a
             // second authority over the same question, which authoring refuses.
             device_min: daemon_vhc_proto::DeviceMinimums::default(),
+            identity: seat,
         },
     );
     roles.insert(
@@ -361,6 +368,7 @@ fn genesis_wire(run_label: &str, config: Value) -> Vec<u8> {
             config: Value::Map(vec![]),
             grants: RoleGrants::default(),
             device_min: daemon_vhc_proto::DeviceMinimums::default(),
+            identity: None,
         },
     );
     let env = GenesisEnvelope {
@@ -569,6 +577,50 @@ async fn certification_minor_assess_refuses_claim_not_composable_without_a_profi
         "the refusal carries the stable typed slug: {:?}",
         elig.reasons
     );
+    sup.ping().await.expect("worker healthy after the refusal");
+    assert_eq!(sup.restarts().await, 0, "no respawn");
+    sup.shutdown().await;
+}
+
+/// The SEATED role set refuses an undirected assess (defect 6 of the c15 drills): an
+/// identity-bound trainer role carries one seat's frozen plan identity, and the worker's
+/// map-order default would hand EVERY undirected joiner the same first seat — both boxes
+/// training the same window slice, the checkpoint slots elected to the other seat published by
+/// nobody. Seat selection belongs to the node (it holds the identity keystore and picks the
+/// role whose binding matches its base identity); the worker's part of the contract is to
+/// refuse to guess. Directed to the seat by name, the same wire proceeds past selection (into
+/// this suite's standing no-profile refusal — proof the refusal above is the selection's own).
+#[tokio::test]
+async fn seated_genesis_refuses_an_undirected_assess() {
+    let module = module_path("tiny_llama.wasm");
+    let sup = supervisor_for(&module);
+
+    let seat = peer_id(&SigningKey::from_bytes(&[0x5Au8; 32]));
+    let wire = genesis_wire_seated("seated-run", guest_config(), Some(seat));
+
+    let err = sup
+        .assess(wire.clone(), None)
+        .await
+        .expect_err("an undirected assess against a seated role set must refuse");
+    assert!(
+        err.to_string().contains("identity-bound seats"),
+        "the refusal names the seat contract, got: {err}"
+    );
+
+    // Directed to the authored seat, selection succeeds — the run proceeds to the standing
+    // typed no-profile refusal (`EstimateNotComposable`), which is PAST role selection.
+    let elig = sup
+        .assess(wire, Some("trainer".to_string()))
+        .await
+        .expect("a directed assess is an outcome, not a transport error");
+    assert!(
+        elig.reasons
+            .iter()
+            .any(|r| r.contains("EstimateNotComposable")),
+        "the directed assess reached the resource seam: {:?}",
+        elig.reasons
+    );
+
     sup.ping().await.expect("worker healthy after the refusal");
     assert_eq!(sup.restarts().await, 0, "no respawn");
     sup.shutdown().await;

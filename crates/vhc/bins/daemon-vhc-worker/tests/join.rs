@@ -360,6 +360,7 @@ fn genesis_wire() -> Vec<u8> {
             config: coordinator_role_config(),
             grants: control_channel("control"),
             device_min: daemon_vhc_proto::DeviceMinimums::default(),
+            identity: None,
         },
     );
     roles.insert(
@@ -378,6 +379,7 @@ fn genesis_wire() -> Vec<u8> {
             // members of the composed claim, and an authored minimum beside a composed one is a
             // second authority over the same question, which authoring refuses.
             device_min: daemon_vhc_proto::DeviceMinimums::default(),
+            identity: None,
         },
     );
 

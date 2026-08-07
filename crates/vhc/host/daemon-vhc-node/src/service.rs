@@ -1311,18 +1311,20 @@ impl VhcService {
             return;
         }
         let worker = self.instance_worker();
-        // Assess + resolve the coordinator endpoint for the TRAINER role (node-directed).
-        let (coordinator, eligibility, assessed_tuple) = match self
-            .resolve_join(&worker, run_id, Some("trainer".to_string()))
-            .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                warn_co!(format!("co-located trainer assess failed: {e}"));
-                worker.shutdown().await;
-                return;
-            }
-        };
+        // Assess + resolve the coordinator endpoint for the TRAINER role. Undirected: against a
+        // SEATED genesis the node selects the trainer seat authored for its own identity
+        // (defect 6); against the pre-seat form the worker's first-non-coordinator default is
+        // the `trainer` role as before.
+        let (coordinator, eligibility, assessed_tuple, directed) =
+            match self.resolve_join(&worker, run_id, None).await {
+                Ok(v) => v,
+                Err(e) => {
+                    warn_co!(format!("co-located trainer assess failed: {e}"));
+                    worker.shutdown().await;
+                    return;
+                }
+            };
+        let trainer_role = directed.unwrap_or_else(|| "trainer".to_string());
         if !eligibility.eligible {
             warn_co!(format!(
                 "co-located trainer ineligible: {}",
@@ -1349,7 +1351,7 @@ impl VhcService {
         let id = RoleInstanceId {
             run_id: run_hash,
             epoch: 0,
-            role: "trainer".to_string(),
+            role: trainer_role.clone(),
             instance,
         };
         let charge = match self.derive_charge(&eligibility, policy, &id.role) {
@@ -1374,7 +1376,7 @@ impl VhcService {
         }
         // The verified head estimate for the staleness judgment (a trainer never carries the
         // reconstruction directive — the seat lineage is not its history to rebuild).
-        let recovery = match self.resolve_recovery(run_id, "trainer").await {
+        let recovery = match self.resolve_recovery(run_id, &trainer_role).await {
             Ok(r) => r,
             Err(e) => {
                 self.arbiter.release(&id);
@@ -1386,7 +1388,7 @@ impl VhcService {
             }
         };
         let restore = match self
-            .resolve_restore(run_id, "trainer", recovery.verified_head)
+            .resolve_restore(run_id, &trainer_role, recovery.verified_head)
             .await
         {
             Ok(r) => r,
@@ -1708,15 +1710,16 @@ impl VhcService {
                 // the coordinator slot poisons every coordinator restore — observed live as
                 // `MigrateIncompatible` on every coordinator rejoin (the quorum guest correctly
                 // refusing a TinyLlama trainer document). The event's generation names the
-                // emitter: the co-trainer's generation ⇒ "trainer", else the run row's role.
-                let co_gen = self
-                    .co_trainers
-                    .lock()
-                    .unwrap()
-                    .get(&run_id)
-                    .map(|e| e.generation);
-                let role = if co_gen == Some(*generation) {
-                    "trainer".to_string()
+                // emitter: the co-trainer's generation ⇒ ITS role (a seat-directed join runs an
+                // authored per-seat label like `trainer-0`), else the run row's role.
+                let co_role = {
+                    let co = self.co_trainers.lock().unwrap();
+                    co.get(&run_id)
+                        .filter(|e| e.generation == *generation)
+                        .map(|e| e.id.role.clone())
+                };
+                let role = if let Some(role) = co_role {
+                    role
                 } else {
                     self.store
                         .get_run(&run_id)?
@@ -2088,7 +2091,15 @@ impl VhcService {
         worker: &Arc<dyn WorkerControl>,
         run_id: &str,
         role: Option<String>,
-    ) -> Result<(String, VhcEligibility, Option<protocol::AdmittedTuple>), VhcError> {
+    ) -> Result<
+        (
+            String,
+            VhcEligibility,
+            Option<protocol::AdmittedTuple>,
+            Option<String>,
+        ),
+        VhcError,
+    > {
         if let Some(discovery) = &self.discovery {
             let run = discovery
                 .get_run(run_id)
@@ -2101,11 +2112,23 @@ impl VhcService {
                 return Err(VhcError::AllowlistRefused(run.coordinator.clone()));
             }
             let envelope = discovery.fetch_envelope(run_id).await?;
-            let verdict = worker.assess(envelope, role).await?;
+            // An undirected join against a SEATED genesis selects the seat authored for this
+            // node's identity (defect 6): the worker's first-non-coordinator default would
+            // decode another seat's plan identity.
+            let role = match role {
+                Some(r) => Some(r),
+                None => self.authored_seat(&envelope)?,
+            };
+            let verdict = worker.assess(envelope, role.clone()).await?;
             // Stamp the node-owned revisions into the immutable admitted tuple (architecture
             // §6.3); the incarnation stays 0 (unassigned) until the node mints it at join.
             let tuple = self.stamp_admitted_tuple(verdict.admitted_tuple.clone())?;
-            Ok((run.coordinator, eligibility_from_assess(&verdict), tuple))
+            Ok((
+                run.coordinator,
+                eligibility_from_assess(&verdict),
+                tuple,
+                role,
+            ))
         } else {
             let coordinator = self.coordinator();
             let eligibility = match worker.probe().await {
@@ -2116,7 +2139,68 @@ impl VhcService {
                     headroom: BTreeMap::new(),
                 },
             };
-            Ok((coordinator, eligibility, None))
+            Ok((coordinator, eligibility, None, role))
+        }
+    }
+
+    /// The authored-SEAT selection for an undirected join (defect 6 of the c15 drills): the
+    /// label of the non-coordinator role whose [`daemon_vhc_proto::RoleEntry::identity`] binds
+    /// this node's base identity. The role's opaque config carries a per-participant plan
+    /// identity the host may never decode (the seam rule); the identity binding is the
+    /// host-visible half that lets the node pick ITS seat.
+    ///
+    /// - `Ok(None)` — the role set carries no identity-bound worker roles (the pre-seat form):
+    ///   the worker's undirected default (first non-coordinator role) applies unchanged.
+    /// - `Ok(Some(label))` — the seat authored for this node.
+    /// - `Err` — the role set IS seated and this node holds no seat (or has no base identity to
+    ///   select with). Joining undirected would silently run someone else's plan identity —
+    ///   every box training the same window slice, the checkpoint slots elected to the
+    ///   un-impersonated seats published by nobody — so the join refuses typed instead.
+    fn authored_seat(&self, envelope_wire: &[u8]) -> Result<Option<String>, VhcError> {
+        let Ok(wire) = daemon_vhc_proto::from_canonical_slice::<daemon_vhc_proto::SignedEnvelope>(
+            envelope_wire,
+        ) else {
+            return Ok(None); // not the signed wire form — the worker's typed refusal names it
+        };
+        let Ok(frozen) =
+            daemon_vhc_proto::FrozenGenesis::open(wire.bytes, wire.signature, wire.signer)
+        else {
+            return Ok(None); // not a verifiable genesis — likewise the worker's refusal to give
+        };
+        let Ok(env) = frozen.decode() else {
+            return Ok(None);
+        };
+        let seats: Vec<(&String, daemon_vhc_proto::PeerId)> = env
+            .roles
+            .iter()
+            .filter(|(_, r)| r.lane != "coordinator")
+            .filter_map(|(name, r)| r.identity.map(|id| (name, id)))
+            .collect();
+        if seats.is_empty() {
+            return Ok(None);
+        }
+        let Some(dir) = &self.identity_dir else {
+            return Err(VhcError::Worker(
+                "the genesis authors identity-bound seats but this node has no identity \
+                 keystore configured to select one"
+                    .into(),
+            ));
+        };
+        let keystore = daemon_vhc_session::keystore::VhcKeystore::open(dir)
+            .map_err(|e| VhcError::Internal(format!("open identity keystore: {e}")))?;
+        let own = keystore
+            .base_identity()
+            .map(|k| daemon_vhc_proto::peer_id(&k))
+            .map_err(|e| VhcError::Internal(format!("no base identity to select a seat: {e}")))?;
+        match seats.iter().find(|(_, id)| *id == own) {
+            Some((label, _)) => Ok(Some((*label).clone())),
+            None => Err(VhcError::Worker(format!(
+                "the genesis authors {} identity-bound seat(s) and none binds this node's base \
+                 identity {} — join from a box whose identity holds a seat, or re-author the \
+                 genesis with this box in the roster",
+                seats.len(),
+                own.to_hex()
+            ))),
         }
     }
 
@@ -2139,7 +2223,7 @@ impl VhcService {
     )> {
         let keeper = self.seat.as_ref()?;
         let seat_role = self.config.seat_role.clone();
-        let (coordinator, eligibility, tuple) = self
+        let (coordinator, eligibility, tuple, _directed) = self
             .resolve_join(worker, run_id, Some(seat_role.clone()))
             .await
             .ok()?;
@@ -3193,16 +3277,21 @@ impl VhcApi for VhcService {
         } else {
             None
         };
-        let (coordinator, eligibility, assessed_tuple, seat_incarnation) = match seat_join {
-            Some(won) => won,
-            None => {
-                let (coordinator, eligibility, assessed_tuple) = self
-                    .resolve_join(&worker, &run_id, None)
-                    .await
-                    .map_err(|e| e.to_api())?;
-                (coordinator, eligibility, assessed_tuple, None)
-            }
-        };
+        let (coordinator, eligibility, assessed_tuple, seat_incarnation, directed_role) =
+            match seat_join {
+                Some((coordinator, eligibility, assessed_tuple, incarnation)) => {
+                    (coordinator, eligibility, assessed_tuple, incarnation, None)
+                }
+                None => {
+                    // Undirected: against a SEATED genesis this selects the trainer seat
+                    // authored for this node's identity (defect 6).
+                    let (coordinator, eligibility, assessed_tuple, directed) = self
+                        .resolve_join(&worker, &run_id, None)
+                        .await
+                        .map_err(|e| e.to_api())?;
+                    (coordinator, eligibility, assessed_tuple, None, directed)
+                }
+            };
 
         // An ineligible assessment refuses HERE, in the funnel's own words. Letting it fall
         // through to charge derivation used to convert every assess refusal into the same
@@ -3253,14 +3342,15 @@ impl VhcApi for VhcService {
                     // ledger entry by blake3(RunLabel) until then (decisions D1 lazy backfill).
                     run_id: run_hash.unwrap_or_else(|| *blake3::hash(run_id.as_bytes()).as_bytes()),
                     epoch,
-                    // The seat-won join runs the configured seat role; else the persisted role
-                    // (the trainer default for a fresh row).
+                    // The seat-won join runs the configured seat role; else the persisted role;
+                    // else the seat the genesis authored for this identity (defect 6), with the
+                    // pre-seat `trainer` default last.
                     role: if seat_incarnation.is_some() {
                         self.config.seat_role.clone()
-                    } else if role.is_empty() {
-                        "trainer".to_string()
-                    } else {
+                    } else if !role.is_empty() {
                         role
+                    } else {
+                        directed_role.unwrap_or_else(|| "trainer".to_string())
                     },
                     // The seat-won join runs at the LEASE'S execution incarnation — which the
                     // keeper COUNTER-MINTED at claim ([SEAT-1] v2: the counter mints every

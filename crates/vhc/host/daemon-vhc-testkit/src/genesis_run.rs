@@ -594,6 +594,7 @@ pub fn genesis_envelope(inputs: &EnvelopeInputs<'_>) -> GenesisEnvelope {
             config: coord_config,
             grants: RoleGrants::default(),
             device_min: daemon_vhc_proto::DeviceMinimums::default(),
+            identity: None,
         },
     );
     roles.insert(
@@ -611,6 +612,7 @@ pub fn genesis_envelope(inputs: &EnvelopeInputs<'_>) -> GenesisEnvelope {
             config: Value::Map(vec![]),
             grants: RoleGrants::default(),
             device_min: daemon_vhc_proto::DeviceMinimums::default(),
+            identity: None,
         },
     );
 

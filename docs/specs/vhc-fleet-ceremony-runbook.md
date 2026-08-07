@@ -454,6 +454,16 @@ keys:
    confirm the value in `authoring-report.txt` alongside the other pins. The harness/assessment
    config form stays `live`-free, so the cadence never moves the fit-probe key (no re-probe on a
    cadence-only change — but the envelope bytes and hence the RUN ID always change).
+   **Seat binding check:** the authoring emits one trainer role **per roster seat**
+   (`trainer-0`, `trainer-1`, …), each `RoleEntry` binding its seat's base identity
+   (`identity`) and freezing that seat's plan identity (`peer`) in the opaque config. A joining
+   node selects the seat bound to its own base identity; an undirected join against a seated
+   genesis is a typed refusal (worker-side backstop). This is the defect-6 fix from the c15
+   drills: a single shared trainer role decoded `peer = roster[0]` on **every** box — all boxes
+   trained the same window slice (the rest of the authored global batch untouched) and the
+   checkpoint slots elected to any other roster identity were published by nobody (the G-4
+   round-16 hole). All seats share the ONE derived trainer execution requirement, so the
+   fit-probe key does not move with the seat.
 2. **Verify locally:** the tool re-opens the frozen envelope (re-derives the hash + verifies the
    signature) and reproduces the expected root before writing the artifacts.
 3. **Seed:** `VHC_BASE=<dev base> VHC_ENVELOPE_B64=$(cat <out>/envelope.b64) node

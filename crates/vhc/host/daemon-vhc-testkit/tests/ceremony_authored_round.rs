@@ -180,7 +180,7 @@ fn the_authored_checkpoint_cadence_reaches_the_trainer_config() {
     let frozen = author_fleet_genesis(b"cadence-wiring-stand-in", &roster);
     let env = frozen.decode().expect("decode the fleet genesis");
 
-    let trainer_config = &env.roles.get("trainer").expect("trainer role").config;
+    let trainer_config = &env.roles.get("trainer-0").expect("trainer role").config;
     let live = field(trainer_config, "live");
     assert_eq!(
         uint_field(&live, "remote_ckpt_every"),
@@ -213,8 +213,9 @@ fn the_fleet_authoring_opens_a_round_its_own_trainer_config_can_plan() {
     let frozen = author_fleet_genesis(&coordinator_wasm, &roster);
     let env = frozen.decode().expect("decode the fleet genesis");
 
-    // -- the trainer's half of the round, read out of the envelope (never transcribed) ----------
-    let trainer_config = &env.roles.get("trainer").expect("trainer role").config;
+    // -- the trainer's half of the round, read out of the envelope (never transcribed; every
+    // per-seat role shares the window arithmetic, so seat 0's config stands for all) -----------
+    let trainer_config = &env.roles.get("trainer-0").expect("trainer role").config;
     let steps_per_round =
         u32::try_from(uint_field(trainer_config, "steps_per_round")).expect("step count");
     let micro_batch = u32::try_from(uint_field(trainer_config, "micro_batch")).expect("micro");

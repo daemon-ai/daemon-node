@@ -814,6 +814,7 @@ mod tests {
                     config: ciborium::value::Value::Map(vec![]),
                     grants: RoleGrants::default(),
                     device_min: DeviceMinimums::default(),
+                    identity: None,
                 },
             );
         }

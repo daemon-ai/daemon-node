@@ -347,12 +347,19 @@ fn ceremony_profile_value() -> Value {
 /// run never authored. The cadence rides the `live` half, never the harness form: it is run
 /// publication policy, not resource geometry, so the module assessment (and with it the
 /// fit-verdict key) is untouched by construction.
+///
+/// `seat` is this role entry's **plan identity** (a roster member): the `peer` the guest plans
+/// its round-window slice and checkpoint-publisher election as. One authored config per seat —
+/// a single shared config gave every joiner the same plan identity (defect 6 of the c15 drills:
+/// every box trained roster\[0\]'s slice and the slots elected to roster\[1\] were published by
+/// nobody).
 #[must_use]
 pub fn ceremony_trainer_config(
     run_label: &str,
     corpus_manifest: Hash,
     roster: &[PeerId],
     remote_ckpt_every: u64,
+    seat: PeerId,
 ) -> Value {
     let text = |s: &str| Value::Text(s.into());
     let live = Value::Map(vec![
@@ -369,6 +376,15 @@ pub fn ceremony_trainer_config(
     let Value::Map(mut fields) = ceremony_trainer_config_harness(roster) else {
         unreachable!("the harness form is a map")
     };
+    // The seat's plan identity replaces the harness stand-in (`roster[0]`). The peer is join
+    // wiring that never enters the module's resource plan (see the assessment note in
+    // `ceremony_execution_with_certification`), so every seat shares one derived execution
+    // requirement while planning a distinct window slice.
+    for (k, v) in &mut fields {
+        if matches!(k, Value::Text(t) if t == "peer") {
+            *v = Value::Bytes(seat.0.to_vec());
+        }
+    }
     fields.push((text("live"), live));
     Value::Map(fields)
 }
@@ -902,28 +918,43 @@ pub fn ceremony_genesis(
             config: coord_config,
             grants: control_channel(BTreeSet::new()),
             device_min: daemon_vhc_proto::DeviceMinimums::default(),
+            // Coordinator DUTY is arbitrated live by the registry seat lease ([SEAT-1]), never
+            // frozen to one box at authoring — any trusted base may win the slot.
+            identity: None,
         },
     );
-    roles.insert(
-        "trainer".to_string(),
-        RoleEntry {
-            // Placed, not composed: what the module's own assessment produced, derived upstream. A
-            // role absent from the authored set stays `None`, which `validate` refuses for a runnable
-            // envelope — defaulting here would be this seat inventing a resource requirement.
-            execution: spec.execution.for_role("trainer"),
-            lane: "trainer".into(),
-            module: "worker.wasm".into(),
-            abi: "vhc@2".into(),
-            config: ceremony_trainer_config(
-                spec.run_label,
-                spec.corpus_manifest,
-                spec.roster,
-                spec.remote_ckpt_cadence_rounds,
-            ),
-            grants: control_channel(granted),
-            device_min: daemon_vhc_proto::DeviceMinimums::default(),
-        },
-    );
+    // One trainer role PER ROSTER SEAT (defect 6 of the c15 drills): the trainer config's plan
+    // identity (`peer`) drives both the round-window split and the checkpoint-publisher
+    // election, so a single shared role — every joiner decoding the same authored
+    // `peer = roster[0]` — had every box training the SAME window slice (the rest of the
+    // authored global batch never touched) and the cadence slots elected to any other identity
+    // published by NOBODY. Each seat freezes one plan identity and binds it host-visibly
+    // (`RoleEntry::identity`), so a joining node selects ITS seat by its base identity and two
+    // boxes cannot decode the same plan identity by construction. All seats share the ONE
+    // derived trainer execution requirement — the plan never varies with the peer (the
+    // assessment note in `ceremony_execution_with_certification`).
+    for (i, seat) in spec.roster.iter().enumerate() {
+        roles.insert(
+            format!("trainer-{i}"),
+            RoleEntry {
+                // Placed, not composed (see the coordinator entry above).
+                execution: spec.execution.for_role("trainer"),
+                lane: "trainer".into(),
+                module: "worker.wasm".into(),
+                abi: "vhc@2".into(),
+                config: ceremony_trainer_config(
+                    spec.run_label,
+                    spec.corpus_manifest,
+                    spec.roster,
+                    spec.remote_ckpt_cadence_rounds,
+                    *seat,
+                ),
+                grants: control_channel(granted.clone()),
+                device_min: daemon_vhc_proto::DeviceMinimums::default(),
+                identity: Some(*seat),
+            },
+        );
+    }
 
     let genesis = GenesisEnvelope {
         run: RunSection {
@@ -1353,9 +1384,35 @@ mod tests {
             StateInit::Manifest { .. } => panic!("seed-derived init"),
         }
 
-        // Both canonical roles present; the trainer carries the FROZEN model verbatim.
+        // The coordinator plus one trainer role PER ROSTER SEAT (defect 6), each binding its
+        // seat's base identity host-visibly and freezing that seat's plan identity (`peer`) in
+        // the opaque config — no two seats may decode the same plan identity.
         assert!(env.roles.contains_key("coordinator"));
-        let trainer = env.roles.get("trainer").expect("trainer role");
+        assert!(env.roles["coordinator"].identity.is_none());
+        for (i, seat) in trusted.iter().enumerate() {
+            let role = env
+                .roles
+                .get(&format!("trainer-{i}"))
+                .expect("one trainer role per roster seat");
+            assert_eq!(
+                role.identity,
+                Some(*seat),
+                "the seat binding is host-visible"
+            );
+            let Value::Map(cfg) = &role.config else {
+                panic!("trainer config is a map");
+            };
+            let peer = cfg
+                .iter()
+                .find_map(|(k, v)| matches!(k, Value::Text(t) if t == "peer").then_some(v))
+                .expect("peer in trainer config");
+            assert_eq!(
+                peer,
+                &Value::Bytes(seat.0.to_vec()),
+                "the seat's plan identity is its own roster entry, not roster[0]"
+            );
+        }
+        let trainer = env.roles.get("trainer-0").expect("trainer role");
         let Value::Map(cfg) = &trainer.config else {
             panic!("trainer config is a map");
         };
@@ -1523,8 +1580,9 @@ mod tests {
             .expect("a non-negative field")
         };
 
-        // The trainer's half: the frozen inner loop over the fleet roster.
-        let trainer = &env.roles.get("trainer").expect("trainer role").config;
+        // The trainer's half: the frozen inner loop over the fleet roster (every per-seat role
+        // shares it; seat 0's stands for all).
+        let trainer = &env.roles.get("trainer-0").expect("trainer role").config;
         let steps = uint(trainer, "steps_per_round");
         let micro = uint(trainer, "micro_batch");
         let Value::Array(roster) = field(trainer, "roster") else {

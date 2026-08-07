@@ -85,6 +85,7 @@ fn genesis_wire(run_label: &str) -> Vec<u8> {
             config: Value::Map(Vec::new()),
             grants: control_channel(),
             device_min: daemon_vhc_proto::DeviceMinimums::default(),
+            identity: None,
         },
     );
     roles.insert(
@@ -110,6 +111,7 @@ fn genesis_wire(run_label: &str) -> Vec<u8> {
             // module-switch identity and journal continuity, not resources, so it has nothing to state
             // here.
             device_min: daemon_vhc_proto::DeviceMinimums::default(),
+            identity: None,
         },
     );
 

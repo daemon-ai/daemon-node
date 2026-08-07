@@ -1757,6 +1757,7 @@ mod tests {
                 config: ciborium::value::Value::Map(vec![]),
                 grants,
                 device_min: daemon_vhc_proto::DeviceMinimums::default(),
+                identity: None,
             },
         );
         roles.insert(
@@ -1773,6 +1774,7 @@ mod tests {
                 config: ciborium::value::Value::Map(vec![]),
                 grants: daemon_vhc_proto::RoleGrants::default(),
                 device_min: daemon_vhc_proto::DeviceMinimums::default(),
+                identity: None,
             },
         );
         let mut artifacts = BTreeMap::new();

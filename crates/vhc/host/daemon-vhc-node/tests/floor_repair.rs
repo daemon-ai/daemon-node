@@ -79,6 +79,7 @@ fn genesis_wire(trusted_bases: &[daemon_vhc_proto::PeerId]) -> (Vec<u8>, [u8; 32
             ..RoleGrants::default()
         },
         device_min: daemon_vhc_proto::DeviceMinimums::default(),
+        identity: None,
     };
     let mut roles = BTreeMap::new();
     roles.insert("coordinator".to_string(), role_entry());

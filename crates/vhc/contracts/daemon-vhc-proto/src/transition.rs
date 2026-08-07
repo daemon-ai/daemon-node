@@ -602,6 +602,7 @@ mod tests {
                 grants: RoleGrants::default(),
                 device_min: DeviceMinimums::default(),
                 execution: Some(crate::execution_requirements::sample_for_tests("cpu")),
+                identity: None,
             },
         );
         roles.insert(
@@ -614,6 +615,7 @@ mod tests {
                 grants: RoleGrants::default(),
                 device_min: DeviceMinimums::default(),
                 execution: Some(crate::execution_requirements::sample_for_tests("cpu")),
+                identity: None,
             },
         );
 

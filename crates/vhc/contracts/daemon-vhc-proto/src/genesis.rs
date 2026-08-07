@@ -329,6 +329,19 @@ pub struct RoleEntry {
     /// refuses for a runnable envelope.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution: Option<RoleExecutionRequirements>,
+    /// The authored **seat binding**: the base identity this role entry was authored FOR
+    /// (additive; `None` = an unbound role any participant may run, the pre-seat form).
+    ///
+    /// Exists because a role's opaque config can carry a per-participant plan identity (the
+    /// trainer's `peer`, which drives its round-window split and the checkpoint-publisher
+    /// election), and the host may never decode the config to learn it (the seam rule). A run
+    /// authored with one SHARED trainer role had every joiner decode the same plan identity —
+    /// every box trained the same window slice (the rest of the global batch untouched) and the
+    /// cadence slots elected to any other identity were published by nobody. The binding is the
+    /// host-visible half: a joining node selects the role whose `identity` is its own base
+    /// identity, and refuses a seat authored for someone else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<PeerId>,
 }
 
 /// `[identities]` — the run's cryptographic identities (architecture §5.1). Opaque-ish to the host
@@ -479,6 +492,21 @@ impl GenesisEnvelope {
                     return Err(VhcProtoError::Validation(format!(
                         "role `{name}` grants artifact {} absent from the artifact map",
                         granted.to_hex()
+                    )));
+                }
+            }
+        }
+        // Seat bindings must be pairwise-distinct: two roles authored for the same base identity
+        // would re-create the plan-identity aliasing the binding exists to prevent (one identity
+        // cannot hold two seats; an unbound role is exempt).
+        let mut seats = BTreeSet::new();
+        for (name, role) in &self.roles {
+            if let Some(identity) = &role.identity {
+                if !seats.insert(*identity) {
+                    return Err(VhcProtoError::Validation(format!(
+                        "role `{name}` binds identity {} which another role already binds — one \
+                         base identity cannot hold two authored seats",
+                        identity.to_hex()
                     )));
                 }
             }
@@ -716,6 +744,7 @@ mod tests {
                 grants: worker_grants,
                 device_min: DeviceMinimums::default(),
                 execution: Some(execution_requirements("cuda")),
+                identity: None,
             },
         );
         roles.insert(
@@ -728,6 +757,7 @@ mod tests {
                 grants: RoleGrants::default(),
                 device_min: DeviceMinimums::default(),
                 execution: Some(execution_requirements("cpu")),
+                identity: None,
             },
         );
 
@@ -810,6 +840,31 @@ mod tests {
         let mut env = sample();
         env.roles.get_mut("worker").unwrap().module = "nope".into();
         assert!(env.validate().is_err());
+    }
+
+    /// The seat bindings (defect 6 of the c15 drills): distinct identities validate; two roles
+    /// binding the SAME base identity are refused (one identity cannot hold two authored
+    /// seats); and the pre-seat form (no bindings at all) stays valid — the field is additive.
+    #[test]
+    fn validate_seat_bindings_must_be_pairwise_distinct() {
+        let mut env = sample();
+        // A second worker seat: same shape, distinct identity — valid.
+        let mut second = env.roles["worker"].clone();
+        env.roles.get_mut("worker").unwrap().identity = Some(PeerId([0xAA; 32]));
+        second.identity = Some(PeerId([0xBB; 32]));
+        env.roles.insert("worker-1".to_string(), second.clone());
+        env.validate().expect("distinct seat bindings validate");
+
+        // The same identity twice: refused.
+        env.roles.get_mut("worker-1").unwrap().identity = Some(PeerId([0xAA; 32]));
+        let err = env.validate().expect_err("an aliased seat binding refuses");
+        assert!(
+            err.to_string().contains("binds identity"),
+            "the refusal names the aliased binding (got: {err})"
+        );
+
+        // The pre-seat form (additive: no bindings) still validates.
+        assert!(sample().validate().is_ok());
     }
 
     /// The state contract is additive: absent it changes nothing; present it commits into the
