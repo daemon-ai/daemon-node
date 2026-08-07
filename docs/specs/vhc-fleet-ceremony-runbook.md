@@ -207,10 +207,17 @@ cargo run -p xtask -- author-ceremony-genesis \
   --trusted-base <hex> --trusted-base <hex> --trusted-base <hex>   # ORDERED; first = authority
   --roster <hex> --roster <hex> --roster <hex> \
   --upgrade-authority <hex> \
-  --min-peers 3 --max-peers 3 --ckpt-cadence 8 --payload-retention 64 \
+  --min-peers 3 --max-peers 3 --ckpt-cadence 4 --payload-retention 64 \
   --warmup-s <n> --round-max-s <n> --witness-s <n> --cooldown-s <n> --stop-rounds <n> \
   --out <dir>
 ```
+
+`--ckpt-cadence` is bounded by the retained record horizon (4 rounds,
+`RETAINED_RECORD_HORIZON_ROUNDS`), not only by retention: a rejoiner's fence trails the live head
+by up to one full cadence slot, and replay-forward bridges at most the horizon. A wider cadence
+authors a run whose crashed trainer is unrecoverable by construction — proven live in the c15f
+drill (cadence 8: the trapped trainer's fence sat 16 rounds behind and every rejoin refused
+`CheckpointStale`). The authoring refuses it typed since defect 7c.
 
 **The two module FILE flags are required, and they are not a convenience.** `--coordinator-wasm` and
 `--trainer-wasm` are checked against `--coordinator-module` / `--trainer-module`, and the file is needed
@@ -443,7 +450,7 @@ Strict order, because the run id (= genesis hash) commits everything and prefixe
 keys:
 
 1. **Author** with the module hashes, the corpus manifest hash, the trust set / roster / upgrade
-   authority, `--min-peers 3 --max-peers 3`, `--ckpt-cadence 8 --payload-retention 64`,
+   authority, `--min-peers 3 --max-peers 3`, `--ckpt-cadence 4 --payload-retention 64`,
    `--stop-rounds 48`, and timers from the smoke calibration (round-max ≈ 3× the slowest measured
    wall; warmup generous). Review `authoring-report.txt`; the human ratifies it before seeding.
    **Cadence wiring check:** `--ckpt-cadence` must land in the trainer role's `live` config as

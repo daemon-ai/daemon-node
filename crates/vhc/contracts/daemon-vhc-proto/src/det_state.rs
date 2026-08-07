@@ -815,11 +815,31 @@ pub fn derive_state_chunk_size(profile_chunk: u64) -> u64 {
 ///
 /// `payload_retention_rounds == 0` means unbounded retention (no constraint);
 /// `remote_cadence_rounds == 0` means remote publication is disabled (nothing to bound).
+///
+/// The cadence is ALSO bounded by the **retained record horizon**
+/// ([`RETAINED_RECORD_HORIZON_ROUNDS`]): a restorer's freshest fence trails the live head by up
+/// to one full cadence slot, and replay-forward can only bridge `head - fence ≤ horizon` rounds.
+/// A cadence above the horizon therefore authors a run whose crashed trainer is unrecoverable
+/// **by construction** for part of every slot — proven live in the c15f drill (cadence 8,
+/// horizon 4: the trapped trainer's fence sat 16 rounds behind and every rejoin refused
+/// `CheckpointStale`). Payload retention bounds the PAYLOAD lane; this bounds the RECORD lane.
 pub fn validate_checkpoint_cadence(
     remote_cadence_rounds: u64,
     payload_retention_rounds: u64,
 ) -> Result<(), VhcProtoError> {
-    if payload_retention_rounds == 0 || remote_cadence_rounds == 0 {
+    if remote_cadence_rounds == 0 {
+        return Ok(());
+    }
+    if remote_cadence_rounds > RETAINED_RECORD_HORIZON_ROUNDS {
+        return Err(VhcProtoError::Validation(format!(
+            "remote checkpoint cadence {remote_cadence_rounds} exceeds the retained record \
+             horizon {RETAINED_RECORD_HORIZON_ROUNDS}: a trainer that dies late in a cadence \
+             slot restores a fence deeper than replay-forward can bridge, so churn recovery \
+             would be impossible by construction; tighten the cadence to \
+             ≤ {RETAINED_RECORD_HORIZON_ROUNDS}"
+        )));
+    }
+    if payload_retention_rounds == 0 {
         return Ok(());
     }
     let need = remote_cadence_rounds.saturating_mul(2);
@@ -1200,12 +1220,31 @@ mod tests {
 
     #[test]
     fn cadence_retention_bound() {
-        // cadence 20 + one churn slot (20) needs retention ≥ 40.
-        validate_checkpoint_cadence(20, 40).unwrap();
-        assert!(validate_checkpoint_cadence(20, 39).is_err());
-        // Unbounded retention / disabled remote publication: no constraint.
-        validate_checkpoint_cadence(20, 0).unwrap();
+        // cadence 4 + one churn slot (4) needs retention ≥ 8.
+        validate_checkpoint_cadence(4, 8).unwrap();
+        assert!(validate_checkpoint_cadence(4, 7).is_err());
+        // Unbounded retention / disabled remote publication: no constraint on THOSE lanes —
+        // but the record-horizon bound below still applies to any enabled cadence.
+        validate_checkpoint_cadence(4, 0).unwrap();
         validate_checkpoint_cadence(0, 8).unwrap();
+    }
+
+    /// The record-horizon bound (defect 7c of the c15 drills): a cadence above
+    /// [`RETAINED_RECORD_HORIZON_ROUNDS`] authors a run whose crashed trainer restores a fence
+    /// deeper than replay-forward can bridge — churn recovery impossible by construction
+    /// (c15f: cadence 8, horizon 4, every rejoin refused `CheckpointStale`). The refusal is
+    /// authoring-time and applies regardless of the retention setting.
+    #[test]
+    fn cadence_record_horizon_bound() {
+        validate_checkpoint_cadence(RETAINED_RECORD_HORIZON_ROUNDS, 64).unwrap();
+        for retention in [0, 64] {
+            let err = validate_checkpoint_cadence(RETAINED_RECORD_HORIZON_ROUNDS + 1, retention)
+                .expect_err("a cadence past the record horizon must refuse at authoring");
+            assert!(
+                err.to_string().contains("retained record horizon"),
+                "the refusal names the horizon bound (got: {err})"
+            );
+        }
     }
 
     proptest! {

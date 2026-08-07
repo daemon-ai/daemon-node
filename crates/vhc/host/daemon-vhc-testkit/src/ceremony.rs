@@ -1356,7 +1356,7 @@ mod tests {
             upgrade_authority: vec![base(1)],
             min_peers: 3,
             max_peers: 3,
-            remote_ckpt_cadence_rounds: 20,
+            remote_ckpt_cadence_rounds: 4,
             payload_retention_rounds: 64,
             timers: CeremonyRunTimers::default(),
         };
@@ -1446,13 +1446,13 @@ mod tests {
             .expect("an integer cadence");
         assert_eq!(
             u64::try_from(i128::from(cadence)).unwrap(),
-            20,
+            4,
             "the authored cadence reaches the guest config"
         );
 
         // Changing the cadence past the retention floor is refused at authoring.
         let mut bad = spec;
-        bad.payload_retention_rounds = 30; // 20 + one churn slot (20) = 40 > 30
+        bad.payload_retention_rounds = 6; // 4 + one churn slot (4) = 8 > 6
         assert!(
             ceremony_genesis(&bad, &author).is_err(),
             "cadence↔retention refused"
@@ -1485,7 +1485,7 @@ mod tests {
             upgrade_authority: vec![base(1)],
             min_peers: 3,
             max_peers: 3,
-            remote_ckpt_cadence_rounds: 8,
+            remote_ckpt_cadence_rounds: 4,
             payload_retention_rounds: 64,
             timers,
         };
@@ -1548,7 +1548,7 @@ mod tests {
             upgrade_authority: vec![base(1)],
             min_peers: 3,
             max_peers: 3,
-            remote_ckpt_cadence_rounds: 8,
+            remote_ckpt_cadence_rounds: 4,
             payload_retention_rounds: 64,
             // The calibrated fleet timers: seconds, on a clock that measures seconds.
             timers: CeremonyRunTimers {
@@ -1654,7 +1654,7 @@ mod tests {
             upgrade_authority: vec![base(1)],
             min_peers: 3,
             max_peers: 3,
-            remote_ckpt_cadence_rounds: 8,
+            remote_ckpt_cadence_rounds: 4,
             payload_retention_rounds: 64,
             timers: CeremonyRunTimers::default(),
         };

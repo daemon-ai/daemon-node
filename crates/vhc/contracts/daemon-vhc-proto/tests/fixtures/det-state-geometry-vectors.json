@@ -32,10 +32,12 @@
     { "chunk": 2097152, "derived": 8388608 }
   ],
   "cadence_retention_vectors": [
-    { "name": "cadence 20 + one churn slot fits retention 40", "cadence": 20, "retention": 40, "expect": "accept" },
-    { "name": "cadence 20 + one churn slot exceeds retention 39", "cadence": 20, "retention": 39, "expect": "refuse" },
-    { "name": "cadence 30 strands a rejoiner past retention 16", "cadence": 30, "retention": 16, "expect": "refuse" },
-    { "name": "retention 0 = unbounded, no constraint", "cadence": 20, "retention": 0, "expect": "accept" },
+    { "name": "cadence 4 + one churn slot fits retention 8", "cadence": 4, "retention": 8, "expect": "accept" },
+    { "name": "cadence 4 + one churn slot exceeds retention 7", "cadence": 4, "retention": 7, "expect": "refuse" },
+    { "name": "cadence 3 strands a rejoiner past retention 5", "cadence": 3, "retention": 5, "expect": "refuse" },
+    { "name": "cadence 5 exceeds the retained record horizon 4 (c15f: churn recovery impossible by construction)", "cadence": 5, "retention": 64, "expect": "refuse" },
+    { "name": "cadence 8 exceeds the retained record horizon even with unbounded retention", "cadence": 8, "retention": 0, "expect": "refuse" },
+    { "name": "retention 0 = unbounded, no payload constraint (cadence within the horizon)", "cadence": 4, "retention": 0, "expect": "accept" },
     { "name": "cadence 0 = remote publication disabled, nothing to bound", "cadence": 0, "retention": 8, "expect": "accept" },
     { "name": "cadence 1 needs retention >= 2", "cadence": 1, "retention": 2, "expect": "accept" },
     { "name": "cadence 1 refuses retention 1", "cadence": 1, "retention": 1, "expect": "refuse" }

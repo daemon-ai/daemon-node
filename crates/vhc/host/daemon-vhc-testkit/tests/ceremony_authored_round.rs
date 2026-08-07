@@ -16,7 +16,7 @@
 // What it drives, end to end:
 //
 //   1. `ceremony_genesis()` authors the fleet genesis at the ratified ceremony parameters
-//      (min = max = 3 trainers, the calibrated wall-clock timers, cadence 8 / retention 64).
+//      (min = max = 3 trainers, the calibrated wall-clock timers, cadence 4 / retention 64).
 //   2. `configure_coordinator` derives the coordinator seat from those frozen bytes and the REAL
 //      coordinator guest runs on the envelope's VERBATIM config — the host never re-authors it.
 //   3. The three roster peers Join and heartbeat ready, exactly the frame flow a fleet bring-up
@@ -124,7 +124,7 @@ fn author_fleet_genesis(coordinator_wasm: &[u8], roster: &[PeerId]) -> FrozenGen
         upgrade_authority: Vec::new(),
         min_peers: FLEET_PEERS as u32,
         max_peers: FLEET_PEERS as u32,
-        remote_ckpt_cadence_rounds: 8,
+        remote_ckpt_cadence_rounds: 4,
         payload_retention_rounds: 64,
         timers: CeremonyRunTimers {
             warmup_s: WARMUP_S,
@@ -184,8 +184,8 @@ fn the_authored_checkpoint_cadence_reaches_the_trainer_config() {
     let live = field(trainer_config, "live");
     assert_eq!(
         uint_field(&live, "remote_ckpt_every"),
-        8,
-        "the guest consumes the cadence the authoring validated (spec cadence 8), not its \
+        4,
+        "the guest consumes the cadence the authoring validated (spec cadence 4), not its \
          serde default of 0 (upload at every boundary)",
     );
 
