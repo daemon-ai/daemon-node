@@ -450,9 +450,13 @@ fn authoring_report(r: &AuthoringReport<'_>) -> String {
     for (i, p) in r.trusted_bases.iter().enumerate() {
         let _ = writeln!(s, "  trusted base {i}     : {}", p.to_hex());
     }
-    let _ = writeln!(s, "-- roster (trainer assignment) --");
+    let _ = writeln!(
+        s,
+        "-- roster (one authored trainer SEAT per entry: role `trainer-<i>` binds the identity \
+         and freezes its plan identity) --"
+    );
     for (i, p) in r.roster.iter().enumerate() {
-        let _ = writeln!(s, "  roster {i}           : {}", p.to_hex());
+        let _ = writeln!(s, "  trainer-{i} seat     : {}", p.to_hex());
     }
     let _ = writeln!(s, "-- upgrade authority --");
     if r.upgrade_authority.is_empty() {
