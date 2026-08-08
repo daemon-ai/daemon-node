@@ -2769,6 +2769,7 @@ name-keyed CBOR (additive decode), inventoried for the accumulated WireVersion d
   | `FailedRetryable { reason: text }` | recoverable environment fault: transport loss, provider fault, resource-budget breach, an unrecoverable inbound sequence gap with no backfill | may reconverge (rejoin as a NEW incarnation) under the retry budget |
   | `FailedTerminal { reason: text }` | module trap, admission identity mismatch, certificate refusal, init/migrate refusal, host storage fault (`HostStorageFailed` — operator repairs the substrate) | no automatic rejoin; owner action |
   | `FailedStorage { reason: text }` | recoverable HOST storage-capacity fault (`HostStorageExhausted`: ENOSPC / quota on the durable substrate) — a host condition, never a module defect | STORAGE-GATED reconvergence: redispatch only after the node's free-space check passes ([RL-4]); the gated wait consumes no retry budget and never escalates |
+  | `FailedTransport { reason: text }` | TRANSIENT transport fault reaching the content/archive planes (connect refused, timeout, connection reset, 5xx/429) — typed at the HTTP boundary and preserved through reconstruction; the environment is momentarily unavailable, never a semantic refusal | TRANSPORT-DEFERRED reconvergence: paced + jittered redispatch from the reconciliation pass ([RL-4]); consumes no retry budget, never escalates, cancellable by leave/pause, deferral visible on the run summary ([RL-6]) |
 
   `reason` strings are operator-facing detail and MUST NOT be branched on; the class is the
   contract. Terminal handling MUST be idempotent (duplicate delivery cannot double-release).
@@ -3038,6 +3039,15 @@ No new node↔worker wire is added — this section consumes §12.6's generation
   (`[vhc.storage] reserve_mb`; `0` disables the gate), deferring budget-free otherwise; once the
   gate opens, any subsequent non-storage failure consumes budget normally. *(Interim mechanism:
   the disk custodian, when it lands, replaces the free-space check as the resume authority.)*
+  **Transport-deferred exception:** a `FailedTransport` terminal (§12.6 [RS-2]) likewise consumes
+  no budget — a transport outage is an availability condition to wait out, not a crash loop to
+  escalate. The reconciliation pass redispatches on a paced, jittered backoff (bounded by the
+  retry config's backoff ceiling); indefinite deferral under a sustained outage is by design and
+  stays owner-cancellable (leave/pause) and owner-visible ([RL-6]). The classification is typed
+  from the HTTP boundary (connect/timeout/reset/5xx/429); semantic refusals — missing objects,
+  authentication, hash mismatch, malformed archives — never ride this lane and consume budget
+  normally. An expired presign re-presigns within the same attempt and is neither lane's
+  terminal.
 - **[RL-5] Pause is durable owner intent with release-on-pause.** The client API gains
   `VhcPause { run_id, op_id }` / `VhcResume { run_id, op_id }` beside join/leave (op_id-idempotent
   intents; name-keyed CBOR, additive). Pause persists the intent FIRST (a paused run survives

@@ -67,6 +67,33 @@ impl Redirects {
     pub const DEFAULT: Redirects = Redirects::FollowValidated { max_hops: 5 };
 }
 
+/// The transport-layer fault class of an [`EgressError::Transport`], preserved TYPED from the
+/// underlying HTTP client so recovery policy can branch on it (connect vs timeout vs reset)
+/// without sniffing error strings — the strings erase exactly this distinction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransportFaultKind {
+    /// Connection establishment failed (dial refused, DNS, TLS handshake never completed).
+    Connect,
+    /// The per-request deadline elapsed.
+    Timeout,
+    /// The peer closed/reset an established connection mid-request (or mid-body).
+    Reset,
+    /// Any other send-level failure (a transport-layer fault whose finer class the client does
+    /// not expose).
+    Other,
+}
+
+impl std::fmt::Display for TransportFaultKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Connect => "connect",
+            Self::Timeout => "timeout",
+            Self::Reset => "reset",
+            Self::Other => "other",
+        })
+    }
+}
+
 /// Why an egress request failed.
 #[derive(Debug, thiserror::Error)]
 pub enum EgressError {
@@ -86,9 +113,50 @@ pub enum EgressError {
     /// The request body could not be encoded.
     #[error("request body encode failed: {0}")]
     Encode(String),
-    /// A transport/TLS failure issuing the request.
-    #[error("request failed: {0}")]
-    Transport(String),
+    /// A transport/TLS failure issuing the request, with its fault class preserved typed.
+    #[error("request failed ({kind}): {detail}")]
+    Transport {
+        /// The transport-layer fault class (connect / timeout / reset / other).
+        kind: TransportFaultKind,
+        /// Operator-facing detail (never branched on).
+        detail: String,
+    },
+}
+
+/// Classify a [`reqwest::Error`] into a typed [`EgressError::Transport`], reading the fault class
+/// off the client's own predicates (and the io source chain for a reset) BEFORE it is stringified.
+fn transport_fault(e: &reqwest::Error) -> EgressError {
+    let kind = if e.is_timeout() {
+        TransportFaultKind::Timeout
+    } else if e.is_connect() {
+        TransportFaultKind::Connect
+    } else if io_reset(e) {
+        TransportFaultKind::Reset
+    } else {
+        TransportFaultKind::Other
+    };
+    EgressError::Transport {
+        kind,
+        detail: e.to_string(),
+    }
+}
+
+/// Whether the error's source chain bottoms out in a connection-reset/aborted/broken-pipe io fault.
+fn io_reset(e: &(dyn std::error::Error + 'static)) -> bool {
+    let mut src = e.source();
+    while let Some(s) = src {
+        if let Some(io) = s.downcast_ref::<std::io::Error>() {
+            return matches!(
+                io.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::UnexpectedEof
+            );
+        }
+        src = s.source();
+    }
+    false
 }
 
 /// Construction knobs for [`EgressClient`].
@@ -245,9 +313,10 @@ impl EgressClient {
         if let Some(timeout) = cfg.timeout {
             builder = builder.timeout(timeout);
         }
-        let http = builder
-            .build()
-            .map_err(|e| EgressError::Transport(e.to_string()))?;
+        let http = builder.build().map_err(|e| EgressError::Transport {
+            kind: TransportFaultKind::Other,
+            detail: e.to_string(),
+        })?;
         Ok(Self { http })
     }
 
@@ -307,10 +376,7 @@ impl EgressClient {
             if let Some(bytes) = &body {
                 builder = builder.body(bytes.clone());
             }
-            let resp = builder
-                .send()
-                .await
-                .map_err(|e| EgressError::Transport(e.to_string()))?;
+            let resp = builder.send().await.map_err(|e| transport_fault(&e))?;
             let status = resp.status();
 
             if !status.is_redirection() {

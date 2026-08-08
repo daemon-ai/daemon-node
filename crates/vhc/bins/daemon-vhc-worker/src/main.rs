@@ -187,11 +187,21 @@ async fn join_live(
         Some(r) => {
             let hash = daemon_vhc_proto::Hash(r.hash);
             let bytes = providers.payloads.get_content(&hash).await.map_err(|e| {
-                format!(
+                let detail = format!(
                     "fetch checkpoint {} (round {}): {e}",
                     hash.to_hex(),
                     r.round
-                )
+                );
+                // A transient transport fault reaching the content plane is the budget-free
+                // deferral lane (Gate C) — never a semantic refusal of the restore itself.
+                if e.is_transient_transport() {
+                    AttachRefusal {
+                        class: ErrorClass::Transient,
+                        detail,
+                    }
+                } else {
+                    AttachRefusal::from(detail)
+                }
             })?;
             let capture = daemon_vhc_session::role_session::decode_snapshot_doc(&bytes)?;
             Some(daemon_vhc_host::run::MigrationInput {
@@ -243,7 +253,18 @@ async fn join_live(
                 providers.payloads.clone(),
             )
             .await
-            .map_err(|e| format!("coordinator reconstruction: {e}"))?;
+            .map_err(|e| match e {
+                // The typed transient lane (Gate C, defect 10): the content plane was
+                // momentarily unreachable — the node defers budget-free and retries paced,
+                // instead of burning the semantic retry budget on a network outage.
+                daemon_vhc_session::reconstruct::ReconstructError::Transport { .. } => {
+                    AttachRefusal {
+                        class: ErrorClass::Transient,
+                        detail: format!("coordinator reconstruction: {e}"),
+                    }
+                }
+                other => AttachRefusal::from(format!("coordinator reconstruction: {other}")),
+            })?;
             Some(daemon_vhc_host::run::MigrationInput {
                 capture,
                 restore: true,
@@ -823,16 +844,27 @@ async fn main() {
                             // record lives on holding its ledger reservation (the Windows
                             // fleet-smoke stale-duty finding — persisted intents rehydrated on
                             // boot, refused their attach, and kept 100% duty until the operator
-                            // wiped run state) and no retry is ever scheduled. Retryable: the
-                            // node's bounded retry budget escalates to terminal on its own.
+                            // wiped run state) and no retry is ever scheduled. A TRANSIENT-class
+                            // refusal (plane dial timeout, content plane unreachable during
+                            // reconstruction/restore) is the budget-free transport lane (Gate C):
+                            // the node defers paced without consuming the retry budget. Every
+                            // other class is retryable under the node's bounded budget, which
+                            // escalates to terminal on its own.
+                            let outcome = if matches!(refusal.class, ErrorClass::Transient) {
+                                protocol::TerminalOutcome::FailedTransport {
+                                    reason: refusal.detail,
+                                }
+                            } else {
+                                protocol::TerminalOutcome::FailedRetryable {
+                                    reason: refusal.detail,
+                                }
+                            };
                             send(
                                 &writer,
                                 &Event::RunTerminated {
                                     run_id: run_id.clone(),
                                     generation: expected.incarnation,
-                                    outcome: protocol::TerminalOutcome::FailedRetryable {
-                                        reason: refusal.detail,
-                                    },
+                                    outcome,
                                 },
                             )
                             .await;

@@ -78,6 +78,19 @@ pub enum ReconstructError {
         /// What failed.
         detail: String,
     },
+    /// A TRANSIENT transport fault reaching the content plane (connect/timeout/reset/5xx) —
+    /// preserved TYPED from the HTTP boundary instead of stringified into the `Segment` fold
+    /// (Gate C, defect 10). The archive is not wrong and the join is not refused semantically:
+    /// the environment is momentarily unavailable, so the caller defers budget-free and
+    /// retries paced. (The c15-20260806g outage: transient R2 egress failures during
+    /// reconstruction consumed the semantic retry budget and drove a healthy seat terminal.)
+    #[error("transient transport fault during reconstruction ({kind}): {detail}")]
+    Transport {
+        /// The transport fault class, verbatim from the net boundary.
+        kind: daemon_vhc_net::TransportFaultKind,
+        /// Operator-facing detail (never branched on).
+        detail: String,
+    },
     /// The sandbox replay itself failed (engine/driver/guest-level).
     #[error("sandbox replay: {0}")]
     Sandbox(String),
@@ -181,7 +194,14 @@ async fn segment_bytes(
     let bytes = segments
         .get_content(&ContentHash(head.body.segment_hash.0))
         .await
-        .map_err(|e| seg_err(format!("content plane fetch: {e}")))?;
+        .map_err(|e| match e {
+            // A transient transport fault stays TYPED (never folded into the semantic
+            // `Segment` refusal): the caller's recovery is budget-free paced deferral.
+            daemon_vhc_net::VhcNetError::Transient { kind, detail } => {
+                ReconstructError::Transport { kind, detail }
+            }
+            other => seg_err(format!("content plane fetch: {other}")),
+        })?;
     if daemon_vhc_proto::blake3_hash(&bytes) != head.body.segment_hash {
         return Err(seg_err("content plane returned foreign bytes".into()));
     }
@@ -636,4 +656,123 @@ fn replay_capture(
     exported.ok_or_else(|| {
         sandbox("the reconstruction instance staged no snapshot (§10.2 export missing)".into())
     })
+}
+
+#[cfg(test)]
+mod transport_lane_tests {
+    //! Gate C (defect 10): the content-plane fetch inside reconstruction preserves the typed
+    //! transient transport lane instead of stringifying it into the semantic `Segment` fold.
+
+    use super::*;
+    use async_trait::async_trait;
+    use daemon_vhc_net::VhcNetError;
+    use daemon_vhc_proto::domains::ARCHIVE_HEAD_DOMAIN;
+    use daemon_vhc_proto::{peer_id, ArchiveHeadBody, CertScope, RunKeyCertificate, SigningKey};
+
+    /// A content plane whose GETs fail with a chosen error (the outage / the pruned store).
+    struct FailingPlane(fn() -> VhcNetError);
+
+    #[async_trait]
+    impl ContentStore for FailingPlane {
+        async fn put_content(&self, _bytes: &[u8]) -> Result<ContentHash, VhcNetError> {
+            unreachable!("reconstruction never writes the content plane")
+        }
+        async fn get_content(&self, _hash: &ContentHash) -> Result<Vec<u8>, VhcNetError> {
+            Err((self.0)())
+        }
+    }
+
+    fn head() -> ArchiveHeadRecord {
+        let base = SigningKey::from_bytes(&[0xB0; 32]);
+        let run_key = SigningKey::from_bytes(&[0x4A; 32]);
+        let cert = RunKeyCertificate::issue(
+            &base,
+            CertScope {
+                run_id: Hash([0x1D; 32]),
+                epoch: 0,
+                role: "coordinator".into(),
+                instance: 1,
+                module_hash: Hash([0x2A; 32]),
+            },
+            peer_id(&run_key),
+        )
+        .expect("cert");
+        ArchiveHeadRecord::publish(
+            &run_key,
+            cert,
+            ArchiveHeadBody {
+                domain: ARCHIVE_HEAD_DOMAIN.into(),
+                run_id: Hash([0x1D; 32]),
+                role: "coordinator".into(),
+                chain_instance: 1,
+                segment: 0,
+                segment_hash: Hash([0xA0; 32]),
+                prev_hash: Hash([0; 32]),
+                records: 4,
+                instance: 1,
+                epoch: 0,
+                module: Hash([0x2A; 32]),
+                predecessor: None,
+                round: None,
+            },
+        )
+        .expect("publish")
+    }
+
+    fn spec() -> ReconstructSpec {
+        ReconstructSpec {
+            heads: Vec::new(),
+            run_id: Hash([0x1D; 32]),
+            trusted: Vec::new(),
+            role: "coordinator".into(),
+            run_label: "run-x".into(),
+            journal_root: None, // a cold standby: every segment fetches remote
+            module: Vec::new(),
+            config: Vec::new(),
+            grants: Vec::new(),
+            incarnation: 2,
+            restore: None,
+            sidecar_key: None,
+            deadline_ms: 1_000,
+        }
+    }
+
+    /// A transient transport fault (connect refused, timeout, 5xx — the R2 outage shape) stays
+    /// TYPED [`ReconstructError::Transport`]: the caller defers budget-free instead of burning
+    /// the semantic retry budget on a network outage (the c15-20260806g terminal loop).
+    #[tokio::test]
+    async fn a_transient_content_plane_fault_stays_typed() {
+        let plane = FailingPlane(|| VhcNetError::Transient {
+            kind: daemon_vhc_net::TransportFaultKind::Connect,
+            detail: "egress: request failed (connect): dial refused".into(),
+        });
+        let err = segment_bytes(&spec(), 1, &head(), &plane)
+            .await
+            .expect_err("the fetch fails");
+        assert!(
+            matches!(
+                err,
+                ReconstructError::Transport {
+                    kind: daemon_vhc_net::TransportFaultKind::Connect,
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    /// A semantic miss (the object genuinely absent / pruned) still folds into the typed
+    /// `Segment` refusal — the budgeted lane: the archive is incomplete, not the network.
+    #[tokio::test]
+    async fn a_semantic_miss_still_folds_into_the_segment_refusal() {
+        let plane =
+            FailingPlane(|| VhcNetError::PayloadMiss("never stored / lifecycle-expired".into()));
+        let err = segment_bytes(&spec(), 1, &head(), &plane)
+            .await
+            .expect_err("the fetch fails");
+        assert!(
+            matches!(err, ReconstructError::Segment { segment: 0, .. }),
+            "got {err:?}"
+        );
+    }
 }

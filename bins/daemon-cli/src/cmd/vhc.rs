@@ -215,6 +215,16 @@ async fn print_detail_snapshot(client: &ApiClient, run_id: &str, json: bool) -> 
                     digest_str(&detail),
                     peers_for_latest(&detail),
                 );
+                // A non-running run shows WHY (typed reason + consumed budget): a budget-free
+                // transport/storage deferral is deliberate waiting, not a crash loop, and the
+                // operator must be able to see that from this one line.
+                if let Some(reason) = detail.summary.terminal_reason.as_deref() {
+                    println!(
+                        "  state={} retries={} reason={reason}",
+                        detail.summary.run_state.as_deref().unwrap_or("-"),
+                        detail.summary.retry_count.unwrap_or(0),
+                    );
+                }
             }
             Ok(())
         }

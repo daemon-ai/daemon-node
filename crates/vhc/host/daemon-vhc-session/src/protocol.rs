@@ -564,6 +564,17 @@ pub enum TerminalOutcome {
         /// Operator-facing detail (never branched on).
         reason: String,
     },
+    /// A TRANSIENT transport fault (connect/timeout/reset/gateway-5xx at the HTTP boundary —
+    /// e.g. the content plane unreachable during coordinator reconstruction, a control-plane
+    /// dial timeout). An environmental condition, never a semantic refusal: the node defers
+    /// the retry **budget-free** with paced, jittered backoff — the join intent is retained,
+    /// the reservation released, and the deferral neither consumes the retry budget nor
+    /// escalates to terminal (Gate C, defect 10 — a network outage is not a crash loop).
+    /// Indefinite deferral is by design and is surfaced in `vhc detail`; `vhc leave` cancels it.
+    FailedTransport {
+        /// Operator-facing detail (never branched on).
+        reason: String,
+    },
 }
 
 /// A self-assessment result for a run (§6.5, §10.2).

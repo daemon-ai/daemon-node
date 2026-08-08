@@ -111,13 +111,90 @@ pub use transport::{
 #[cfg(feature = "ws")]
 pub use ws_client::{ReconnectConfig, WsAuth, WsConfig, WsControlPlane};
 
+/// The fault class of a [`VhcNetError::Transient`] — preserved TYPED from the HTTP boundary
+/// (Gate C, defect 10): the egress client's own connect/timeout/reset classification plus the
+/// status classes only the HTTP call site can see. Recovery policy branches on this (a transient
+/// fault defers budget-free; a semantic refusal stays budgeted) — string-sniffing the erased
+/// error text cannot implement that split.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransportFaultKind {
+    /// Connection establishment failed (dial refused, DNS, TLS handshake never completed).
+    Connect,
+    /// The per-request deadline elapsed.
+    Timeout,
+    /// The peer closed/reset an established connection mid-request or mid-body.
+    Reset,
+    /// The server answered with a gateway/server fault (`5xx`) or throttling (`429`) — the
+    /// endpoint exists and refused transiently; retrying is the correct recovery.
+    ServerFault,
+    /// Any other send-level transport fault whose finer class the client does not expose.
+    Other,
+}
+
+impl std::fmt::Display for TransportFaultKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Connect => "connect",
+            Self::Timeout => "timeout",
+            Self::Reset => "reset",
+            Self::ServerFault => "server-fault",
+            Self::Other => "other",
+        })
+    }
+}
+
+impl From<daemon_egress::TransportFaultKind> for TransportFaultKind {
+    fn from(k: daemon_egress::TransportFaultKind) -> Self {
+        match k {
+            daemon_egress::TransportFaultKind::Connect => Self::Connect,
+            daemon_egress::TransportFaultKind::Timeout => Self::Timeout,
+            daemon_egress::TransportFaultKind::Reset => Self::Reset,
+            daemon_egress::TransportFaultKind::Other => Self::Other,
+        }
+    }
+}
+
+/// Map an [`daemon_egress::EgressError`] onto the typed taxonomy: send-level transport faults
+/// stay TYPED transient ([`VhcNetError::Transient`]); policy/encode/redirect refusals are
+/// semantic ([`VhcNetError::Transport`]) — retrying cannot change them.
+pub fn classify_egress(e: &daemon_egress::EgressError, context: &str) -> VhcNetError {
+    match e {
+        daemon_egress::EgressError::Transport { kind, detail } => VhcNetError::Transient {
+            kind: (*kind).into(),
+            detail: format!("{context}: {detail}"),
+        },
+        other => VhcNetError::Transport(format!("{context}: {other}")),
+    }
+}
+
+/// Whether an HTTP status is a TRANSIENT server-side fault (gateway/server `5xx`, throttling
+/// `429`) — the endpoint refused transiently and retrying is the correct recovery. Every other
+/// non-success status is an authoritative (semantic) refusal.
+#[must_use]
+pub fn status_is_transient(status: reqwest::StatusCode) -> bool {
+    status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+}
+
 /// Errors surfaced by the vhc transport.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum VhcNetError {
-    /// A control-plane or payload-plane transport step failed.
+    /// A control-plane or payload-plane transport step failed in a way retrying cannot change
+    /// (malformed request, policy refusal, an authoritative `4xx`) — the SEMANTIC lane: these
+    /// consume the caller's retry budget.
     #[error("vhc transport error: {0}")]
     Transport(String),
+    /// A TRANSIENT transport-layer fault at the HTTP boundary (connect / timeout / reset /
+    /// gateway `5xx`), preserved typed from the egress client (Gate C, defect 10). These are
+    /// environmental — the network or the far end is momentarily unavailable — and MUST NOT
+    /// consume any semantic retry budget: the recovery is paced, budget-free deferral.
+    #[error("transient transport fault ({kind}): {detail}")]
+    Transient {
+        /// The transport fault class.
+        kind: TransportFaultKind,
+        /// Operator-facing detail (never branched on).
+        detail: String,
+    },
     /// An artifact fetch (`file`, and later `r2` / `hf` / `https`) failed.
     #[error("artifact fetch failed: {0}")]
     Fetch(String),
@@ -152,6 +229,16 @@ pub enum VhcNetError {
     /// An artifact URL could not be parsed.
     #[error("malformed artifact url: {0}")]
     BadUrl(String),
+}
+
+impl VhcNetError {
+    /// Whether this is the TYPED transient transport lane ([`VhcNetError::Transient`]) — the
+    /// budget-free deferral class. Everything else (misses, hash mismatches, semantic transport
+    /// refusals) stays on the caller's budgeted lane.
+    #[must_use]
+    pub fn is_transient_transport(&self) -> bool {
+        matches!(self, Self::Transient { .. })
+    }
 }
 
 #[cfg(test)]

@@ -342,18 +342,27 @@ async fn egress_get_range(
     let resp = egress
         .execute(req, Redirects::DEFAULT)
         .await
-        .map_err(|e| VhcNetError::Fetch(format!("egress range GET {url}: {e}")))?;
+        .map_err(|e| crate::classify_egress(&e, &format!("egress range GET {url}")))?;
     let status = resp.status();
     let partial = status.as_u16() == 206;
     if !status.is_success() {
-        return Err(VhcNetError::Fetch(format!(
-            "range GET {url} returned {status}"
-        )));
+        let detail = format!("range GET {url} returned {status}");
+        return Err(if crate::status_is_transient(status) {
+            VhcNetError::Transient {
+                kind: crate::TransportFaultKind::ServerFault,
+                detail,
+            }
+        } else {
+            VhcNetError::Fetch(detail)
+        });
     }
     let bytes = resp
         .bytes()
         .await
-        .map_err(|e| VhcNetError::Fetch(format!("read body {url}: {e}")))?
+        .map_err(|e| VhcNetError::Transient {
+            kind: crate::TransportFaultKind::Reset,
+            detail: format!("read body {url}: {e}"),
+        })?
         .to_vec();
     Ok(if partial {
         RangeBody::Partial(bytes)
@@ -386,21 +395,30 @@ fn slice_range(
     Ok(bytes[off as usize..end as usize].to_vec())
 }
 
-/// GET `url` through the egress client and return the body, mapping non-2xx + transport failures to
+/// GET `url` through the egress client and return the body. Send-level faults and `5xx` are the
+/// TYPED transient lane ([`VhcNetError::Transient`]); an authoritative non-2xx is a semantic
 /// [`VhcNetError::Fetch`]. Validated redirects are followed (data hosts / HF `resolve` 302 to CDN).
 async fn egress_get_bytes(egress: &EgressClient, url: &str) -> Result<Vec<u8>, VhcNetError> {
     let resp = egress
         .get(url, Redirects::DEFAULT)
         .await
-        .map_err(|e| VhcNetError::Fetch(format!("egress GET {url}: {e}")))?;
+        .map_err(|e| crate::classify_egress(&e, &format!("egress GET {url}")))?;
     let status = resp.status();
     if !status.is_success() {
-        return Err(VhcNetError::Fetch(format!("GET {url} returned {status}")));
+        let detail = format!("GET {url} returned {status}");
+        return Err(if crate::status_is_transient(status) {
+            VhcNetError::Transient {
+                kind: crate::TransportFaultKind::ServerFault,
+                detail,
+            }
+        } else {
+            VhcNetError::Fetch(detail)
+        });
     }
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| VhcNetError::Fetch(format!("read body {url}: {e}")))?;
+    let bytes = resp.bytes().await.map_err(|e| VhcNetError::Transient {
+        kind: crate::TransportFaultKind::Reset,
+        detail: format!("read body {url}: {e}"),
+    })?;
     Ok(bytes.to_vec())
 }
 
@@ -850,16 +868,23 @@ mod tests {
     }
 
     /// The `https://` scheme is *wired* to egress (a fetch is attempted, not `SchemeUnsupported`):
-    /// an unreachable host yields a `Fetch` error, proving dispatch reaches `egress_get_bytes`.
+    /// an unreachable host yields the TYPED transient connect fault (Gate C), proving dispatch
+    /// reaches `egress_get_bytes` — and that the fault class survives the boundary.
     #[tokio::test]
     async fn https_scheme_routes_through_egress() {
         let resolver = ArtifactResolver::with_egress(egress());
-        // Port 1 on loopback: connection refused immediately (no TLS handshake completes) → Fetch.
+        // Port 1 on loopback: connection refused immediately → the typed transient connect fault.
         let art = ArtifactRef::new("https://127.0.0.1:1/artifact", blake3_hash(b""));
         let err = resolver.fetch(&art).await.unwrap_err();
         assert!(
-            matches!(err, VhcNetError::Fetch(_)),
-            "https must route through egress (got {err:?})"
+            matches!(
+                err,
+                VhcNetError::Transient {
+                    kind: crate::TransportFaultKind::Connect,
+                    ..
+                }
+            ),
+            "https must route through egress with the fault class preserved (got {err:?})"
         );
     }
 }

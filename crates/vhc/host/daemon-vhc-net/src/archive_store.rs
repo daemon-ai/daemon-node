@@ -134,22 +134,30 @@ impl ArchiveHeadStore for HttpArchiveHeadStore {
             .egress
             .execute(req, Redirects::None)
             .await
-            .map_err(|e| VhcNetError::Transport(format!("publish archive head: {e}")))?;
+            .map_err(|e| crate::classify_egress(&e, "publish archive head"))?;
         let status = resp.status();
-        let body = resp
-            .bytes()
-            .await
-            .map_err(|e| VhcNetError::Transport(format!("read archive head response: {e}")))?;
+        let body = resp.bytes().await.map_err(|e| VhcNetError::Transient {
+            kind: crate::TransportFaultKind::Reset,
+            detail: format!("read archive head response: {e}"),
+        })?;
         if status.is_success() || status.as_u16() == 409 {
             let decoded: HeadMutationResponse = from_canonical_slice(&body).map_err(|e| {
                 VhcNetError::Transport(format!("decode archive head decision ({status}): {e}"))
             })?;
             return Ok(decoded.decision);
         }
-        Err(VhcNetError::Transport(format!(
+        let detail = format!(
             "publish archive head returned {status}: {}",
             String::from_utf8_lossy(&body)
-        )))
+        );
+        Err(if crate::status_is_transient(status) {
+            VhcNetError::Transient {
+                kind: crate::TransportFaultKind::ServerFault,
+                detail,
+            }
+        } else {
+            VhcNetError::Transport(detail)
+        })
     }
 
     async fn fetch_heads(&self) -> Result<Vec<ArchiveHeadRecord>, VhcNetError> {
@@ -158,19 +166,25 @@ impl ArchiveHeadStore for HttpArchiveHeadStore {
             .egress
             .execute(self.authed(EgressRequest::get(&url)), Redirects::None)
             .await
-            .map_err(|e| VhcNetError::Transport(format!("fetch archive heads: {e}")))?;
+            .map_err(|e| crate::classify_egress(&e, "fetch archive heads"))?;
         let status = resp.status();
         if status.as_u16() == 404 {
             return Ok(Vec::new());
         }
-        let body = resp
-            .bytes()
-            .await
-            .map_err(|e| VhcNetError::Transport(format!("read archive heads body: {e}")))?;
+        let body = resp.bytes().await.map_err(|e| VhcNetError::Transient {
+            kind: crate::TransportFaultKind::Reset,
+            detail: format!("read archive heads body: {e}"),
+        })?;
         if !status.is_success() {
-            return Err(VhcNetError::Transport(format!(
-                "fetch archive heads returned {status}"
-            )));
+            let detail = format!("fetch archive heads returned {status}");
+            return Err(if crate::status_is_transient(status) {
+                VhcNetError::Transient {
+                    kind: crate::TransportFaultKind::ServerFault,
+                    detail,
+                }
+            } else {
+                VhcNetError::Transport(detail)
+            });
         }
         let snapshot: HeadsSnapshot = from_canonical_slice(&body)
             .map_err(|e| VhcNetError::Transport(format!("decode archive heads snapshot: {e}")))?;

@@ -148,10 +148,10 @@ impl<P: PresignClient> R2Store<P> {
         };
         let status = egress_resp.status();
         if !status.is_success() {
-            return Err(VhcNetError::Transport(format!(
-                "presigned content PUT {} returned {status}",
-                resp.url
-            )));
+            return Err(status_error(
+                status,
+                format!("presigned content PUT {} returned {status}", resp.url),
+            ));
         }
         Ok(())
     }
@@ -184,10 +184,10 @@ impl<P: PresignClient> R2Store<P> {
         if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::FORBIDDEN {
             return Ok(None);
         }
-        Err(VhcNetError::Transport(format!(
-            "presigned GET {} returned {status}",
-            resp.url
-        )))
+        Err(status_error(
+            status,
+            format!("presigned GET {} returned {status}", resp.url),
+        ))
     }
 }
 
@@ -214,10 +214,10 @@ impl<P: PresignClient> PayloadStore for R2Store<P> {
         };
         let status = egress_resp.status();
         if !status.is_success() {
-            return Err(VhcNetError::Transport(format!(
-                "presigned PUT {} returned {status}",
-                resp.url
-            )));
+            return Err(status_error(
+                status,
+                format!("presigned PUT {} returned {status}", resp.url),
+            ));
         }
         Ok(blake3_hash(bytes))
     }
@@ -314,14 +314,12 @@ const PUT_ATTEMPTS: u32 = 4;
 /// The first retry backoff; doubles per attempt (2 s, 4 s, 8 s).
 const PUT_BACKOFF_BASE: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Whether a put fault is worth retrying: transport-class faults (egress errors, gateway 5xx)
-/// are; a 4xx in the status text is an authoritative refusal (bad signature, missing object
-/// prefix, over-size) that retrying cannot change.
+/// Whether a put fault is worth retrying in-attempt: exactly the TYPED transient lane
+/// (egress send faults, gateway 5xx — [`VhcNetError::Transient`]). A semantic
+/// [`VhcNetError::Transport`] (an authoritative 4xx: bad signature, missing object prefix,
+/// over-size) is a refusal retrying cannot change.
 fn is_transient(e: &VhcNetError) -> bool {
-    match e {
-        VhcNetError::Transport(msg) => !msg.contains("returned 4"),
-        _ => false,
-    }
+    e.is_transient_transport()
 }
 
 /// A typed availability miss for `key` (the stall-ladder signal; mirrors `store.rs`'s taxonomy).
@@ -334,14 +332,32 @@ fn miss(key: &PayloadKey) -> VhcNetError {
     ))
 }
 
-/// Map an [`EgressError`](daemon_egress::EgressError) onto a transport error.
+/// Map an [`EgressError`](daemon_egress::EgressError) onto the typed taxonomy: send-level
+/// transport faults stay typed transient; policy/encode refusals stay semantic.
 fn transport(e: daemon_egress::EgressError) -> VhcNetError {
-    VhcNetError::Transport(format!("egress: {e}"))
+    crate::classify_egress(&e, "egress")
 }
 
-/// Map a response-body read failure (`reqwest::Error`) onto a transport error.
+/// Map a response-body read failure (`reqwest::Error`) onto the typed taxonomy — a body that
+/// dies mid-read is a reset-class transient fault (the request itself already succeeded).
 fn read_body(e: reqwest::Error) -> VhcNetError {
-    VhcNetError::Transport(format!("read object body: {e}"))
+    VhcNetError::Transient {
+        kind: crate::TransportFaultKind::Reset,
+        detail: format!("read object body: {e}"),
+    }
+}
+
+/// Map a non-success HTTP status onto the typed taxonomy: `5xx`/`429` is a typed transient
+/// server fault; any other status is an authoritative semantic refusal.
+fn status_error(status: reqwest::StatusCode, detail: String) -> VhcNetError {
+    if crate::status_is_transient(status) {
+        VhcNetError::Transient {
+            kind: crate::TransportFaultKind::ServerFault,
+            detail,
+        }
+    } else {
+        VhcNetError::Transport(detail)
+    }
 }
 
 #[cfg(test)]
@@ -550,6 +566,97 @@ mod tests {
             store.get_content(&hash).await.unwrap(),
             b"fold-keyed-bytes",
             "the untrusted store serves the keyed bytes; the pump verifies"
+        );
+    }
+
+    // --- Gate C: the typed transient transport lane at the object store --------------------------
+
+    /// A presign stub that mints non-expiring URLs at a fixed base — lets a test point the
+    /// store's object traffic anywhere (a `5xx` mock, a closed port).
+    struct StaticPresign {
+        base: String,
+    }
+
+    #[async_trait]
+    impl PresignClient for StaticPresign {
+        async fn presign(
+            &self,
+            _run: &RunId,
+            req: &PresignRequest,
+        ) -> Result<PresignResponse, VhcNetError> {
+            Ok(PresignResponse {
+                url: format!("{}/{}", self.base, r2_object_key(&run(), req).unwrap()),
+                expires_at: u64::MAX,
+                headers: std::collections::BTreeMap::new(),
+            })
+        }
+    }
+
+    /// Gate C: an object store answering `5xx` on a presigned GET is a TYPED transient server
+    /// fault (the budget-free deferral lane) — never a semantic transport refusal and never a
+    /// miss.
+    #[tokio::test]
+    async fn a_5xx_object_store_is_a_typed_transient_fault() {
+        use daemon_egress::{EgressClient, EgressConfig};
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(502))
+            .mount(&server)
+            .await;
+        let store = R2Store::new(
+            StaticPresign { base: server.uri() },
+            EgressClient::new(EgressConfig::default()).unwrap(),
+            run(),
+        );
+
+        let err = store
+            .get_content(&blake3_hash(b"whatever"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                VhcNetError::Transient {
+                    kind: crate::TransportFaultKind::ServerFault,
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    /// Gate C: a connect-refused object store (the R2 outage shape) is a TYPED transient
+    /// connect fault, preserved from the egress client — the classification the defect-10
+    /// strings erased.
+    #[tokio::test]
+    async fn a_connect_refused_object_store_is_a_typed_transient_fault() {
+        use daemon_egress::{EgressClient, EgressConfig};
+
+        // A port nothing listens on: the OS refuses the dial.
+        let store = R2Store::new(
+            StaticPresign {
+                base: "http://127.0.0.1:9".to_string(),
+            },
+            EgressClient::new(EgressConfig::default()).unwrap(),
+            run(),
+        );
+
+        let err = store
+            .get_content(&blake3_hash(b"whatever"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                VhcNetError::Transient {
+                    kind: crate::TransportFaultKind::Connect,
+                    ..
+                }
+            ),
+            "got {err:?}"
         );
     }
 

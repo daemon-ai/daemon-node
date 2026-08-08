@@ -1862,17 +1862,35 @@ impl VhcService {
             protocol::TerminalOutcome::FailedStorage { reason } => {
                 (RunState::FailedRetryable, reason.clone())
             }
+            // The typed transport taxonomy (Gate C, defect 10): a transient network fault
+            // (connect/timeout/reset/5xx — e.g. the content plane unreachable during
+            // reconstruction) is environmental, never a failed attempt. The deferral below is
+            // BUDGET-FREE and the reason is surfaced prefixed so `vhc detail` shows the run
+            // is deliberately waiting out an outage rather than crash-looping.
+            protocol::TerminalOutcome::FailedTransport { reason } => (
+                RunState::FailedRetryable,
+                format!("transport fault (deferred budget-free): {reason}"),
+            ),
         };
         let storage_gated = matches!(outcome, protocol::TerminalOutcome::FailedStorage { .. });
+        let transport_deferred =
+            matches!(outcome, protocol::TerminalOutcome::FailedTransport { .. });
         // The bounded retry budget: a recoverable failure past the budget escalates to terminal
         // with a typed reason; within it, the next reconvergence is backoff-scheduled. A
         // storage-gated failure bypasses the budget entirely — the gate (not the budget) is
         // what bounds it, so it can never launder a crash loop: the moment the disk has
         // headroom the run redispatches and any non-storage failure consumes budget normally.
+        // A transport deferral equally bypasses the budget: the retry is paced with JITTER
+        // (half the ceiling plus a spread, so a fleet knocked over by one outage never
+        // thunders back in lockstep), indefinitely by design — `vhc leave` cancels the intent,
+        // and any non-transport failure after redispatch consumes budget normally.
         let retry = &self.config.retry;
         let consumed = row.as_ref().map_or(0, |r| r.retry_count);
         let (target, reason, next_retry) = if storage_gated {
             let due = now_ms() + retry.max_backoff_ms as i64;
+            (RunState::FailedRetryable, reason, Some(due))
+        } else if transport_deferred {
+            let due = now_ms() + transport_backoff_jittered_ms(retry, run_id) as i64;
             (RunState::FailedRetryable, reason, Some(due))
         } else if target == RunState::FailedRetryable {
             if consumed >= retry.max_retries {
@@ -1902,11 +1920,29 @@ impl VhcService {
         // 3) The terminal commits.
         self.store.commit_release(run_id)?;
         // 4) Retry bookkeeping. A storage-gated terminal defers (schedules the next free-space
-        // check) without consuming budget, and durably marks the gate.
+        // check) without consuming budget, and durably marks the gate. A transport deferral
+        // equally defers without consuming budget (the jittered due time was computed above)
+        // and surfaces itself as a typed warning — the operator-visible evidence that the run
+        // is waiting out a network outage by design.
+        let mut emitted = Vec::new();
         if let Some(due) = next_retry {
             if storage_gated {
                 let _ = self.store.defer_retry(run_id, due);
                 let _ = self.store.set_storage_gated(run_id, true);
+            } else if transport_deferred {
+                let _ = self.store.defer_retry(run_id, due);
+                let _ = self.emit(
+                    VhcEvent::Warning {
+                        run_id: run_id.to_string(),
+                        class: "transport_deferred".to_string(),
+                        detail: format!(
+                            "transient transport fault: retry deferred budget-free until \
+                             +{} ms (retry budget unchanged; `vhc leave` cancels)",
+                            due.saturating_sub(now_ms())
+                        ),
+                    },
+                    &mut emitted,
+                );
             } else {
                 let _ = self.store.bump_retry(run_id, due);
             }
@@ -1916,7 +1952,6 @@ impl VhcService {
         // record — no run identity outlives the run it was minted for. `failed_retryable` is NOT
         // terminal for the identity (reconvergence supersedes it under the retry budget), so its
         // material survives. Idempotent (remove_run tolerates absence).
-        let mut emitted = Vec::new();
         if target != RunState::FailedRetryable {
             if let Some(dir) = &self.identity_dir {
                 if let Ok(keystore) = daemon_vhc_session::keystore::VhcKeystore::open(dir) {
@@ -3927,6 +3962,24 @@ fn retry_backoff_ms(cfg: &daemon_vhc_session::config::RetryConfig, attempt: u32)
         .min(cfg.max_backoff_ms.max(cfg.initial_backoff_ms))
 }
 
+/// The transport-deferral pacing (Gate C): half the backoff ceiling plus a per-(run, moment)
+/// jitter across the other half — so a fleet knocked over by one shared outage never retries in
+/// lockstep, and each individual deferral still lands within `[max/2, max]`. Deterministic
+/// inputs (run id + wall clock) through the std hasher — pacing needs spread, not secrecy, so
+/// no rand dependency is warranted.
+fn transport_backoff_jittered_ms(
+    cfg: &daemon_vhc_session::config::RetryConfig,
+    run_id: &str,
+) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let ceiling = cfg.max_backoff_ms.max(cfg.initial_backoff_ms).max(2);
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    run_id.hash(&mut hasher);
+    now_ms().hash(&mut hasher);
+    let jitter = hasher.finish() % (ceiling / 2);
+    ceiling / 2 + jitter
+}
+
 /// Wall-clock unix ms (the retry schedule is a coarse wall-clock quantity, like the store's).
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -4715,6 +4768,80 @@ mod storage_gate_tests {
             RunState::FailedRetryable,
             "storage exhaustion never escalates to failed_terminal"
         );
+    }
+
+    /// A `FailedTransport` terminal (Gate C, defect 10 — a transient network fault, e.g. the
+    /// content plane unreachable during coordinator reconstruction) defers BUDGET-FREE: the
+    /// row stays `failed_retryable` with the join intent retained, `retry_count` is untouched,
+    /// the next attempt is scheduled with jittered pacing inside `[ceiling/2, ceiling]`, the
+    /// deferral is surfaced typed (`transport_deferred` warning + prefixed reason — the
+    /// `vhc detail` evidence), and repeated transport terminals can NEVER escalate to
+    /// terminal — an outage is waited out, not crash-looped.
+    #[test]
+    fn a_transport_terminal_defers_budget_free_with_jittered_pacing() {
+        let svc = coordinator_trainer_service(OwnerBudget::unbounded());
+        seed_joined_run(&svc, "run-t", 7);
+
+        let before = now_ms();
+        let emitted = svc
+            .handle_run_terminated(
+                "run-t",
+                7,
+                &protocol::TerminalOutcome::FailedTransport {
+                    reason: "coordinator reconstruction: transient transport fault (connect): \
+                             egress: request failed"
+                        .into(),
+                },
+            )
+            .expect("the terminal transitions");
+
+        let row = svc.store.get_run("run-t").expect("read").expect("row");
+        assert_eq!(row.run_state, RunState::FailedRetryable);
+        assert!(!row.storage_gated, "transport is not the storage gate");
+        assert_eq!(
+            row.retry_count, 0,
+            "a transport deferral never consumes the retry budget"
+        );
+        let due = row.next_retry_ms.expect("a paced retry is scheduled");
+        let ceiling = svc.config.retry.max_backoff_ms as i64;
+        assert!(
+            due >= before + ceiling / 2 && due <= now_ms() + ceiling,
+            "the jittered due time lands within [ceiling/2, ceiling]: due={due} before={before}"
+        );
+        assert!(
+            row.terminal_reason
+                .as_deref()
+                .is_some_and(|r| r.starts_with("transport fault (deferred budget-free):")),
+            "the reason is visibly prefixed for vhc detail: {:?}",
+            row.terminal_reason
+        );
+        assert!(
+            emitted.iter().any(|e| matches!(
+                e,
+                VhcEvent::Warning { class, .. } if class == "transport_deferred"
+            )),
+            "the deferral surfaces as a typed warning event"
+        );
+
+        // Indefinite by design: run it past the ordinary budget — no escalation, no budget.
+        for _ in 0..svc.config.retry.max_retries + 2 {
+            seed_joined_run(&svc, "run-t", 7);
+            svc.handle_run_terminated(
+                "run-t",
+                7,
+                &protocol::TerminalOutcome::FailedTransport {
+                    reason: "still unreachable".into(),
+                },
+            )
+            .expect("transitions again");
+        }
+        let row = svc.store.get_run("run-t").expect("read").expect("row");
+        assert_eq!(
+            row.run_state,
+            RunState::FailedRetryable,
+            "a transport outage never escalates to failed_terminal"
+        );
+        assert_eq!(row.retry_count, 0, "…and never consumes budget");
     }
 
     /// An ordinary retryable terminal is unchanged by the taxonomy: budget consumed, no gate.

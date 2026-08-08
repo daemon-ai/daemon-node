@@ -245,18 +245,15 @@ impl HttpPresignClient {
     }
 }
 
-#[async_trait]
-impl PresignClient for HttpPresignClient {
-    async fn presign(
+impl HttpPresignClient {
+    /// One presign POST: encode, send, decode — every fault typed (send-level faults and
+    /// endpoint `5xx` are TRANSIENT; an authoritative `4xx` or a decode failure is semantic).
+    /// An already-expired mint surfaces [`VhcNetError::PresignExpired`].
+    async fn mint(
         &self,
         run: &RunId,
         req: &PresignRequest,
     ) -> Result<PresignResponse, VhcNetError> {
-        let cache_key = CacheKey::of(run, req);
-        if let Some(hit) = self.cached(&cache_key) {
-            return Ok(hit);
-        }
-
         let mut ereq = EgressRequest::post_json(self.endpoint(run), req)
             .map_err(|e| VhcNetError::Transport(format!("encode presign request: {e}")))?;
         if let Some(token) = &self.bearer {
@@ -271,17 +268,25 @@ impl PresignClient for HttpPresignClient {
             .egress
             .execute(ereq, Redirects::DEFAULT)
             .await
-            .map_err(|e| VhcNetError::Transport(format!("presign request: {e}")))?;
+            .map_err(|e| crate::classify_egress(&e, "presign request"))?;
         let status = resp.status();
-        let body = resp
-            .bytes()
-            .await
-            .map_err(|e| VhcNetError::Transport(format!("read presign body: {e}")))?;
+        let body = resp.bytes().await.map_err(|e| VhcNetError::Transient {
+            kind: crate::TransportFaultKind::Reset,
+            detail: format!("read presign body: {e}"),
+        })?;
         if !status.is_success() {
-            return Err(VhcNetError::Transport(format!(
+            let detail = format!(
                 "presign endpoint returned {status}: {}",
                 String::from_utf8_lossy(&body)
-            )));
+            );
+            return Err(if crate::status_is_transient(status) {
+                VhcNetError::Transient {
+                    kind: crate::TransportFaultKind::ServerFault,
+                    detail,
+                }
+            } else {
+                VhcNetError::Transport(detail)
+            });
         }
         let presigned: PresignResponse = serde_json::from_slice(&body)
             .map_err(|e| VhcNetError::Transport(format!("decode presign response: {e}")))?;
@@ -296,6 +301,31 @@ impl PresignClient for HttpPresignClient {
                 presigned.expires_at
             )));
         }
+        Ok(presigned)
+    }
+}
+
+#[async_trait]
+impl PresignClient for HttpPresignClient {
+    async fn presign(
+        &self,
+        run: &RunId,
+        req: &PresignRequest,
+    ) -> Result<PresignResponse, VhcNetError> {
+        let cache_key = CacheKey::of(run, req);
+        if let Some(hit) = self.cached(&cache_key) {
+            return Ok(hit);
+        }
+
+        // An expired credential re-presigns ONCE within the same attempt (Gate C): the object may
+        // well exist — only the credential aged out (clock skew, a mint raced across its own
+        // expiry). A second expired mint is authoritative (a misconfigured coordinator) and
+        // surfaces typed; it must not silently loop.
+        let presigned = match self.mint(run, req).await {
+            Err(VhcNetError::PresignExpired(_)) => self.mint(run, req).await?,
+            other => other?,
+        };
+
         // Cache only if it will outlive the skew margin (so `cached()` can always reuse it).
         if presigned.expires_at > now_unix() + self.skew_margin_s {
             self.cache
@@ -397,6 +427,121 @@ mod tests {
         let reser = serde_json::to_value(&resp).unwrap();
         let original: serde_json::Value = serde_json::from_str(resp_fixture).unwrap();
         assert_eq!(reser, original);
+    }
+
+    /// Gate C: a presign endpoint answering `5xx` is a TYPED transient server fault — the
+    /// budget-free deferral lane — never a semantic transport refusal.
+    #[tokio::test]
+    async fn a_5xx_presign_endpoint_is_a_typed_transient_fault() {
+        use daemon_egress::{EgressClient, EgressConfig};
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/presign$"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let egress = EgressClient::new(EgressConfig::default()).unwrap();
+        let client = HttpPresignClient::new(egress, format!("{}/api/v1/vhc", server.uri()));
+        let err = client
+            .presign(
+                &RunId::new("run-c"),
+                &PresignRequest::payload(PresignOp::Get, 1, "aabb"),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                VhcNetError::Transient {
+                    kind: crate::TransportFaultKind::ServerFault,
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    /// Gate C: an authoritative `4xx` from the presign endpoint (bad auth, unknown run) stays
+    /// on the SEMANTIC lane — retrying cannot change it, so it must consume budget.
+    #[tokio::test]
+    async fn a_4xx_presign_endpoint_stays_a_semantic_refusal() {
+        use daemon_egress::{EgressClient, EgressConfig};
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/presign$"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+
+        let egress = EgressClient::new(EgressConfig::default()).unwrap();
+        let client = HttpPresignClient::new(egress, format!("{}/api/v1/vhc", server.uri()));
+        let err = client
+            .presign(
+                &RunId::new("run-c"),
+                &PresignRequest::payload(PresignOp::Get, 1, "aabb"),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, VhcNetError::Transport(_)), "got {err:?}");
+    }
+
+    /// Gate C: a mint that arrives already expired (clock skew, a mint racing its own expiry)
+    /// re-presigns ONCE within the same attempt and succeeds on a fresh credential — no budget
+    /// burned, no caller-visible failure. A coordinator that keeps minting dead URLs still
+    /// surfaces `PresignExpired` (covered by `store_presign_expired_rejected`, whose mock
+    /// expires every mint).
+    #[tokio::test]
+    async fn an_expired_mint_represigns_once_in_attempt() {
+        use daemon_egress::{EgressClient, EgressConfig};
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let expired = PresignResponse {
+            url: format!("{}/obj/x", server.uri()),
+            expires_at: now_unix().saturating_sub(60),
+            headers: BTreeMap::new(),
+        };
+        let fresh = PresignResponse {
+            url: format!("{}/obj/x", server.uri()),
+            expires_at: now_unix() + 900,
+            headers: BTreeMap::new(),
+        };
+        // First POST answers with the dead credential; the in-attempt retry gets the live one.
+        Mock::given(method("POST"))
+            .and(path_regex(r"/presign$"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::to_value(&expired).unwrap()),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/presign$"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::to_value(&fresh).unwrap()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let egress = EgressClient::new(EgressConfig::default()).unwrap();
+        let client = HttpPresignClient::new(egress, format!("{}/api/v1/vhc", server.uri()));
+        let got = client
+            .presign(
+                &RunId::new("run-c"),
+                &PresignRequest::payload(PresignOp::Get, 1, "aabb"),
+            )
+            .await
+            .expect("the in-attempt re-presign recovers");
+        assert_eq!(got.expires_at, fresh.expires_at);
     }
 
     /// The URL cache presigns once per (run, object, op) while the URL is unexpired: a second call
