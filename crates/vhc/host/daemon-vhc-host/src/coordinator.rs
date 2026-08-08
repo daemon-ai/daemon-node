@@ -298,6 +298,39 @@ impl Coordinator {
         )
     }
 
+    /// [`Coordinator::start_migrating`] with an external durable [`JournalSink`](crate::run::JournalSink)
+    /// (the production-journal shape): the resumed incarnation founds a successor chain whose
+    /// early records carry the §10.2 restore read-backs — the sidecar-referenced span shape a
+    /// second-crash reconstruction must consume.
+    ///
+    /// # Errors
+    /// A `String` on selection/start/migrate failure (harness-level).
+    pub fn start_migrating_with_sink(
+        wasm: &[u8],
+        spec: &CoordinatorSpec,
+        grants: Vec<u8>,
+        instance: u64,
+        key_seed: [u8; 32],
+        capture: SnapshotCapture,
+        sink: Box<dyn crate::run::JournalSink>,
+    ) -> Result<Self, String> {
+        Self::start_inner(
+            wasm,
+            spec,
+            grants,
+            instance,
+            key_seed,
+            Some(MigrationInput {
+                capture,
+                restore: true,
+                migrate_fuel: None,
+                carried_state: Vec::new(),
+                anchor: true,
+            }),
+            Some(sink),
+        )
+    }
+
     fn start_inner(
         wasm: &[u8],
         spec: &CoordinatorSpec,

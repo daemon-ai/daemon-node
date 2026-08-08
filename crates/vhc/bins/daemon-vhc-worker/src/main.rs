@@ -227,6 +227,14 @@ async fn join_live(
                     grants: binding.run.grants.clone(),
                     incarnation,
                     restore: restore.map(|m| m.capture),
+                    // The node-durable journal key (§8.5): lets a same-box reconstruction
+                    // decrypt the sidecar-referenced restore read-backs its own crashed
+                    // incarnations recorded. Best-effort — a cold standby has no keystore
+                    // and resolves those values content-addressed instead.
+                    sidecar_key: daemon_vhc_session::keystore::VhcKeystore::from_env()
+                        .ok()
+                        .and_then(|ks| ks.journal_sidecar_key().ok())
+                        .map(|k| *k.bytes()),
                     // The export's quiesce ceiling: a reconstruction drains a full replay's
                     // state, so it gets a generous fixed budget (independent of the session's
                     // leave-drain deadline).

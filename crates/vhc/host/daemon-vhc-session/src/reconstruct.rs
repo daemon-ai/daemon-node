@@ -112,6 +112,12 @@ pub struct ReconstructSpec {
     /// path's candidate (engaged only when the recovered stream's last tag-10 byte-matches its
     /// manifest; otherwise the full lineage replays from genesis).
     pub restore: Option<SnapshotCapture>,
+    /// The node's durable journal sidecar key (§8.5, `VhcKeystore::journal_sidecar_key`) —
+    /// lets a SAME-BOX reconstruction decrypt the sidecar-referenced read-back values its own
+    /// crashed incarnations recorded (a successor chain's §10.2 restore sections exceed
+    /// `READBACK_INLINE_MAX` and ride sidecars, never the archive). `None` (a cold standby)
+    /// falls back to content-addressed resolution against the span's rebuilt migration capture.
+    pub sidecar_key: Option<[u8; 32]>,
     /// The quiesce drain ceiling for the state export (ms).
     pub deadline_ms: u64,
 }
@@ -201,6 +207,7 @@ async fn recover_records(
     let mut records: Vec<Record> = Vec::new();
 
     for chain in lineage {
+        let mut chain_records: Vec<Record> = Vec::new();
         let mut last_complete: Option<[u8; 32]> = None;
         for head in &chain.heads {
             let bytes = segment_bytes(spec, chain.chain_instance, head, segments).await?;
@@ -217,66 +224,128 @@ async fn recover_records(
                 });
             }
             last_complete = Some(scan.complete_file_blake3);
-            records.extend(scan.records);
+            chain_records.extend(scan.records);
         }
 
         // The NEWEST chain's local unsealed tail: segments past the last attested head, chained
         // via prev_blake3. Only the crashed box holds it; a cold standby reconstructs to the
         // archived point (which the coordinator's replay-forward semantics then catch up).
         let is_newest = std::ptr::eq(*chain, *lineage.last().expect("lineage non-empty"));
-        if !is_newest {
-            continue;
-        }
-        let Some(root) = &spec.journal_root else {
-            continue;
-        };
-        let dir = crate::journal_home::journal_dir(
-            root,
-            &spec.run_label,
-            &spec.role,
-            chain.chain_instance,
-        );
-        let Ok(paths) = JournalPaths::open(&dir) else {
-            continue;
-        };
-        let Ok(ordinals) = paths.existing_segments() else {
-            continue;
-        };
-        let first_unpublished = chain
-            .heads
-            .last()
-            .map_or(0, |h| h.body.segment.saturating_add(1));
-        let mut prev = last_complete;
-        for ord in ordinals {
-            if ord < first_unpublished {
-                continue;
+        let dir = spec.journal_root.as_ref().map(|root| {
+            crate::journal_home::journal_dir(
+                root,
+                &spec.run_label,
+                &spec.role,
+                chain.chain_instance,
+            )
+        });
+        'tail: {
+            if !is_newest {
+                break 'tail;
             }
-            let scan = match scan_file(paths.segment(ord)) {
-                Ok(s) => s,
-                Err(e) => {
+            let Some(dir) = &dir else {
+                break 'tail;
+            };
+            let Ok(paths) = JournalPaths::open(dir) else {
+                break 'tail;
+            };
+            let Ok(ordinals) = paths.existing_segments() else {
+                break 'tail;
+            };
+            let first_unpublished = chain
+                .heads
+                .last()
+                .map_or(0, |h| h.body.segment.saturating_add(1));
+            let mut prev = last_complete;
+            for ord in ordinals {
+                if ord < first_unpublished {
+                    continue;
+                }
+                let scan = match scan_file(paths.segment(ord)) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(
+                            run = spec.run_label,
+                            segment = ord,
+                            error = %e,
+                            "coordinator reconstruction: unreadable local tail segment; stopping the tail walk"
+                        );
+                        break;
+                    }
+                };
+                if prev.is_some_and(|p| p != scan.header.prev_blake3) {
                     tracing::warn!(
                         run = spec.run_label,
                         segment = ord,
-                        error = %e,
-                        "coordinator reconstruction: unreadable local tail segment; stopping the tail walk"
+                        "coordinator reconstruction: local tail segment does not chain; stopping the tail walk"
                     );
                     break;
                 }
-            };
-            if prev.is_some_and(|p| p != scan.header.prev_blake3) {
-                tracing::warn!(
-                    run = spec.run_label,
-                    segment = ord,
-                    "coordinator reconstruction: local tail segment does not chain; stopping the tail walk"
-                );
-                break;
+                prev = Some(scan.complete_file_blake3);
+                chain_records.extend(scan.records);
             }
-            prev = Some(scan.complete_file_blake3);
-            records.extend(scan.records);
         }
+
+        // Same-box sidecar hydration (§8.5): a record's sidecar-referenced read-back value
+        // (a successor incarnation's §10.2 restore sections) lives in the chain's LOCAL
+        // sidecar store, decryptable with the node's own journal key. Best-effort: what does
+        // not hydrate here still resolves content-addressed against the span's migration
+        // capture in `build_script`, and only THEN refuses typed.
+        if let (Some(key), Some(dir)) = (spec.sidecar_key, &dir) {
+            hydrate_sidecars(&mut chain_records, dir, key);
+        }
+        records.extend(chain_records);
     }
 
     Ok(records)
+}
+
+/// Inline every locally-decryptable sidecar-referenced read-back value in `records`
+/// (§8.5: the store binds the owning span's execution identity, and the AEAD nonce is
+/// `(record ord, instantiation counter)` — both recovered from the stream itself: the
+/// span's tag-0 header and tag-13 instantiation record).
+fn hydrate_sidecars(records: &mut [Record], jdir: &std::path::Path, key: [u8; 32]) {
+    let sidecar_dir = match JournalPaths::open(jdir) {
+        Ok(paths) => paths.sidecars(),
+        Err(_) => return,
+    };
+    let mut store: Option<daemon_vhc_journal::SidecarStore<daemon_vhc_journal::StaticKey>> = None;
+    let mut counter: u64 = 0;
+    for record in records.iter_mut() {
+        match &mut record.body {
+            Body::RunHeader(h) => {
+                let id = daemon_vhc_journal::ExecIdentity {
+                    run_id: h.run_id,
+                    epoch: h.epoch,
+                    role: h.role.clone(),
+                    instance: h.instance,
+                    module: h.module,
+                };
+                store = daemon_vhc_journal::SidecarStore::open(
+                    &sidecar_dir,
+                    id,
+                    daemon_vhc_journal::StaticKey::new(key),
+                )
+                .ok();
+            }
+            Body::Instantiation(inst) => counter = inst.counter,
+            Body::ReadBack(r) if r.value.is_none() => {
+                if let (Some(sref), Some(store)) = (&r.sidecar, &store) {
+                    match store.get(sref, record.ord, counter) {
+                        Ok(bytes) => r.value = Some(bytes),
+                        Err(e) => tracing::debug!(
+                            ord = record.ord,
+                            hash = %sref.hash.to_hex(),
+                            error = %e,
+                            "reconstruction: local sidecar did not hydrate; deferring to \
+                             content-addressed resolution"
+                        ),
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// One incarnation's slice of the recovered stream: its tag-0 header, its instantiation reason
@@ -320,23 +389,62 @@ fn split_spans(records: Vec<Record>) -> Result<Vec<Span>, ReconstructError> {
     Ok(spans)
 }
 
+/// The content-addressed section values a span's sidecar-referenced read-backs resolve
+/// against: every INLINE section of the capture the span migrates from, keyed by its
+/// plaintext blake3 — exactly the bytes the live driver staged for `read_back(kind = 3)`
+/// (§10.2 restore bindings), whose hash is what the sidecar ref records.
+fn sections_by_hash(
+    capture: Option<&SnapshotCapture>,
+) -> std::collections::BTreeMap<[u8; 32], Vec<u8>> {
+    let mut map = std::collections::BTreeMap::new();
+    if let Some(capture) = capture {
+        for section in &capture.sections {
+            if let daemon_vhc_proto::det_state::CkptDocSection::Inline(_, bytes) = section {
+                map.insert(*blake3::hash(bytes).as_bytes(), bytes.clone());
+            }
+        }
+    }
+    map
+}
+
 /// The §8.7 record → [`ReplayScript`] mapping (the same split the D2 archive replay uses):
 /// delivered events verbatim (frames, timer fires, completions — in journaled order),
 /// read-backs routed by kind, clock readings, timer arms/cancels, device profiles.
-fn build_script(records: &[Record]) -> Result<ReplayScript, ReconstructError> {
+///
+/// A read-back whose value rode a sidecar (plaintext > `READBACK_INLINE_MAX`, §8.5) is
+/// resolved CONTENT-ADDRESSED from `sections`: sidecar files are node-local (their key
+/// material never rides the archive, §8.5), but the only sidecar-sized read-backs a
+/// coordinator records are its §10.2 restore sections (`read_back(kind = 3)` is legal
+/// only during `da_migrate`) — and those bytes are exactly the migration capture the
+/// reconstruction already rebuilt from the predecessor span. An unresolvable reference
+/// refuses typed: replaying a guessed value would fork the seat behind its own record.
+fn build_script(
+    records: &[Record],
+    sections: &std::collections::BTreeMap<[u8; 32], Vec<u8>>,
+) -> Result<ReplayScript, ReconstructError> {
     let mut script = ReplayScript::default();
     for record in records {
         match &record.body {
             Body::Event(e) => script.events.push_back((e.at, e.frame.clone())),
             Body::ReadBack(r) => {
-                if r.sidecar.is_some() {
-                    return Err(ReconstructError::Sandbox(format!(
-                        "record {}: sidecar-referenced read-back values are not available to \
-                         a reconstruction (no sidecar key material rides the archive)",
-                        record.ord
-                    )));
-                }
-                let value = r.value.clone().unwrap_or_default();
+                let value = match (&r.value, &r.sidecar) {
+                    (Some(v), _) => v.clone(),
+                    (None, Some(sref)) => {
+                        sections.get(sref.hash.as_bytes()).cloned().ok_or_else(|| {
+                            ReconstructError::Sandbox(format!(
+                                "record {}: the sidecar-referenced read-back value {} ({} B, \
+                                 kind {}) resolves neither inline nor against the span's \
+                                 migration capture — the lineage does not carry the bytes \
+                                 this replay must re-feed",
+                                record.ord,
+                                sref.hash.to_hex(),
+                                sref.size,
+                                r.kind
+                            ))
+                        })?
+                    }
+                    (None, None) => Vec::new(),
+                };
                 if r.kind >= 128 {
                     // The retired bridge's reserved journal kinds: never re-fed.
                 } else if r.kind == u64::from(daemon_vhc_abi::READBACK_KIND_STREAM_BYTES) {
@@ -454,7 +562,14 @@ fn replay_capture(
             )));
         }
 
-        let mut script = build_script(&span.records)?;
+        // Sidecar-referenced read-backs (§10.2 restore sections) resolve content-addressed
+        // against the capture this span migrates from — available BEFORE the take below.
+        let section_values = if span.reason == 2 {
+            sections_by_hash(carried.as_ref())
+        } else {
+            sections_by_hash(None)
+        };
+        let mut script = build_script(&span.records, &section_values)?;
         script.identity = Some(RunIdentity {
             run_id: span.header.run_id.0,
             epoch: span.header.epoch,

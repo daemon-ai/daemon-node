@@ -287,12 +287,15 @@ fn write_crashed_journal(
     chain_instance
 }
 
-/// Publish the sealed prefix through the PRODUCT publisher and return the attested heads.
-async fn publish_prefix(
+/// Publish the sealed prefix of role incarnation `instance` through the PRODUCT publisher and
+/// return the attested heads.
+#[allow(clippy::too_many_arguments)]
+async fn publish_prefix_of(
     root: &std::path::Path,
     run_id: Hash,
     module: Hash,
     base_key: &SigningKey,
+    instance: u64,
     chain_instance: u64,
     segments: Arc<MemoryContentStore>,
     heads_dir: &std::path::Path,
@@ -303,7 +306,7 @@ async fn publish_prefix(
             run_id,
             epoch: 0,
             role: "coordinator".into(),
-            instance: 1,
+            instance,
             module_hash: module,
         },
     )
@@ -324,7 +327,7 @@ async fn publish_prefix(
         "coordinator".into(),
         ArchiveSpec {
             seals: rx,
-            journal_dir: journal_dir(root, RUN_LABEL, "coordinator", 1),
+            journal_dir: journal_dir(root, RUN_LABEL, "coordinator", instance),
             chain_instance,
             round_claim: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         },
@@ -337,30 +340,63 @@ async fn publish_prefix(
     heads.fetch_heads().await.expect("stored heads")
 }
 
-/// Open the primary's durable journal home (instance 1) under a SMALL rotate policy, so a short
-/// drill still leaves the §8 crash shape on disk: sealed segments (the publishable prefix) plus
-/// an unsealed local tail. Returns the sink and its founding chain instance.
-fn open_live_sink(root: &std::path::Path, spec: &CoordinatorSpec) -> (DurableSink, u64) {
+/// [`publish_prefix_of`] for the founding incarnation (instance 1).
+async fn publish_prefix(
+    root: &std::path::Path,
+    run_id: Hash,
+    module: Hash,
+    base_key: &SigningKey,
+    chain_instance: u64,
+    segments: Arc<MemoryContentStore>,
+    heads_dir: &std::path::Path,
+) -> Vec<daemon_vhc_proto::ArchiveHeadRecord> {
+    publish_prefix_of(
+        root,
+        run_id,
+        module,
+        base_key,
+        1,
+        chain_instance,
+        segments,
+        heads_dir,
+    )
+    .await
+}
+
+/// Open role incarnation `instance`'s durable journal home under a SMALL rotate policy, so a
+/// short drill still leaves the §8 crash shape on disk: sealed segments (the publishable
+/// prefix) plus an unsealed local tail. Returns the sink and its founding chain instance.
+fn open_live_sink_of(
+    root: &std::path::Path,
+    spec: &CoordinatorSpec,
+    instance: u64,
+    max_records: u64,
+) -> (DurableSink, u64) {
     let identity = RunIdentity {
         run_id: spec.run_id.0,
         epoch: 0,
         role: "coordinator".into(),
-        instance: 1,
+        instance,
         module: spec.module_hash.0,
     };
-    let jdir = journal_dir(root, RUN_LABEL, "coordinator", 1);
+    let jdir = journal_dir(root, RUN_LABEL, "coordinator", instance);
     let sink = DurableSink::open_with_policy(
         &jdir,
         &identity,
         [0x5C; 32],
         daemon_vhc_journal::RotatePolicy {
-            max_records: 24,
+            max_records,
             max_open: None,
         },
     )
     .expect("journal open");
     let instance = sink.founding_instance();
     (sink, instance)
+}
+
+/// [`open_live_sink_of`] for the founding incarnation (instance 1).
+fn open_live_sink(root: &std::path::Path, spec: &CoordinatorSpec) -> (DurableSink, u64) {
+    open_live_sink_of(root, spec, 1, 24)
 }
 
 /// Pin the §8 crash shape the live primary left on disk: at least one sealed (publishable)
@@ -457,6 +493,7 @@ async fn crash_restart_reconstructs_through_the_product_path_and_resumes_byte_id
             grants: phase_a_grants(),
             incarnation: 1,
             restore: None,
+            sidecar_key: Some([0x5C; 32]),
             deadline_ms: 60_000,
         },
         store,
@@ -484,6 +521,7 @@ async fn crash_restart_reconstructs_through_the_product_path_and_resumes_byte_id
             grants: phase_a_grants(),
             incarnation: 1,
             restore: None,
+            sidecar_key: None,
             deadline_ms: 60_000,
         },
         store,
@@ -715,6 +753,7 @@ async fn completion_borne_availability_evidence_reconstructs_to_the_recorded_rou
             grants: phase_a_grants(),
             incarnation: 1,
             restore: None,
+            sidecar_key: Some([0x5C; 32]),
             deadline_ms: 60_000,
         },
         store,
@@ -794,6 +833,7 @@ async fn conflicting_heads_refuse_reconstruction_typed() {
             grants: phase_a_grants(),
             incarnation: 1,
             restore: None,
+            sidecar_key: None,
             deadline_ms: 60_000,
         },
         store,
@@ -850,6 +890,7 @@ async fn untrusted_attestor_refuses_reconstruction_typed() {
             grants: phase_a_grants(),
             incarnation: 1,
             restore: None,
+            sidecar_key: None,
             deadline_ms: 60_000,
         },
         store,
@@ -859,5 +900,182 @@ async fn untrusted_attestor_refuses_reconstruction_typed() {
     assert!(
         matches!(err, ReconstructError::Verify(_)),
         "the refusal is the typed chain-verification error, got: {err}"
+    );
+}
+
+/// The c15-20260806h terminal shape (Defect 13): after a first crash + reconstruction the
+/// standby resumes via §10.2 migration — and the successor chain's first records are its
+/// restore read-backs, whose values exceed `READBACK_INLINE_MAX` and ride ENCRYPTED LOCAL
+/// SIDECARS (§8.5; the key material never rides the archive). c15h's SECOND reconstruction
+/// refused on exactly those references ("no sidecar key material rides the archive"), five
+/// retries consumed the budget, and the run went terminal on a healthy box. Same-box, the
+/// node's own journal key must decrypt the recorded sections (with the content-addressed
+/// migration-capture fallback for what does not hydrate) and the two-chain lineage must
+/// reconstruct to the recorded round.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_resumed_seat_with_sidecar_restore_readbacks_reconstructs_after_a_second_crash() {
+    // Enough committed rounds that the exported CoordinatorState exceeds READBACK_INLINE_MAX
+    // (the retained record ring grows per round) — asserted below, not assumed.
+    const PRE: u64 = 10;
+    const POST: u64 = 2;
+    let rig = rig();
+    let root = tempdir();
+
+    // -- crash #1: the primary drives PRE rounds under the live driver, then dies ----------------
+    let primary_key_seed = *blake3::hash(b"reconstruct/second-crash/primary").as_bytes();
+    let (sink, chain1) = open_live_sink(&root, &rig.spec);
+    let mut primary = Coordinator::start_with_sink(
+        &rig.wasm,
+        &rig.spec,
+        phase_a_grants(),
+        1,
+        primary_key_seed,
+        Box::new(sink),
+    )
+    .unwrap();
+    for sm in &build_script(&rig.worker_keys, 0..PRE) {
+        primary.deliver(&sm.key, &sm.msg).expect("primary deliver");
+    }
+    for i in 0..decision_count(PRE, true) {
+        primary
+            .next_decision(Duration::from_secs(60))
+            .unwrap_or_else(|e| panic!("primary decision {i}: {e}"));
+    }
+
+    // ONE head store for the whole lineage (the production registry): the successor chain's
+    // publisher resolves its succession link from the store's view of earlier chains.
+    let heads_dir = root.join("heads");
+    let segments = Arc::new(MemoryContentStore::new());
+    let heads = publish_prefix(
+        &root,
+        rig.spec.run_id,
+        rig.spec.module_hash,
+        &rig.base_key,
+        chain1,
+        segments.clone(),
+        &heads_dir,
+    )
+    .await;
+    assert!(!heads.is_empty(), "chain 1's sealed prefix published");
+
+    let store: Arc<dyn ContentStore> = segments.clone();
+    let capture = reconstruct_coordinator(
+        ReconstructSpec {
+            heads: heads.clone(),
+            run_id: rig.spec.run_id,
+            trusted: vec![rig.base_id],
+            role: "coordinator".into(),
+            run_label: RUN_LABEL.into(),
+            journal_root: Some(root.clone()),
+            module: rig.wasm.clone(),
+            config: rig.spec.config_bytes.clone(),
+            grants: phase_a_grants(),
+            incarnation: 2,
+            restore: None,
+            sidecar_key: Some([0x5C; 32]),
+            deadline_ms: 60_000,
+        },
+        store,
+    )
+    .await
+    .expect("the first-crash reconstruction succeeds");
+    let end = primary.kill().expect("primary killed");
+    assert!(matches!(end, RunEnd::Outcome(_)), "guest thread joined");
+
+    // -- the standby resumes FROM the capture (§10.2), journaling to its own durable home --------
+    let standby_key_seed = *blake3::hash(b"reconstruct/second-crash/standby").as_bytes();
+    // A tight rotate policy: the successor's FIRST segment (the one carrying the §10.2 restore
+    // read-back) must seal and publish before the short post-resume drive ends.
+    let (sink2, chain2) = open_live_sink_of(&root, &rig.spec, 2, 8);
+    let mut standby = Coordinator::start_migrating_with_sink(
+        &rig.wasm,
+        &rig.spec,
+        phase_a_grants(),
+        2,
+        standby_key_seed,
+        capture,
+        Box::new(sink2),
+    )
+    .unwrap();
+    for sm in &build_script(&rig.worker_keys, PRE..PRE + POST) {
+        standby.deliver(&sm.key, &sm.msg).expect("standby deliver");
+    }
+    for i in 0..decision_count(POST, false) {
+        standby
+            .next_decision(Duration::from_secs(60))
+            .unwrap_or_else(|e| panic!("standby decision {i}: {e}"));
+    }
+
+    // The defect shape MUST be on disk: the successor chain's §10.2 restore read-back rode a
+    // sidecar (value NOT inline in the record) — otherwise this drill proves nothing.
+    {
+        let jdir = journal_dir(&root, RUN_LABEL, "coordinator", 2);
+        let paths = daemon_vhc_journal::JournalPaths::open(&jdir).expect("journal home");
+        let mut sidecar_refs = 0;
+        for ord in paths.existing_segments().expect("segment listing") {
+            let scan = daemon_vhc_journal::scan_file(paths.segment(ord)).expect("scan");
+            for r in &scan.records {
+                if let daemon_vhc_journal::Body::ReadBack(rb) = &r.body {
+                    if rb.sidecar.is_some() && rb.value.is_none() {
+                        sidecar_refs += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            sidecar_refs >= 1,
+            "the restore read-back must ride a sidecar (§8.5) for this drill to exercise \
+             the second-crash shape — raise PRE if the state stayed under the inline max"
+        );
+    }
+
+    // -- crash #2: chain 2's sealed prefix publishes; reconstruct over BOTH chains ---------------
+    let heads = publish_prefix_of(
+        &root,
+        rig.spec.run_id,
+        rig.spec.module_hash,
+        &rig.base_key,
+        2,
+        chain2,
+        segments.clone(),
+        &heads_dir,
+    )
+    .await;
+    assert!(
+        heads.iter().any(|h| h.body.chain_instance == chain2),
+        "the successor chain's sealed prefix published into the shared store"
+    );
+    let store: Arc<dyn ContentStore> = segments;
+    let capture2 = reconstruct_coordinator(
+        ReconstructSpec {
+            heads,
+            run_id: rig.spec.run_id,
+            trusted: vec![rig.base_id],
+            role: "coordinator".into(),
+            run_label: RUN_LABEL.into(),
+            journal_root: Some(root.clone()),
+            module: rig.wasm.clone(),
+            config: rig.spec.config_bytes.clone(),
+            grants: phase_a_grants(),
+            incarnation: 3,
+            restore: None,
+            sidecar_key: Some([0x5C; 32]),
+            deadline_ms: 60_000,
+        },
+        store,
+    )
+    .await
+    .expect("the second-crash lineage reconstructs (Defect 13: sidecar restore read-backs)");
+    let state = coordinator_state_from_capture(&capture2).expect("exported state decodes");
+    assert_eq!(
+        state.round,
+        PRE + POST,
+        "the rebuilt seat stands at the RECORDED next un-opened round across both chains"
+    );
+
+    let end = standby.kill().expect("standby killed");
+    assert!(
+        matches!(end, RunEnd::Outcome(_)),
+        "standby guest thread joined"
     );
 }
