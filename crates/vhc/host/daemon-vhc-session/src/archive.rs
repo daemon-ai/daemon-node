@@ -152,6 +152,23 @@ pub struct ArchiveSpec {
     /// against this set (an unverifiable store row must never shape our signed head). Empty =
     /// own-base linking only.
     pub trusted: Vec<daemon_vhc_proto::PeerId>,
+    /// PREDECESSOR chains of this seat whose local journal homes exist on this box (the
+    /// reconstruction seam, defect 16): a successor founded from a crashed chain's records must
+    /// get that chain's sealed-but-unpublished suffix INTO the archive, or the lineage it
+    /// founds can never reconstruct anywhere else. The publisher adopts each backlog —
+    /// sealing the abandoned tail, uploading the segments, attesting their heads under its own
+    /// certified span (cross-span attestation: `ArchiveHeadBody.instance` is the SEALING span,
+    /// `chain_instance` stays the predecessor's) — BEFORE its own founding head links to the
+    /// (now complete) predecessor terminal. Ascending chain-instance order.
+    pub predecessors: Vec<PredecessorChain>,
+}
+
+/// One predecessor chain's local coordinates (see [`ArchiveSpec::predecessors`]).
+pub struct PredecessorChain {
+    /// The predecessor chain's founding incarnation (its `chain_instance`).
+    pub chain_instance: u64,
+    /// The predecessor chain's local journal home.
+    pub journal_dir: PathBuf,
 }
 
 /// Capped exponential backoff for the publisher's retry loops: transient store/registry faults
@@ -212,6 +229,7 @@ pub fn spawn_archive_publisher(
             round_claim: spec.round_claim,
             archived_round: spec.archived_round,
             trusted: spec.trusted,
+            predecessors: spec.predecessors,
             published_tip: None,
             predecessor: None,
             ledger,
@@ -253,6 +271,9 @@ struct Publisher {
     /// The genesis-trusted attestor set for CROSS-BASE succession-link resolution (see
     /// [`ArchiveSpec::trusted`]).
     trusted: Vec<daemon_vhc_proto::PeerId>,
+    /// Predecessor chains with local journal homes whose unpublished suffixes this publisher
+    /// adopts (see [`ArchiveSpec::predecessors`]).
+    predecessors: Vec<PredecessorChain>,
     /// The highest head ordinal the store holds for this chain (`None` = nothing published).
     published_tip: Option<u64>,
     /// The predecessor chain's terminal head address (segment 0's succession link), resolved
@@ -326,6 +347,13 @@ impl Publisher {
             self.archived_round
                 .fetch_max(round.saturating_add(1), Ordering::Relaxed);
         }
+        // Defect 16 — adopt every predecessor chain's unpublished sealed suffix FIRST: the
+        // records this seat's boot capture folded must be in the archive before our founding
+        // head commits a succession link, or the lineage we found can never reconstruct
+        // anywhere else. Runs on every reconciliation (a crash between a predecessor's seal
+        // and its publish acknowledgment re-sends here, like our own backlog).
+        let adopted_terminal = self.adopt_predecessors(&stored).await;
+
         // The succession link: our founding head names the predecessor chain's last published
         // head by content address (`None` when this run+role has no earlier chain). Candidates
         // are NOT scoped to our own base: a seat that moved boxes (a new base identity per
@@ -359,6 +387,15 @@ impl Publisher {
                     return false;
                 }
             };
+            // An adopted backlog EXTENDED the predecessor chain past the stored view — the
+            // succession link must name the complete terminal, not the stale tip.
+            if let Some((chain, segment, address)) = adopted_terminal {
+                let stored_coords =
+                    predecessor_tip.map(|h| (h.body.chain_instance, h.body.segment));
+                if stored_coords.is_none_or(|coords| (chain, segment) > coords) {
+                    self.predecessor = Some(address);
+                }
+            }
         }
 
         // The on-disk sealed chain above the published tip.
@@ -422,6 +459,294 @@ impl Publisher {
             }
         }
         true
+    }
+
+    /// Adopt every configured predecessor chain's unpublished sealed suffix into the archive
+    /// (defect 16 — see [`ArchiveSpec::predecessors`]): seal the abandoned tail, then upload +
+    /// attest every sealed segment above the chain's stored tip, in chain order. Returns the
+    /// newest adopted head's `(chain_instance, segment, content address)` — the
+    /// succession-link candidate.
+    ///
+    /// Best-effort per chain: a predecessor whose backlog cannot publish is logged loudly and
+    /// skipped — our own chain's publication must not be held hostage, and the local bytes
+    /// stay retained (nothing here prunes on failure) for the next reconciliation.
+    async fn adopt_predecessors(
+        &mut self,
+        stored: &[ArchiveHeadRecord],
+    ) -> Option<(u64, u64, Hash)> {
+        let preds = std::mem::take(&mut self.predecessors);
+        let mut newest: Option<(u64, u64, Hash)> = None;
+        for pred in &preds {
+            // The chain's stored tip anchors both the walk floor and the prev-link check. A
+            // chain the store has NEVER seen is not adoptable (its founding head's succession
+            // link belongs to the span that founded it, which we cannot re-derive here).
+            let Some(tip) = stored
+                .iter()
+                .filter(|h| {
+                    h.body.run_id == self.run_id
+                        && h.body.role == self.role
+                        && h.body.chain_instance == pred.chain_instance
+                })
+                .max_by_key(|h| h.body.segment)
+            else {
+                tracing::warn!(
+                    run = self.run_label,
+                    chain = pred.chain_instance,
+                    "predecessor chain has no stored head; its local backlog is not adoptable"
+                );
+                continue;
+            };
+            if let Err(e) = daemon_vhc_journal::seal_abandoned_tail(&pred.journal_dir) {
+                tracing::warn!(
+                    run = self.run_label,
+                    chain = pred.chain_instance,
+                    error = %e,
+                    "predecessor abandoned-tail seal failed; adopting only already-sealed segments"
+                );
+            }
+            let Ok(paths) = JournalPaths::open(&pred.journal_dir) else {
+                continue;
+            };
+            let Ok(ordinals) = paths.existing_segments() else {
+                continue;
+            };
+            let mut pred_ledger = crate::custody::CustodyLedger::load(&pred.journal_dir).ok();
+            let mut prev = tip.body.segment_hash;
+            for ord in ordinals {
+                if ord <= tip.body.segment {
+                    continue;
+                }
+                let Ok(scan) = scan_file(paths.segment(ord)) else {
+                    break;
+                };
+                if !scan.sealed {
+                    // A record-free active file, or a tail the seal above could not close.
+                    break;
+                }
+                if Hash(scan.header.prev_blake3) != prev {
+                    tracing::warn!(
+                        run = self.run_label,
+                        chain = pred.chain_instance,
+                        segment = ord,
+                        "predecessor backlog segment does not chain from the stored tip; \
+                         adoption stopped"
+                    );
+                    break;
+                }
+                let records = scan
+                    .records
+                    .iter()
+                    .filter(|r| !matches!(r.body, daemon_vhc_journal::Body::Seal(_)))
+                    .count() as u64;
+                let sealed = SealedSegment {
+                    id: scan.header.id.clone(),
+                    segment: ord,
+                    path: paths.segment(ord),
+                    segment_blake3: scan.complete_file_blake3,
+                    prev_blake3: scan.header.prev_blake3,
+                    records,
+                };
+                let Some(address) = self.publish_adopted(pred.chain_instance, &sealed).await else {
+                    break;
+                };
+                if let Some(ledger) = pred_ledger.as_mut() {
+                    if let Err(e) =
+                        ledger.record_archived(ord, Hash(scan.complete_file_blake3), records)
+                    {
+                        tracing::warn!(
+                            run = self.run_label,
+                            chain = pred.chain_instance,
+                            segment = ord,
+                            error = %e,
+                            "predecessor custody ledger persist failed"
+                        );
+                    }
+                }
+                tracing::info!(
+                    run = self.run_label,
+                    role = self.role,
+                    chain = pred.chain_instance,
+                    segment = ord,
+                    records,
+                    "adopted a predecessor chain's unpublished segment into the archive"
+                );
+                prev = Hash(scan.complete_file_blake3);
+                if newest.is_none_or(|(c, s, _)| (pred.chain_instance, ord) > (c, s)) {
+                    newest = Some((pred.chain_instance, ord, address));
+                }
+            }
+        }
+        self.predecessors = preds;
+        newest
+    }
+
+    /// Publish ONE adopted predecessor segment: upload the bytes, then attest its head under
+    /// OUR OWN certified span (cross-span attestation — `ArchiveHeadBody.instance` names the
+    /// sealing/attesting span, `chain_instance` stays the predecessor's; the wire contract
+    /// requires only `instance >= chain_instance`). Returns the acknowledged head's content
+    /// address, or `None` on an abort-worthy refusal.
+    async fn publish_adopted(
+        &mut self,
+        chain_instance: u64,
+        sealed: &SealedSegment,
+    ) -> Option<Hash> {
+        let bytes = match read_segment(&sealed.path) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::error!(
+                    run = self.run_label,
+                    chain = chain_instance,
+                    segment = sealed.segment,
+                    error = %e,
+                    "adopted segment unreadable; adoption stopped"
+                );
+                return None;
+            }
+        };
+        if daemon_vhc_proto::blake3_hash(&bytes).0 != sealed.segment_blake3 {
+            tracing::error!(
+                run = self.run_label,
+                chain = chain_instance,
+                segment = sealed.segment,
+                "adopted segment bytes do not match the scan hash; adoption stopped"
+            );
+            return None;
+        }
+        let mut attempt = 0u32;
+        loop {
+            match self.segments.put_content(&bytes).await {
+                Ok(address) if address.0 == sealed.segment_blake3 => break,
+                Ok(_) => {
+                    tracing::error!(
+                        run = self.run_label,
+                        chain = chain_instance,
+                        segment = sealed.segment,
+                        "content store returned a foreign address; adoption stopped"
+                    );
+                    return None;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        run = self.run_label,
+                        chain = chain_instance,
+                        segment = sealed.segment,
+                        error = %e,
+                        attempt,
+                        "adopted segment upload failed; retrying"
+                    );
+                    backoff(attempt).await;
+                    attempt += 1;
+                }
+            }
+        }
+
+        let claim_at_stamp = self.round_claim.load(Ordering::Relaxed);
+        let record = {
+            let bindings = self.bindings.lock().expect("signer bindings mutex");
+            // The NEWEST binding is the attesting span (our own certified incarnation).
+            let Some(binding) = bindings.last() else {
+                tracing::error!(
+                    run = self.run_label,
+                    chain = chain_instance,
+                    segment = sealed.segment,
+                    "no signer binding to attest the adopted segment; adoption stopped"
+                );
+                return None;
+            };
+            let scope = &binding.certificate.body.scope;
+            let body = ArchiveHeadBody {
+                domain: ARCHIVE_HEAD_DOMAIN.into(),
+                run_id: self.run_id,
+                role: self.role.clone(),
+                chain_instance,
+                segment: sealed.segment,
+                segment_hash: Hash(sealed.segment_blake3),
+                prev_hash: Hash(sealed.prev_blake3),
+                records: sealed.records,
+                instance: scope.instance,
+                epoch: scope.epoch,
+                module: scope.module_hash,
+                // Adoption never republishes a founding head (the walk floor is the stored
+                // tip), so no succession link is ever authored here.
+                predecessor: None,
+                round: claim_at_stamp.checked_sub(1),
+            };
+            match ArchiveHeadRecord::publish(
+                &SigningKey::from_bytes(&binding.signing_seed),
+                binding.certificate.clone(),
+                body,
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::error!(
+                        run = self.run_label,
+                        chain = chain_instance,
+                        segment = sealed.segment,
+                        error = %e,
+                        "adopted archive head does not author; adoption stopped"
+                    );
+                    return None;
+                }
+            }
+        };
+        let address = match record.content_address() {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::error!(
+                    run = self.run_label,
+                    chain = chain_instance,
+                    segment = sealed.segment,
+                    error = %e,
+                    "adopted archive head does not re-encode; adoption stopped"
+                );
+                return None;
+            }
+        };
+        let mut attempt = 0u32;
+        loop {
+            match self.heads.put_head(&record).await {
+                Ok(ArchiveHeadDecision::Accepted | ArchiveHeadDecision::AlreadyStored) => {
+                    return Some(address);
+                }
+                Ok(ArchiveHeadDecision::RejectedNonExtending {
+                    stored_segment,
+                    stored_segment_hash,
+                }) => {
+                    tracing::error!(
+                        run = self.run_label,
+                        chain = chain_instance,
+                        segment = sealed.segment,
+                        stored_segment,
+                        stored_hash = %stored_segment_hash.to_hex(),
+                        ours = %Hash(sealed.segment_blake3).to_hex(),
+                        "adopted head refused as non-extending (fork evidence); adoption stopped"
+                    );
+                    return None;
+                }
+                Ok(ArchiveHeadDecision::RejectedStructural { reason }) => {
+                    tracing::error!(
+                        run = self.run_label,
+                        chain = chain_instance,
+                        segment = sealed.segment,
+                        reason,
+                        "adopted head refused structurally; adoption stopped"
+                    );
+                    return None;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        run = self.run_label,
+                        chain = chain_instance,
+                        segment = sealed.segment,
+                        error = %e,
+                        attempt,
+                        "adopted head publish failed; retrying"
+                    );
+                    backoff(attempt).await;
+                    attempt += 1;
+                }
+            }
+        }
     }
 
     /// Publish one sealed segment: upload the bytes (content-addressed), then the attested head.
@@ -768,6 +1093,7 @@ mod tests {
                 round_claim: Arc::new(AtomicU64::new(0)),
                 archived_round: Arc::new(AtomicU64::new(0)),
                 trusted: Vec::new(),
+                predecessors: Vec::new(),
             },
             heads.clone(),
             segments.clone(),
@@ -817,6 +1143,7 @@ mod tests {
                 round_claim: Arc::new(AtomicU64::new(0)),
                 archived_round: Arc::new(AtomicU64::new(0)),
                 trusted: Vec::new(),
+                predecessors: Vec::new(),
             },
             heads.clone(),
             segments.clone(),
@@ -879,6 +1206,7 @@ mod tests {
                 round_claim: Arc::new(AtomicU64::new(0)),
                 archived_round: Arc::new(AtomicU64::new(0)),
                 trusted: Vec::new(),
+                predecessors: Vec::new(),
             },
             heads.clone(),
             segments.clone(),

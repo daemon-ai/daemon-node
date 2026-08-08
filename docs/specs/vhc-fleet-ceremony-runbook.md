@@ -363,6 +363,28 @@ lineage fold still sees exactly one founding chain per seat. Own-base linking ne
 set; the cross-attestor case is pinned by the `reconstruct_product` matrix
 (`archive_only_recovery_reconstructs_across_a_second_trusted_base_identity`).
 
+**The crash-tail closure (defect 16, c15k).** A hard-killed coordinator leaves a suffix of
+records past its last archived head — sealed segments the outage kept from publishing, plus the
+unsealed cut segment. Reconstruction consumes that suffix (the successor's boot capture folds
+it), so it MUST reach the archive or every later archive-only fold replays a state *behind* the
+successor's recorded restore read-back and refuses at the content-address gate. Two mechanisms
+close the gap on the production path:
+
+- **Seal before consume** — `recover_records` runs `seal_abandoned_tail` over each lineage
+  chain's local journal home before walking its tail: the crash-cut segment is truncated to its
+  durable length and sealed in place, becoming publishable archive material. A tail that cannot
+  be sealed is NOT consumed (its records could never reach the archive).
+- **Predecessor backlog adoption** — the successor session's publisher receives the recovery
+  lineage's predecessor chain instances (`ArchiveSpec.predecessors`, derived from the
+  `reconstruct` credential) and, before its own founding head commits, uploads every
+  sealed-but-unpublished predecessor segment and attests its head under the successor's OWN
+  certified span (cross-span attestation: `body.chain_instance` = the predecessor's,
+  `body.instance` = the successor's — the reader's span-monotonicity rule `instance ≥
+  chain_instance` admits it). The succession link then names the COMPLETE predecessor terminal.
+
+Both are pinned end-to-end by
+`reconstruct_product::a_consumed_crash_tail_reaches_the_archive_and_the_lineage_reconstructs_archive_only`.
+
 ### 3.5 The per-round digest on the product API
 
 The per-round det-state digest each peer produces (§5.6 of the architecture) is surfaced on the node

@@ -139,7 +139,31 @@ async fn join_live(
         .into());
     }
     let binding = backend::role_binding(resolved, genesis, run_id, incarnation)?;
-    let (journal, archive) = journal_sink(run_id, &binding.run.identity, &binding.trusted_bases)?;
+    // The recovery directive names this seat's PREDECESSOR chains: any with a local journal
+    // home get their unpublished sealed suffix adopted into the archive by this session's
+    // publisher (defect 16 — the records a reconstruction consumes must become archive
+    // material, or the successor chain can never reconstruct off this box).
+    let predecessor_instances: Vec<u64> = creds
+        .reconstruct
+        .as_ref()
+        .map(|recovery| {
+            let mut instances: Vec<u64> = recovery
+                .heads
+                .iter()
+                .filter(|h| h.body.role == binding.run.identity.role)
+                .map(|h| h.body.chain_instance)
+                .collect();
+            instances.sort_unstable();
+            instances.dedup();
+            instances
+        })
+        .unwrap_or_default();
+    let (journal, archive) = journal_sink(
+        run_id,
+        &binding.run.identity,
+        &binding.trusted_bases,
+        &predecessor_instances,
+    )?;
     let keystore = daemon_vhc_session::keystore::VhcKeystore::from_env()
         .map_err(|e| format!("identity store: {e}"))?;
     let announcement =
@@ -371,6 +395,7 @@ fn journal_sink(
     run_label: &str,
     identity: &daemon_vhc_host::run::RunIdentity,
     trusted_bases: &[daemon_vhc_proto::PeerId],
+    predecessor_instances: &[u64],
 ) -> Result<
     (
         Box<dyn daemon_vhc_host::run::JournalSink>,
@@ -396,6 +421,18 @@ fn journal_sink(
         .map_err(|e| format!("journal home: open {}: {e}", dir.display()))?;
     let (seal_tx, seals) = tokio::sync::mpsc::unbounded_channel();
     sink.arm_seal_hook(seal_tx);
+    // Predecessor chains with a LOCAL journal home (the same-box recovery shape): their
+    // unpublished sealed suffix is adopted into the archive by this session's publisher
+    // (defect 16 — see `ArchiveSpec::predecessors`).
+    let predecessors: Vec<daemon_vhc_session::archive::PredecessorChain> = predecessor_instances
+        .iter()
+        .filter(|inst| **inst < sink.founding_instance())
+        .map(|inst| daemon_vhc_session::archive::PredecessorChain {
+            chain_instance: *inst,
+            journal_dir: journal_home::journal_dir(&root, run_label, &identity.role, *inst),
+        })
+        .filter(|p| p.journal_dir.is_dir())
+        .collect();
     let archive = daemon_vhc_session::archive::ArchiveSpec {
         seals,
         journal_dir: dir,
@@ -406,6 +443,7 @@ fn journal_sink(
         // link a predecessor chain published under a DIFFERENT trusted base (a seat that
         // moved boxes keeps ONE recovery lineage).
         trusted: trusted_bases.to_vec(),
+        predecessors,
     };
     Ok((Box::new(sink), Some(archive)))
 }
@@ -949,6 +987,7 @@ async fn main() {
                                 &run_id,
                                 &binding.run.identity,
                                 &binding.trusted_bases,
+                                &[],
                             ) {
                                 Ok(parts) => parts,
                                 Err(detail) => {

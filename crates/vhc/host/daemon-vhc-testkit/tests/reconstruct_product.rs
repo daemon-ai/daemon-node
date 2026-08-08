@@ -306,6 +306,7 @@ async fn publish_prefix_of(
     segments: Arc<dyn ContentStore>,
     heads_dir: &std::path::Path,
     trusted: Vec<daemon_vhc_proto::PeerId>,
+    predecessors: Vec<daemon_vhc_session::archive::PredecessorChain>,
 ) -> Vec<daemon_vhc_proto::ArchiveHeadRecord> {
     let certified = issue_run_key(
         base_key,
@@ -339,6 +340,7 @@ async fn publish_prefix_of(
             round_claim: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             archived_round: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             trusted,
+            predecessors,
         },
         heads.clone(),
         segments,
@@ -368,6 +370,7 @@ async fn publish_prefix(
         chain_instance,
         segments,
         heads_dir,
+        Vec::new(),
         Vec::new(),
     )
     .await
@@ -1050,6 +1053,7 @@ async fn a_resumed_seat_with_sidecar_restore_readbacks_reconstructs_after_a_seco
         segments.clone(),
         &heads_dir,
         Vec::new(),
+        Vec::new(),
     )
     .await;
     assert!(
@@ -1252,6 +1256,7 @@ async fn a_cold_standby_with_zero_local_state_reconstructs_solely_from_the_produ
         segments.clone(),
         &heads_dir,
         Vec::new(),
+        Vec::new(),
     )
     .await;
     assert!(
@@ -1296,6 +1301,251 @@ async fn a_cold_standby_with_zero_local_state_reconstructs_solely_from_the_produ
         "the rebuilt seat stands at the RECORDED next un-opened round — the committed head \
          reproduced solely from the archive"
     );
+}
+
+/// **The defect-16 regression (c15k, 2026-08-08): a crash tail CONSUMED by reconstruction must
+/// reach the archive.** The live shape: the killed coordinator left a 99-record suffix past its
+/// last archived head; the same-box reconstruction consumed it (correct — the successor's boot
+/// capture folds it), but nothing ever published it, so every later archive fold replayed a
+/// state BEHIND the successor's recorded §10.2 restore read-back and refused at the
+/// content-address gate ("resolves neither inline nor against the span's migration capture").
+///
+/// The closure under test, end to end on the production paths:
+/// 1. reconstruction SEALS the abandoned tail in place before consuming it
+///    (`seal_abandoned_tail` inside `recover_records`);
+/// 2. the successor session's archive publisher ADOPTS the predecessor's
+///    sealed-but-unpublished suffix — uploading the segments and attesting their heads under
+///    its OWN certified span (cross-span attestation) — BEFORE its founding head commits the
+///    succession link;
+/// 3. a zero-local-state reconstruction over the completed archive rebuilds the whole lineage.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_consumed_crash_tail_reaches_the_archive_and_the_lineage_reconstructs_archive_only() {
+    const PRE: u64 = 10;
+    const POST: u64 = 2;
+    let rig = rig();
+    let root = tempdir();
+
+    // -- chain 1: the primary drives PRE rounds, killed — an UNSEALED tail with records ----------
+    // A rotate cadence chosen so the kill cuts MID-segment: the tail must carry records the
+    // sealed prefix does not (the c15k shape — 99 consumed-but-unarchived records).
+    let primary_key_seed = *blake3::hash(b"reconstruct/defect16/primary").as_bytes();
+    let (sink, chain1) = open_live_sink_of(&root, &rig.spec, 1, 7);
+    let mut primary = Coordinator::start_with_sink(
+        &rig.wasm,
+        &rig.spec,
+        phase_a_grants(),
+        1,
+        primary_key_seed,
+        Box::new(sink),
+    )
+    .unwrap();
+    for sm in &build_script(&rig.worker_keys, 0..PRE) {
+        primary.deliver(&sm.key, &sm.msg).expect("primary deliver");
+    }
+    for i in 0..decision_count(PRE, true) {
+        primary
+            .next_decision(Duration::from_secs(60))
+            .unwrap_or_else(|e| panic!("primary decision {i}: {e}"));
+    }
+
+    // The hard kill: snapshot the journal bytes AT the cut (the graceful `kill()` below writes
+    // a Stop terminal that seals — the live c15k kill was `SIGKILL`, which does not), reap the
+    // guest thread, then restore the snapshot. The restored directory is byte-for-byte what a
+    // hard-killed process leaves behind.
+    let jdir1 = journal_dir(&root, RUN_LABEL, "coordinator", 1);
+    let crash_copy = root.join("crash-cut-chain1");
+    copy_dir(&jdir1, &crash_copy);
+    let end = primary.kill().expect("primary killed");
+    assert!(matches!(end, RunEnd::Outcome(_)), "guest thread joined");
+    std::fs::remove_dir_all(&jdir1).expect("discard the post-kill journal");
+    std::fs::rename(&crash_copy, &jdir1).expect("restore the crash-cut bytes");
+
+    // Pin the c15k shape: the final segment is UNSEALED and carries records (the crash cut).
+    let tail_ord = {
+        let paths = daemon_vhc_journal::JournalPaths::open(&jdir1).expect("journal home");
+        let ords = paths.existing_segments().expect("segment listing");
+        let last = *ords.last().expect("at least one segment");
+        let scan = daemon_vhc_journal::scan_file(paths.segment(last)).expect("scan");
+        assert!(
+            !scan.sealed && !scan.records.is_empty(),
+            "the crash must leave an unsealed tail WITH records for this drill \
+             (rotate-policy drift? tail: sealed={} records={})",
+            scan.sealed,
+            scan.records.len()
+        );
+        last
+    };
+
+    // Only the SEALED prefix reaches the archive pre-crash (the tail is local-only — c15k).
+    let heads_dir = root.join("heads");
+    let segments = Arc::new(MemoryContentStore::new());
+    let heads = publish_prefix(
+        &root,
+        rig.spec.run_id,
+        rig.spec.module_hash,
+        &rig.base_key,
+        chain1,
+        segments.clone(),
+        &heads_dir,
+    )
+    .await;
+    assert!(
+        heads
+            .iter()
+            .filter(|h| h.body.chain_instance == chain1)
+            .all(|h| h.body.segment < tail_ord),
+        "the unsealed tail must NOT be in the pre-crash archive"
+    );
+
+    // -- reconstruction #1 (same box): consumes prefix + tail, SEALING the tail in place ---------
+    let store: Arc<dyn ContentStore> = segments.clone();
+    let capture = reconstruct_coordinator(
+        ReconstructSpec {
+            heads: heads.clone(),
+            run_id: rig.spec.run_id,
+            trusted: vec![rig.base_id],
+            role: "coordinator".into(),
+            run_label: RUN_LABEL.into(),
+            journal_root: Some(root.clone()),
+            module: rig.wasm.clone(),
+            config: rig.spec.config_bytes.clone(),
+            grants: phase_a_grants(),
+            incarnation: 2,
+            restore: None,
+            sidecar_key: Some([0x5C; 32]),
+            deadline_ms: 60_000,
+        },
+        store,
+    )
+    .await
+    .expect("the first (same-box) reconstruction succeeds");
+    {
+        let paths = daemon_vhc_journal::JournalPaths::open(&jdir1).expect("journal home");
+        let scan = daemon_vhc_journal::scan_file(paths.segment(tail_ord)).expect("scan");
+        assert!(
+            scan.sealed,
+            "the consumed crash tail was sealed in place (Gate A durability ordering)"
+        );
+    }
+
+    // -- chain 2: the standby resumes from the capture, drives POST rounds, killed ---------------
+    let standby_key_seed = *blake3::hash(b"reconstruct/defect16/standby").as_bytes();
+    let (sink2, chain2) = open_live_sink_of(&root, &rig.spec, 2, 8);
+    let mut standby = Coordinator::start_migrating_with_sink(
+        &rig.wasm,
+        &rig.spec,
+        phase_a_grants(),
+        2,
+        standby_key_seed,
+        capture,
+        Box::new(sink2),
+    )
+    .unwrap();
+    for sm in &build_script(&rig.worker_keys, PRE..PRE + POST) {
+        standby.deliver(&sm.key, &sm.msg).expect("standby deliver");
+    }
+    for i in 0..decision_count(POST, false) {
+        standby
+            .next_decision(Duration::from_secs(60))
+            .unwrap_or_else(|e| panic!("standby decision {i}: {e}"));
+    }
+    let end = standby.kill().expect("standby killed");
+    assert!(
+        matches!(end, RunEnd::Outcome(_)),
+        "standby guest thread joined"
+    );
+    seal_tail(&root, &rig.spec, 2);
+
+    // -- the successor's publisher ADOPTS chain 1's backlog, then publishes chain 2 --------------
+    let heads = publish_prefix_of(
+        &root,
+        rig.spec.run_id,
+        rig.spec.module_hash,
+        &rig.base_key,
+        2,
+        chain2,
+        segments.clone(),
+        &heads_dir,
+        Vec::new(),
+        vec![daemon_vhc_session::archive::PredecessorChain {
+            chain_instance: chain1,
+            journal_dir: jdir1.clone(),
+        }],
+    )
+    .await;
+    let chain1_tip = heads
+        .iter()
+        .filter(|h| h.body.chain_instance == chain1)
+        .max_by_key(|h| h.body.segment)
+        .expect("chain 1 stored");
+    assert_eq!(
+        chain1_tip.body.segment, tail_ord,
+        "the adopted crash-tail head reached the store"
+    );
+    assert_eq!(
+        chain1_tip.body.instance, 2,
+        "the tail head is attested by the SUCCESSOR span (cross-span attestation)"
+    );
+    let founding2 = heads
+        .iter()
+        .find(|h| h.body.chain_instance == chain2 && h.body.segment == 0)
+        .expect("chain 2 founding head");
+    assert_eq!(
+        founding2.body.predecessor,
+        Some(
+            chain1_tip
+                .content_address()
+                .expect("terminal head re-encodes")
+        ),
+        "the successor's succession link names the COMPLETE predecessor terminal (the \
+         adopted tail head), not the stale pre-crash tip"
+    );
+
+    // -- zero local state: the archive alone rebuilds the whole lineage --------------------------
+    let run_state = daemon_vhc_session::journal_home::run_state_dir(&root, RUN_LABEL);
+    std::fs::remove_dir_all(&run_state).expect("local run state deleted");
+    let store: Arc<dyn ContentStore> = segments;
+    let capture2 = reconstruct_coordinator(
+        ReconstructSpec {
+            heads,
+            run_id: rig.spec.run_id,
+            trusted: vec![rig.base_id],
+            role: "coordinator".into(),
+            run_label: RUN_LABEL.into(),
+            journal_root: None,
+            module: rig.wasm.clone(),
+            config: rig.spec.config_bytes.clone(),
+            grants: phase_a_grants(),
+            incarnation: 3,
+            restore: None,
+            sidecar_key: None,
+            deadline_ms: 60_000,
+        },
+        store,
+    )
+    .await
+    .expect(
+        "defect 16 closed: the consumed tail is IN the archive, so the lineage reconstructs \
+         with zero local state",
+    );
+    let state = coordinator_state_from_capture(&capture2).expect("exported state decodes");
+    assert_eq!(
+        state.round,
+        PRE + POST,
+        "the rebuilt seat stands at the recorded next un-opened round across both chains"
+    );
+}
+
+/// A flat file copy (journal homes hold no subdirectories) — the hard-kill byte snapshot.
+fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).expect("snapshot dir");
+    for entry in std::fs::read_dir(from).expect("read journal home") {
+        let path = entry.expect("dir entry").path();
+        if path.is_file() {
+            std::fs::copy(&path, to.join(path.file_name().expect("file name")))
+                .expect("snapshot file");
+        }
+    }
 }
 
 /// Hex of a proto hash (the [`FsContentStore`] object filename — objects live flat as
@@ -1579,6 +1829,7 @@ async fn archive_only_recovery_reconstructs_across_a_second_trusted_base_identit
         // Base B's publisher links its founding head to base A's terminal head THROUGH the
         // genesis-trusted set — the seat's recovery lineage survives the box move.
         trusted.clone(),
+        Vec::new(),
     )
     .await;
     assert!(

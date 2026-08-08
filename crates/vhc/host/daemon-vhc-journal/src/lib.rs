@@ -50,7 +50,7 @@ use std::path::{Path, PathBuf};
 pub use record::{Body, ExecIdentity, Record};
 pub use segment::{scan_bytes, scan_file, ScanResult, SegmentHeader, SegmentWriter};
 pub use sidecar::{KeyProvider, SidecarError, SidecarStore, StaticKey};
-pub use store::{Journal, RotatePolicy, SealHook, SealedSegment};
+pub use store::{seal_abandoned_tail, Journal, RotatePolicy, SealHook, SealedSegment};
 
 use daemon_vhc_abi::JOURNAL_FORMAT_VERSION;
 

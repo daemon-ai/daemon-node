@@ -24,6 +24,7 @@
 mod archive_pull;
 mod ceremony;
 mod publish;
+mod reconstruct_probe;
 mod replay;
 mod tokenize;
 
@@ -355,6 +356,27 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Forensic/audit probe over an assembled archive directory: dump the verified chain
+    /// topology (every role's chains, predecessor links, the coordinator lineage), each
+    /// lineage chain's span structure (instantiation reasons, read-back kinds, sidecar
+    /// references), then run the PRODUCTION §8.8 coordinator reconstruction archive-only (no
+    /// local journal home, no sidecar key) and report the exported capture's section content
+    /// addresses — or the typed refusal.
+    VhcReconstructProbe {
+        /// The archive directory (the `vhc-replay` layout).
+        #[arg(long)]
+        archive: PathBuf,
+        /// The run id (genesis hash hex) the archive belongs to.
+        #[arg(long)]
+        run: String,
+        /// Reconstruct only the lineage prefix up to and including this chain instance
+        /// (isolates which span stops resolving).
+        #[arg(long)]
+        through: Option<u64>,
+        /// Topology + span dump only; skip the reconstruction.
+        #[arg(long)]
+        no_reconstruct: bool,
+    },
     /// Tokenize a corpus into fixed-width shards + `manifest.json` (spec §8; M1 seam).
     TokenizeCorpus {
         /// HF dataset repo id (e.g. `roneneldan/TinyStories`); omit when using `--text`.
@@ -582,6 +604,17 @@ fn main() -> anyhow::Result<()> {
             out,
         }),
         Cmd::VhcReplay { archive, run, json } => replay::run(replay::Args { archive, run, json }),
+        Cmd::VhcReconstructProbe {
+            archive,
+            run,
+            through,
+            no_reconstruct,
+        } => reconstruct_probe::run(reconstruct_probe::Args {
+            archive,
+            run,
+            through,
+            no_reconstruct,
+        }),
         Cmd::TokenizeCorpus {
             dataset,
             dataset_file,

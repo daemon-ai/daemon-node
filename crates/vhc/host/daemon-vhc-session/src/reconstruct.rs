@@ -256,17 +256,43 @@ async fn recover_records(
             chain_records.extend(scan.records);
         }
 
-        // The NEWEST chain's local unsealed tail: segments past the last attested head, chained
-        // via prev_blake3. Only the crashed box holds it; a cold standby reconstructs to the
-        // archived point (which the coordinator's replay-forward semantics then catch up).
-        let is_newest = std::ptr::eq(*chain, *lineage.last().expect("lineage non-empty"));
+        // EVERY chain's local continuation: segments past the last attested head, chained via
+        // prev_blake3. For the newest chain this is the crash cut; for an INTERMEDIATE chain it
+        // is the sealed-but-unpublished suffix its successor's boot capture already folded — a
+        // replay that skipped it would rebuild a state BEHIND the successor's recorded §10.2
+        // restore read-backs and refuse at the content-address gate (the c15k defect-16 shape:
+        // a 99-record tail consumed at the first recovery, absent from every later fold).
+        //
+        // Durability first (Gate A ordering): the crash cut is SEALED in place before it is
+        // consumed — records this replay folds must be able to become archive material, or the
+        // successor chain this reconstruction founds re-creates the same unreconstructable
+        // lineage one seam later. A segment that still cannot seal is NOT consumed (crash-cut-
+        // earlier semantics: the coordinator's replay-forward path re-derives what a dropped
+        // suffix would have contributed).
         'tail: {
-            if !is_newest {
-                break 'tail;
-            }
             let Some(dir) = &dir else {
                 break 'tail;
             };
+            match daemon_vhc_journal::seal_abandoned_tail(dir) {
+                Ok(sealed) if !sealed.is_empty() => {
+                    tracing::info!(
+                        run = spec.run_label,
+                        chain = chain.chain_instance,
+                        segments = ?sealed,
+                        "coordinator reconstruction: sealed the crashed chain's abandoned tail"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        run = spec.run_label,
+                        chain = chain.chain_instance,
+                        error = %e,
+                        "coordinator reconstruction: abandoned-tail seal failed; only already-\
+                         sealed local segments will be consumed"
+                    );
+                }
+            }
             let Ok(paths) = JournalPaths::open(dir) else {
                 break 'tail;
             };
@@ -300,6 +326,18 @@ async fn recover_records(
                         segment = ord,
                         "coordinator reconstruction: local tail segment does not chain; stopping the tail walk"
                     );
+                    break;
+                }
+                if !scan.sealed {
+                    if !scan.records.is_empty() {
+                        tracing::warn!(
+                            run = spec.run_label,
+                            segment = ord,
+                            records = scan.records.len(),
+                            "coordinator reconstruction: an unsealable local tail segment is NOT \
+                             consumed (its records could never reach the archive)"
+                        );
+                    }
                     break;
                 }
                 prev = Some(scan.complete_file_blake3);

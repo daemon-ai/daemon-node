@@ -779,6 +779,43 @@ impl<K: KeyProvider + Clone> Journal<K> {
     }
 }
 
+/// Seal every ABANDONED unsealed segment with records in the journal at `dir` — the crash cut
+/// of a chain whose writer died (§8.2). The intact prefix (scan-verified, torn suffix
+/// truncated) is sealed IN PLACE, making the records archive material: a coordinator
+/// reconstruction that consumes a crashed predecessor's tail must leave those records sealed,
+/// or the successor chain's boot capture folds history the archive can never re-derive (the
+/// c15k defect-16 shape: a 99-record unsealed tail consumed at recovery, skipped by every
+/// later archive-only replay).
+///
+/// A record-free unsealed segment (a header-only active file) is left alone — it carries
+/// nothing to protect and recovery reopens it for appends. Idempotent: a second pass finds
+/// everything sealed and returns empty.
+///
+/// The caller must hold the series' single-writer discipline (the crashed writer is dead;
+/// no live sink has the directory open).
+///
+/// # Errors
+/// [`JournalError`] on an unlistable home or a seal that cannot be written (the caller must
+/// then treat the tail as NOT consumable — replaying records that cannot become durable
+/// recreates the divergence this exists to prevent).
+pub fn seal_abandoned_tail(dir: &std::path::Path) -> Result<Vec<u64>, JournalError> {
+    let paths = JournalPaths::open(dir)?;
+    let mut sealed = Vec::new();
+    for ord in paths.existing_segments()? {
+        let path = paths.segment(ord);
+        let scan = scan_file(&path)?;
+        if scan.sealed || scan.records.is_empty() {
+            continue;
+        }
+        let mut bytes = std::fs::read(&path).map_err(JournalError::Io)?;
+        bytes.truncate(scan.durable_len as usize);
+        let mut writer = SegmentWriter::reopen(&path, &bytes, scan.records.len() as u64)?;
+        writer.seal()?;
+        sealed.push(ord);
+    }
+    Ok(sealed)
+}
+
 /// Crash-recovery state reconstructed from the segment chain (§8.2/§8.4).
 struct Recovery {
     next_ord: u64,

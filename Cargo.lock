@@ -18980,6 +18980,7 @@ dependencies = [
  "daemon-vhc-abi",
  "daemon-vhc-guest-build",
  "daemon-vhc-host",
+ "daemon-vhc-journal",
  "daemon-vhc-net",
  "daemon-vhc-observe",
  "daemon-vhc-proto",

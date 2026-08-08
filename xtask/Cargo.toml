@@ -65,6 +65,10 @@ daemon-vhc-resource = { workspace = true, features = ["test-support"] }
 # the payload store by content hash (presigned PUT direct-to-R2). Both are existing workspace deps
 # already in the lock via daemon-vhc-net, so no new third-party crate / deny change.
 daemon-vhc-net = { workspace = true }
+# `vhc-reconstruct-probe` (the archive-recovery forensic command): scans the archived record
+# segments directly (span structure, read-back sidecar references) before driving the production
+# reconstruction over them. Existing workspace dep (via daemon-vhc-session), no lock change.
+daemon-vhc-journal = { workspace = true }
 daemon-egress = { workspace = true }
 tokio = { workspace = true }
 blake3 = { workspace = true }
