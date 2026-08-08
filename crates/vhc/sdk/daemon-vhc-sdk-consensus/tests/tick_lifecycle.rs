@@ -117,7 +117,8 @@ fn proto3_ring_wraps_and_cursor_threads() {
     let coord = key(200);
     let mut state = to_first_round(cfg, &ks);
 
-    for round in 0..5 {
+    let ring = daemon_vhc_sdk_consensus::coordinator::NUM_STORED_ROUNDS as u64;
+    for round in 0..=ring {
         assert_eq!(
             state.data_index,
             round * 100,
@@ -126,13 +127,13 @@ fn proto3_ring_wraps_and_cursor_threads() {
         let (s, _) = complete_round(state, &ks, &coord, round, (round + 1) as u8);
         state = s;
     }
-    // After completing rounds 0..=4 we are opening round 5; the ring slot for round 4 (index 0)
-    // must hold round 4 (it wrapped over round 0).
-    assert_eq!(state.round, 5);
-    assert_eq!(state.data_index, 500);
+    // After completing rounds 0..=ring we are opening round ring+1; the ring slot for round
+    // `ring` (index 0) must hold that round (it wrapped over round 0).
+    assert_eq!(state.round, ring + 1);
+    assert_eq!(state.data_index, (ring + 1) * 100);
     assert_eq!(
-        state.rounds.slots[0].round, 4,
-        "ring reused slot 0 for round 4"
+        state.rounds.slots[0].round, ring,
+        "ring reused slot 0 for round {ring}"
     );
 }
 

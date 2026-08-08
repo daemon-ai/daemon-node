@@ -30,18 +30,20 @@ fn authoring_refuses_a_cadence_that_strands_a_rejoiner() {
     author_check_checkpoint_cadence(0, 8).expect("remote publication disabled: nothing to bound");
 }
 
-/// Defect 7c (c15f): a cadence above the retained record horizon authors a run whose crashed
-/// trainer restores a fence deeper than replay-forward can bridge — every rejoin refuses
-/// `CheckpointStale`, churn recovery impossible by construction (cadence 8, horizon 4: the
-/// trapped trainer's fence sat 16 rounds behind the live head). Refused at authoring,
-/// regardless of retention.
+/// Defects 7c (c15f) and 14 (c15h): the cadence plus one in-flight-upload slot must fit the
+/// retained record horizon, or a crashed trainer restores a fence deeper than replay-forward
+/// can bridge — every rejoin refuses `CheckpointStale`, churn recovery impossible by
+/// construction (c15f: cadence 8 vs horizon 4; c15h: cadence 4 vs horizon 4 — zero slack, the
+/// newest checkpoint upload was still in flight at the crash and the 2/2-quorum run wedged
+/// permanently). Refused at authoring, regardless of retention.
 #[test]
 fn authoring_refuses_a_cadence_past_the_record_horizon() {
-    let horizon = daemon_vhc_proto::det_state::RETAINED_RECORD_HORIZON_ROUNDS;
-    author_check_checkpoint_cadence(horizon, 64).expect("a cadence at the horizon authors");
+    let max = daemon_vhc_proto::det_state::RETAINED_RECORD_HORIZON_ROUNDS / 2;
+    author_check_checkpoint_cadence(max, 64)
+        .expect("a cadence at half the horizon (one slot of upload slack) authors");
     for retention in [0, 64] {
-        let err = author_check_checkpoint_cadence(horizon + 1, retention)
-            .expect_err("a cadence past the record horizon is refused at authoring");
+        let err = author_check_checkpoint_cadence(max + 1, retention)
+            .expect_err("a cadence past half the record horizon is refused at authoring");
         assert!(
             err.contains("retained record horizon"),
             "the refusal names the record-horizon bound: {err}"

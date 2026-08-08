@@ -703,7 +703,8 @@ async fn join_refuses_a_checkpoint_too_stale_for_the_retained_horizon() {
         ..enabled_config()
     };
 
-    // Restored fence 1 vs live head 10: 9 rounds behind, horizon 4 — refused typed.
+    // Restored fence 1 vs a live head one past the horizon's reach — refused typed.
+    let horizon = daemon_vhc_proto::RETAINED_RECORD_HORIZON_ROUNDS;
     let worker = FakeWorker::new();
     let svc = VhcService::new(VhcServiceParts {
         config: config.clone(),
@@ -712,7 +713,7 @@ async fn join_refuses_a_checkpoint_too_stale_for_the_retained_horizon() {
         feed: None,
         discovery: Some(Arc::new(StaleCheckpointDiscovery {
             trainer_round: 1,
-            coordinator_round: 10,
+            coordinator_round: 1 + horizon + 1,
         })),
         budget: None,
         worker_factory: None,

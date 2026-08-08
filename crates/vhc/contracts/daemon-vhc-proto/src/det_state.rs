@@ -83,7 +83,16 @@ pub const STATE_CHUNK_SIZE_TARGET: u64 = 4 << 20;
 /// join-time checkpoint-freshness check consumes it host-side without linking round vocabulary
 /// (ABI §12.5 [OWN-3]). Companions: [`validate_checkpoint_cadence`] bounds the PAYLOAD lane the
 /// same way at authoring time.
-pub const RETAINED_RECORD_HORIZON_ROUNDS: u64 = 4;
+///
+/// **Sizing (defect 14, c15h):** the horizon must absorb the freshest fence being a full cadence
+/// slot old at crash time PLUS the newest cadence checkpoint never having finished its upload —
+/// checkpoint assembly + by-ref upload lags round closure by one-to-two rounds live (c15h: the
+/// round-4 pointer landed while the head stood at 8–9; the round-8 upload was still in flight at
+/// the crash, so fence 4 vs head 9 overran a horizon of 4 and re-admission was impossible while
+/// the 2/2-quorum run could not progress — a permanent wedge). The ring slots hold per-round
+/// digests (KB-scale), so the slack is nearly free; [`validate_checkpoint_cadence`] enforces
+/// `2 × cadence ≤ horizon` so one entirely missed checkpoint cycle still restores.
+pub const RETAINED_RECORD_HORIZON_ROUNDS: u64 = 16;
 
 /// The consensus-canonical family every det-state manifest MUST carry.
 pub const MASTER_FAMILY: &str = "master";
@@ -817,12 +826,21 @@ pub fn derive_state_chunk_size(profile_chunk: u64) -> u64 {
 /// `remote_cadence_rounds == 0` means remote publication is disabled (nothing to bound).
 ///
 /// The cadence is ALSO bounded by the **retained record horizon**
-/// ([`RETAINED_RECORD_HORIZON_ROUNDS`]): a restorer's freshest fence trails the live head by up
-/// to one full cadence slot, and replay-forward can only bridge `head - fence ≤ horizon` rounds.
-/// A cadence above the horizon therefore authors a run whose crashed trainer is unrecoverable
-/// **by construction** for part of every slot — proven live in the c15f drill (cadence 8,
-/// horizon 4: the trapped trainer's fence sat 16 rounds behind and every rejoin refused
-/// `CheckpointStale`). Payload retention bounds the PAYLOAD lane; this bounds the RECORD lane.
+/// ([`RETAINED_RECORD_HORIZON_ROUNDS`]), with the SAME one-slot churn slack as the payload lane:
+///
+/// ```text
+/// remote_cadence_rounds × 2 ≤ RETAINED_RECORD_HORIZON_ROUNDS
+/// ```
+///
+/// A restorer's freshest fence trails the live head by up to one full cadence slot, and the
+/// newest cadence checkpoint may never have completed its upload (assembly + by-ref upload lag
+/// round closure by one-to-two rounds live), so the reachable fence can be a full EXTRA slot
+/// old. Replay-forward can only bridge `head - fence ≤ horizon` rounds; past it the run is
+/// unrecoverable **by construction**. Proven live twice: c15f (cadence 8, horizon 4 — the
+/// trapped trainer's fence sat 16 rounds behind, every rejoin refused `CheckpointStale`) and
+/// c15h (cadence 4, horizon 4 — zero slack: the round-8 upload was in flight at the crash, so
+/// fence 4 vs head 9 wedged a 2/2-quorum run permanently, defect 14). Payload retention bounds
+/// the PAYLOAD lane; this bounds the RECORD lane.
 pub fn validate_checkpoint_cadence(
     remote_cadence_rounds: u64,
     payload_retention_rounds: u64,
@@ -830,13 +848,16 @@ pub fn validate_checkpoint_cadence(
     if remote_cadence_rounds == 0 {
         return Ok(());
     }
-    if remote_cadence_rounds > RETAINED_RECORD_HORIZON_ROUNDS {
+    let record_need = remote_cadence_rounds.saturating_mul(2);
+    if record_need > RETAINED_RECORD_HORIZON_ROUNDS {
+        let max = RETAINED_RECORD_HORIZON_ROUNDS / 2;
         return Err(VhcProtoError::Validation(format!(
-            "remote checkpoint cadence {remote_cadence_rounds} exceeds the retained record \
-             horizon {RETAINED_RECORD_HORIZON_ROUNDS}: a trainer that dies late in a cadence \
-             slot restores a fence deeper than replay-forward can bridge, so churn recovery \
-             would be impossible by construction; tighten the cadence to \
-             ≤ {RETAINED_RECORD_HORIZON_ROUNDS}"
+            "remote checkpoint cadence {remote_cadence_rounds} + one in-flight-upload slot \
+             ({record_need} rounds) exceeds the retained record horizon \
+             {RETAINED_RECORD_HORIZON_ROUNDS}: a trainer that dies late in a cadence slot whose \
+             newest checkpoint upload never completed restores a fence deeper than \
+             replay-forward can bridge, so churn recovery would be impossible by construction \
+             (defect 14, c15h); tighten the cadence to ≤ {max}"
         )));
     }
     if payload_retention_rounds == 0 {
@@ -1229,17 +1250,19 @@ mod tests {
         validate_checkpoint_cadence(0, 8).unwrap();
     }
 
-    /// The record-horizon bound (defect 7c of the c15 drills): a cadence above
-    /// [`RETAINED_RECORD_HORIZON_ROUNDS`] authors a run whose crashed trainer restores a fence
-    /// deeper than replay-forward can bridge — churn recovery impossible by construction
-    /// (c15f: cadence 8, horizon 4, every rejoin refused `CheckpointStale`). The refusal is
-    /// authoring-time and applies regardless of the retention setting.
+    /// The record-horizon bound (defects 7c and 14 of the c15 drills): the cadence plus one
+    /// in-flight-upload slot must fit the horizon — a boundary cadence (`cadence == horizon`,
+    /// c15f) or a zero-slack one (`2 × cadence > horizon`, c15h: the newest checkpoint upload
+    /// was still in flight at the crash) authors a run whose crashed trainer restores a fence
+    /// deeper than replay-forward can bridge — churn recovery impossible by construction. The
+    /// refusal is authoring-time and applies regardless of the retention setting.
     #[test]
     fn cadence_record_horizon_bound() {
-        validate_checkpoint_cadence(RETAINED_RECORD_HORIZON_ROUNDS, 64).unwrap();
+        let max = RETAINED_RECORD_HORIZON_ROUNDS / 2;
+        validate_checkpoint_cadence(max, 64).unwrap();
         for retention in [0, 64] {
-            let err = validate_checkpoint_cadence(RETAINED_RECORD_HORIZON_ROUNDS + 1, retention)
-                .expect_err("a cadence past the record horizon must refuse at authoring");
+            let err = validate_checkpoint_cadence(max + 1, retention)
+                .expect_err("a cadence past half the record horizon must refuse at authoring");
             assert!(
                 err.to_string().contains("retained record horizon"),
                 "the refusal names the horizon bound (got: {err})"
