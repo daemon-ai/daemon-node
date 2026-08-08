@@ -29,7 +29,7 @@ use super::{JournalError, JournalPaths};
 
 /// Host-configurable segment rotation policy (§8.2: segments roll at a size/record threshold,
 /// and optionally at an age bound — the archive **recovery-point cadence**).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct RotatePolicy {
     /// Roll (seal + start a new segment) once a segment reaches this many records.
     pub max_records: u64,
@@ -39,6 +39,13 @@ pub struct RotatePolicy {
     /// behind a large record count: the sealed-segment publisher only ever sees sealed
     /// segments, so the open segment's age bounds the recovery-point lag.
     pub max_open: Option<std::time::Duration>,
+    /// An EXTERNAL recovery-point request cell (Gate B' round-aware seal pacing): whenever the
+    /// cell's value exceeds the count of requests this journal has already honored, the next
+    /// append seals the (non-empty) open segment first, exactly like the age bound. The journal
+    /// stays vocabulary-free — the owner encodes its own pacing (the session bumps the cell as
+    /// the committed-round watermark drifts past the archive tip); this substrate sees only "a
+    /// recovery point was requested". `None` disables the seam.
+    pub roll_request: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl Default for RotatePolicy {
@@ -47,6 +54,7 @@ impl Default for RotatePolicy {
         Self {
             max_records: 1024,
             max_open: None,
+            roll_request: None,
         }
     }
 }
@@ -97,6 +105,9 @@ pub struct Journal<K: KeyProvider> {
     current_prev: [u8; 32],
     /// When the current segment was opened (the [`RotatePolicy::max_open`] age clock).
     opened_at: std::time::Instant,
+    /// How many external recovery-point requests ([`RotatePolicy::roll_request`]) this journal
+    /// has already honored — the next append rolls first whenever the cell exceeds this.
+    roll_honored: u64,
     /// The identity in SEGMENT 0's header — the series' **founding identity** (the archive chain
     /// scope; constant across live-upgrade seams).
     founding_id: ExecIdentity,
@@ -106,6 +117,14 @@ pub struct Journal<K: KeyProvider> {
     /// root lives under [`daemon_vhc_custody::CUSTODY_ROOT_ENV`]. `None` = uncustodied (tests,
     /// non-VHC embedders) — every reservation is a no-op.
     custody: Option<(Arc<DiskCustodian>, String)>,
+}
+
+/// The current value of the external recovery-point request cell (0 when the seam is unwired).
+fn requests_outstanding(rotate: &RotatePolicy) -> u64 {
+    rotate
+        .roll_request
+        .as_ref()
+        .map_or(0, |cell| cell.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// The reserved margin for segment bookkeeping writes whose exact size is not worth
@@ -175,6 +194,9 @@ impl<K: KeyProvider + Clone> Journal<K> {
             r.commit();
         }
         let sidecars = SidecarStore::open(paths.sidecars(), id.clone(), key)?;
+        // Requests raised BEFORE this journal existed are already honored by construction:
+        // a fresh (empty) chain has no un-sealed history to protect.
+        let roll_honored = requests_outstanding(&rotate);
         Ok(Self {
             paths,
             id: id.clone(),
@@ -188,6 +210,7 @@ impl<K: KeyProvider + Clone> Journal<K> {
             current_header_id: id.clone(),
             current_prev: GENESIS_PREV,
             opened_at: std::time::Instant::now(),
+            roll_honored,
             founding_id: id,
             on_seal: None,
             custody,
@@ -255,6 +278,9 @@ impl<K: KeyProvider + Clone> Journal<K> {
             )
         };
 
+        // Requests raised against a PREVIOUS journal instance don't carry over: the pacing owner
+        // re-derives its lag from live state and re-raises if the gap still stands.
+        let roll_honored = requests_outstanding(&rotate);
         Ok(Self {
             paths,
             id,
@@ -268,6 +294,7 @@ impl<K: KeyProvider + Clone> Journal<K> {
             current_header_id,
             current_prev,
             opened_at: std::time::Instant::now(),
+            roll_honored,
             founding_id: recovery.founding_id,
             on_seal: None,
             custody,
@@ -702,7 +729,17 @@ impl<K: KeyProvider + Clone> Journal<K> {
                 .rotate
                 .max_open
                 .is_some_and(|max| self.opened_at.elapsed() >= max);
-        if over_count || over_age {
+        // An external recovery-point request ([`RotatePolicy::roll_request`]) seals on the same
+        // non-empty/append-time discipline as the age bound; an empty segment marks the request
+        // honored without churning the chain (there is nothing new to protect — the previous
+        // seal IS the requested recovery point).
+        let requested = requests_outstanding(&self.rotate);
+        let over_request = requested > self.roll_honored;
+        if over_request && records == 0 {
+            self.roll_honored = requested;
+        }
+        if over_count || over_age || (over_request && records > 0) {
+            self.roll_honored = requested.max(self.roll_honored);
             self.roll()?;
         }
         Ok(())

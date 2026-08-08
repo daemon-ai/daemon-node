@@ -212,12 +212,25 @@ cargo run -p xtask -- author-ceremony-genesis \
   --out <dir>
 ```
 
-`--ckpt-cadence` is bounded by the retained record horizon (4 rounds,
+`--ckpt-cadence` is bounded by the retained record horizon (16 rounds,
 `RETAINED_RECORD_HORIZON_ROUNDS`), not only by retention: a rejoiner's fence trails the live head
-by up to one full cadence slot, and replay-forward bridges at most the horizon. A wider cadence
-authors a run whose crashed trainer is unrecoverable by construction — proven live in the c15f
-drill (cadence 8: the trapped trainer's fence sat 16 rounds behind and every rejoin refused
-`CheckpointStale`). The authoring refuses it typed since defect 7c.
+by up to one full cadence slot, and the coordinator's in-memory ring replay bridges at most the
+horizon. The authoring refuses a wider cadence typed since defect 7c — but since Gate B' this
+inequality is **sizing for the ordinary rejoin, not the recoverability guarantee**: a fence that
+trails past the ring is bridged by **staged archive catch-up** (the node rides the verified
+archive lineage in the join credentials; the worker extracts the coordinator's historical round
+records from attested segments and folds them before live attach; round-aware seal pacing in the
+session keeps the archive tip within ring reach of the live head). `CheckpointStale` now refuses
+only the gap BOTH planes genuinely cannot bridge — an archive tip itself beyond ring reach of the
+head (a publication outage outlasting the ring; Gate C keeps publication retrying budget-free).
+The c15f drill shape (cadence 8, fence 16 rounds behind) recovers through catch-up today.
+
+**Payload retention honesty:** `--payload-retention` is an authored claim, not an enforced R2
+lifecycle — no production path deletes R2 payloads by age today (only the fs payload plane
+prunes). Ceremony verification must therefore *prove* payload availability across the run rather
+than assume the window. When payload GC ever lands, it must pin the **recovery closure of the
+latest usable checkpoint** (every payload a catch-up from that fence could fetch), never delete
+by nominal age alone.
 
 **The two module FILE flags are required, and they are not a convenience.** `--coordinator-wasm` and
 `--trainer-wasm` are checked against `--coordinator-module` / `--trainer-module`, and the file is needed

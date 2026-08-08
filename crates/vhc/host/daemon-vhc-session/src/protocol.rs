@@ -1126,6 +1126,17 @@ pub struct SessionCredentials {
     /// Additive (`#[serde(default)]` keeps pre-extension credential buffers decodable).
     #[serde(default)]
     pub reconstruct: Option<CoordinatorRecovery>,
+    /// An optional TRAINER ARCHIVE CATCH-UP directive (Gate B'; architecture §5.3): present when
+    /// the node judged the role's restore fence reachable only through the ARCHIVED record
+    /// stream — the fence trails the live head past the coordinator's retained ring, but the
+    /// verified archive lineage covers the gap. The worker re-verifies the carried heads against
+    /// genesis trust, extracts the seat's historical committed records from the attested
+    /// segments, and stages them into the restored guest BEFORE live attachment (the ring replay
+    /// then covers the unarchived tail; the dedup window absorbs overlap). `None` = the ring
+    /// alone suffices (or nothing to catch up). Additive (`#[serde(default)]` keeps
+    /// pre-extension credential buffers decodable, like `reconstruct`).
+    #[serde(default)]
+    pub catch_up: Option<TrainerCatchUp>,
 }
 
 /// The node-resolved coordinator crash-recovery directive ([`SessionCredentials::reconstruct`]):
@@ -1140,6 +1151,23 @@ pub struct CoordinatorRecovery {
     /// re-derives the lineage itself; a subset would silently truncate history).
     #[serde(default)]
     pub heads: Vec<daemon_vhc_proto::ArchiveHeadRecord>,
+}
+
+/// The node-resolved trainer archive catch-up directive ([`SessionCredentials::catch_up`]): the
+/// SEAT role's verified archive lineage (the coordinator's published journal chains — the stream
+/// that carries the committed `RoundRecord`s a detached trainer must fold) plus the restore
+/// fence the staged fold starts above. Carriage is bootstrap, not trust — the worker re-verifies
+/// every head against the same genesis, exactly like [`CoordinatorRecovery`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrainerCatchUp {
+    /// The head records of the seat role's published chains (every chain, founding order — the
+    /// worker re-derives the lineage itself; a subset would silently truncate history).
+    #[serde(default)]
+    pub heads: Vec<daemon_vhc_proto::ArchiveHeadRecord>,
+    /// The restore fence (the round the restored checkpoint covers): the staged fold delivers
+    /// archived records for rounds STRICTLY ABOVE it. `0` with no restore = fold everything.
+    #[serde(default)]
+    pub from_round: u64,
 }
 
 /// A late-join checkpoint restore reference (the node-resolved registry pointer): the round the
@@ -1891,6 +1919,7 @@ mod tests {
             expires_at_ms: 0,
             restore: None,
             reconstruct: None,
+            catch_up: None,
         };
         let back = SessionCredentials::from_bytes(&ws_only.to_bytes().unwrap()).unwrap();
         assert_eq!(back, ws_only);
@@ -1949,6 +1978,11 @@ mod tests {
             // The §8.8 reconstruction directive round-trips (an additive field: the ws_only
             // form above proves a directive-free body still decodes).
             reconstruct: Some(CoordinatorRecovery { heads: Vec::new() }),
+            // The Gate B' trainer catch-up directive round-trips (additive, like reconstruct).
+            catch_up: Some(TrainerCatchUp {
+                heads: Vec::new(),
+                from_round: 42,
+            }),
         };
         let back = SessionCredentials::from_bytes(&full.to_bytes().unwrap()).unwrap();
         assert_eq!(back, full);

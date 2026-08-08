@@ -150,6 +150,7 @@ fn rig(wasm: &[u8], admitted_quotas: Option<AdmittedQuotas>) -> Rig {
         restore: None,
         admitted_quotas,
         archive: None,
+        catch_up: Vec::new(),
     };
     Rig {
         plane,

@@ -169,6 +169,11 @@ pub struct RoleSessionSpec {
     /// publish. Paired with [`RoleProviders::archive_heads`] — both present spawns the
     /// incremental publisher.
     pub archive: Option<crate::archive::ArchiveSpec>,
+    /// The staged archive catch-up input (Gate B'): the seat's historical committed records the
+    /// worker extracted from the VERIFIED archive lineage
+    /// ([`crate::reconstruct::extract_catch_up_frames`]), folded into the restored guest BEFORE
+    /// any live frame. Empty = no catch-up (the ordinary join).
+    pub catch_up: Vec<crate::reconstruct::CatchUpFrame>,
 }
 
 /// A throttle level (the owner's GPU-governor lever, forwarded verbatim by the worker loop).
@@ -339,11 +344,16 @@ pub fn spawn_role(
     // the cell the archive spec carries ([`crate::archive::ArchiveSpec::round_claim`]), and the
     // archive publisher stamps it into each head as the ABI §8.8 freshness claim. A session
     // without an archive seam still relays through a (publisher-less) cell.
-    let mut round_claim = Arc::new(AtomicU64::new(0));
+    let mut pacer = None;
     let archive_publisher = match (spec.archive.take(), spec.providers.archive_heads.clone()) {
         (Some(archive), Some(heads)) => {
             let journal_dir = archive.journal_dir.clone();
-            round_claim = archive.round_claim.clone();
+            pacer = Some(SealPacer {
+                claim: archive.round_claim.clone(),
+                archived: archive.archived_round.clone(),
+                request: Some(crate::journal_home::roll_request_cell(&journal_dir)),
+                last_request: AtomicU64::new(0),
+            });
             let task = crate::archive::spawn_archive_publisher(
                 run_label.clone(),
                 Hash(spec.run.identity.run_id),
@@ -357,6 +367,7 @@ pub fn spawn_role(
         }
         _ => None,
     };
+    let pacer = pacer.unwrap_or_else(|| SealPacer::unpaced(Arc::new(AtomicU64::new(0))));
     let task = {
         let generation = generation.clone();
         tokio::spawn(async move {
@@ -375,7 +386,7 @@ pub fn spawn_role(
                 cmd_rx,
                 &generation,
                 &signer_bindings,
-                &round_claim,
+                &pacer,
             )
             .await;
             let _ = events.send(Event::RunTerminated {
@@ -406,6 +417,67 @@ pub fn spawn_role(
         task,
         generation,
         run_label,
+    }
+}
+
+/// Round-aware seal pacing: request a recovery point once the attested archive tip's stamped
+/// committed-round watermark lags the live claim by more than this many rounds — half the
+/// coordinator's retained ring, leaving the other half as seal + upload headroom so the
+/// archive/ring overlap invariant (the archive tip stays within ring reach of the live head)
+/// holds even while a publication is in flight.
+const SEAL_PACING_MAX_LAG_ROUNDS: u64 = daemon_vhc_proto::RETAINED_RECORD_HORIZON_ROUNDS / 2;
+
+/// The Gate B' overlap enforcer (architecture §4.4): the egress relay advances the live
+/// committed-round watermark through [`Self::observe_round`]; when the archive tip's stamped
+/// claim ([`crate::archive::ArchiveSpec::archived_round`]) trails it past
+/// [`SEAL_PACING_MAX_LAG_ROUNDS`], the pacer bumps the journal series' recovery-point request
+/// cell ([`crate::journal_home::roll_request_cell`]) so the open segment seals at the next
+/// append and the publisher can close the gap. At most one request per advanced live claim (a
+/// slow upload never triggers a request storm); a session without an archive seam paces nothing.
+pub(crate) struct SealPacer {
+    /// The live committed-round watermark (`0` = none, else `round + 1`).
+    claim: Arc<AtomicU64>,
+    /// The archive-tip watermark (same encoding), advanced by the publisher per acknowledged head.
+    archived: Arc<AtomicU64>,
+    /// The series' recovery-point request cell (`None` = no archive seam — pacing inert).
+    request: Option<Arc<AtomicU64>>,
+    /// The live claim at the most recent request — re-request only after the head advances.
+    last_request: AtomicU64,
+}
+
+impl SealPacer {
+    /// A pacer for a session without an archive seam: the watermark still advances (the cell is
+    /// shared with whoever reads it), but no recovery points are ever requested.
+    fn unpaced(claim: Arc<AtomicU64>) -> Self {
+        Self {
+            claim,
+            archived: Arc::new(AtomicU64::new(0)),
+            request: None,
+            last_request: AtomicU64::new(0),
+        }
+    }
+
+    /// Fold one published `RoundRecord`'s round: advance the live watermark, then request a
+    /// recovery point if the archive tip now trails past the pacing bound.
+    fn observe_round(&self, round: u64) {
+        let claim = round.saturating_add(1);
+        let live = self.claim.fetch_max(claim, Ordering::Relaxed).max(claim);
+        let Some(request) = &self.request else {
+            return;
+        };
+        let lag = live.saturating_sub(self.archived.load(Ordering::Relaxed));
+        if lag <= SEAL_PACING_MAX_LAG_ROUNDS {
+            return;
+        }
+        if self.last_request.fetch_max(live, Ordering::Relaxed) < live {
+            request.fetch_add(1, Ordering::Relaxed);
+            tracing::info!(
+                round,
+                lag,
+                "seal pacing: recovery point requested — the archive tip's committed-round \
+                 watermark trails the live head"
+            );
+        }
     }
 }
 
@@ -456,7 +528,7 @@ async fn run_role(
     mut commands: mpsc::UnboundedReceiver<RoleCommand>,
     generation: &Arc<AtomicU64>,
     signer_bindings: &Arc<std::sync::Mutex<Vec<crate::archive::SignerBinding>>>,
-    round_claim: &Arc<AtomicU64>,
+    pacer: &SealPacer,
 ) -> TerminalOutcome {
     let RoleSessionSpec {
         module,
@@ -472,6 +544,7 @@ async fn run_role(
         restore,
         mut admitted_quotas,
         archive: _, // taken by `spawn_role` (the publisher runs beside the session)
+        catch_up,
     } = spec;
 
     let mut identity = run_cfg.identity.clone();
@@ -610,7 +683,45 @@ async fn run_role(
     let mut last_health_emit = std::time::Instant::now();
     let mut last_health_detail = String::new();
 
-    'session: loop {
+    // Gate B' staged archive catch-up (architecture §5.3): fold the extracted historical
+    // coordinator records BEFORE any live frame. Live frames (the coordinator's ring
+    // replay-forward, triggered by the certificate announce above) buffer in `inbound` until
+    // the loop below starts consuming, so the fold order is strictly archived-history-first;
+    // the guest's resync guard and the dedup window absorb any overlap with the ring tail.
+    if !catch_up.is_empty() {
+        tracing::info!(
+            run = run_label,
+            records = catch_up.len(),
+            from = catch_up.first().map(|f| f.round),
+            to = catch_up.last().map(|f| f.round),
+            "staged archive catch-up: folding archived coordinator records before live attach"
+        );
+        let _ = events.send(Event::Warning {
+            class: "archive_catch_up".into(),
+            detail: format!(
+                "folding {} archived round records (rounds {}..={}) before live attach — the \
+                 restore fence trails the coordinator's retained ring",
+                catch_up.len(),
+                catch_up.first().map_or(0, |f| f.round),
+                catch_up.last().map_or(0, |f| f.round),
+            ),
+        });
+        if let Err(reason) = staged_catch_up(
+            &current.pump,
+            &providers,
+            &mut current.egress,
+            events,
+            generation.load(Ordering::SeqCst),
+            pacer,
+            &catch_up,
+        )
+        .await
+        {
+            transport_fault = Some(reason);
+        }
+    }
+
+    'session: while transport_fault.is_none() {
         let gen_now = generation.load(Ordering::SeqCst);
         tokio::select! {
             frame = inbound.recv() => {
@@ -634,7 +745,7 @@ async fn run_role(
             }
             _ = egress.notified() => {
                 if let Err(reason) = relay_egress(
-                    &current.pump, &providers, &mut current.egress, events, gen_now, round_claim,
+                    &current.pump, &providers, &mut current.egress, events, gen_now, pacer,
                 ).await {
                     transport_fault = Some(reason);
                     break 'session;
@@ -776,7 +887,7 @@ async fn run_role(
         &mut current.egress,
         events,
         gen_now,
-        round_claim,
+        pacer,
     )
     .await;
 
@@ -1627,6 +1738,59 @@ fn envelope_sender(frame: &[u8]) -> Option<[u8; 32]> {
     })
 }
 
+/// Gate B' staged archive catch-up delivery (architecture §5.3): present the extracted
+/// historical coordinator records to the restored guest, in round order, BEFORE any live frame
+/// folds. Authenticity is the VERIFIED ARCHIVE LINEAGE (heads signed to genesis trust, segment
+/// bytes re-hashed by the extractor) — delivery deliberately bypasses the attach's per-frame
+/// certificate liveness, which would refuse a superseded coordinator incarnation's frames as
+/// `CertRevoked` even though its committed records are exactly the history a rejoiner must fold.
+/// Pump-direct delivery journals each frame as ordinary tag-12 evidence (replay-forward
+/// fidelity), honors spool backpressure by re-presenting the same frame, and services guest
+/// egress between attempts (the fold's `payload_get`s resolve from the content plane exactly as
+/// in live operation).
+async fn staged_catch_up(
+    pump: &PumpHandle,
+    providers: &RoleProviders,
+    cursors: &mut EgressCursors,
+    events: &mpsc::UnboundedSender<Event>,
+    generation: u64,
+    pacer: &SealPacer,
+    frames: &[crate::reconstruct::CatchUpFrame],
+) -> Result<(), String> {
+    use daemon_vhc_host::run::DeliverVerdict;
+    for f in frames {
+        loop {
+            let verdict = pump
+                .deliver_frame(
+                    u32::try_from(f.channel).unwrap_or(u32::MAX),
+                    f.seq,
+                    f.sender,
+                    f.payload.clone(),
+                    f.frame.clone(),
+                )
+                .map_err(|e| format!("archive catch-up delivery (round {}): {e}", f.round))?;
+            match verdict {
+                DeliverVerdict::Accepted => break,
+                DeliverVerdict::SpoolFull | DeliverVerdict::SenderQuota => {
+                    // The guest is folding: service its egress (op completions are what
+                    // unblock the fold) and re-present the very same frame.
+                    relay_egress(pump, providers, cursors, events, generation, pacer).await?;
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                DeliverVerdict::FrameTooLarge => {
+                    return Err(format!(
+                        "archive catch-up frame for round {} exceeds the channel bound",
+                        f.round
+                    ));
+                }
+            }
+        }
+    }
+    // One egress pass after the last delivery so ops the fold already issued are in flight
+    // before the live loop takes over.
+    relay_egress(pump, providers, cursors, events, generation, pacer).await
+}
+
 /// Relay pending guest egress: published frames onto the control plane verbatim (they are
 /// already §12.1-signed by the certified per-run key), op requests against the content-addressed
 /// providers, metrics as advisory events. Returns a fault reason on transport failure.
@@ -1643,7 +1807,7 @@ async fn relay_egress(
     cursors: &mut EgressCursors,
     events: &mpsc::UnboundedSender<Event>,
     generation: u64,
-    round_claim: &AtomicU64,
+    pacer: &SealPacer,
 ) -> Result<(), String> {
     // Guest log lines onto the node's own stream. This is how a guest panic becomes readable:
     // the SDK's hook forwards the message here a beat before the `unreachable` trap, so the line
@@ -1664,11 +1828,12 @@ async fn relay_egress(
     for (channel, seq, frame) in published.iter().skip(cursors.published) {
         tracing::trace!(channel, seq, kind = %frame_kind(frame), "egress: publishing module frame");
         // Advance the committed-round watermark on every published `RoundRecord` — the archive
-        // publisher stamps it into each attested head as the §8.8 freshness claim. A structural
-        // shape probe (like `frame_kind`): the frame stays opaque, and only a coordinator seat
-        // ever publishes records, so trainer egress never matches.
+        // publisher stamps it into each attested head as the §8.8 freshness claim, and the seal
+        // pacer requests a recovery point when the archive tip trails past the overlap bound. A
+        // structural shape probe (like `frame_kind`): the frame stays opaque, and only a
+        // coordinator seat ever publishes records, so trainer egress never matches.
         if let Some(round) = published_round_record(frame) {
-            round_claim.fetch_max(round.saturating_add(1), Ordering::Relaxed);
+            pacer.observe_round(round);
         }
         providers
             .control
@@ -1750,10 +1915,14 @@ async fn service_op(
                 if let Some(round) = live_checkpoint_watermark(&bytes) {
                     // Publish the referenced family CHUNKS to the content plane ([SF-6]/C5): a
                     // restoring peer fetches them chunk-keyed ([SF-R2]). The chunks come from THIS
-                    // (publishing) instance's self-sealed store; content-addressed `put_content` is
-                    // idempotent, so family chunks unchanged since a prior slot upload NOTHING
-                    // (skip-on-present) — the amortized remote cost is the changed chunks + the
-                    // small document, not the whole family every slot.
+                    // (publishing) instance's self-sealed store. Content-addressed `put_content`
+                    // is idempotent in EFFECT (a re-put lands the same object), but the WAN store
+                    // has no skip-on-present probe — every referenced chunk re-uploads in full,
+                    // every slot, serially, inside THIS op service (the guest's op relay stalls
+                    // for the duration). Measured live (c15h, 786M params ≈ 12.6 GB across the 4
+                    // by-ref families): 14–25 minutes per slot — the defect-14 upload lag. The
+                    // walk logs a one-line cost summary; the node raises `checkpoint_lag` when
+                    // the durable fence drifts toward the retained-record horizon.
                     let mut chunks_durable = true;
                     if let Ok(capture) = decode_snapshot_doc(&bytes) {
                         let referenced: Vec<[u8; 32]> = capture
@@ -2314,14 +2483,19 @@ async fn upload_referenced_families(
     externally_sourced: impl Fn(&[u8; 32]) -> bool,
     artifacts: &dyn ContentStore,
 ) -> bool {
+    let started = std::time::Instant::now();
     let mut durable = true;
+    let (mut families, mut chunk_count, mut byte_count) = (0u64, 0u64, 0u64);
     for section in &capture.sections {
         let daemon_vhc_proto::det_state::CkptDocSection::ByRef(name, fref) = section else {
             continue;
         };
         match sealed(&fref.fold.0) {
             Ok(chunks) => {
+                families += 1;
                 for (h, chunk) in &chunks {
+                    chunk_count += 1;
+                    byte_count += chunk.len() as u64;
                     if let Err(e) = artifacts.put_content(chunk).await {
                         tracing::warn!(
                             family = %name,
@@ -2349,6 +2523,24 @@ async fn upload_referenced_families(
             }
         }
     }
+    // The c15h upload-lag lesson (defect 14's root): at ceremony scale this walk moves the
+    // FULL by-ref closure (4 param-sized f32 families ≈ 12.6 GB at 786M params) serially
+    // through presign+PUT per chunk, measured live at 14–25 minutes per slot — and it runs
+    // inside the op-service path, so the whole seat stalls for the duration. Voiced as one
+    // INFO summary so every future run's publication cost is read off the session log, not
+    // reconstructed from slow-op forensics.
+    let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    tracing::info!(
+        families,
+        chunks = chunk_count,
+        bytes = byte_count,
+        ms,
+        mb_per_s = (byte_count / 1024 / 1024 * 1000)
+            .checked_div(ms)
+            .unwrap_or(0),
+        durable,
+        "live checkpoint family upload walk finished"
+    );
     durable
 }
 
@@ -2809,5 +3001,54 @@ mod tests {
         ciborium::into_writer(&wire, &mut bytes).unwrap();
         assert_eq!(envelope_sender(&bytes), Some([0xAB; 32]));
         assert_eq!(envelope_sender(b"junk"), None);
+    }
+
+    /// The Gate B' seal pacer: no request inside the pacing bound; ONE request per advanced
+    /// live claim past it (a slow upload never storms); a fresh archive tip resets the lag; an
+    /// unpaced session (no archive seam) never requests.
+    #[test]
+    fn the_seal_pacer_requests_once_per_advanced_claim_past_the_lag_bound() {
+        let claim = Arc::new(AtomicU64::new(0));
+        let archived = Arc::new(AtomicU64::new(0));
+        let request = Arc::new(AtomicU64::new(0));
+        let pacer = SealPacer {
+            claim: claim.clone(),
+            archived: archived.clone(),
+            request: Some(request.clone()),
+            last_request: AtomicU64::new(0),
+        };
+
+        // Inside the bound: no request.
+        pacer.observe_round(SEAL_PACING_MAX_LAG_ROUNDS - 1);
+        assert_eq!(request.load(Ordering::Relaxed), 0, "within the bound");
+
+        // Past the bound (archived still 0): exactly one request for this claim.
+        pacer.observe_round(SEAL_PACING_MAX_LAG_ROUNDS);
+        assert_eq!(request.load(Ordering::Relaxed), 1, "one request past it");
+        pacer.observe_round(SEAL_PACING_MAX_LAG_ROUNDS); // same round re-observed
+        assert_eq!(
+            request.load(Ordering::Relaxed),
+            1,
+            "no storm on a re-observation"
+        );
+
+        // The head advances while the lag persists: one more request per advanced claim.
+        pacer.observe_round(SEAL_PACING_MAX_LAG_ROUNDS + 1);
+        assert_eq!(request.load(Ordering::Relaxed), 2, "one per advanced claim");
+
+        // The archive tip catches up: lag back inside the bound, no further requests.
+        archived.store(claim.load(Ordering::Relaxed), Ordering::Relaxed);
+        pacer.observe_round(SEAL_PACING_MAX_LAG_ROUNDS + 2);
+        assert_eq!(
+            request.load(Ordering::Relaxed),
+            2,
+            "a fresh tip resets the lag"
+        );
+
+        // The unpaced pacer advances the watermark but never requests.
+        let unpaced_claim = Arc::new(AtomicU64::new(0));
+        let unpaced = SealPacer::unpaced(unpaced_claim.clone());
+        unpaced.observe_round(1_000);
+        assert_eq!(unpaced_claim.load(Ordering::Relaxed), 1_001);
     }
 }

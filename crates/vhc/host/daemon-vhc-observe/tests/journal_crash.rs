@@ -244,7 +244,8 @@ fn multi_segment_chain_recovers_after_tear_on_last_segment() {
     };
 
     {
-        let mut j = Journal::create(&root, ident(), StaticKey::new([3u8; 32]), rotate).unwrap();
+        let mut j =
+            Journal::create(&root, ident(), StaticKey::new([3u8; 32]), rotate.clone()).unwrap();
         for i in 0..7u64 {
             j.append(Body::Event(EventRec {
                 at: i,
@@ -341,6 +342,7 @@ fn the_age_bound_rolls_a_stale_nonempty_segment_but_never_an_empty_one() {
     let rotate = RotatePolicy {
         max_records: 1_000,
         max_open: Some(std::time::Duration::from_millis(30)),
+        ..RotatePolicy::default()
     };
     let rolls = Arc::new(Counter::new(0));
 
@@ -374,6 +376,78 @@ fn the_age_bound_rolls_a_stale_nonempty_segment_but_never_an_empty_one() {
         "a stale non-empty segment seals before the next append"
     );
     assert_eq!(j.current_segment(), 1);
+}
+
+/// The [`RotatePolicy::roll_request`] external recovery-point request (Gate B' round-aware seal
+/// pacing): bumping the cell seals a NON-empty segment at the next append, exactly like the age
+/// bound; against an EMPTY segment the request is marked honored without churning the chain
+/// (the previous seal IS the requested recovery point); and a request raised BEFORE the journal
+/// existed is honored by construction (no spurious first-append roll).
+#[test]
+fn a_recovery_point_request_seals_on_the_next_append_but_never_churns_an_empty_segment() {
+    use std::sync::atomic::AtomicU64 as Counter;
+    use std::sync::Arc;
+
+    let dir = tempdir();
+    let root = dir.join("journal");
+    let request = Arc::new(Counter::new(1)); // raised before the journal exists
+    let rotate = RotatePolicy {
+        max_records: 1_000,
+        roll_request: Some(request.clone()),
+        ..RotatePolicy::default()
+    };
+    let rolls = Arc::new(Counter::new(0));
+
+    let mut j = Journal::create(&root, ident(), StaticKey::new([3u8; 32]), rotate).unwrap();
+    let n = rolls.clone();
+    j.set_seal_hook(Box::new(move |_| {
+        n.fetch_add(1, Ordering::Relaxed);
+    }));
+
+    // The pre-existing request is already honored (a fresh chain protects nothing).
+    j.append(Body::Clock(daemon_vhc_observe::journal::record::ClockRec {
+        now: 1,
+    }))
+    .unwrap();
+    assert_eq!(
+        rolls.load(Ordering::Relaxed),
+        0,
+        "a request predating the journal never rolls its first segment"
+    );
+
+    // A live request against a NON-empty segment: the next append seals it first.
+    request.fetch_add(1, Ordering::Relaxed);
+    j.append(Body::Clock(daemon_vhc_observe::journal::record::ClockRec {
+        now: 2,
+    }))
+    .unwrap();
+    assert_eq!(
+        rolls.load(Ordering::Relaxed),
+        1,
+        "a requested recovery point seals the open segment at the next append"
+    );
+    assert_eq!(j.current_segment(), 1);
+
+    // A request against an EMPTY open segment (an explicit seal drained it): marked honored, no
+    // content-free churn — the previous seal IS the requested recovery point — and once honored,
+    // later appends land without sealing.
+    j.roll().unwrap(); // seals segment 1 (the now:2 record) → segment 2 opens empty
+    assert_eq!(rolls.load(Ordering::Relaxed), 2);
+    request.fetch_add(1, Ordering::Relaxed);
+    j.append(Body::Clock(daemon_vhc_observe::journal::record::ClockRec {
+        now: 3,
+    }))
+    .unwrap();
+    j.append(Body::Clock(daemon_vhc_observe::journal::record::ClockRec {
+        now: 4,
+    }))
+    .unwrap();
+    assert_eq!(
+        rolls.load(Ordering::Relaxed),
+        2,
+        "a request against an empty segment never churns the chain"
+    );
+    assert_eq!(j.current_segment(), 2);
 }
 
 /// The founding identity is segment 0's header identity, surviving both a reopen and a

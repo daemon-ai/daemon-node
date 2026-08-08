@@ -277,6 +277,34 @@ async fn join_live(
             })
         }
     };
+    // Gate B' trainer archive catch-up: the node judged the restore fence reachable only through
+    // the ARCHIVED record stream. Extract the seat's historical committed records here, before
+    // the session spawns — re-verifying the carried heads against genesis trust (carriage, not
+    // trust) and re-hashing every segment against its attested head. The staged fold happens
+    // inside the session, before live attachment. A genuine archive gap refuses the join typed;
+    // a transient content-plane fault defers budget-free (Gate C).
+    let catch_up = match &creds.catch_up {
+        None => Vec::new(),
+        Some(cu) => daemon_vhc_session::reconstruct::extract_catch_up_frames(
+            &daemon_vhc_session::reconstruct::CatchUpSpec {
+                heads: cu.heads.clone(),
+                run_id: daemon_vhc_proto::Hash(genesis_hash),
+                trusted: binding.trusted_bases.clone(),
+                run_label: run_id.to_string(),
+                journal_root: daemon_vhc_session::journal_home::run_dir_from_env(),
+                after_round: cu.from_round,
+            },
+            providers.payloads.as_ref(),
+        )
+        .await
+        .map_err(|e| match e {
+            daemon_vhc_session::reconstruct::ReconstructError::Transport { .. } => AttachRefusal {
+                class: ErrorClass::Transient,
+                detail: format!("trainer archive catch-up: {e}"),
+            },
+            other => AttachRefusal::from(format!("trainer archive catch-up: {other}")),
+        })?,
+    };
     Ok(RoleSessionSpec {
         module: resolved.module.clone(),
         // The measured backend selection materialized (no fallback: an unavailable admitted
@@ -296,6 +324,7 @@ async fn join_live(
         restore,
         admitted_quotas: binding.quotas,
         archive,
+        catch_up,
     })
 }
 
@@ -371,6 +400,7 @@ fn journal_sink(
         journal_dir: dir,
         chain_instance: sink.founding_instance(),
         round_claim: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        archived_round: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
     };
     Ok((Box::new(sink), Some(archive)))
 }
@@ -949,6 +979,8 @@ async fn main() {
                                 // stream (when durable) is dropped and the on-disk chain
                                 // remains the local record.
                                 archive,
+                                // No registry ⇒ no node-resolved catch-up directive.
+                                catch_up: Vec::new(),
                             };
                             let handle = spawn_role(run_id.clone(), spec, role_events.clone());
                             roles.insert(run_id, handle);

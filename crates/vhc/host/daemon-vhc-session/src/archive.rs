@@ -140,6 +140,11 @@ pub struct ArchiveSpec {
     /// `RoundRecord` (structural probe — no schema linked), and stamped by the publisher into
     /// each head as the ABI §8.8 freshness claim ([`daemon_vhc_proto::ArchiveHeadBody::round`]).
     pub round_claim: Arc<AtomicU64>,
+    /// The ARCHIVE-TIP round watermark (same `0`/`round + 1` encoding): advanced by the
+    /// publisher on every acknowledged head to the claim it stamped. The session's seal pacer
+    /// reads `round_claim - archived_round` as the live archive/ring overlap lag (Gate B') and
+    /// requests a recovery point when it drifts.
+    pub archived_round: Arc<AtomicU64>,
 }
 
 /// Capped exponential backoff for the publisher's retry loops: transient store/registry faults
@@ -198,6 +203,7 @@ pub fn spawn_archive_publisher(
             segments,
             bindings,
             round_claim: spec.round_claim,
+            archived_round: spec.archived_round,
             published_tip: None,
             predecessor: None,
             ledger,
@@ -233,6 +239,9 @@ struct Publisher {
     bindings: Arc<Mutex<Vec<SignerBinding>>>,
     /// The committed-round watermark (`0` = none, else `round + 1`) stamped on each head.
     round_claim: Arc<AtomicU64>,
+    /// The archive-tip watermark (same encoding), advanced on each ACKNOWLEDGED head to the
+    /// claim it stamped — the seal pacer's overlap-lag input.
+    archived_round: Arc<AtomicU64>,
     /// The highest head ordinal the store holds for this chain (`None` = nothing published).
     published_tip: Option<u64>,
     /// The predecessor chain's terminal head address (segment 0's succession link), resolved
@@ -294,12 +303,18 @@ impl Publisher {
                 && h.body.role == self.role
                 && h.certificate.base_identity == base
         };
-        self.published_tip = stored
+        let own_tip = stored
             .iter()
             .filter(own)
             .filter(|h| h.body.chain_instance == self.chain_instance)
-            .map(|h| h.body.segment)
-            .max();
+            .max_by_key(|h| h.body.segment);
+        self.published_tip = own_tip.map(|h| h.body.segment);
+        // Seed the archive-tip watermark from the stored tip's stamped claim, so a restarted
+        // session's seal pacer measures lag against what is actually archived rather than 0.
+        if let Some(round) = own_tip.and_then(|h| h.body.round) {
+            self.archived_round
+                .fetch_max(round.saturating_add(1), Ordering::Relaxed);
+        }
         // The succession link: our founding head names the predecessor chain's last published
         // head by content address (`None` when this base+role has no earlier chain).
         if self.published_tip.is_none() {
@@ -445,6 +460,7 @@ impl Publisher {
         }
 
         // -- the attested head, signed by the SEALING span's per-run key ------------------------
+        let claim_at_stamp = self.round_claim.load(Ordering::Relaxed);
         let body = ArchiveHeadBody {
             domain: ARCHIVE_HEAD_DOMAIN.into(),
             run_id: self.run_id,
@@ -458,7 +474,7 @@ impl Publisher {
             epoch: sealed.id.epoch,
             module: sealed.id.module,
             predecessor: (sealed.segment == 0).then_some(self.predecessor).flatten(),
-            round: self.round_claim.load(Ordering::Relaxed).checked_sub(1),
+            round: claim_at_stamp.checked_sub(1),
         };
         let record = {
             let bindings = self.bindings.lock().expect("signer bindings mutex");
@@ -510,6 +526,10 @@ impl Publisher {
                         "archive segment + attested head published"
                     );
                     self.published_tip = Some(sealed.segment);
+                    // The acknowledged head carries `claim_at_stamp` as its freshness claim —
+                    // advance the archive-tip watermark the seal pacer measures lag against.
+                    self.archived_round
+                        .fetch_max(claim_at_stamp, Ordering::Relaxed);
                     self.record_and_prune(sealed);
                     return true;
                 }
@@ -722,6 +742,7 @@ mod tests {
                 journal_dir: jdir.clone(),
                 chain_instance: sink.founding_instance(),
                 round_claim: Arc::new(AtomicU64::new(0)),
+                archived_round: Arc::new(AtomicU64::new(0)),
             },
             heads.clone(),
             segments.clone(),
@@ -769,6 +790,7 @@ mod tests {
                 journal_dir: jdir.clone(),
                 chain_instance: 1,
                 round_claim: Arc::new(AtomicU64::new(0)),
+                archived_round: Arc::new(AtomicU64::new(0)),
             },
             heads.clone(),
             segments.clone(),
@@ -829,6 +851,7 @@ mod tests {
                 journal_dir: jdir.clone(),
                 chain_instance: sink.founding_instance(),
                 round_claim: Arc::new(AtomicU64::new(0)),
+                archived_round: Arc::new(AtomicU64::new(0)),
             },
             heads.clone(),
             segments.clone(),

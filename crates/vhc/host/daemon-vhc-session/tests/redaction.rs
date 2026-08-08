@@ -88,6 +88,7 @@ fn no_secret_crosses_the_command_wire_or_lands_in_a_journal() {
         expires_at_ms: 0,
         restore: None,
         reconstruct: None,
+        catch_up: None,
     };
 
     // (a) the command wire: encode the exact `JoinRun` the node sends.

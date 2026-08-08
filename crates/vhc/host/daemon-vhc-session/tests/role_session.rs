@@ -100,6 +100,7 @@ fn rig(wasm: &[u8], role: &str, config: Vec<u8>) -> Rig {
         restore: None,
         admitted_quotas: None,
         archive: None,
+        catch_up: Vec::new(),
     };
     let own_sender = certified.sender().0;
     Rig {

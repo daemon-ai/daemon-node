@@ -45,13 +45,36 @@ use daemon_vhc_proto::Hash;
 pub const RECOVERY_POINT_MAX_OPEN: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// The production rotate policy: the substrate's record threshold plus the recovery-point age
-/// bound.
+/// bound, plus the series' external recovery-point request cell (Gate B' round-aware seal
+/// pacing — the archive publisher bumps the cell when the live committed-round watermark drifts
+/// past the archive tip by more than the join slack, and the next append seals).
 #[must_use]
-fn production_rotate_policy() -> RotatePolicy {
+fn production_rotate_policy(dir: &Path) -> RotatePolicy {
     RotatePolicy {
         max_open: Some(RECOVERY_POINT_MAX_OPEN),
+        roll_request: Some(roll_request_cell(dir)),
         ..RotatePolicy::default()
     }
+}
+
+/// The process-local recovery-point request registry, keyed like [`SEAL_STREAMS`] by the journal
+/// series' root: the cell must outlive any one sink (the archive publisher holds it across the
+/// live-upgrade seam's sink swap), so both sides fetch-or-create it here.
+static ROLL_REQUESTS: std::sync::Mutex<
+    std::collections::BTreeMap<PathBuf, std::sync::Arc<std::sync::atomic::AtomicU64>>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// The recovery-point request cell for the journal series rooted at `dir` (fetch-or-create).
+/// Incrementing it asks the journal to seal its open segment at the next append — the
+/// round-aware seal pacing seam ([`RotatePolicy::roll_request`]).
+#[must_use]
+pub fn roll_request_cell(dir: &Path) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+    ROLL_REQUESTS
+        .lock()
+        .expect("roll-request registry")
+        .entry(dir.to_path_buf())
+        .or_default()
+        .clone()
 }
 
 /// The environment variable through which the node hands a worker subprocess the run-state root
@@ -156,7 +179,7 @@ impl DurableSink {
         identity: &RunIdentity,
         sidecar_key: [u8; 32],
     ) -> Result<Self, JournalError> {
-        Self::open_with_policy(dir, identity, sidecar_key, production_rotate_policy())
+        Self::open_with_policy(dir, identity, sidecar_key, production_rotate_policy(dir))
     }
 
     /// [`Self::open`] under an explicit rotate policy — the harness seat: a crash-reconstruction
@@ -264,7 +287,7 @@ impl DurableSink {
             dir,
             id.clone(),
             StaticKey::new(sidecar_key),
-            production_rotate_policy(),
+            production_rotate_policy(dir),
             hook,
         )?;
         Ok(Self { journal, id })

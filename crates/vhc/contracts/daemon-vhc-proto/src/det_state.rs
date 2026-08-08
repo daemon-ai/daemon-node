@@ -889,15 +889,21 @@ pub fn derive_state_chunk_size(profile_chunk: u64) -> u64 {
 /// remote_cadence_rounds × 2 ≤ RETAINED_RECORD_HORIZON_ROUNDS
 /// ```
 ///
-/// A restorer's freshest fence trails the live head by up to one full cadence slot, and the
+/// **This inequality is authoring-time SIZING, not the recoverability guarantee** (demoted by
+/// Gate B'). It bounds how far the coordinator's in-memory ring-replay lane alone can bridge —
+/// a restorer's freshest fence trails the live head by up to one full cadence slot, and the
 /// newest cadence checkpoint may never have completed its upload (assembly + by-ref upload lag
-/// round closure by one-to-two rounds live), so the reachable fence can be a full EXTRA slot
-/// old. Replay-forward can only bridge `head - fence ≤ horizon` rounds; past it the run is
-/// unrecoverable **by construction**. Proven live twice: c15f (cadence 8, horizon 4 — the
-/// trapped trainer's fence sat 16 rounds behind, every rejoin refused `CheckpointStale`) and
-/// c15h (cadence 4, horizon 4 — zero slack: the round-8 upload was in flight at the crash, so
-/// fence 4 vs head 9 wedged a 2/2-quorum run permanently, defect 14). Payload retention bounds
-/// the PAYLOAD lane; this bounds the RECORD lane.
+/// round closure live), so the reachable fence can be a full EXTRA slot old. Sized well, the
+/// ring covers the ordinary rejoin. Past the ring, recovery is NOT lost: the node resolves a
+/// staged **archive catch-up** (architecture §5.3 — the archived record stream bridges
+/// `fence → archive tip`, the ring covers the unarchived tail, and the session's round-aware
+/// seal pacing keeps that overlap live). The genuine wedge — refused typed as
+/// `CheckpointStale` — is only a gap BOTH planes cannot cover. Proven live twice before the
+/// catch-up lane existed: c15f (cadence 8, horizon 4 — the trapped trainer's fence sat 16
+/// rounds behind, every rejoin refused) and c15h (cadence 4, horizon 4 — zero slack: the
+/// round-8 upload was in flight at the crash, so fence 4 vs head 9 wedged a 2/2-quorum run
+/// permanently, defect 14). Payload retention bounds the PAYLOAD lane; this sizes the RECORD
+/// ring lane.
 pub fn validate_checkpoint_cadence(
     remote_cadence_rounds: u64,
     payload_retention_rounds: u64,
@@ -911,10 +917,10 @@ pub fn validate_checkpoint_cadence(
         return Err(VhcProtoError::Validation(format!(
             "remote checkpoint cadence {remote_cadence_rounds} + one in-flight-upload slot \
              ({record_need} rounds) exceeds the retained record horizon \
-             {RETAINED_RECORD_HORIZON_ROUNDS}: a trainer that dies late in a cadence slot whose \
-             newest checkpoint upload never completed restores a fence deeper than \
-             replay-forward can bridge, so churn recovery would be impossible by construction \
-             (defect 14, c15h); tighten the cadence to ≤ {max}"
+             {RETAINED_RECORD_HORIZON_ROUNDS}: the ordinary rejoin would overrun the ring-replay \
+             lane on every churn and lean on archive catch-up routinely (sizing rule — the \
+             archive lane still recovers it, defect 14/c15h posture); tighten the cadence to \
+             ≤ {max}"
         )));
     }
     if payload_retention_rounds == 0 {

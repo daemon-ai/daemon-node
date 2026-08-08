@@ -330,6 +330,7 @@ async fn publish_prefix_of(
             journal_dir: journal_dir(root, RUN_LABEL, "coordinator", instance),
             chain_instance,
             round_claim: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            archived_round: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         },
         heads.clone(),
         segments,
@@ -386,7 +387,7 @@ fn open_live_sink_of(
         [0x5C; 32],
         daemon_vhc_journal::RotatePolicy {
             max_records,
-            max_open: None,
+            ..daemon_vhc_journal::RotatePolicy::default()
         },
     )
     .expect("journal open");

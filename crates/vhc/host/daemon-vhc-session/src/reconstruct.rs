@@ -171,7 +171,7 @@ pub async fn reconstruct_coordinator(
 /// Obtain one attested sealed segment's bytes: the local journal home's file when it
 /// hash-matches the head, else the content plane (hash-verified either way).
 async fn segment_bytes(
-    spec: &ReconstructSpec,
+    local_dir: Option<&std::path::Path>,
     chain_instance: u64,
     head: &ArchiveHeadRecord,
     segments: &dyn ContentStore,
@@ -181,10 +181,8 @@ async fn segment_bytes(
         segment: head.body.segment,
         detail,
     };
-    if let Some(root) = &spec.journal_root {
-        let dir =
-            crate::journal_home::journal_dir(root, &spec.run_label, &spec.role, chain_instance);
-        if let Ok(paths) = JournalPaths::open(&dir) {
+    if let Some(dir) = local_dir {
+        if let Ok(paths) = JournalPaths::open(dir) {
             if let Ok(bytes) = read_local(&paths.segment(head.body.segment)) {
                 if daemon_vhc_proto::blake3_hash(&bytes) == head.body.segment_hash {
                     return Ok(bytes);
@@ -232,8 +230,16 @@ async fn recover_records(
     for chain in lineage {
         let mut chain_records: Vec<Record> = Vec::new();
         let mut last_complete: Option<[u8; 32]> = None;
+        let dir = spec.journal_root.as_ref().map(|root| {
+            crate::journal_home::journal_dir(
+                root,
+                &spec.run_label,
+                &spec.role,
+                chain.chain_instance,
+            )
+        });
         for head in &chain.heads {
-            let bytes = segment_bytes(spec, chain.chain_instance, head, segments).await?;
+            let bytes = segment_bytes(dir.as_deref(), chain.chain_instance, head, segments).await?;
             let scan = scan_bytes(&bytes).map_err(|e| ReconstructError::Segment {
                 chain_instance: chain.chain_instance,
                 segment: head.body.segment,
@@ -254,14 +260,6 @@ async fn recover_records(
         // via prev_blake3. Only the crashed box holds it; a cold standby reconstructs to the
         // archived point (which the coordinator's replay-forward semantics then catch up).
         let is_newest = std::ptr::eq(*chain, *lineage.last().expect("lineage non-empty"));
-        let dir = spec.journal_root.as_ref().map(|root| {
-            crate::journal_home::journal_dir(
-                root,
-                &spec.run_label,
-                &spec.role,
-                chain.chain_instance,
-            )
-        });
         'tail: {
             if !is_newest {
                 break 'tail;
@@ -697,6 +695,172 @@ fn replay_capture(
     })
 }
 
+// ---- Gate B': trainer archive catch-up extraction ------------------------------------------------
+
+/// One archived coordinator publish extracted for a trainer's staged catch-up fold: the complete
+/// §12.1-signed wire frame (delivered pump-direct, journaled as ordinary tag-12 evidence) plus
+/// the delivery coordinates already parsed out of it.
+#[derive(Clone, Debug)]
+pub struct CatchUpFrame {
+    /// The channel the coordinator published on.
+    pub channel: u64,
+    /// The coordinator's durable channel-scoped sequence number.
+    pub seq: u64,
+    /// The publishing per-run key (from the frame envelope).
+    pub sender: [u8; 32],
+    /// The module payload bytes (the frame's second element).
+    pub payload: Vec<u8>,
+    /// The complete signed wire frame, verbatim.
+    pub frame: Vec<u8>,
+    /// The `RoundRecord` round the frame carries (the fold-order / dedup key).
+    pub round: u64,
+}
+
+/// Everything the catch-up extractor needs — resolved by the join path, verified here.
+pub struct CatchUpSpec {
+    /// The node-carried seat-lineage heads ([`crate::protocol::TrainerCatchUp`]) — re-verified
+    /// against `trusted` before anything is read.
+    pub heads: Vec<ArchiveHeadRecord>,
+    /// The run's cryptographic id (the genesis hash).
+    pub run_id: Hash,
+    /// The genesis-trusted base identities (from the resolved envelope — never the credentials).
+    pub trusted: Vec<PeerId>,
+    /// The run label (the journal home's directory key, for the local-segment fast path).
+    pub run_label: String,
+    /// The durable run-state root for local segment reuse. `None` / no local copy = every
+    /// sealed segment fetches from the content plane.
+    pub journal_root: Option<PathBuf>,
+    /// The restore fence: only rounds STRICTLY ABOVE this extract.
+    pub after_round: u64,
+}
+
+/// Extract the seat's historical committed `RoundRecord` frames from its verified archive
+/// lineage — the trainer staged-catch-up input (architecture §5.3: "the host fetches
+/// record-archive segments by range … SDK replays records since the fence as ordinary frames").
+///
+/// Authenticity comes from the VERIFIED LINEAGE (heads signed to genesis trust, every segment's
+/// bytes re-hashed against its attested head), deliberately NOT from per-frame certificate
+/// liveness — a superseded coordinator incarnation's committed records are exactly the history a
+/// rejoiner must fold, and its certificate is long revoked. The frame probe is structural (the
+/// `frame_kind` discipline — no SDK schema linked): it reads the wire union's variant name and
+/// the record's `round`, leaving the module payload opaque. Re-publishes of the same round
+/// (replay-forward emissions inside the archived stream) deduplicate on the round key — a
+/// committed round's record is canonical.
+///
+/// # Errors
+/// A typed [`ReconstructError`]; a join carrying a catch-up directive that cannot extract MUST
+/// refuse (a genuine archive gap is [`ReconstructError::Segment`], never a silent wedge) —
+/// except the [`ReconstructError::Transport`] lane, which defers budget-free (Gate C).
+pub async fn extract_catch_up_frames(
+    spec: &CatchUpSpec,
+    segments: &dyn ContentStore,
+) -> Result<Vec<CatchUpFrame>, ReconstructError> {
+    let chains = verify_chains(&spec.run_id, &spec.trusted, spec.heads.clone())?;
+    let Some(role) = chains.first().map(|c| c.role.clone()) else {
+        return Err(ReconstructError::Sandbox(
+            "the catch-up directive carries no verified chains".into(),
+        ));
+    };
+    if chains.iter().any(|c| c.role != role) {
+        return Err(ReconstructError::Sandbox(
+            "the catch-up directive mixes roles; one seat lineage expected".into(),
+        ));
+    }
+    let lineage = coordinator_lineage(&chains, &role)?;
+
+    let mut frames: Vec<CatchUpFrame> = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for chain in &lineage {
+        let dir = spec.journal_root.as_ref().map(|root| {
+            crate::journal_home::journal_dir(root, &spec.run_label, &role, chain.chain_instance)
+        });
+        for head in &chain.heads {
+            let bytes = segment_bytes(dir.as_deref(), chain.chain_instance, head, segments).await?;
+            let scan = scan_bytes(&bytes).map_err(|e| ReconstructError::Segment {
+                chain_instance: chain.chain_instance,
+                segment: head.body.segment,
+                detail: format!("scan: {e}"),
+            })?;
+            if Hash(scan.header.prev_blake3) != head.body.prev_hash {
+                return Err(ReconstructError::Segment {
+                    chain_instance: chain.chain_instance,
+                    segment: head.body.segment,
+                    detail: "segment header's prev link disagrees with the attested head".into(),
+                });
+            }
+            for record in &scan.records {
+                let Body::Publish(p) = &record.body else {
+                    continue;
+                };
+                let Some((round, sender, payload)) = round_record_frame(&p.frame) else {
+                    continue;
+                };
+                if round > spec.after_round && seen.insert(round) {
+                    frames.push(CatchUpFrame {
+                        channel: p.channel,
+                        seq: p.seq,
+                        sender,
+                        payload,
+                        frame: p.frame.clone(),
+                        round,
+                    });
+                }
+            }
+        }
+    }
+    // Chains walk founding-first, so rounds are near-sorted already; the fold order MUST be
+    // ascending (the guest's resync guard folds monotonically past its watermark).
+    frames.sort_by_key(|f| f.round);
+    Ok(frames)
+}
+
+/// If a §12.1 wire frame carries a wire `RoundRecord`, its `(round, sender, payload)` — else
+/// `None`. A structural shape probe in the `frame_kind` discipline (see
+/// `role_session::published_round_record`): no SDK schema is linked; the walk reads exactly the
+/// envelope's `sender`, the externally-tagged wire union's variant name and the record's
+/// `round` field, all fixed by the consensus wire contract.
+fn round_record_frame(frame: &[u8]) -> Option<(u64, [u8; 32], Vec<u8>)> {
+    use ciborium::value::Value;
+    let Ok(Value::Array(parts)) = ciborium::de::from_reader(frame) else {
+        return None;
+    };
+    let Some(Value::Bytes(payload)) = parts.get(1) else {
+        return None;
+    };
+    let Some(Value::Map(env)) = parts.first() else {
+        return None;
+    };
+    let sender: [u8; 32] = env.iter().find_map(|(k, v)| match (k, v) {
+        (Value::Text(t), Value::Bytes(b)) if t == "sender" => b.as_slice().try_into().ok(),
+        _ => None,
+    })?;
+    let inner: Value = ciborium::de::from_reader(payload.as_slice()).ok()?;
+    // The externally-tagged union: a 1-element map (serde's standard shape) or a
+    // `[name, value]` variant array.
+    let (tag, body) = match &inner {
+        Value::Map(entries) if entries.len() == 1 => match &entries[0] {
+            (Value::Text(t), v) => (t.as_str(), v),
+            _ => return None,
+        },
+        Value::Array(items) if items.len() == 2 => match items.first() {
+            Some(Value::Text(t)) => (t.as_str(), &items[1]),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    if tag != "RoundRecord" {
+        return None;
+    }
+    let Value::Map(fields) = body else {
+        return None;
+    };
+    let round = fields.iter().find_map(|(k, v)| match (k, v) {
+        (Value::Text(t), Value::Integer(n)) if t == "round" => u64::try_from(i128::from(*n)).ok(),
+        _ => None,
+    })?;
+    Some((round, sender, payload.clone()))
+}
+
 #[cfg(test)]
 mod transport_lane_tests {
     //! Gate C (defect 10): the content-plane fetch inside reconstruction preserves the typed
@@ -758,24 +922,6 @@ mod transport_lane_tests {
         .expect("publish")
     }
 
-    fn spec() -> ReconstructSpec {
-        ReconstructSpec {
-            heads: Vec::new(),
-            run_id: Hash([0x1D; 32]),
-            trusted: Vec::new(),
-            role: "coordinator".into(),
-            run_label: "run-x".into(),
-            journal_root: None, // a cold standby: every segment fetches remote
-            module: Vec::new(),
-            config: Vec::new(),
-            grants: Vec::new(),
-            incarnation: 2,
-            restore: None,
-            sidecar_key: None,
-            deadline_ms: 1_000,
-        }
-    }
-
     /// A transient transport fault (connect refused, timeout, 5xx — the R2 outage shape) stays
     /// TYPED [`ReconstructError::Transport`]: the caller defers budget-free instead of burning
     /// the semantic retry budget on a network outage (the c15-20260806g terminal loop).
@@ -785,7 +931,8 @@ mod transport_lane_tests {
             kind: daemon_vhc_net::TransportFaultKind::Connect,
             detail: "egress: request failed (connect): dial refused".into(),
         });
-        let err = segment_bytes(&spec(), 1, &head(), &plane)
+        // A cold standby (no local journal dir): every segment fetches remote.
+        let err = segment_bytes(None, 1, &head(), &plane)
             .await
             .expect_err("the fetch fails");
         assert!(
@@ -806,12 +953,227 @@ mod transport_lane_tests {
     async fn a_semantic_miss_still_folds_into_the_segment_refusal() {
         let plane =
             FailingPlane(|| VhcNetError::PayloadMiss("never stored / lifecycle-expired".into()));
-        let err = segment_bytes(&spec(), 1, &head(), &plane)
+        let err = segment_bytes(None, 1, &head(), &plane)
             .await
             .expect_err("the fetch fails");
         assert!(
             matches!(err, ReconstructError::Segment { segment: 0, .. }),
             "got {err:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod catch_up_tests {
+    //! Gate B': the trainer archive catch-up extractor — verified lineage in, the fence-bounded,
+    //! round-deduplicated, ascending `RoundRecord` frame stream out.
+
+    use super::*;
+    use async_trait::async_trait;
+    use daemon_vhc_net::VhcNetError;
+    use daemon_vhc_proto::domains::ARCHIVE_HEAD_DOMAIN;
+    use daemon_vhc_proto::{peer_id, ArchiveHeadBody, CertScope, RunKeyCertificate, SigningKey};
+
+    const RUN: [u8; 32] = [0x1D; 32];
+    const MODULE: [u8; 32] = [0x2A; 32];
+    const SENDER: [u8; 32] = [0xC0; 32];
+
+    /// A content plane serving exactly the uploaded segments, content-addressed.
+    struct MapPlane(std::collections::BTreeMap<[u8; 32], Vec<u8>>);
+
+    #[async_trait]
+    impl ContentStore for MapPlane {
+        async fn put_content(&self, _bytes: &[u8]) -> Result<ContentHash, VhcNetError> {
+            unreachable!("extraction never writes the content plane")
+        }
+        async fn get_content(&self, hash: &ContentHash) -> Result<Vec<u8>, VhcNetError> {
+            self.0
+                .get(&hash.0)
+                .cloned()
+                .ok_or_else(|| VhcNetError::PayloadMiss("absent".into()))
+        }
+    }
+
+    /// A §12.1-shaped wire frame carrying a wire `RoundRecord` (structural shape only — the
+    /// extractor never verifies the signature; authenticity is the attested segment).
+    fn round_record_wire_frame(round: u64) -> Vec<u8> {
+        use ciborium::value::Value;
+        let mut payload = Vec::new();
+        ciborium::into_writer(
+            &Value::Map(vec![(
+                Value::from("RoundRecord"),
+                Value::Map(vec![(Value::from("round"), Value::from(round))]),
+            )]),
+            &mut payload,
+        )
+        .unwrap();
+        let envelope = Value::Map(vec![
+            (Value::from("sender"), Value::Bytes(SENDER.to_vec())),
+            (Value::from("channel"), Value::from(0u64)),
+            (Value::from("seq"), Value::from(round)),
+        ]);
+        let wire = Value::Array(vec![
+            envelope,
+            Value::Bytes(payload),
+            Value::Bytes(vec![0u8; 64]),
+        ]);
+        let mut out = Vec::new();
+        ciborium::into_writer(&wire, &mut out).unwrap();
+        out
+    }
+
+    /// Author a real sealed coordinator segment (through the journal substrate) whose publishes
+    /// carry rounds 1..=3 plus a replay-forward RE-publish of round 2, upload it to a map plane,
+    /// and attest it with a head signed to a trusted base. The extractor must return exactly the
+    /// post-fence rounds, deduplicated and ascending.
+    #[tokio::test]
+    async fn extraction_is_fence_bounded_deduplicated_and_ascending() {
+        let dir = tempfile::tempdir().unwrap();
+        let jroot = dir.path().join("journal");
+        let id = daemon_vhc_journal::ExecIdentity {
+            run_id: Hash(RUN),
+            epoch: 0,
+            role: "coordinator".into(),
+            instance: 1,
+            module: Hash(MODULE),
+        };
+        {
+            let mut j = daemon_vhc_journal::Journal::create(
+                &jroot,
+                id,
+                daemon_vhc_journal::StaticKey::new([0; 32]),
+                daemon_vhc_journal::RotatePolicy::default(),
+            )
+            .unwrap();
+            for round in [1u64, 2, 3, 2] {
+                // rounds in publication order, with a replay-forward duplicate
+                j.publish(0, b"round-payload", round_record_wire_frame(round))
+                    .unwrap();
+            }
+            j.roll().unwrap(); // seal segment 0
+        }
+        // Test-only fixture read inside a tempdir — not a production fs path.
+        #[allow(clippy::disallowed_methods)]
+        let seg_bytes = std::fs::read(JournalPaths::open(&jroot).unwrap().segment(0)).unwrap();
+        let seg_hash = daemon_vhc_proto::blake3_hash(&seg_bytes);
+
+        let base = SigningKey::from_bytes(&[0xB0; 32]);
+        let run_key = SigningKey::from_bytes(&[0x4A; 32]);
+        let cert = RunKeyCertificate::issue(
+            &base,
+            CertScope {
+                run_id: Hash(RUN),
+                epoch: 0,
+                role: "coordinator".into(),
+                instance: 1,
+                module_hash: Hash(MODULE),
+            },
+            peer_id(&run_key),
+        )
+        .unwrap();
+        let head = ArchiveHeadRecord::publish(
+            &run_key,
+            cert,
+            ArchiveHeadBody {
+                domain: ARCHIVE_HEAD_DOMAIN.into(),
+                run_id: Hash(RUN),
+                role: "coordinator".into(),
+                chain_instance: 1,
+                segment: 0,
+                segment_hash: seg_hash,
+                prev_hash: Hash([0; 32]),
+                records: 4,
+                instance: 1,
+                epoch: 0,
+                module: Hash(MODULE),
+                predecessor: None,
+                round: Some(3),
+            },
+        )
+        .unwrap();
+
+        let plane = MapPlane([(seg_hash.0, seg_bytes)].into_iter().collect());
+        let spec = CatchUpSpec {
+            heads: vec![head],
+            run_id: Hash(RUN),
+            trusted: vec![peer_id(&base)],
+            run_label: "run-x".into(),
+            journal_root: None, // a cold rejoiner: the segment fetches from the content plane
+            after_round: 1,     // the restore fence
+        };
+        let frames = extract_catch_up_frames(&spec, &plane)
+            .await
+            .expect("extraction succeeds from the verified lineage");
+        let rounds: Vec<u64> = frames.iter().map(|f| f.round).collect();
+        assert_eq!(
+            rounds,
+            vec![2, 3],
+            "post-fence only, the replay-forward duplicate deduplicated, ascending"
+        );
+        for f in &frames {
+            assert_eq!(f.sender, SENDER, "the sender parses out of the envelope");
+            assert_eq!(f.channel, 0);
+            assert!(!f.payload.is_empty(), "the module payload rides verbatim");
+            assert!(
+                !f.frame.is_empty(),
+                "the complete wire frame rides verbatim"
+            );
+        }
+    }
+
+    /// A directive whose segment is gone from BOTH planes is the genuine archive gap: a typed
+    /// `Segment` refusal (the re-scoped `CheckpointStale` posture — never a silent wedge).
+    #[tokio::test]
+    async fn a_genuine_archive_gap_refuses_typed() {
+        let base = SigningKey::from_bytes(&[0xB0; 32]);
+        let run_key = SigningKey::from_bytes(&[0x4A; 32]);
+        let cert = RunKeyCertificate::issue(
+            &base,
+            CertScope {
+                run_id: Hash(RUN),
+                epoch: 0,
+                role: "coordinator".into(),
+                instance: 1,
+                module_hash: Hash(MODULE),
+            },
+            peer_id(&run_key),
+        )
+        .unwrap();
+        let head = ArchiveHeadRecord::publish(
+            &run_key,
+            cert,
+            ArchiveHeadBody {
+                domain: ARCHIVE_HEAD_DOMAIN.into(),
+                run_id: Hash(RUN),
+                role: "coordinator".into(),
+                chain_instance: 1,
+                segment: 0,
+                segment_hash: Hash([0xEE; 32]), // attested, but stored nowhere
+                prev_hash: Hash([0; 32]),
+                records: 1,
+                instance: 1,
+                epoch: 0,
+                module: Hash(MODULE),
+                predecessor: None,
+                round: Some(9),
+            },
+        )
+        .unwrap();
+        let plane = MapPlane(std::collections::BTreeMap::new());
+        let spec = CatchUpSpec {
+            heads: vec![head],
+            run_id: Hash(RUN),
+            trusted: vec![peer_id(&base)],
+            run_label: "run-x".into(),
+            journal_root: None,
+            after_round: 0,
+        };
+        let err = extract_catch_up_frames(&spec, &plane)
+            .await
+            .expect_err("a missing attested segment refuses");
+        assert!(
+            matches!(err, ReconstructError::Segment { segment: 0, .. }),
+            "typed segment refusal, got {err:?}"
         );
     }
 }

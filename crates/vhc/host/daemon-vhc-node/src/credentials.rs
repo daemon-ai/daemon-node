@@ -23,7 +23,7 @@ use daemon_vhc_session::config::{RegistryAuthConfig, RegistryConfig};
 use daemon_vhc_session::keystore::{KeystoreError, VhcKeystore};
 use daemon_vhc_session::protocol::{
     CheckpointRestore, CoordinatorRecovery, CredentialsRecord, IrohPlane, SessionCredentials,
-    WsAuthSpec,
+    TrainerCatchUp, WsAuthSpec,
 };
 use daemon_vhc_session::provisioning::{provision_run_identity, ProvisionScope};
 
@@ -61,6 +61,10 @@ pub struct JoinBootstrap {
     /// a seat-role join with published history must reconstruct from before reporting ready.
     /// `None` = a fresh seat / not the seat role.
     pub reconstruct: Option<CoordinatorRecovery>,
+    /// The trainer archive catch-up directive (Gate B'): the node-verified seat lineage a
+    /// trainer whose restore fence trails the retained ring folds from before live attach.
+    /// `None` = the ring alone suffices.
+    pub catch_up: Option<TrainerCatchUp>,
 }
 
 /// The output of one authorship pass: the wire credentials bytes for `JoinRun.credentials` and
@@ -108,6 +112,7 @@ pub fn author_join(
         seat,
         iroh,
         reconstruct,
+        catch_up,
     } = bootstrap;
     let cred = |e: KeystoreError| VhcError::Internal(format!("credential authorship: {e}"));
 
@@ -181,6 +186,8 @@ pub fn author_join(
         // The §8.8 reconstruction directive (node-verified archive lineage; the worker
         // re-verifies before acting — carriage, not trust).
         reconstruct,
+        // The Gate B' trainer catch-up directive (same carriage discipline).
+        catch_up,
     };
     let wire = credentials
         .to_bytes()

@@ -402,6 +402,28 @@ struct IrohEndpointOwner {
 }
 
 /// One live supervised role-instance: its ledger identity and its worker child.
+/// The durable-checkpoint lag alarm threshold (Gate B'): warn when a trainer generation's
+/// freshest DURABLE checkpoint (its restore fence) trails the live head by three quarters of
+/// the retained-record horizon. Sizing: the tolerated steady-state fence lag is one entirely
+/// missed publisher cycle plus the in-flight upload (`2 × cadence + upload slack` — c15h
+/// measured the by-ref family walk at 14–25 min ≈ 1–2 rounds), which the
+/// `2 × cadence ≤ horizon` authoring rule keeps at or under half the horizon; three quarters
+/// is therefore past every healthy shape while still leaving a quarter of the horizon to act
+/// before a rejoin needs archive catch-up (defect 14's wedge was exactly this drift, unvoiced).
+const CHECKPOINT_LAG_WARN_ROUNDS: u64 = daemon_vhc_proto::RETAINED_RECORD_HORIZON_ROUNDS / 4 * 3;
+
+/// Durable-checkpoint lag alarm state for one role-instance generation (Gate B').
+#[derive(Default)]
+struct CkptLagTrack {
+    /// The freshest round with a DURABLE checkpoint document (chunks + doc on the content
+    /// plane — the `CheckpointPublished` edge), `None` until the generation first publishes.
+    fence: Option<u64>,
+    /// The largest lag already warned about — the alarm re-voices only when the drift GROWS,
+    /// so a run sitting steadily past the threshold is one warning per widening round, never
+    /// a per-event flood.
+    warned_lag: u64,
+}
+
 struct InstanceEntry {
     /// The identity ADMITTED against the owner ledgers — the arbiter's reservation key. It
     /// stays fixed for the entry's whole life (release must present the admitted key), even
@@ -470,6 +492,9 @@ pub struct VhcService {
     /// The run the worker is currently on (from the last `RunPhase`), used to attribute events that
     /// don't carry a run id (`RoundProgress`/`RoundOutcome`/…).
     current_run: Mutex<Option<String>>,
+    /// Durable-checkpoint lag alarm state, `run id → generation → track` (Gate B'): fed by
+    /// `CheckpointPublished` (the fence) and `RoundOutcome` (the head), cleared on leave/wipe.
+    ckpt_lag: Mutex<BTreeMap<String, BTreeMap<u64, CkptLagTrack>>>,
     /// The coalescing vhc-feed revision stamped on each `VhcChanged` pointer.
     rev: AtomicU64,
     /// The pinned iroh bind port per run label (chosen once per node lifetime, so the published
@@ -526,6 +551,7 @@ impl VhcService {
             events_tx,
             feed: parts.feed,
             current_run: Mutex::new(None),
+            ckpt_lag: Mutex::new(BTreeMap::new()),
             rev: AtomicU64::new(0),
             iroh_ports: Mutex::new(BTreeMap::new()),
             iroh_endpoint: Mutex::new(BTreeMap::new()),
@@ -1174,8 +1200,8 @@ impl VhcService {
                 return Err(e);
             }
         };
-        let restore = match self
-            .resolve_restore(&run.run_id, &run.role, recovery.verified_head)
+        let (restore, catch_up) = match self
+            .resolve_restore(&run.run_id, &run.role, &recovery)
             .await
         {
             Ok(r) => r,
@@ -1197,6 +1223,7 @@ impl VhcService {
                 JoinResume {
                     restore,
                     reconstruct: recovery.reconstruct,
+                    catch_up,
                 },
                 seat,
             )
@@ -1387,9 +1414,7 @@ impl VhcService {
                 return;
             }
         };
-        let restore = match self
-            .resolve_restore(run_id, &trainer_role, recovery.verified_head)
-            .await
+        let (restore, catch_up) = match self.resolve_restore(run_id, &trainer_role, &recovery).await
         {
             Ok(r) => r,
             Err(e) => {
@@ -1409,6 +1434,7 @@ impl VhcService {
                 JoinResume {
                     restore,
                     reconstruct: recovery.reconstruct,
+                    catch_up,
                 },
                 seat,
             )
@@ -1730,24 +1756,39 @@ impl VhcService {
                 let discovery = discovery.clone();
                 let (run, round, hash, kind) = (run_id.clone(), *round, hash.clone(), kind.clone());
                 tokio::spawn(async move {
-                    match discovery
-                        .publish_checkpoint(&run, &role, &kind, round, &hash, 0)
-                        .await
-                    {
-                        Ok(()) => {
-                            tracing::debug!(
-                                run,
-                                role,
-                                kind,
-                                round,
-                                hash,
-                                "checkpoint pointer published"
-                            );
+                    // Bounded in-task retry (Gate B'): the pointer is the fence every restore
+                    // resolves against, minted here AFTER the 14–25-minute family upload walk
+                    // already paid its full durability cost — dropping it on one failed POST
+                    // silently discards that entire slot (the seat believes it published; the
+                    // registry never learned). A registry blip is far shorter than a slot, so
+                    // a few paced attempts close the gap; a still-failing pointer stays what it
+                    // always was (advisory, best-effort) and is voiced as a warning.
+                    let mut last = None;
+                    for (attempt, pause_s) in [0u64, 2, 8, 30].into_iter().enumerate() {
+                        if pause_s > 0 {
+                            tokio::time::sleep(std::time::Duration::from_secs(pause_s)).await;
                         }
-                        Err(e) => {
-                            tracing::warn!(run, role, kind, round, error = %e, "checkpoint pointer publication failed");
+                        match discovery
+                            .publish_checkpoint(&run, &role, &kind, round, &hash, 0)
+                            .await
+                        {
+                            Ok(()) => {
+                                tracing::debug!(
+                                    run,
+                                    role,
+                                    kind,
+                                    round,
+                                    hash,
+                                    attempt,
+                                    "checkpoint pointer published"
+                                );
+                                return;
+                            }
+                            Err(e) => last = Some(e),
                         }
                     }
+                    let error = last.expect("at least one attempt ran");
+                    tracing::warn!(run, role, kind, round, %error, "checkpoint pointer publication failed (all attempts)");
                 });
             } else {
                 tracing::debug!(
@@ -1758,6 +1799,90 @@ impl VhcService {
         }
 
         let mut emitted = Vec::new();
+        // The durable-checkpoint lag alarm (Gate B'; defect 14's unvoiced drift): the FENCE a
+        // rejoin would restore from is the freshest DURABLE checkpoint (`CheckpointPublished` —
+        // doc + chunks on the content plane), and it trails the head by checkpoint assembly +
+        // the by-ref upload walk (measured 14–25 min per slot at ceremony scale). Past the
+        // retained-record horizon that drift wedges re-admission (`CheckpointStale`), so it is
+        // voiced as a persisted warning while there is still margin to act. Trainer generations
+        // only: a coordinator recovers through archive reconstruction, never a live pointer.
+        match ev {
+            protocol::Event::CheckpointPublished {
+                round, generation, ..
+            } => {
+                let mut lag_map = self.ckpt_lag.lock().unwrap();
+                let track = lag_map
+                    .entry(run_id.clone())
+                    .or_default()
+                    .entry(*generation)
+                    .or_default();
+                track.fence = Some(track.fence.map_or(*round, |f| f.max(*round)));
+                // A fresh fence closes the voiced drift; a NEW drift warns anew.
+                track.warned_lag = 0;
+            }
+            protocol::Event::RoundOutcome {
+                round, generation, ..
+            } => {
+                let role = {
+                    let co = self.co_trainers.lock().unwrap();
+                    co.get(&run_id)
+                        .filter(|e| e.generation == *generation)
+                        .map(|e| e.id.role.clone())
+                }
+                .or_else(|| {
+                    self.store
+                        .get_run(&run_id)
+                        .ok()
+                        .flatten()
+                        .map(|r| r.role)
+                        .filter(|r| !r.is_empty())
+                });
+                if role.as_deref().is_some_and(|r| r != "coordinator") {
+                    let warn = {
+                        let mut lag_map = self.ckpt_lag.lock().unwrap();
+                        let track = lag_map
+                            .entry(run_id.clone())
+                            .or_default()
+                            .entry(*generation)
+                            .or_default();
+                        // No fence at all → the exposure is the whole span since genesis.
+                        let lag = round.saturating_sub(track.fence.unwrap_or(0));
+                        (lag >= CHECKPOINT_LAG_WARN_ROUNDS && lag > track.warned_lag).then(|| {
+                            track.warned_lag = lag;
+                            match track.fence {
+                                Some(f) => format!(
+                                    "{}'s freshest durable checkpoint (round {f}) trails the \
+                                     live head (round {round}) by {lag} rounds — the retained \
+                                     horizon is {}; past it a rejoin needs archive catch-up \
+                                     (is checkpoint publication stalled?)",
+                                    role.as_deref().unwrap_or("trainer"),
+                                    daemon_vhc_proto::RETAINED_RECORD_HORIZON_ROUNDS,
+                                ),
+                                None => format!(
+                                    "{} has published NO durable checkpoint by round {round} — \
+                                     the retained horizon is {}; a crash before the first \
+                                     durable checkpoint restarts this seat from scratch",
+                                    role.as_deref().unwrap_or("trainer"),
+                                    daemon_vhc_proto::RETAINED_RECORD_HORIZON_ROUNDS,
+                                ),
+                            }
+                        })
+                    };
+                    if let Some(detail) = warn {
+                        tracing::warn!(run = run_id, generation, "{detail}");
+                        self.emit(
+                            VhcEvent::Warning {
+                                run_id: run_id.clone(),
+                                class: "checkpoint_lag".to_string(),
+                                detail,
+                            },
+                            &mut emitted,
+                        )?;
+                    }
+                }
+            }
+            _ => {}
+        }
         if let Some(sev) = translate(ev, &run_id) {
             self.emit(sev, &mut emitted)?;
         }
@@ -2326,6 +2451,7 @@ impl VhcService {
         let JoinResume {
             restore,
             reconstruct,
+            catch_up,
         } = resume;
         let tuple = tuple.map(|mut t| {
             t.incarnation = id.instance;
@@ -2368,6 +2494,7 @@ impl VhcService {
                 seat,
                 iroh,
                 reconstruct,
+                catch_up,
             },
         )?;
         Ok((Some(tuple), authored.wire, authored.credentials_ref))
@@ -3054,14 +3181,18 @@ impl VhcService {
     /// Consensus safety is unaffected (round digests cover exactly the class-0 consensus
     /// sections; c15g proved live agreement).
     ///
-    /// **Join-time cadence-vs-ring reachability** (the recovery-honesty check): a restorer
-    /// replays forward across the coordinator's retained record ring
+    /// **Join-time fence reachability** (the recovery-honesty check, re-scoped by Gate B'): a
+    /// restorer replays forward across the coordinator's retained record ring
     /// ([`daemon_vhc_proto::RETAINED_RECORD_HORIZON_ROUNDS`]), and with three seats the run
     /// progresses while one trainer is absent — no static cadence/ring relation guarantees the
-    /// fence stays reachable. So the judgment is made HERE, from actual run evidence, before
-    /// any rehydration: when the restore fence is more than the horizon behind the run's live
-    /// head, the join refuses typed ([`VhcError::CheckpointStale`]) instead of wedging into the
-    /// module's post-restore `GapRefused`.
+    /// fence stays reachable. The judgment is made HERE, from actual run evidence, before any
+    /// rehydration — but a fence past the ring is no longer an automatic refusal: when the
+    /// VERIFIED archive lineage covers the gap (its latest round claim reaches within a ring of
+    /// the head), the join instead carries a [`protocol::TrainerCatchUp`] directive — the worker
+    /// folds the archived records up to the archive tip, and the ring replay covers the
+    /// unarchived tail (architecture §5.3). [`VhcError::CheckpointStale`] remains only for the
+    /// gap the planes genuinely cannot bridge (no lineage / an archive tip itself past ring
+    /// reach of the head) — typed, naming the missing closure.
     ///
     /// The head estimate prefers `verified_head` — the latest committed-round claim across the
     /// seat lineage's SIGNED archive heads ([`Self::resolve_recovery`]); certificate-chained
@@ -3075,10 +3206,16 @@ impl VhcService {
         &self,
         run_id: &str,
         role: &str,
-        verified_head: Option<u64>,
-    ) -> Result<Option<protocol::CheckpointRestore>, VhcError> {
+        recovery: &RecoveryResolution,
+    ) -> Result<
+        (
+            Option<protocol::CheckpointRestore>,
+            Option<protocol::TrainerCatchUp>,
+        ),
+        VhcError,
+    > {
         let Some(discovery) = self.discovery.as_ref() else {
-            return Ok(None);
+            return Ok((None, None));
         };
         let role = if role.is_empty() { "trainer" } else { role };
         let Some(pointer) = discovery
@@ -3087,11 +3224,12 @@ impl VhcService {
             .ok()
             .flatten()
         else {
-            return Ok(None);
+            return Ok((None, None));
         };
         let Some(hash) = hex32(&pointer.hash) else {
-            return Ok(None);
+            return Ok((None, None));
         };
+        let mut catch_up = None;
         if role != "coordinator" {
             let pointer_head = discovery
                 .fetch_checkpoint(run_id, "coordinator")
@@ -3099,15 +3237,45 @@ impl VhcService {
                 .ok()
                 .flatten()
                 .map(|coord| coord.round);
+            let verified_head = recovery.verified_head;
             if let Some(evidence) = verified_head.into_iter().chain(pointer_head).max() {
                 let head = evidence.max(pointer.round);
                 let horizon = daemon_vhc_proto::RETAINED_RECORD_HORIZON_ROUNDS;
                 if head > pointer.round.saturating_add(horizon) {
-                    return Err(VhcError::CheckpointStale {
-                        restored: pointer.round,
-                        head,
-                        horizon,
+                    // The archive tip (the lineage's latest VERIFIED round claim) must reach
+                    // within a ring of the head, or the gap between the archived stream and
+                    // the retained ring is unbridgeable — the genuine CheckpointStale.
+                    let bridgeable = !recovery.lineage_heads.is_empty()
+                        && verified_head.is_some_and(|tip| tip.saturating_add(horizon) >= head);
+                    if !bridgeable {
+                        return Err(VhcError::CheckpointStale {
+                            restored: pointer.round,
+                            head,
+                            horizon,
+                        });
+                    }
+                    catch_up = Some(protocol::TrainerCatchUp {
+                        heads: recovery.lineage_heads.clone(),
+                        from_round: pointer.round,
                     });
+                    let detail = format!(
+                        "{role}'s restore fence (round {}) trails the live head (round {head}) \
+                         past the retained ring ({horizon}); the verified archive lineage \
+                         (tip round {}) bridges the gap — staging archive catch-up before \
+                         live attach",
+                        pointer.round,
+                        verified_head.unwrap_or(0),
+                    );
+                    tracing::info!(run = run_id, "{detail}");
+                    let mut emitted = Vec::new();
+                    let _ = self.emit(
+                        VhcEvent::Warning {
+                            run_id: run_id.to_string(),
+                            class: "archive_catch_up".to_string(),
+                            detail,
+                        },
+                        &mut emitted,
+                    );
                 }
             }
         }
@@ -3143,10 +3311,13 @@ impl VhcService {
             round = pointer.round,
             "resolved late-join checkpoint restore pointer (streaming by-ref rehydration follows)"
         );
-        Ok(Some(protocol::CheckpointRestore {
-            round: pointer.round,
-            hash,
-        }))
+        Ok((
+            Some(protocol::CheckpointRestore {
+                round: pointer.round,
+                hash,
+            }),
+            catch_up,
+        ))
     }
 
     /// Resolve the run's published archive lineage for the join (§8.8; the recovery half of the
@@ -3204,11 +3375,12 @@ impl VhcService {
         let lineage = daemon_vhc_proto::coordinator_lineage(&chains, seat_role)
             .map_err(|e| VhcError::Discovery(format!("archive lineage cannot be ordered: {e}")))?;
         let verified_head = daemon_vhc_proto::latest_round_claim(&lineage);
+        let lineage_heads: Vec<daemon_vhc_proto::ArchiveHeadRecord> = lineage
+            .iter()
+            .flat_map(|chain| chain.heads.iter().cloned())
+            .collect();
         let reconstruct = (role == seat_role).then(|| protocol::CoordinatorRecovery {
-            heads: lineage
-                .iter()
-                .flat_map(|chain| chain.heads.iter().cloned())
-                .collect(),
+            heads: lineage_heads.clone(),
         });
         if let Some(directive) = &reconstruct {
             tracing::info!(
@@ -3222,6 +3394,7 @@ impl VhcService {
         Ok(RecoveryResolution {
             reconstruct,
             verified_head,
+            lineage_heads,
         })
     }
 }
@@ -3235,8 +3408,14 @@ struct RecoveryResolution {
     /// The reconstruction directive to ride the credentials (`None` = fresh seat, or not the
     /// seat role).
     reconstruct: Option<protocol::CoordinatorRecovery>,
-    /// The latest verified committed-round claim across the seat lineage's signed heads.
+    /// The latest verified committed-round claim across the seat lineage's signed heads —
+    /// simultaneously the freshness evidence for the restore staleness judgment AND the
+    /// archive-coverage tip the Gate B' catch-up decision bridges with.
     verified_head: Option<u64>,
+    /// The seat lineage's verified head records, founding order (the carriage for BOTH the
+    /// coordinator reconstruction directive and a trainer catch-up directive). Empty = no
+    /// published seat history.
+    lineage_heads: Vec<daemon_vhc_proto::ArchiveHeadRecord>,
 }
 
 /// The join's node-resolved RESUME inputs, authored into the credentials as one unit: the role's
@@ -3245,6 +3424,7 @@ struct RecoveryResolution {
 struct JoinResume {
     restore: Option<protocol::CheckpointRestore>,
     reconstruct: Option<protocol::CoordinatorRecovery>,
+    catch_up: Option<protocol::TrainerCatchUp>,
 }
 
 /// Decode a 64-char lowercase-hex blake3 into a 32-byte array (`None` on any malformation).
@@ -3468,10 +3648,7 @@ impl VhcApi for VhcService {
                 return Err(e.to_api());
             }
         };
-        let restore = match self
-            .resolve_restore(&run_id, &id.role, recovery.verified_head)
-            .await
-        {
+        let (restore, catch_up) = match self.resolve_restore(&run_id, &id.role, &recovery).await {
             Ok(r) => r,
             Err(e) => {
                 if existing.is_none() {
@@ -3494,6 +3671,7 @@ impl VhcApi for VhcService {
                 JoinResume {
                     restore: restore.clone(),
                     reconstruct: recovery.reconstruct.clone(),
+                    catch_up: catch_up.clone(),
                 },
                 seat.clone(),
             )
@@ -3533,6 +3711,7 @@ impl VhcApi for VhcService {
                             JoinResume {
                                 restore,
                                 reconstruct: recovery.reconstruct,
+                                catch_up,
                             },
                             seat,
                         )
@@ -3686,6 +3865,7 @@ impl VhcApi for VhcService {
         }
         // The run holds no role-instance here anymore: this node's iroh endpoint is unowned.
         self.forget_node_iroh_endpoint(&run_id);
+        self.ckpt_lag.lock().unwrap().remove(&run_id);
         // A leaving coordinator surrenders its seat (fenced release; the floor persists).
         self.release_seat_for(&run_id).await;
         self.emit_changed(Some(run_id));
@@ -4919,12 +5099,16 @@ mod storage_gate_tests {
         let mut svc = coordinator_trainer_service(OwnerBudget::unbounded());
         svc.discovery = Some(Arc::new(SiblingOnly));
 
-        let restore = svc
-            .resolve_restore("run-d", "trainer-1", None)
+        let (restore, catch_up) = svc
+            .resolve_restore("run-d", "trainer-1", &RecoveryResolution::default())
             .await
-            .expect("the sibling fallback resolves")
-            .expect("a restore pointer stands");
+            .expect("the sibling fallback resolves");
+        let restore = restore.expect("a restore pointer stands");
         assert_eq!(restore.round, 8);
+        assert!(
+            catch_up.is_none(),
+            "no head evidence, no catch-up directive"
+        );
 
         let events = svc.store.recent_events("run-d", 16).expect("events read");
         let warning = events
@@ -4939,6 +5123,275 @@ mod storage_gate_tests {
         assert!(
             warning.contains("trainer-1") && warning.contains("trainer-0"),
             "the warning names both seats: {warning}"
+        );
+    }
+
+    /// Gate B' catch-up decision (defect 14 closed properly): a restore fence past the ring
+    /// horizon is no longer an unconditional `CheckpointStale` — when the verified archive
+    /// lineage reaches within a ring of the head, the join carries a staged catch-up directive
+    /// (the lineage heads + the fence) and a persisted `archive_catch_up` warning; the typed
+    /// refusal remains ONLY for the gap the planes genuinely cannot bridge (archive tip itself
+    /// past ring reach, or no lineage at all).
+    #[tokio::test]
+    async fn a_stale_fence_bridged_by_the_archive_lineage_rides_a_catch_up_directive() {
+        struct StaleShape;
+        #[async_trait]
+        impl crate::discovery::RunDiscovery for StaleShape {
+            async fn list_runs(&self) -> Result<Vec<crate::discovery::DiscoveredRun>, VhcError> {
+                Ok(Vec::new())
+            }
+            async fn get_run(
+                &self,
+                _run_id: &str,
+            ) -> Result<Option<crate::discovery::DiscoveredRun>, VhcError> {
+                Ok(None)
+            }
+            async fn fetch_envelope(&self, _run_id: &str) -> Result<Vec<u8>, VhcError> {
+                Ok(Vec::new())
+            }
+            async fn fetch_checkpoint(
+                &self,
+                _run_id: &str,
+                role: &str,
+            ) -> Result<Option<crate::discovery::CheckpointPointer>, VhcError> {
+                // The c15h shape scaled to the production horizon: the trainer's freshest
+                // fence (round 4) trails the coordinator's live head (round 30) past the
+                // 16-round ring.
+                let round = if role == "coordinator" { 30 } else { 4 };
+                Ok(Some(crate::discovery::CheckpointPointer {
+                    role: role.into(),
+                    kind: "live".into(),
+                    round,
+                    hash: "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262".into(),
+                    size: 2048,
+                }))
+            }
+        }
+
+        // One signed head stands in for the verified seat lineage (authenticity was already
+        // resolve_recovery's job; this decision consumes its outputs).
+        let base = daemon_vhc_proto::SigningKey::from_bytes(&[0xB0; 32]);
+        let run_key = daemon_vhc_proto::SigningKey::from_bytes(&[0x4A; 32]);
+        let cert = daemon_vhc_proto::RunKeyCertificate::issue(
+            &base,
+            daemon_vhc_proto::CertScope {
+                run_id: daemon_vhc_proto::Hash([0x1D; 32]),
+                epoch: 0,
+                role: "coordinator".into(),
+                instance: 1,
+                module_hash: daemon_vhc_proto::Hash([0x2A; 32]),
+            },
+            daemon_vhc_proto::peer_id(&run_key),
+        )
+        .expect("cert issues");
+        let head = daemon_vhc_proto::ArchiveHeadRecord::publish(
+            &run_key,
+            cert,
+            daemon_vhc_proto::ArchiveHeadBody {
+                domain: daemon_vhc_proto::domains::ARCHIVE_HEAD_DOMAIN.into(),
+                run_id: daemon_vhc_proto::Hash([0x1D; 32]),
+                role: "coordinator".into(),
+                chain_instance: 1,
+                segment: 0,
+                segment_hash: daemon_vhc_proto::Hash([0xAA; 32]),
+                prev_hash: daemon_vhc_proto::Hash([0; 32]),
+                records: 1,
+                instance: 1,
+                epoch: 0,
+                module: daemon_vhc_proto::Hash([0x2A; 32]),
+                predecessor: None,
+                round: Some(28),
+            },
+        )
+        .expect("head publishes");
+
+        let mut svc = coordinator_trainer_service(OwnerBudget::unbounded());
+        svc.discovery = Some(Arc::new(StaleShape));
+
+        // Bridgeable: the archive tip (28) reaches within a ring (16) of the head (30) —
+        // the join proceeds, carrying the catch-up directive fenced at the restore round.
+        let bridged = RecoveryResolution {
+            reconstruct: None,
+            verified_head: Some(28),
+            lineage_heads: vec![head.clone()],
+        };
+        let (restore, catch_up) = svc
+            .resolve_restore("run-b", "trainer-1", &bridged)
+            .await
+            .expect("a bridgeable gap is not a refusal");
+        assert_eq!(restore.expect("the fence still restores").round, 4);
+        let directive = catch_up.expect("the catch-up directive rides the join");
+        assert_eq!(directive.from_round, 4, "fenced at the restore round");
+        assert_eq!(directive.heads.len(), 1, "the verified lineage rides along");
+        let events = svc.store.recent_events("run-b", 16).expect("events read");
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                VhcEvent::Warning { class, .. } if class == "archive_catch_up"
+            )),
+            "the staged catch-up is a persisted warning"
+        );
+
+        // Unbridgeable: the archive tip (10) is itself past ring reach of the head — the
+        // genuine CheckpointStale, typed with the real shape.
+        let gapped = RecoveryResolution {
+            reconstruct: None,
+            verified_head: Some(10),
+            lineage_heads: vec![head],
+        };
+        let err = svc
+            .resolve_restore("run-b", "trainer-1", &gapped)
+            .await
+            .expect_err("an archive gap refuses");
+        assert!(
+            matches!(
+                err,
+                VhcError::CheckpointStale {
+                    restored: 4,
+                    head: 30,
+                    horizon: daemon_vhc_proto::RETAINED_RECORD_HORIZON_ROUNDS,
+                }
+            ),
+            "typed with the genuine shape, got {err:?}"
+        );
+
+        // No lineage at all (head evidence only from the registry pointer): equally refused.
+        let err = svc
+            .resolve_restore("run-b", "trainer-1", &RecoveryResolution::default())
+            .await
+            .expect_err("no lineage cannot bridge");
+        assert!(matches!(err, VhcError::CheckpointStale { .. }));
+    }
+
+    /// Gate B' durable-checkpoint lag alarm (defect 14's unvoiced drift): a trainer whose
+    /// freshest DURABLE checkpoint trails the live head by the warn margin gets a persisted
+    /// `checkpoint_lag` warning — voiced when the drift GROWS (never a per-round flood), closed
+    /// by a fresh durable fence, and re-armed for a new drift.
+    #[tokio::test]
+    async fn checkpoint_lag_past_the_horizon_margin_is_a_persisted_warning() {
+        let svc = coordinator_trainer_service(OwnerBudget::unbounded());
+        seed_joined_run(&svc, "run-lag", 7);
+        svc.store
+            .set_execution_identity("run-lag", 0, "trainer-0", 7)
+            .expect("the row carries the trainer role");
+        svc.handle_worker_event(&protocol::Event::RunPhase {
+            run_id: "run-lag".into(),
+            phase: "running".into(),
+            epoch: 0,
+            round: 0,
+            generation: 7,
+        })
+        .expect("phase attributes the run");
+
+        let outcome = |round| protocol::Event::RoundOutcome {
+            round,
+            committed: 2,
+            ingested: 2,
+            stalled: false,
+            digest: [0u8; 16],
+            generation: 7,
+        };
+        let lag_warning = |outs: &[VhcEvent]| {
+            outs.iter().find_map(|e| match e {
+                VhcEvent::Warning { class, detail, .. } if class == "checkpoint_lag" => {
+                    Some(detail.clone())
+                }
+                _ => None,
+            })
+        };
+
+        // Under the margin nothing is voiced.
+        let outs = svc
+            .handle_worker_event(&outcome(CHECKPOINT_LAG_WARN_ROUNDS - 1))
+            .expect("outcome handled");
+        assert!(lag_warning(&outs).is_none(), "no warning under the margin");
+
+        // Crossing it with NO durable checkpoint at all names the from-scratch exposure.
+        let outs = svc
+            .handle_worker_event(&outcome(CHECKPOINT_LAG_WARN_ROUNDS))
+            .expect("outcome handled");
+        let warning = lag_warning(&outs).expect("the crossing is voiced");
+        assert!(
+            warning.contains("NO durable checkpoint") && warning.contains("trainer-0"),
+            "the no-fence exposure is named: {warning}"
+        );
+
+        // An unchanged lag does not re-voice.
+        let outs = svc
+            .handle_worker_event(&outcome(CHECKPOINT_LAG_WARN_ROUNDS))
+            .expect("outcome handled");
+        assert!(lag_warning(&outs).is_none(), "an unchanged lag stays quiet");
+
+        // A fresh durable fence closes the drift…
+        svc.handle_worker_event(&protocol::Event::CheckpointPublished {
+            round: CHECKPOINT_LAG_WARN_ROUNDS,
+            hash: "abc".into(),
+            location: "payload/abc".into(),
+            generation: 7,
+            kind: "live".into(),
+        })
+        .expect("checkpoint handled");
+        let outs = svc
+            .handle_worker_event(&outcome(CHECKPOINT_LAG_WARN_ROUNDS + 1))
+            .expect("outcome handled");
+        assert!(
+            lag_warning(&outs).is_none(),
+            "a fresh fence closes the drift"
+        );
+
+        // …and a NEW drift past the margin re-warns, naming the stale fence.
+        let outs = svc
+            .handle_worker_event(&outcome(2 * CHECKPOINT_LAG_WARN_ROUNDS))
+            .expect("outcome handled");
+        let warning = lag_warning(&outs).expect("a new drift is voiced");
+        assert!(
+            warning.contains(&format!("round {CHECKPOINT_LAG_WARN_ROUNDS}")),
+            "the stale fence is named: {warning}"
+        );
+
+        // The warning is persisted (the `vhc detail` recent-events window), not only broadcast.
+        let events = svc.store.recent_events("run-lag", 64).expect("events read");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, VhcEvent::Warning { class, .. } if class == "checkpoint_lag")),
+            "the lag warning is a persisted event"
+        );
+    }
+
+    /// The lag alarm is trainer-scoped: a coordinator generation never warns (it recovers
+    /// through archive reconstruction, never a live pointer).
+    #[tokio::test]
+    async fn checkpoint_lag_never_warns_for_a_coordinator_generation() {
+        let svc = coordinator_trainer_service(OwnerBudget::unbounded());
+        seed_joined_run(&svc, "run-coord", 3);
+        svc.store
+            .set_execution_identity("run-coord", 0, "coordinator", 3)
+            .expect("the row carries the coordinator role");
+        svc.handle_worker_event(&protocol::Event::RunPhase {
+            run_id: "run-coord".into(),
+            phase: "running".into(),
+            epoch: 0,
+            round: 0,
+            generation: 3,
+        })
+        .expect("phase attributes the run");
+
+        let outs = svc
+            .handle_worker_event(&protocol::Event::RoundOutcome {
+                round: 4 * CHECKPOINT_LAG_WARN_ROUNDS,
+                committed: 2,
+                ingested: 2,
+                stalled: false,
+                digest: [0u8; 16],
+                generation: 3,
+            })
+            .expect("outcome handled");
+        assert!(
+            !outs
+                .iter()
+                .any(|e| matches!(e, VhcEvent::Warning { class, .. } if class == "checkpoint_lag")),
+            "a coordinator generation never trips the trainer fence alarm"
         );
     }
 

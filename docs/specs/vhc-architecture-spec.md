@@ -1013,6 +1013,28 @@ from silence.
   inherits the run-pinned `state_chunk_size`, so it serves those folds **self-sealed** — the host
   keeps custody of canonical state across the fence, publishing nothing to and fetching nothing
   from the payload plane. Local switch ≠ content-plane restore.
+- **[RL-9]** **A stale restore fence is bridged by staged archive catch-up, and the archive tip
+  is paced to stay within reach.** A rejoiner's fence may trail the live head past the
+  coordinator's bounded in-memory replay ring (`RETAINED_RECORD_HORIZON_ROUNDS` — authoring-time
+  *sizing* for the ordinary rejoin, not the recoverability guarantee). When it does, the node
+  compares the fence against the seat lineage's **verified** archive tip (the latest signed
+  committed-round claim, certificate-chained to genesis trust — never registry metadata): if the
+  tip reaches within a ring of the head, the join proceeds carrying a **catch-up directive**
+  (the verified head records + the fence) in its internal session credentials — additive,
+  node↔worker only, no consensus-wire change. The worker re-verifies the lineage, fetches the
+  attested segments (local file when hash-matched, else the content plane), extracts the
+  coordinator's historical round records from the archived publish stream, and the restored
+  guest folds them **staged, before live attach** — authenticity is the verified lineage, so the
+  historical frames deliberately bypass per-frame certificate liveness (a superseded incarnation's
+  records would otherwise refuse `CertRevoked`); payload bytes fetch from the content plane as in
+  live operation; the ordinary ring replay covers the unarchived tail and the dedup window
+  absorbs the overlap. The **overlap invariant** is host-enforced by round-aware seal pacing: the
+  session watches the committed-round watermark against the acknowledged archive tip and requests
+  a journal recovery point (a segment seal at the next append — never churning an empty segment)
+  once the lag crosses half the ring, so the archived stream and the ring always overlap under
+  healthy publication. A gap that still forms (a publication outage outlasting the ring — the
+  budget-free transport deferral keeps publication retrying) is a **typed refusal**
+  (`CheckpointStale`, naming the fence/head/horizon shape), never a silent wedge.
 
 ### 6.5 Node-local role composition
 
