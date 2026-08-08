@@ -3396,41 +3396,52 @@ impl VhcService {
             if let Some(evidence) = verified_head.into_iter().chain(pointer_head).max() {
                 let head = evidence.max(pointer.round);
                 let horizon = daemon_vhc_proto::RETAINED_RECORD_HORIZON_ROUNDS;
-                if head > pointer.round.saturating_add(horizon) {
-                    // The archive tip (the lineage's latest VERIFIED round claim) must reach
-                    // within a ring of the head, or the gap between the archived stream and
-                    // the retained ring is unbridgeable — the genuine CheckpointStale.
-                    let bridgeable = !recovery.lineage_heads.is_empty()
-                        && verified_head.is_some_and(|tip| tip.saturating_add(horizon) >= head);
-                    if !bridgeable {
+                // ANY fence gap stages archive catch-up when the verified lineage usefully
+                // reaches it (defect 18, c15m live): the nominal ring horizon is NOT a replay
+                // guarantee — a reconstructed coordinator's ring starts at its boot round, so
+                // a within-horizon gap can still be unreplayable and the trainer loops
+                // OUTCOME_STALE_RESTORE through the paced-respawn lane (fence 0, head 3,
+                // horizon 16 — the c15m shape). Catch-up overlap with the live ring replay is
+                // absorbed by the dedup window by design (Gate B'). "Usefully reaches": the
+                // tip covers the fence AND stands within a ring of the head. Without that,
+                // a within-ring gap proceeds bare (a young run's live ring is all there is)
+                // and a past-ring gap refuses typed — the genuine CheckpointStale.
+                if head > pointer.round {
+                    let ring_nominal = head <= pointer.round.saturating_add(horizon);
+                    let archive_reaches = !recovery.lineage_heads.is_empty()
+                        && verified_head.is_some_and(|tip| {
+                            tip >= pointer.round && tip.saturating_add(horizon) >= head
+                        });
+                    if archive_reaches {
+                        catch_up = Some(protocol::TrainerCatchUp {
+                            heads: recovery.lineage_heads.clone(),
+                            from_round: pointer.round,
+                        });
+                        let detail = format!(
+                            "{role}'s restore fence (round {}) trails the live head \
+                             (round {head}); the verified archive lineage (tip round {}) \
+                             covers the gap — staging archive catch-up before live attach \
+                             (ring replay + dedup absorb any overlap)",
+                            pointer.round,
+                            verified_head.unwrap_or(0),
+                        );
+                        tracing::info!(run = run_id, "{detail}");
+                        let mut emitted = Vec::new();
+                        let _ = self.emit(
+                            VhcEvent::Warning {
+                                run_id: run_id.to_string(),
+                                class: "archive_catch_up".to_string(),
+                                detail,
+                            },
+                            &mut emitted,
+                        );
+                    } else if !ring_nominal {
                         return Err(VhcError::CheckpointStale {
                             restored: pointer.round,
                             head,
                             horizon,
                         });
                     }
-                    catch_up = Some(protocol::TrainerCatchUp {
-                        heads: recovery.lineage_heads.clone(),
-                        from_round: pointer.round,
-                    });
-                    let detail = format!(
-                        "{role}'s restore fence (round {}) trails the live head (round {head}) \
-                         past the retained ring ({horizon}); the verified archive lineage \
-                         (tip round {}) bridges the gap — staging archive catch-up before \
-                         live attach",
-                        pointer.round,
-                        verified_head.unwrap_or(0),
-                    );
-                    tracing::info!(run = run_id, "{detail}");
-                    let mut emitted = Vec::new();
-                    let _ = self.emit(
-                        VhcEvent::Warning {
-                            run_id: run_id.to_string(),
-                            class: "archive_catch_up".to_string(),
-                            detail,
-                        },
-                        &mut emitted,
-                    );
                 }
             }
         }
@@ -5650,6 +5661,124 @@ mod storage_gate_tests {
             .await
             .expect_err("no lineage cannot bridge");
         assert!(matches!(err, VhcError::CheckpointStale { .. }));
+    }
+
+    /// Defect 18 (c15m live): a WITHIN-horizon fence gap must still stage archive catch-up
+    /// when the verified lineage covers it — the nominal ring horizon is not a replay
+    /// guarantee. A reconstructed coordinator's ring starts at its boot round, so the live
+    /// shape (fence 0, head 3, horizon 16) replayed nothing before round 3: the respawned
+    /// trainer looped `OUTCOME_STALE_RESTORE` through the paced-respawn lane every ~15 min
+    /// with no catch-up ever staged, because the old trigger required the gap to EXCEED the
+    /// horizon. Also pins the young-run posture: the same small gap with NO published lineage
+    /// proceeds bare (no directive, no refusal) — the live ring is all there is.
+    #[tokio::test]
+    async fn a_within_horizon_gap_after_reconstruction_still_stages_archive_catch_up() {
+        struct ReconstructedShape;
+        #[async_trait]
+        impl crate::discovery::RunDiscovery for ReconstructedShape {
+            async fn list_runs(&self) -> Result<Vec<crate::discovery::DiscoveredRun>, VhcError> {
+                Ok(Vec::new())
+            }
+            async fn get_run(
+                &self,
+                _run_id: &str,
+            ) -> Result<Option<crate::discovery::DiscoveredRun>, VhcError> {
+                Ok(None)
+            }
+            async fn fetch_envelope(&self, _run_id: &str) -> Result<Vec<u8>, VhcError> {
+                Ok(Vec::new())
+            }
+            async fn fetch_checkpoint(
+                &self,
+                _run_id: &str,
+                role: &str,
+            ) -> Result<Option<crate::discovery::CheckpointPointer>, VhcError> {
+                // The c15m shape verbatim: the co-trainer's only checkpoint is the round-0
+                // slot; the coordinator was killed with round 3 committed.
+                let round = if role == "coordinator" { 3 } else { 0 };
+                Ok(Some(crate::discovery::CheckpointPointer {
+                    role: role.into(),
+                    kind: "live".into(),
+                    round,
+                    hash: "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262".into(),
+                    size: 2048,
+                }))
+            }
+        }
+
+        let base = daemon_vhc_proto::SigningKey::from_bytes(&[0xB1; 32]);
+        let run_key = daemon_vhc_proto::SigningKey::from_bytes(&[0x4B; 32]);
+        let cert = daemon_vhc_proto::RunKeyCertificate::issue(
+            &base,
+            daemon_vhc_proto::CertScope {
+                run_id: daemon_vhc_proto::Hash([0x1E; 32]),
+                epoch: 0,
+                role: "coordinator".into(),
+                instance: 1,
+                module_hash: daemon_vhc_proto::Hash([0x2B; 32]),
+            },
+            daemon_vhc_proto::peer_id(&run_key),
+        )
+        .expect("cert issues");
+        let head = daemon_vhc_proto::ArchiveHeadRecord::publish(
+            &run_key,
+            cert,
+            daemon_vhc_proto::ArchiveHeadBody {
+                domain: daemon_vhc_proto::domains::ARCHIVE_HEAD_DOMAIN.into(),
+                run_id: daemon_vhc_proto::Hash([0x1E; 32]),
+                role: "coordinator".into(),
+                chain_instance: 1,
+                segment: 0,
+                segment_hash: daemon_vhc_proto::Hash([0xAB; 32]),
+                prev_hash: daemon_vhc_proto::Hash([0; 32]),
+                records: 1,
+                instance: 1,
+                epoch: 0,
+                module: daemon_vhc_proto::Hash([0x2B; 32]),
+                predecessor: None,
+                round: Some(2),
+            },
+        )
+        .expect("head publishes");
+
+        let mut svc = coordinator_trainer_service(OwnerBudget::unbounded());
+        svc.discovery = Some(Arc::new(ReconstructedShape));
+
+        // Lineage present (tip 2 covers fence 0, within a ring of head 3): the within-horizon
+        // gap stages catch-up — the leg the old past-horizon-only trigger dropped.
+        let recovered = RecoveryResolution {
+            reconstruct: None,
+            verified_head: Some(2),
+            lineage_heads: vec![head],
+        };
+        let (restore, catch_up) = svc
+            .resolve_restore("run-e", "trainer-0", &recovered)
+            .await
+            .expect("a covered gap is never a refusal");
+        assert_eq!(restore.expect("the fence still restores").round, 0);
+        let directive = catch_up.expect("defect 18: the within-horizon gap stages catch-up");
+        assert_eq!(directive.from_round, 0, "fenced at the restore round");
+        assert_eq!(directive.heads.len(), 1, "the verified lineage rides along");
+        let events = svc.store.recent_events("run-e", 16).expect("events read");
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                VhcEvent::Warning { class, .. } if class == "archive_catch_up"
+            )),
+            "the staged catch-up is a persisted warning"
+        );
+
+        // Young run (same gap, NO published lineage): bare restore — no directive, no refusal;
+        // the live ring is the only replay plane that exists.
+        let (restore, catch_up) = svc
+            .resolve_restore("run-f", "trainer-0", &RecoveryResolution::default())
+            .await
+            .expect("a within-ring gap with no archive proceeds");
+        assert_eq!(restore.expect("the fence still restores").round, 0);
+        assert!(
+            catch_up.is_none(),
+            "nothing to extract from an unpublished lineage"
+        );
     }
 
     /// Gate B' durable-checkpoint lag alarm (defect 14's unvoiced drift): a trainer whose
