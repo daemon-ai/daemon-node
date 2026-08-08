@@ -424,6 +424,20 @@ struct CkptLagTrack {
     warned_lag: u64,
 }
 
+/// The RAII half of the defect-17 bring-up serialization ([`VhcService::begin_bring_up`]):
+/// holds the run's slot in `bring_up` for the life of one join/reconverge transaction and
+/// releases it on drop — every early return of those long async bodies releases correctly.
+struct BringUpGuard<'a> {
+    set: &'a Mutex<std::collections::BTreeSet<String>>,
+    run_id: String,
+}
+
+impl Drop for BringUpGuard<'_> {
+    fn drop(&mut self) {
+        self.set.lock().unwrap().remove(&self.run_id);
+    }
+}
+
 struct InstanceEntry {
     /// The identity ADMITTED against the owner ledgers — the arbiter's reservation key. It
     /// stays fixed for the entry's whole life (release must present the admitted key), even
@@ -472,6 +486,13 @@ pub struct VhcService {
     /// its own worker child, incarnation, and ledger reservation. Empty unless the flag is set, so
     /// every existing gate is byte-identical.
     co_trainers: Mutex<BTreeMap<String, InstanceEntry>>,
+    /// Run bring-up transactions currently in flight (defect 17): an explicit `vhc join` and
+    /// the auto-resume reconvergence SERIALIZE here — the second entrant refuses/skips instead
+    /// of minting a competing incarnation. The c15k zombie: a restart's auto-resume raced the
+    /// operator's explicit join, three coordinator incarnations were minted in seconds, and
+    /// the survivor sat permanently superseded — WS-attached, certified outbound, refusing
+    /// every inbound record, with no liveness signal anywhere.
+    bring_up: Mutex<std::collections::BTreeSet<String>>,
     /// The co-located trainer's paced-respawn lane (defect 15), `run id → (attempts, due ms)`.
     /// A retryable-class sibling terminal arms it; the reconcile tick's repair pass fires it —
     /// the sibling has no run-level retry lane of its own because the PRIMARY seat instance
@@ -550,6 +571,7 @@ impl VhcService {
             arbiter: OwnerArbiter::new(parts.budget.unwrap_or_else(OwnerBudget::unbounded)),
             instances: Mutex::new(BTreeMap::new()),
             co_trainers: Mutex::new(BTreeMap::new()),
+            bring_up: Mutex::new(std::collections::BTreeSet::new()),
             co_retry: Mutex::new(BTreeMap::new()),
             worker_factory: parts.worker_factory,
             identity_dir: parts.identity_dir,
@@ -1141,7 +1163,31 @@ impl VhcService {
     /// mint strictly above the observed floor, so the restarted attempt re-reserves, re-authors,
     /// and re-publishes under a fresh superseding identity. A second stale refusal surfaces
     /// typed — never a loop.
+    /// Enter the run's bring-up transaction (defect 17): `None` when another bring-up (an
+    /// explicit join or an auto-resume reconvergence) already holds it. The guard releases on
+    /// drop, so every early return of the long async transaction bodies releases correctly.
+    fn begin_bring_up(&self, run_id: &str) -> Option<BringUpGuard<'_>> {
+        let mut set = self.bring_up.lock().unwrap();
+        if !set.insert(run_id.to_string()) {
+            return None;
+        }
+        Some(BringUpGuard {
+            set: &self.bring_up,
+            run_id: run_id.to_string(),
+        })
+    }
+
     async fn reconverge(&self, run: &PersistedRun) -> Result<(), VhcError> {
+        // Defect 17: the auto-resume half of the serialization — an explicit join (or another
+        // reconvergence) already bringing this run up owns the transaction; this pass simply
+        // yields (the retry lane re-fires if the standing transaction fails to land).
+        let Some(_guard) = self.begin_bring_up(&run.run_id) else {
+            tracing::info!(
+                run_id = run.run_id,
+                "reconverge: a bring-up for this run is already in flight; yielding to it"
+            );
+            return Ok(());
+        };
         match self.reconverge_attempt(run).await {
             Err(VhcError::OwnFloorRepaired { floor }) => {
                 tracing::info!(
@@ -3616,6 +3662,30 @@ impl VhcApi for VhcService {
         // child is torn down, never left idling.
         let fresh_child = existing.is_none() && self.worker_factory.is_some();
 
+        // Defect 17: a FRESH bring-up serializes against the auto-resume reconvergence (and any
+        // concurrent explicit join). Two racing bring-ups mint competing incarnations whose
+        // supersession leaves the survivor a zombie — the second entrant refuses TYPED instead.
+        // (A repeated join of a LIVE instance re-converges above without minting anything, so
+        // it never needs the guard.)
+        let _bring_up = if existing.is_none() {
+            match self.begin_bring_up(&run_id) {
+                Some(guard) => Some(guard),
+                None => {
+                    if fresh_child {
+                        worker.shutdown().await;
+                    }
+                    return Err(VhcError::Internal(format!(
+                        "a bring-up for `{run_id}` is already in flight (auto-resume or a \
+                         concurrent join); the standing transaction owns this run — retry \
+                         after it settles"
+                    ))
+                    .to_api());
+                }
+            }
+        } else {
+            None
+        };
+
         // Node-computed eligibility (ADR-003). When a discovery seam is configured, resolve the
         // run + fetch the frozen envelope + run the worker's real §6.5 `AssessRun` before `JoinRun`,
         // and take the coordinator endpoint from discovery. With no discovery configured, fall back
@@ -5056,6 +5126,70 @@ mod arbitration_tests {
         assert!(
             !svc.co_trainers.lock().unwrap().contains_key("run-a"),
             "no sibling entry appears from a refused attempt"
+        );
+    }
+
+    /// **Defect 17 (c15k): an explicit join and the auto-resume reconvergence SERIALIZE.**
+    /// Pre-fix both bring-up transactions ran concurrently through assess → mint → join,
+    /// minting competing incarnations (105/107/110 live) whose supersession left the survivor
+    /// a zombie — certified outbound, refused inbound, no liveness signal. The guard makes the
+    /// second entrant refuse typed (explicit join) or yield (reconvergence), and releases on
+    /// every exit path.
+    #[tokio::test]
+    async fn a_join_during_an_in_flight_bring_up_refuses_typed_and_reconverge_yields() {
+        let probe = Hardware {
+            gpus: 1,
+            vram_mb: 25_559,
+            ram_mb: 32_000,
+            ..Hardware::default()
+        };
+        let budget = OwnerBudget::from_config(&OwnerBudgetConfig::default(), Some(&probe), 50);
+        let svc = coordinator_trainer_service(budget);
+
+        // An auto-resume bring-up holds the run's transaction.
+        let guard = svc.begin_bring_up("run-a").expect("first entrant enters");
+        assert!(
+            svc.begin_bring_up("run-a").is_none(),
+            "a second entrant never enters the same run's bring-up"
+        );
+
+        // The explicit join refuses TYPED without touching the worker or minting anything.
+        let err = svc
+            .vhc_join("run-a".into(), policy(100), "op".into())
+            .await
+            .expect_err("a join during an in-flight bring-up refuses");
+        assert!(
+            err.to_string().contains("already in flight"),
+            "the refusal names the standing transaction: {err}"
+        );
+        assert!(
+            svc.instances.lock().unwrap().is_empty(),
+            "no competing instance was created"
+        );
+
+        // The reconvergence half yields Ok without minting a competing incarnation.
+        svc.store
+            .put_join_intent(
+                "run-a",
+                "wss://example/run-a",
+                &policy(100),
+                None,
+                &eligibility(2 << 30, 2 << 30),
+            )
+            .expect("row");
+        let run = svc.store.get_run("run-a").expect("read").expect("row");
+        svc.reconverge(&run).await.expect("reconverge yields");
+        assert!(
+            svc.instances.lock().unwrap().is_empty(),
+            "the yielding reconvergence created nothing"
+        );
+
+        // Release: the next entrant proceeds (and the guard is re-entrant-safe by run id).
+        drop(guard);
+        let reacquired = svc.begin_bring_up("run-a");
+        assert!(
+            reacquired.is_some(),
+            "the transaction slot releases with the guard"
         );
     }
 }

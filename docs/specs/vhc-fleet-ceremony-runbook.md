@@ -637,6 +637,18 @@ never wait it out.
   head-verification error is the fork/corruption fail-closed path: adjudicate the archive
   (§5.7), never force a fresh seat.
 
+**Bring-up serialization (defect 17, c15k).** One bring-up transaction per run per node: an
+explicit `daemon-cli vhc join` issued while the node's auto-resume reconvergence is in flight
+refuses typed ("a bring-up … is already in flight — retry after it settles"), and a
+reconvergence firing under a standing explicit join yields to it. Pre-fix both ran
+concurrently and minted competing incarnations whose supersession left the survivor a zombie
+— certified outbound, refusing every inbound record, no liveness signal. Defense in depth on
+the session side: after every ingested distribution record the attach re-judges its OWN key
+(`CertCheck::own_death`); evidence of self-supersession (a higher incarnation on the own
+certifying base's ladder, an explicit revocation, or a fencing seat grant) ends the session
+typed-retryable (`superseded` warning) so reconvergence mints a fresh incarnation above the
+floor — supersession is a terminal, never a mute.
+
 ### 5.6 Completion
 
 `--stop-rounds 48` → the run reaches its terminal state on every box; `daemon-cli vhc detail`

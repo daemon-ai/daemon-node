@@ -210,6 +210,33 @@ impl CertCheck {
         Err(last_err)
     }
 
+    /// Judge OUR OWN per-run key under the evidence this attach has verified: `Some(refusal)`
+    /// when the key is explicitly revoked, its incarnation is superseded by a higher observed
+    /// one on its OWN certifying base's ladder, or a verified seat grant binds our role to a
+    /// different claimant. `None` while alive — and `None` when no stored certificate names
+    /// the key (absence of evidence never kills; a sibling base's ladder never judges us).
+    ///
+    /// Defect 17 (c15k): a superseded incarnation that keeps running is a ZOMBIE — peers
+    /// accept its still-certified outbound voice while its every inbound sender judgment
+    /// refuses `CertRevoked`, so no liveness signal fires anywhere. Supersession is a session
+    /// TERMINAL, not a mute: the session polls this after every ingested distribution record
+    /// and ends typed-retryable so reconvergence mints a fresh incarnation above the floor.
+    #[must_use]
+    pub fn own_death(&self, scope: &CertScope, own: &PeerId) -> Option<String> {
+        let base = self
+            .certs
+            .iter()
+            .find(|c| c.body.run_key == *own)
+            .map(|c| c.base_identity)?;
+        if let Err(e) = self.revocations.judge(scope, own, &base) {
+            return Some(e.to_string());
+        }
+        if self.seat_terms.binds(&scope.run_id, &scope.role, own) == Some(false) {
+            return Some(CertError::SeatSuperseded.to_string());
+        }
+        None
+    }
+
     /// Judge one verified frame's sender: certified to a trusted base for the full scope, and not
     /// revoked/superseded.
     fn judge(&self, scope: &CertScope, sender: &PeerId) -> Result<(), CertError> {
@@ -329,6 +356,15 @@ impl InboundFrames {
     /// the control plane). `None` only on the harness path.
     pub fn certs_mut(&mut self) -> Option<&mut CertCheck> {
         self.cert_check.as_mut()
+    }
+
+    /// [`CertCheck::own_death`] over this attach's certificate layer (`None` on the harness
+    /// path — no evidence, no judgment).
+    #[must_use]
+    pub fn own_death(&self, scope: &CertScope, own: &PeerId) -> Option<String> {
+        self.cert_check
+            .as_ref()
+            .and_then(|c| c.own_death(scope, own))
     }
 
     /// Route one inbound §12.3 distribution record into the certificate layer (the records
@@ -578,6 +614,13 @@ impl Attach {
         self.frames.ingest_distribution(record)
     }
 
+    /// [`CertCheck::own_death`] over the attach's certificate layer (the defect-17 self-check
+    /// the session runs after each ingested distribution record).
+    #[must_use]
+    pub fn own_death(&self, scope: &CertScope, own: &PeerId) -> Option<String> {
+        self.frames.own_death(scope, own)
+    }
+
     /// Verify + (iff verified, first-sighted, in-sequence) deliver one inbound wire frame.
     ///
     /// The pump's reliable class is bounded and back-pressures rather than drops (§4.7): on a
@@ -676,5 +719,69 @@ mod tests {
             v.accept(&frame(&uncertified, run)),
             InboundVerdict::Deliver { .. }
         ));
+    }
+
+    /// **The defect-17 self-check (c15k): a session must SEE its own supersession.** The live
+    /// zombie: a racing bring-up minted a higher coordinator incarnation, the survivor's every
+    /// inbound judgment refused `CertRevoked`, peers still accepted its certified outbound
+    /// voice, and no liveness signal fired anywhere for 14+ minutes. `own_death` is the
+    /// session's mirror judgment over the same ledger — evidence that kills us must end us.
+    #[test]
+    fn own_death_sees_supersession_on_the_own_base_ladder_and_never_a_siblings() {
+        let base_a = SigningKey::from_bytes(&[0xA0; 32]);
+        let base_b = SigningKey::from_bytes(&[0xB0; 32]);
+        let run = daemon_vhc_proto::Hash([0x11; 32]);
+        let scope = |role: &str, instance: u64| CertScope {
+            run_id: run,
+            epoch: 0,
+            role: role.into(),
+            instance,
+            module_hash: daemon_vhc_proto::Hash([0x22; 32]),
+        };
+        let own_key = SigningKey::from_bytes(&[0x01; 32]);
+        let own = peer_id(&own_key);
+        let own_cert =
+            RunKeyCertificate::issue(&base_a, scope("coordinator", 5), own).expect("own cert");
+
+        let mut check = CertCheck::new(
+            vec![peer_id(&base_a), peer_id(&base_b)],
+            vec![own_cert.clone()],
+        );
+        assert_eq!(
+            check.own_death(&scope("coordinator", 5), &own),
+            None,
+            "alive while no higher incarnation is observed"
+        );
+
+        // A SIBLING base's ladder never judges us: base B certifies a higher incarnation of
+        // the same role name — a roster sibling's parallel ladder, not our supersession.
+        let sibling_key = SigningKey::from_bytes(&[0x02; 32]);
+        let sibling =
+            RunKeyCertificate::issue(&base_b, scope("coordinator", 9), peer_id(&sibling_key))
+                .expect("sibling cert");
+        check.ingest_certificate(sibling);
+        assert_eq!(
+            check.own_death(&scope("coordinator", 5), &own),
+            None,
+            "a sibling base's ladder never kills us"
+        );
+
+        // OUR base certifies incarnation 6 of our role slot: we are superseded — dead, typed.
+        let successor_key = SigningKey::from_bytes(&[0x03; 32]);
+        let successor =
+            RunKeyCertificate::issue(&base_a, scope("coordinator", 6), peer_id(&successor_key))
+                .expect("successor cert");
+        check.ingest_certificate(successor);
+        let death = check
+            .own_death(&scope("coordinator", 5), &own)
+            .expect("superseded incarnation judged dead");
+        assert!(
+            death.contains("revoked") || death.contains("superseded"),
+            "the refusal names the supersession: {death}"
+        );
+
+        // No stored certificate names the key at all → no judgment (absence never kills).
+        let stranger = peer_id(&SigningKey::from_bytes(&[0x04; 32]));
+        assert_eq!(check.own_death(&scope("coordinator", 5), &stranger), None);
     }
 }

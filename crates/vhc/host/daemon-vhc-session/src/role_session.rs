@@ -727,12 +727,35 @@ async fn run_role(
             frame = inbound.recv() => {
                 match frame {
                     Some(frame) => {
-                        if !accept_inbound(
-                            &mut current.attach, &frame, own_sender, &mut held, events, gen_now,
-                            &mut health,
+                        match accept_inbound(
+                            &mut current.attach, &frame, own_sender, &current.identity,
+                            &mut held, events, gen_now, &mut health,
                         ) {
-                            transport_fault = Some("inbound frame delivery failed".into());
-                            break 'session;
+                            InboundStep::Continue => {}
+                            InboundStep::DeliveryFailed => {
+                                transport_fault = Some("inbound frame delivery failed".into());
+                                break 'session;
+                            }
+                            InboundStep::Superseded(refusal) => {
+                                // Defect 17: verified evidence judged THIS incarnation dead.
+                                // Terminate typed-retryable — reconvergence mints a fresh
+                                // incarnation above the supersession floor; running on as a
+                                // certified-outbound / refused-inbound zombie wedges the run
+                                // with no liveness signal anywhere.
+                                let _ = events.send(Event::Warning {
+                                    class: "superseded".into(),
+                                    detail: format!(
+                                        "own incarnation {} is dead to the run ({refusal}); \
+                                         terminating the session for a fresh incarnation \
+                                         (generation {gen_now})",
+                                        current.identity.instance
+                                    ),
+                                });
+                                transport_fault = Some(format!(
+                                    "own incarnation superseded: {refusal}"
+                                ));
+                                break 'session;
+                            }
                         }
                     }
                     None => {
@@ -1513,18 +1536,34 @@ fn unix_ms_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// How one inbound frame left the session loop.
+enum InboundStep {
+    /// Processed (delivered / duplicate / held / refused typed) — the loop continues.
+    Continue,
+    /// A pump/journal failure while delivering an already-verified frame.
+    DeliveryFailed,
+    /// The ingested evidence judged OUR OWN incarnation dead (defect 17): revoked, superseded
+    /// by a higher incarnation on our certifying base's ladder, or fenced by a verified seat
+    /// grant binding the role elsewhere. The session must END — a superseded incarnation that
+    /// keeps running is a zombie (peers accept its outbound voice; its inbound judgment
+    /// refuses everything; no liveness signal fires).
+    Superseded(String),
+}
+
 /// Verify + deliver one inbound wire frame. Own-voice echoes (a plane that self-delivers) are
 /// dropped before verification; gapped and back-pressured frames are HELD for re-presentation —
-/// the reliable class never silently skips. Returns `false` on a pump/journal delivery failure.
+/// the reliable class never silently skips.
+#[allow(clippy::too_many_arguments)]
 fn accept_inbound(
     attach: &mut Attach,
     frame: &[u8],
     own_sender: PeerId,
+    identity: &RunIdentity,
     held: &mut VecDeque<(std::time::Instant, Vec<u8>)>,
     events: &mpsc::UnboundedSender<Event>,
     generation: u64,
     health: &mut InboundHealth,
-) -> bool {
+) -> InboundStep {
     // §12.3 distribution records travel on the same plane beside frames; the classification is
     // structural (a record is a top-level map, a §12.1 frame a top-level array), so this decode
     // attempt is cheap and never speculative on frame bytes. A refused record is a typed
@@ -1535,7 +1574,21 @@ fn accept_inbound(
         health.records = health.records.saturating_add(1);
         match attach.ingest_distribution(record) {
             Ok(()) => {
-                tracing::debug!("inbound: distribution record ingested (peer cert/revocation)")
+                tracing::debug!("inbound: distribution record ingested (peer cert/revocation)");
+                // The defect-17 self-check: did the evidence just ingested kill US? A
+                // certificate for a higher incarnation of our own role slot, an explicit
+                // revocation of our key, or a seat grant fencing our role all mean this
+                // incarnation must terminate — supersession is a terminal, never a mute.
+                let own_scope = daemon_vhc_proto::CertScope {
+                    run_id: daemon_vhc_proto::Hash(identity.run_id),
+                    epoch: identity.epoch,
+                    role: identity.role.clone(),
+                    instance: identity.instance,
+                    module_hash: daemon_vhc_proto::Hash(identity.module),
+                };
+                if let Some(refusal) = attach.own_death(&own_scope, &own_sender) {
+                    return InboundStep::Superseded(refusal);
+                }
             }
             Err(refusal) => {
                 tracing::debug!(%refusal, "inbound: distribution record refused");
@@ -1545,12 +1598,12 @@ fn accept_inbound(
                 });
             }
         }
-        return true;
+        return InboundStep::Continue;
     }
     // Echo filter: the §12.1 frame envelope's `sender` field (mechanism, not message schema).
     // The module's own voice is already its state; a self-delivering plane must not feed it back.
     if envelope_sender(frame) == Some(own_sender.0) {
-        return true;
+        return InboundStep::Continue;
     }
     match attach.deliver(frame) {
         Ok(InboundVerdict::Deliver { .. }) => {
@@ -1560,17 +1613,17 @@ fn accept_inbound(
                 sender = envelope_sender(frame).map(|s| hex16(&s)),
                 "inbound: frame delivered to the module"
             );
-            true
+            InboundStep::Continue
         }
         Ok(InboundVerdict::Duplicate { .. }) => {
             health.duplicate = health.duplicate.saturating_add(1);
-            true
+            InboundStep::Continue
         }
         Ok(InboundVerdict::Gap { .. } | InboundVerdict::Backpressure { .. }) => {
             health.held = health.held.saturating_add(1);
             tracing::debug!("inbound: frame held (gap/backpressure)");
             hold_frame(held, frame);
-            true
+            InboundStep::Continue
         }
         Ok(
             verdict @ (InboundVerdict::BadSignature(_)
@@ -1587,9 +1640,9 @@ fn accept_inbound(
                 class: "frame_refused".into(),
                 detail: format!("{verdict:?} (generation {generation})"),
             });
-            true
+            InboundStep::Continue
         }
-        Err(_) => false,
+        Err(_) => InboundStep::DeliveryFailed,
     }
 }
 
