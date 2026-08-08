@@ -1864,6 +1864,22 @@ sidecar-header = {
   Publishing a journal (e.g. for third-party audit) does NOT automatically publish sidecars; a
   journal consumer without a sidecar (or without the key) sees a typed `ReplayMissingPayload`
   outcome (§8.7), not silent divergence.
+- **Reconstruction never depends on sidecar files or key material (normative; the Gate A
+  closure of the c15-20260806h refusal).** Confidentiality above is preserved by construction
+  because the §8.8 archive-portable recovery path needs no sidecar: the only sidecar-sized
+  read-back a coordinator seat records is its §10.2 restore section (`read_back(kind = 3)`,
+  legal only during `da_migrate`; by-ref sections restore through `data@2::fetch`, never
+  through kind 3), and those plaintext bytes are content-addressed INLINE sections of the
+  migration capture the reconstruction rebuilds from the archived record stream itself. The
+  reconstruction executor resolves a sidecar-referenced kind-3 value against that capture as
+  the AUTHORITATIVE path; the node's local sidecar store (decrypted under the journal key,
+  hash-verified) is a same-box cache fast-path only. Data classification, measured on real
+  ceremony journals (c15h): coordinator chains carry kind-3 only; trainer chains additionally
+  carry kind-5 tensor exports (private model state) which stay node-local encrypted and are
+  NEVER reconstruction inputs — no plaintext sidecar publication exists or is needed.
+  Durability ordering at the archive boundary: the capture rides the record stream, so the
+  §8.8 publisher's existing order — hash-verified segment upload durable → attested head
+  accepted → only then local closure prune-eligible — is the complete dependency order.
 
 ### 8.6 Evidence: original signed frames (normative)
 

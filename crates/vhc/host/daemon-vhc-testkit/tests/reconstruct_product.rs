@@ -1079,3 +1079,209 @@ async fn a_resumed_seat_with_sidecar_restore_readbacks_reconstructs_after_a_seco
         "standby guest thread joined"
     );
 }
+
+/// Seal a crashed chain's unsealed tail by the SAME-BOX recovery reopen (the production
+/// mechanism that closes the archive/crash gap: the next incarnation reopens the file series,
+/// the recovery point seals, and the publisher's startup sweep archives it). The terminal is
+/// a journal record, never a replay input.
+fn seal_tail(root: &std::path::Path, spec: &CoordinatorSpec, instance: u64) {
+    let identity = RunIdentity {
+        run_id: spec.run_id.0,
+        epoch: 0,
+        role: "coordinator".into(),
+        instance,
+        module: spec.module_hash.0,
+    };
+    let jdir = journal_dir(root, RUN_LABEL, "coordinator", instance);
+    let mut sink = DurableSink::open(&jdir, &identity, [0x5C; 32]).expect("recovery reopen");
+    sink.terminal(2, None, None)
+        .expect("seal the recovery point");
+}
+
+/// **The Gate A decisive regression (defect 13 closed properly): archive-portable recovery
+/// with ZERO local state.** The plan's bar: "delete ALL local run state (journals, sidecars,
+/// `journal.key`), reconstruct solely from the assembled product archive, reproduce the
+/// committed head and every recorded decision."
+///
+/// The lineage crosses the hardest seam — a successor chain whose first records are §10.2
+/// restore read-backs riding encrypted LOCAL sidecars (the c15h refusal shape) — and the
+/// final reconstruction runs as a true cold standby: `journal_root: None` (no local segments,
+/// no local tail, no sidecar files) and `sidecar_key: None` (no node key material). The
+/// kind-3 values must resolve through the AUTHORITATIVE path: content-addressed against the
+/// migration capture rebuilt from the archived record stream itself. The decision gate
+/// (`verify_decisions`) runs inside the executor at every span, so success here IS the
+/// "every recorded decision" proof.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cold_standby_with_zero_local_state_reconstructs_solely_from_the_product_archive() {
+    const PRE: u64 = 10;
+    const POST: u64 = 2;
+    let rig = rig();
+    let root = tempdir();
+
+    // -- chain 1: the primary drives PRE rounds, crashes; the recovery reopen seals the tail ------
+    let primary_key_seed = *blake3::hash(b"reconstruct/zero-local/primary").as_bytes();
+    let (sink, chain1) = open_live_sink(&root, &rig.spec);
+    let mut primary = Coordinator::start_with_sink(
+        &rig.wasm,
+        &rig.spec,
+        phase_a_grants(),
+        1,
+        primary_key_seed,
+        Box::new(sink),
+    )
+    .unwrap();
+    for sm in &build_script(&rig.worker_keys, 0..PRE) {
+        primary.deliver(&sm.key, &sm.msg).expect("primary deliver");
+    }
+    for i in 0..decision_count(PRE, true) {
+        primary
+            .next_decision(Duration::from_secs(60))
+            .unwrap_or_else(|e| panic!("primary decision {i}: {e}"));
+    }
+    let end = primary.kill().expect("primary killed");
+    assert!(matches!(end, RunEnd::Outcome(_)), "guest thread joined");
+    seal_tail(&root, &rig.spec, 1);
+
+    let heads_dir = root.join("heads");
+    let segments = Arc::new(MemoryContentStore::new());
+    let heads = publish_prefix(
+        &root,
+        rig.spec.run_id,
+        rig.spec.module_hash,
+        &rig.base_key,
+        chain1,
+        segments.clone(),
+        &heads_dir,
+    )
+    .await;
+    assert!(!heads.is_empty(), "chain 1 published to the archive");
+
+    // -- reconstruction #1 is ALREADY a cold standby: the successor may be a different box, so
+    //    the capture it resumes from must derive from the archive alone --------------------------
+    let store: Arc<dyn ContentStore> = segments.clone();
+    let capture = reconstruct_coordinator(
+        ReconstructSpec {
+            heads: heads.clone(),
+            run_id: rig.spec.run_id,
+            trusted: vec![rig.base_id],
+            role: "coordinator".into(),
+            run_label: RUN_LABEL.into(),
+            journal_root: None,
+            module: rig.wasm.clone(),
+            config: rig.spec.config_bytes.clone(),
+            grants: phase_a_grants(),
+            incarnation: 2,
+            restore: None,
+            sidecar_key: None,
+            deadline_ms: 60_000,
+        },
+        store,
+    )
+    .await
+    .expect("the first cold-standby reconstruction succeeds from the archive alone");
+
+    // -- chain 2: the standby resumes from the capture (§10.2), drives POST rounds, crashes ------
+    let standby_key_seed = *blake3::hash(b"reconstruct/zero-local/standby").as_bytes();
+    let (sink2, chain2) = open_live_sink_of(&root, &rig.spec, 2, 8);
+    let mut standby = Coordinator::start_migrating_with_sink(
+        &rig.wasm,
+        &rig.spec,
+        phase_a_grants(),
+        2,
+        standby_key_seed,
+        capture,
+        Box::new(sink2),
+    )
+    .unwrap();
+    for sm in &build_script(&rig.worker_keys, PRE..PRE + POST) {
+        standby.deliver(&sm.key, &sm.msg).expect("standby deliver");
+    }
+    for i in 0..decision_count(POST, false) {
+        standby
+            .next_decision(Duration::from_secs(60))
+            .unwrap_or_else(|e| panic!("standby decision {i}: {e}"));
+    }
+    let end = standby.kill().expect("standby killed");
+    assert!(
+        matches!(end, RunEnd::Outcome(_)),
+        "standby guest thread joined"
+    );
+    seal_tail(&root, &rig.spec, 2);
+
+    // The defect shape MUST be on disk before the sweep: the successor chain's §10.2 restore
+    // read-back rode a sidecar — otherwise this drill proves nothing about Gate A.
+    {
+        let jdir = journal_dir(&root, RUN_LABEL, "coordinator", 2);
+        let paths = daemon_vhc_journal::JournalPaths::open(&jdir).expect("journal home");
+        let mut sidecar_refs = 0;
+        for ord in paths.existing_segments().expect("segment listing") {
+            let scan = daemon_vhc_journal::scan_file(paths.segment(ord)).expect("scan");
+            for r in &scan.records {
+                if let daemon_vhc_journal::Body::ReadBack(rb) = &r.body {
+                    if rb.sidecar.is_some() && rb.value.is_none() {
+                        sidecar_refs += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            sidecar_refs >= 1,
+            "the restore read-back must ride a sidecar (§8.5) for this drill to exercise \
+             the archive-portability seam — raise PRE if the state stayed under the inline max"
+        );
+    }
+
+    let heads = publish_prefix_of(
+        &root,
+        rig.spec.run_id,
+        rig.spec.module_hash,
+        &rig.base_key,
+        2,
+        chain2,
+        segments.clone(),
+        &heads_dir,
+    )
+    .await;
+    assert!(
+        heads.iter().any(|h| h.body.chain_instance == chain2),
+        "chain 2 published to the archive"
+    );
+
+    // -- DELETE all local run state: journals, sidecars, unsealed tails, everything --------------
+    let run_state = daemon_vhc_session::journal_home::run_state_dir(&root, RUN_LABEL);
+    assert!(
+        run_state.is_dir(),
+        "the run-state dir exists before the sweep"
+    );
+    std::fs::remove_dir_all(&run_state).expect("local run state deleted");
+
+    // -- the decisive reconstruction: zero local state, no key material, archive only ------------
+    let store: Arc<dyn ContentStore> = segments;
+    let capture2 = reconstruct_coordinator(
+        ReconstructSpec {
+            heads,
+            run_id: rig.spec.run_id,
+            trusted: vec![rig.base_id],
+            role: "coordinator".into(),
+            run_label: RUN_LABEL.into(),
+            journal_root: None,
+            module: rig.wasm.clone(),
+            config: rig.spec.config_bytes.clone(),
+            grants: phase_a_grants(),
+            incarnation: 3,
+            restore: None,
+            sidecar_key: None,
+            deadline_ms: 60_000,
+        },
+        store,
+    )
+    .await
+    .expect("zero local state: the product archive alone reconstructs the seat (Gate A)");
+    let state = coordinator_state_from_capture(&capture2).expect("exported state decodes");
+    assert_eq!(
+        state.round,
+        PRE + POST,
+        "the rebuilt seat stands at the RECORDED next un-opened round — the committed head \
+         reproduced solely from the archive"
+    );
+}

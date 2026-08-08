@@ -125,11 +125,14 @@ pub struct ReconstructSpec {
     /// path's candidate (engaged only when the recovered stream's last tag-10 byte-matches its
     /// manifest; otherwise the full lineage replays from genesis).
     pub restore: Option<SnapshotCapture>,
-    /// The node's durable journal sidecar key (§8.5, `VhcKeystore::journal_sidecar_key`) —
-    /// lets a SAME-BOX reconstruction decrypt the sidecar-referenced read-back values its own
-    /// crashed incarnations recorded (a successor chain's §10.2 restore sections exceed
-    /// `READBACK_INLINE_MAX` and ride sidecars, never the archive). `None` (a cold standby)
-    /// falls back to content-addressed resolution against the span's rebuilt migration capture.
+    /// The node's durable journal sidecar key (§8.5, `VhcKeystore::journal_sidecar_key`) — a
+    /// same-box CACHE FAST-PATH only (Gate A): it lets this reconstruction decrypt the local
+    /// sidecar files its own crashed incarnations wrote, skipping a capture replay dependency.
+    /// The AUTHORITATIVE path never needs it: the only sidecar-sized read-backs a coordinator
+    /// records are its §10.2 restore sections (kind 3, legal only during `da_migrate`), and
+    /// those bytes are content-addressed sections of the migration capture the reconstruction
+    /// rebuilds from the archived record stream itself. `None` (a cold standby / different box)
+    /// is therefore fully supported, not degraded.
     pub sidecar_key: Option<[u8; 32]>,
     /// The quiesce drain ceiling for the state export (ms).
     pub deadline_ms: u64,
@@ -306,11 +309,14 @@ async fn recover_records(
             }
         }
 
-        // Same-box sidecar hydration (§8.5): a record's sidecar-referenced read-back value
-        // (a successor incarnation's §10.2 restore sections) lives in the chain's LOCAL
-        // sidecar store, decryptable with the node's own journal key. Best-effort: what does
-        // not hydrate here still resolves content-addressed against the span's migration
-        // capture in `build_script`, and only THEN refuses typed.
+        // Same-box sidecar hydration (§8.5) — the CACHE FAST-PATH (Gate A), never the
+        // authority: a record's sidecar-referenced read-back value (a successor incarnation's
+        // §10.2 restore sections) may live in the chain's LOCAL sidecar store, decryptable
+        // with the node's own journal key and verified against its content address. What does
+        // not hydrate here (a cold standby, a pruned store, a different box) resolves through
+        // the AUTHORITATIVE path in `build_script`: content-addressed against the migration
+        // capture rebuilt from the archived record stream. Only when BOTH miss does the
+        // reconstruction refuse typed.
         if let (Some(key), Some(dir)) = (spec.sidecar_key, &dir) {
             hydrate_sidecars(&mut chain_records, dir, key);
         }
@@ -432,12 +438,16 @@ fn sections_by_hash(
 /// read-backs routed by kind, clock readings, timer arms/cancels, device profiles.
 ///
 /// A read-back whose value rode a sidecar (plaintext > `READBACK_INLINE_MAX`, §8.5) is
-/// resolved CONTENT-ADDRESSED from `sections`: sidecar files are node-local (their key
-/// material never rides the archive, §8.5), but the only sidecar-sized read-backs a
-/// coordinator records are its §10.2 restore sections (`read_back(kind = 3)` is legal
-/// only during `da_migrate`) — and those bytes are exactly the migration capture the
-/// reconstruction already rebuilt from the predecessor span. An unresolvable reference
-/// refuses typed: replaying a guessed value would fork the seat behind its own record.
+/// resolved CONTENT-ADDRESSED from `sections` — the AUTHORITATIVE archive path (Gate A):
+/// sidecar files are node-local (their key material never rides the archive, §8.5), but
+/// the only sidecar-sized read-backs a coordinator records are its §10.2 restore sections
+/// (`read_back(kind = 3)` is legal only during `da_migrate`, and by-ref sections restore
+/// through `data@2::fetch`, never through kind 3) — so those bytes are exactly the INLINE
+/// sections of the migration capture the reconstruction already rebuilt from the archived
+/// stream. The c15h audit confirms the domain: kind 3 is the ONLY sidecar-referenced kind
+/// any coordinator chain records (trainer kind-5 tensor exports stay node-local and are
+/// never reconstruction inputs). An unresolvable reference refuses typed: replaying a
+/// guessed value would fork the seat behind its own record.
 fn build_script(
     records: &[Record],
     sections: &std::collections::BTreeMap<[u8; 32], Vec<u8>>,
@@ -485,6 +495,21 @@ fn build_script(
         }
     }
     Ok(script)
+}
+
+/// Whether an encoded event frame is the host's `Stop` delivery (`EV_TAG_STOP`): the frame is
+/// the canonical CBOR array `[tag, ...]` and the tag is its first element.
+fn is_stop_event(frame: &[u8]) -> bool {
+    let Ok(ciborium::value::Value::Array(items)) =
+        ciborium::de::from_reader::<ciborium::value::Value, _>(frame)
+    else {
+        return false;
+    };
+    matches!(
+        items.first(),
+        Some(ciborium::value::Value::Integer(i))
+            if u64::try_from(*i) == Ok(daemon_vhc_abi::EV_TAG_STOP)
+    )
 }
 
 /// The decision gate: every recorded outbound publish `(channel, seq, payload hash)` of the
@@ -590,6 +615,20 @@ fn replay_capture(
             sections_by_hash(None)
         };
         let mut script = build_script(&span.records, &section_values)?;
+        // A TRAILING recorded stop delivery (`EV_TAG_STOP`) is the host's end-of-feed marker —
+        // a graceful stop that was journaled before the process exited — not a consensus
+        // input: the guest returns from `da_run` on it without publishing, so re-feeding it
+        // would end the replay before the synthetic reconstruction Quiesce can export
+        // (§10.2). Drop it; the state to rebuild IS the state at the stop point. (A stop with
+        // records after it — a same-incarnation node-restart resume — replays through the
+        // live LOCAL recovery path, never through this executor.)
+        if script
+            .events
+            .back()
+            .is_some_and(|(_, frame)| is_stop_event(frame))
+        {
+            script.events.pop_back();
+        }
         script.identity = Some(RunIdentity {
             run_id: span.header.run_id.0,
             epoch: span.header.epoch,
