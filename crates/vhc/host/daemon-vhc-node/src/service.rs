@@ -472,6 +472,13 @@ pub struct VhcService {
     /// its own worker child, incarnation, and ledger reservation. Empty unless the flag is set, so
     /// every existing gate is byte-identical.
     co_trainers: Mutex<BTreeMap<String, InstanceEntry>>,
+    /// The co-located trainer's paced-respawn lane (defect 15), `run id → (attempts, due ms)`.
+    /// A retryable-class sibling terminal arms it; the reconcile tick's repair pass fires it —
+    /// the sibling has no run-level retry lane of its own because the PRIMARY seat instance
+    /// stays live (the run row never leaves `Running`), so without this a retryable sibling
+    /// terminal silently halved the run's membership until the operator intervened (c15k:
+    /// `OUTCOME_STALE_RESTORE` after coordinator reconstruction stalled the run for good).
+    co_retry: Mutex<BTreeMap<String, (u32, i64)>>,
     worker_factory: Option<WorkerFactory>,
     /// The identity keystore directory (D-P8 credential + per-run cert authorship); `None`
     /// disables node-side authorship (tests / headless).
@@ -543,6 +550,7 @@ impl VhcService {
             arbiter: OwnerArbiter::new(parts.budget.unwrap_or_else(OwnerBudget::unbounded)),
             instances: Mutex::new(BTreeMap::new()),
             co_trainers: Mutex::new(BTreeMap::new()),
+            co_retry: Mutex::new(BTreeMap::new()),
             worker_factory: parts.worker_factory,
             identity_dir: parts.identity_dir,
             run_dir: parts.run_dir,
@@ -1019,6 +1027,57 @@ impl VhcService {
                         &mut emitted,
                     );
                     self.emit_changed(Some(run.run_id.clone()));
+                }
+            }
+        }
+        // Defect 15 — the co-located trainer repair pass: a seat-holding run whose sibling died
+        // on a retryable-class terminal re-converges the sibling here, paced by the lane armed
+        // in `handle_run_terminated`. The lane fires only while the run is genuinely live on
+        // this node (row `Running`, primary instance present, seat role); anything else clears
+        // it — a leave/terminal of the primary owns the whole teardown.
+        if self.config.coordinator_trains {
+            let now = now_ms();
+            let due_siblings: Vec<String> = {
+                let lane = self.co_retry.lock().unwrap();
+                lane.iter()
+                    .filter(|(_, (_, due))| *due <= now)
+                    .map(|(run_id, _)| run_id.clone())
+                    .collect()
+            };
+            for run_id in due_siblings {
+                if self.co_trainers.lock().unwrap().contains_key(&run_id) {
+                    // A competing path (reconvergence of the primary) already respawned it.
+                    self.co_retry.lock().unwrap().remove(&run_id);
+                    continue;
+                }
+                let row = self.store.get_run(&run_id)?;
+                let primary_live = self.instances.lock().unwrap().contains_key(&run_id);
+                let eligible = row.as_ref().is_some_and(|r| {
+                    r.run_state == RunState::Running
+                        && !r.role.is_empty()
+                        && r.role == self.config.seat_role
+                }) && primary_live;
+                if !eligible {
+                    self.co_retry.lock().unwrap().remove(&run_id);
+                    continue;
+                }
+                let policy = row.expect("eligible row present").policy;
+                self.spawn_co_located_trainer(&run_id, &policy).await;
+                if self.co_trainers.lock().unwrap().contains_key(&run_id) {
+                    self.co_retry.lock().unwrap().remove(&run_id);
+                    reconverged += 1;
+                } else {
+                    // The spawn refused (warned inside): re-arm with grown backoff so the
+                    // repair keeps trying without a hot loop.
+                    let mut lane = self.co_retry.lock().unwrap();
+                    let attempts = lane.get(&run_id).map_or(1, |(n, _)| *n);
+                    lane.insert(
+                        run_id.clone(),
+                        (
+                            attempts.saturating_add(1),
+                            now_ms() + retry_backoff_ms(retry, attempts) as i64,
+                        ),
+                    );
                 }
             }
         }
@@ -1940,6 +1999,56 @@ impl VhcService {
             };
             if let Some(e) = co {
                 self.arbiter.release(&e.id);
+                // Defect 15: a retryable-class sibling terminal arms the PACED respawn lane —
+                // the primary seat instance is still live, so the run-level retry lane never
+                // fires for the sibling; without this the run silently loses half its local
+                // membership (c15k: the trainer's `OUTCOME_STALE_RESTORE` after coordinator
+                // reconstruction, dropped here, wedged the run below its floor). Pacing
+                // mirrors the primary lane: transport = jittered budget-free, storage = the
+                // gate ceiling, retryable = growing backoff; deliberate ends (completed /
+                // left / failed_terminal) never respawn.
+                let retry = &self.config.retry;
+                let (respawn, reason) = match outcome {
+                    protocol::TerminalOutcome::FailedRetryable { reason } => {
+                        (true, reason.as_str())
+                    }
+                    protocol::TerminalOutcome::FailedStorage { reason } => (true, reason.as_str()),
+                    protocol::TerminalOutcome::FailedTransport { reason } => {
+                        (true, reason.as_str())
+                    }
+                    _ => (false, ""),
+                };
+                if respawn {
+                    let (attempts, pace_ms) = {
+                        let mut lane = self.co_retry.lock().unwrap();
+                        let attempts = lane.get(run_id).map_or(0, |(n, _)| *n);
+                        let pace_ms = match outcome {
+                            protocol::TerminalOutcome::FailedTransport { .. } => {
+                                transport_backoff_jittered_ms(retry, run_id)
+                            }
+                            protocol::TerminalOutcome::FailedStorage { .. } => retry.max_backoff_ms,
+                            _ => retry_backoff_ms(retry, attempts),
+                        };
+                        lane.insert(
+                            run_id.to_string(),
+                            (attempts.saturating_add(1), now_ms() + pace_ms as i64),
+                        );
+                        (attempts, pace_ms)
+                    };
+                    let mut emitted = Vec::new();
+                    let _ = self.emit(
+                        VhcEvent::Warning {
+                            run_id: run_id.to_string(),
+                            class: "co_trainer".to_string(),
+                            detail: format!(
+                                "co-located trainer terminated (attempt {attempts}): {reason} — \
+                                 paced respawn in {pace_ms} ms"
+                            ),
+                        },
+                        &mut emitted,
+                    );
+                    return Ok(emitted);
+                }
                 return Ok(Vec::new());
             }
         }
@@ -3863,6 +3972,8 @@ impl VhcApi for VhcService {
             e.worker.shutdown().await;
             self.arbiter.release(&e.id);
         }
+        // The owner's leave cancels any pending sibling respawn (defect 15's paced lane).
+        self.co_retry.lock().unwrap().remove(&run_id);
         // The run holds no role-instance here anymore: this node's iroh endpoint is unowned.
         self.forget_node_iroh_endpoint(&run_id);
         self.ckpt_lag.lock().unwrap().remove(&run_id);
@@ -4801,6 +4912,150 @@ mod arbitration_tests {
                 }
             ),
             "expected a typed duty-exhausted refusal, got {refusal:?}"
+        );
+    }
+
+    /// **Defect 15 (c15k): a retryable-class co-located trainer terminal arms the paced respawn
+    /// lane; a deliberate end never does.** Pre-fix the co arm of `handle_run_terminated` removed
+    /// the sibling entry and returned — the primary seat instance stays live, so the run-level
+    /// retry lane never fires for the sibling, and the run silently lost half its local
+    /// membership (the c15k trainer's `OUTCOME_STALE_RESTORE` after coordinator reconstruction
+    /// wedged the run below its floor for good).
+    #[test]
+    fn a_retryable_co_trainer_terminal_arms_the_paced_respawn_lane() {
+        let probe = Hardware {
+            gpus: 1,
+            vram_mb: 25_559,
+            ram_mb: 32_000,
+            ..Hardware::default()
+        };
+        let budget = OwnerBudget::from_config(&OwnerBudgetConfig::default(), Some(&probe), 50);
+        let svc = coordinator_trainer_service(budget);
+
+        // The retryable sibling terminal: entry torn down, duty released, lane ARMED.
+        let id = instance_id("trainer", 8);
+        let charge = svc
+            .derive_charge(&eligibility(2 << 30, 2 << 30), &policy(100), "trainer")
+            .unwrap();
+        svc.admit_placed(&id, charge, 100).expect("trainer admits");
+        svc.co_trainers.lock().unwrap().insert(
+            "run-a".to_string(),
+            InstanceEntry {
+                id,
+                generation: 8,
+                worker: Arc::new(NoopWorker),
+            },
+        );
+        svc.handle_worker_event(&protocol::Event::RunTerminated {
+            run_id: "run-a".to_string(),
+            generation: 8,
+            outcome: protocol::TerminalOutcome::FailedRetryable {
+                reason: "guest outcome 3 (stale restore)".to_string(),
+            },
+        })
+        .expect("terminal handled");
+        assert_eq!(svc.arbiter.remaining().duty_pct, 100, "duty released");
+        {
+            let lane = svc.co_retry.lock().unwrap();
+            let (attempts, due) = lane.get("run-a").expect("the respawn lane is armed");
+            assert_eq!(*attempts, 1);
+            assert!(*due > now_ms(), "the respawn is PACED, not immediate");
+        }
+
+        // A deliberate end (completed / left): torn down, and NO respawn is ever scheduled.
+        let id = instance_id("trainer", 9);
+        let charge = svc
+            .derive_charge(&eligibility(2 << 30, 2 << 30), &policy(100), "trainer")
+            .unwrap();
+        svc.admit_placed(&id, charge, 100).expect("trainer admits");
+        svc.co_trainers.lock().unwrap().insert(
+            "run-b".to_string(),
+            InstanceEntry {
+                id,
+                generation: 9,
+                worker: Arc::new(NoopWorker),
+            },
+        );
+        svc.handle_worker_event(&protocol::Event::RunTerminated {
+            run_id: "run-b".to_string(),
+            generation: 9,
+            outcome: protocol::TerminalOutcome::Completed { outcome: 0 },
+        })
+        .expect("terminal handled");
+        assert!(
+            !svc.co_retry.lock().unwrap().contains_key("run-b"),
+            "a deliberate sibling end never respawns"
+        );
+    }
+
+    /// **Defect 15, the repair side:** the reconcile tick's co-trainer pass fires a due lane
+    /// entry — a live seat-holding run gets a respawn ATTEMPT (re-armed with grown backoff when
+    /// the attempt refuses, so the repair survives transient refusals without a hot loop), and
+    /// a lane entry whose run is gone is cleared, never retried forever.
+    #[tokio::test]
+    async fn the_reconcile_repair_pass_fires_due_co_trainer_lanes_and_clears_dead_ones() {
+        let probe = Hardware {
+            gpus: 1,
+            vram_mb: 25_559,
+            ram_mb: 32_000,
+            ..Hardware::default()
+        };
+        let budget = OwnerBudget::from_config(&OwnerBudgetConfig::default(), Some(&probe), 50);
+        let svc = coordinator_trainer_service(budget);
+
+        // A LIVE seat-holding run: durable row (running, seat role) + live primary instance.
+        svc.store
+            .put_join_intent(
+                "run-a",
+                "wss://example/run-a",
+                &policy(100),
+                None,
+                &eligibility(2 << 30, 2 << 30),
+            )
+            .expect("row");
+        svc.store.mark_running("run-a").expect("running");
+        svc.store
+            .set_execution_identity("run-a", 0, "coordinator", 1)
+            .expect("identity");
+        svc.instances.lock().unwrap().insert(
+            "run-a".to_string(),
+            InstanceEntry {
+                id: instance_id("coordinator", 1),
+                generation: 1,
+                worker: Arc::new(NoopWorker),
+            },
+        );
+
+        // Both lanes due in the past: one live run, one the store never heard of.
+        svc.co_retry
+            .lock()
+            .unwrap()
+            .insert("run-a".to_string(), (1, now_ms() - 1));
+        svc.co_retry
+            .lock()
+            .unwrap()
+            .insert("ghost".to_string(), (3, now_ms() - 1));
+
+        svc.reconcile_tick().await.expect("tick");
+
+        {
+            let lane = svc.co_retry.lock().unwrap();
+            assert!(
+                !lane.contains_key("ghost"),
+                "a lane whose run no longer exists is cleared, not retried forever"
+            );
+            // The NoopWorker cannot complete a real join, so the attempt refused — the lane
+            // re-arms with GROWN backoff instead of dropping the intent (the repair stays
+            // alive) and never leaves a sibling entry behind.
+            let (attempts, due) = lane
+                .get("run-a")
+                .expect("the live run's lane survives a refused attempt");
+            assert!(*attempts >= 2, "the attempt count grew, got {attempts}");
+            assert!(*due > now_ms(), "re-armed paced, not hot-looped");
+        }
+        assert!(
+            !svc.co_trainers.lock().unwrap().contains_key("run-a"),
+            "no sibling entry appears from a refused attempt"
         );
     }
 }

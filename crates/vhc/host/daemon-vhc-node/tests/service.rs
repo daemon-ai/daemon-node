@@ -921,13 +921,17 @@ fn coordinator_head(
     .expect("head publishes")
 }
 
-/// **The stale-trainer refusal against the TRUE run head** (§8.8; plan phase 5): the registry's
+/// **The verified-archive-head judgment at join** (§8.8; Gate B' re-scope): the registry's
 /// coordinator pointer is ABSENT, and the only head evidence is the committed-round claim on the
 /// seat lineage's SIGNED archive heads — certificate-chained to the genesis coordinator identity.
 /// A trainer whose restore fence is more than the retained horizon behind that verified claim is
-/// refused typed at join; a claim at the horizon boundary joins.
+/// no longer refused outright (the pre-B' wedge, defect 14): the verified lineage IS the archive
+/// tip, so the join proceeds carrying a staged archive catch-up directive (recorded as an
+/// `archive_catch_up` warning). A claim at the horizon boundary joins plain. The gap the planes
+/// genuinely cannot bridge (no lineage at all) remains the typed `CheckpointStale` — pinned by
+/// the `a_fence_past_the_ring_*` unit tests beside `resolve_restore`.
 #[tokio::test]
-async fn join_refuses_a_trainer_stale_against_the_verified_archive_head() {
+async fn join_stages_archive_catch_up_for_a_trainer_stale_against_the_verified_head() {
     let base = daemon_vhc_proto::SigningKey::from_bytes(&[0xB5; 32]);
     let (wire, run_id) = frozen_genesis_wire(&base);
     let config = VhcConfig {
@@ -959,15 +963,24 @@ async fn join_refuses_a_trainer_stale_against_the_verified_archive_head() {
         run_dir: None,
         seat_directory: None,
     });
-    let err = svc
-        .vhc_join("run-archive-stale".into(), policy(), "op".into())
+    svc.vhc_join("run-archive-stale".into(), policy(), "op".into())
         .await
-        .unwrap_err();
-    assert!(
-        err.to_string().contains("checkpoint too stale"),
-        "typed staleness refusal against the verified archive claim, got: {err}"
+        .expect("a fence past the horizon joins when the verified lineage bridges the gap");
+    assert_eq!(
+        worker.calls().joins,
+        vec!["run-archive-stale".to_string()],
+        "the join was issued (staged catch-up, not a refusal)"
     );
-    assert!(worker.calls().joins.is_empty(), "no join was issued");
+    let staged = svc
+        .store()
+        .recent_events("run-archive-stale", 32)
+        .expect("events read")
+        .iter()
+        .any(|ev| matches!(ev, VhcEvent::Warning { class, .. } if class == "archive_catch_up"));
+    assert!(
+        staged,
+        "the staged archive catch-up is recorded as an `archive_catch_up` warning"
+    );
 
     // Fence 1 vs a claim exactly at the horizon boundary: reachable — the join proceeds.
     let worker = FakeWorker::new();
