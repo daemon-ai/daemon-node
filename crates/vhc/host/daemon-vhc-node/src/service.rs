@@ -1073,14 +1073,41 @@ impl VhcService {
                     continue;
                 }
                 let row = self.store.get_run(&run_id)?;
-                let primary_live = self.instances.lock().unwrap().contains_key(&run_id);
-                let eligible = row.as_ref().is_some_and(|r| {
-                    r.run_state == RunState::Running
-                        && !r.role.is_empty()
-                        && r.role == self.config.seat_role
-                }) && primary_live;
-                if !eligible {
+                // Defect 19: only a GENUINE teardown clears the lane — the row gone, a
+                // deliberate end (completed / left / failed_terminal / intent withdrawn), or a
+                // non-seat role. A TRANSIENT window (row mid-churn in `failed_retryable` /
+                // `starting`, or the primary mid-replacement) used to clear it too, which
+                // orphaned the sibling forever once the seat came back (c15m: the lane died
+                // during the seat-replacement churn and no trainer respawn ever fired again).
+                let torn_down = row.as_ref().is_none_or(|r| {
+                    matches!(
+                        r.run_state,
+                        RunState::Completed | RunState::Left | RunState::FailedTerminal
+                    ) || r.desired_state != DesiredState::Joined
+                        || r.role.is_empty()
+                        || r.role != self.config.seat_role
+                });
+                if torn_down {
                     self.co_retry.lock().unwrap().remove(&run_id);
+                    continue;
+                }
+                let primary_live = self.instances.lock().unwrap().contains_key(&run_id);
+                let ready = row
+                    .as_ref()
+                    .is_some_and(|r| r.run_state == RunState::Running)
+                    && primary_live;
+                if !ready {
+                    // Transient: keep the lane armed with grown backoff and let a later tick
+                    // (or the seat's own reconvergence) pick it up.
+                    let mut lane = self.co_retry.lock().unwrap();
+                    let attempts = lane.get(&run_id).map_or(1, |(n, _)| *n);
+                    lane.insert(
+                        run_id.clone(),
+                        (
+                            attempts.saturating_add(1),
+                            now_ms() + retry_backoff_ms(retry, attempts) as i64,
+                        ),
+                    );
                     continue;
                 }
                 let policy = row.expect("eligible row present").policy;
@@ -1438,9 +1465,23 @@ impl VhcService {
             );
             return;
         }
-        // Idempotent: a repeated seat-join re-converges on the existing co-trainer.
-        if self.co_trainers.lock().unwrap().contains_key(run_id) {
-            return;
+        // Defect 19: a registered sibling here is STALE by construction — every caller gates on
+        // a fresh seat bring-up (`existing.is_none()` / reconverge's fresh mint) or on an empty
+        // lane (the repair pass), so an entry can only belong to a REPLACED owner. It is bound
+        // to the superseded owner's endpoint and will only die asynchronously; left registered
+        // it blocked every respawn (the old idempotence early-return) while its eventual
+        // stream-closure cleanup raced the next bring-up (c15m: trainer-0 never respawned for
+        // 2+ hours across five seat replacements). The transaction that replaces the seat owns
+        // the sibling's replacement: reap deterministically, then spawn fresh.
+        let stale = self.co_trainers.lock().unwrap().remove(run_id);
+        if let Some(e) = stale {
+            self.arbiter.release(&e.id);
+            e.worker.shutdown().await;
+            warn_co!(format!(
+                "reaped the superseded owner's co-trainer sibling (generation {}) before \
+                 respawning under the fresh seat",
+                e.generation
+            ));
         }
         let worker = self.instance_worker();
         // Assess + resolve the coordinator endpoint for the TRAINER role. Undirected: against a
@@ -3657,8 +3698,17 @@ impl VhcApi for VhcService {
         // INSERT-OR-UPDATE keeps a repeated join convergent regardless.
         self.require_enabled().map_err(|e| e.to_api())?;
 
+        // Defect 17 + defect 19a: the bring-up guard is acquired BEFORE the live-instance check
+        // so the coalesce-vs-mint decision is made INSIDE the serialized section. The old order
+        // (check, then guard) left a window where a join racing a COMPLETING bring-up read the
+        // instance map before that transaction's insert, found nothing, then acquired the freed
+        // guard and minted a superseding seat over a healthy one — cascading supersession churn
+        // (c15m). Every completed bring-up inserts its instance before releasing the guard, so
+        // a holder of the guard sees a settled map.
+        let bring_up = self.begin_bring_up(&run_id);
         // A repeated join of a LIVE role-instance re-converges on the existing child + its
-        // standing reservation — it never double-charges the ledgers.
+        // standing reservation — it never double-charges the ledgers (and needs no guard;
+        // nothing is minted).
         let existing = {
             let instances = self.instances.lock().unwrap();
             instances
@@ -3676,10 +3726,8 @@ impl VhcApi for VhcService {
         // Defect 17: a FRESH bring-up serializes against the auto-resume reconvergence (and any
         // concurrent explicit join). Two racing bring-ups mint competing incarnations whose
         // supersession leaves the survivor a zombie — the second entrant refuses TYPED instead.
-        // (A repeated join of a LIVE instance re-converges above without minting anything, so
-        // it never needs the guard.)
         let _bring_up = if existing.is_none() {
-            match self.begin_bring_up(&run_id) {
+            match bring_up {
                 Some(guard) => Some(guard),
                 None => {
                     if fresh_child {
@@ -3694,6 +3742,7 @@ impl VhcApi for VhcService {
                 }
             }
         } else {
+            drop(bring_up);
             None
         };
 
@@ -5137,6 +5186,119 @@ mod arbitration_tests {
         assert!(
             !svc.co_trainers.lock().unwrap().contains_key("run-a"),
             "no sibling entry appears from a refused attempt"
+        );
+    }
+
+    /// **Defect 19 (c15m), the lane-survival half:** a due co-trainer lane whose run is in a
+    /// TRANSIENT window (the primary seat mid-replacement — row standing, instance absent)
+    /// re-arms with grown backoff instead of being cleared. The old pass cleared it, so once
+    /// the seat came back no trainer respawn ever fired again (trainer-0 stayed dead for 2+
+    /// hours across five seat replacements). A GENUINE teardown (intent withdrawn) still
+    /// clears.
+    #[tokio::test]
+    async fn a_due_co_trainer_lane_survives_a_transient_seat_replacement_window() {
+        let probe = Hardware {
+            gpus: 1,
+            vram_mb: 25_559,
+            ram_mb: 32_000,
+            ..Hardware::default()
+        };
+        let budget = OwnerBudget::from_config(&OwnerBudgetConfig::default(), Some(&probe), 50);
+        let svc = coordinator_trainer_service(budget);
+
+        // The transient shape: a seat-holding Running row whose primary instance is ABSENT
+        // (mid-replacement — the next bring-up will re-insert it).
+        svc.store
+            .put_join_intent(
+                "run-a",
+                "wss://example/run-a",
+                &policy(100),
+                None,
+                &eligibility(2 << 30, 2 << 30),
+            )
+            .expect("row");
+        svc.store.mark_running("run-a").expect("running");
+        svc.store
+            .set_execution_identity("run-a", 0, "coordinator", 1)
+            .expect("identity");
+        svc.co_retry
+            .lock()
+            .unwrap()
+            .insert("run-a".to_string(), (1, now_ms() - 1));
+
+        svc.reconcile_tick().await.expect("tick");
+        {
+            let lane = svc.co_retry.lock().unwrap();
+            let (attempts, due) = lane
+                .get("run-a")
+                .expect("the lane SURVIVES the transient window");
+            assert!(
+                *attempts >= 2,
+                "re-armed with grown backoff, got {attempts}"
+            );
+            assert!(*due > now_ms(), "paced, not hot-looped");
+        }
+
+        // The genuine teardown: the owner withdrew the intent — the lane clears.
+        svc.store
+            .set_desired_state("run-a", DesiredState::Left)
+            .expect("intent withdrawn");
+        svc.co_retry
+            .lock()
+            .unwrap()
+            .insert("run-a".to_string(), (1, now_ms() - 1));
+        svc.reconcile_tick().await.expect("tick");
+        assert!(
+            !svc.co_retry.lock().unwrap().contains_key("run-a"),
+            "a withdrawn intent clears the lane"
+        );
+    }
+
+    /// **Defect 19 (c15m), the stale-sibling half:** a fresh seat bring-up that finds a
+    /// REGISTERED co-trainer entry reaps it (reservation released, entry removed) before
+    /// spawning — the entry can only belong to a replaced owner (every caller gates on a fresh
+    /// seat mint or an empty lane). The old idempotence early-return kept the corpse
+    /// registered, which blocked every respawn while its stream-closure cleanup raced the next
+    /// bring-up.
+    #[tokio::test]
+    async fn a_fresh_seat_bring_up_reaps_the_superseded_owners_co_trainer_sibling() {
+        let probe = Hardware {
+            gpus: 1,
+            vram_mb: 25_559,
+            ram_mb: 32_000,
+            ..Hardware::default()
+        };
+        let budget = OwnerBudget::from_config(&OwnerBudgetConfig::default(), Some(&probe), 50);
+        let svc = coordinator_trainer_service(budget);
+
+        // The superseded owner's sibling: registered, holding a duty reservation.
+        let id = instance_id("trainer", 7);
+        let charge = svc
+            .derive_charge(&eligibility(2 << 30, 2 << 30), &policy(100), "trainer")
+            .unwrap();
+        svc.admit_placed(&id, charge, 100).expect("trainer admits");
+        assert!(svc.arbiter.remaining().duty_pct < 100, "duty held");
+        svc.co_trainers.lock().unwrap().insert(
+            "run-a".to_string(),
+            InstanceEntry {
+                id,
+                generation: 7,
+                worker: Arc::new(NoopWorker),
+            },
+        );
+
+        // The fresh bring-up's sibling spawn: the NoopWorker cannot pass assess, so no NEW
+        // sibling lands — but the stale one must be reaped and its reservation released
+        // regardless.
+        svc.spawn_co_located_trainer("run-a", &policy(100)).await;
+        assert!(
+            !svc.co_trainers.lock().unwrap().contains_key("run-a"),
+            "the stale sibling entry was reaped, not kept by the old idempotence early-return"
+        );
+        assert_eq!(
+            svc.arbiter.remaining().duty_pct,
+            100,
+            "the superseded sibling's duty reservation was released"
         );
     }
 

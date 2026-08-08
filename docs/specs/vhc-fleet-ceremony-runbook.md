@@ -649,6 +649,27 @@ certifying base's ladder, an explicit revocation, or a fencing seat grant) ends 
 typed-retryable (`superseded` warning) so reconvergence mints a fresh incarnation above the
 floor — supersession is a terminal, never a mute.
 
+**Catch-up staging is gap-driven, not horizon-driven (defect 18, c15m).** The nominal
+16-round retained ring is NOT a replay guarantee — a reconstructed coordinator's ring starts
+at its boot round. The node stages archive catch-up for ANY restore-fence gap the verified
+lineage usefully reaches (tip covers the fence, within a ring of the head); overlap with the
+live ring replay is absorbed by the dedup window. Pre-fix, a within-horizon gap after
+reconstruction staged nothing and the respawned trainer looped `OUTCOME_STALE_RESTORE`
+through the paced-respawn lane indefinitely. A within-ring gap with no published archive
+proceeds bare (a young run); a past-ring gap without archive reach refuses typed.
+
+**Seat replacement owns sibling replacement (defect 19, c15m).** Three invariants keep the
+co-located trainer alive across seat churn: (a) an explicit join's coalesce-vs-mint decision
+happens INSIDE the bring-up guard, so a join racing a completing bring-up coalesces with the
+freshly inserted instance instead of minting a superseding seat; (b) a fresh seat bring-up
+that finds a registered co-trainer sibling reaps it deterministically (the entry can only
+belong to a replaced owner) and respawns it under the new seat; (c) the paced-respawn lane
+survives transient windows (row mid-churn, primary mid-replacement) with grown backoff and
+clears only on genuine teardown (completed / left / failed_terminal / intent withdrawn).
+Pre-fix, the lane was cleared mid-churn and the stale sibling blocked every respawn — a
+peerless coordinator idled for hours while five seat replacements each failed to bring the
+trainer back.
+
 ### 5.6 Completion
 
 `--stop-rounds 48` → the run reaches its terminal state on every box; `daemon-cli vhc detail`
