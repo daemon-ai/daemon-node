@@ -89,9 +89,14 @@ fn genesis_wire(trusted_bases: &[PeerId]) -> (Vec<u8>, [u8; 32]) {
         ..RoleGrants::default()
     };
     let role_entry = |lane: &str| RoleEntry {
-        // No execution requirements: this fixture drives declared-claim roles, so the worker's
-        // admission takes the truthful no-authority path.
-        execution: None,
+        // A fixture envelope: this exercises the seat mechanism, which has nothing to do with
+        // resources — the SAME shared trivial construction every compute-free module emits
+        // (schema major 3 requires an execution structure per role, [DI-6] phase 2).
+        execution: Some(
+            daemon_vhc_proto::RoleExecutionRequirements::fixture_over_trivial_plan(vec![
+                "cpu".to_string()
+            ]),
+        ),
         lane: lane.into(),
         module: "role.wasm".into(),
         abi: "vhc@2".into(),
@@ -390,6 +395,7 @@ async fn coordinator_seat_claim_launch_and_trainer_lease_resolve() {
         secret_ref: None,
         expires_at_ms: 0,
         restore: None,
+        catch_up: None,
     };
     join_role(&mut coord, coord_tuple, COORD_ROLE, bid, &coord_creds, step).await;
 
@@ -450,6 +456,7 @@ async fn coordinator_seat_claim_launch_and_trainer_lease_resolve() {
         secret_ref: None,
         expires_at_ms: 0,
         restore: None,
+        catch_up: None,
     };
     join_role(
         &mut trainer,

@@ -388,6 +388,7 @@ async fn two_workers_exchange_certified_frames_over_the_live_ws_plane() {
         secret_ref: None, // unauthenticated local relay lane
         expires_at_ms: 0,
         restore: None,
+        catch_up: None,
     };
 
     // B first (subscribed before A attaches), then A: A's certificate announcement + frames

@@ -41,7 +41,9 @@ use std::time::Duration;
 use ciborium::value::Value;
 
 use daemon_vhc_host::run::{JournalSink, RunEnd, RunIdentity};
-use daemon_vhc_net::{ArchiveHeadStore, ContentStore, FsArchiveHeadStore, MemoryContentStore};
+use daemon_vhc_net::{
+    ArchiveHeadStore, ContentStore, FsArchiveHeadStore, FsContentStore, MemoryContentStore,
+};
 use daemon_vhc_proto::{
     blake3_hash, peer_id, to_canonical_vec, CapabilitySet, CertScope, Hash, IrohId, PeerId,
     SigningKey, VHC_PROTO_VERSION,
@@ -53,7 +55,10 @@ use daemon_vhc_sdk_consensus::{SignedMessage, VhcMessage};
 use daemon_vhc_session::archive::{spawn_archive_publisher, ArchiveSpec, SignerBinding};
 use daemon_vhc_session::identity::issue_run_key;
 use daemon_vhc_session::journal_home::{journal_dir, DurableSink};
-use daemon_vhc_session::reconstruct::{reconstruct_coordinator, ReconstructError, ReconstructSpec};
+use daemon_vhc_session::reconstruct::{
+    extract_catch_up_frames, reconstruct_coordinator, CatchUpSpec, ReconstructError,
+    ReconstructSpec,
+};
 use daemon_vhc_testkit::genesis_run::{phase_a_grants, EnvelopeInputs};
 use daemon_vhc_testkit::live_genesis::fixture_authored_execution;
 use daemon_vhc_testkit::{
@@ -288,7 +293,8 @@ fn write_crashed_journal(
 }
 
 /// Publish the sealed prefix of role incarnation `instance` through the PRODUCT publisher and
-/// return the attested heads.
+/// return the attested heads. `trusted` is the genesis-trusted attestor set the publisher may
+/// link cross-base predecessors against (empty = own-base linking only).
 #[allow(clippy::too_many_arguments)]
 async fn publish_prefix_of(
     root: &std::path::Path,
@@ -297,8 +303,9 @@ async fn publish_prefix_of(
     base_key: &SigningKey,
     instance: u64,
     chain_instance: u64,
-    segments: Arc<MemoryContentStore>,
+    segments: Arc<dyn ContentStore>,
     heads_dir: &std::path::Path,
+    trusted: Vec<daemon_vhc_proto::PeerId>,
 ) -> Vec<daemon_vhc_proto::ArchiveHeadRecord> {
     let certified = issue_run_key(
         base_key,
@@ -331,6 +338,7 @@ async fn publish_prefix_of(
             chain_instance,
             round_claim: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             archived_round: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            trusted,
         },
         heads.clone(),
         segments,
@@ -348,7 +356,7 @@ async fn publish_prefix(
     module: Hash,
     base_key: &SigningKey,
     chain_instance: u64,
-    segments: Arc<MemoryContentStore>,
+    segments: Arc<dyn ContentStore>,
     heads_dir: &std::path::Path,
 ) -> Vec<daemon_vhc_proto::ArchiveHeadRecord> {
     publish_prefix_of(
@@ -360,6 +368,7 @@ async fn publish_prefix(
         chain_instance,
         segments,
         heads_dir,
+        Vec::new(),
     )
     .await
 }
@@ -1040,6 +1049,7 @@ async fn a_resumed_seat_with_sidecar_restore_readbacks_reconstructs_after_a_seco
         chain2,
         segments.clone(),
         &heads_dir,
+        Vec::new(),
     )
     .await;
     assert!(
@@ -1241,6 +1251,7 @@ async fn a_cold_standby_with_zero_local_state_reconstructs_solely_from_the_produ
         chain2,
         segments.clone(),
         &heads_dir,
+        Vec::new(),
     )
     .await;
     assert!(
@@ -1285,4 +1296,516 @@ async fn a_cold_standby_with_zero_local_state_reconstructs_solely_from_the_produ
         "the rebuilt seat stands at the RECORDED next un-opened round — the committed head \
          reproduced solely from the archive"
     );
+}
+
+/// Hex of a proto hash (the [`FsContentStore`] object filename — objects live flat as
+/// `<root>/<blake3 hex>`).
+fn hex_of(h: &Hash) -> String {
+    let mut s = String::with_capacity(64);
+    for b in h.0 {
+        s.push(char::from_digit((b >> 4) as u32, 16).expect("nibble"));
+        s.push(char::from_digit((b & 0xf) as u32, 16).expect("nibble"));
+    }
+    s
+}
+
+/// **Gate B'/E: the trainer catch-up bridge over REAL production journals, under round-aware
+/// seal pacing, ending at the fs-plane retention wall.** The c15h wedge shape (a trainer fence
+/// rounds behind the live head): the coordinator drives ten rounds under the live driver with
+/// seal pacing as the ONLY rotation input (no count/age threshold — publication is maximally
+/// delayed, the reconciliation sweep publishes everything at the end, and the recovery points
+/// exist purely because pacing requested them). A cold rejoiner with fence 4 then extracts the
+/// staged catch-up frames from the attested archive alone and receives EXACTLY the post-fence
+/// committed `RoundRecord`s, ascending, each carrying the guest's genuine module payload. Then
+/// the retention wall: prune one archived segment from the fs content plane and the same
+/// extraction refuses with the TYPED segment error (the re-scoped `CheckpointStale` posture —
+/// a genuine archive gap is loud, never a silent wedge).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_trainer_fence_past_the_ring_bridges_from_the_paced_archive_until_the_retention_wall() {
+    const PRE: u64 = 10;
+    const FENCE: u64 = 4;
+    let rig = rig();
+    let root = tempdir();
+
+    // -- the primary drives PRE rounds; seal pacing is the only rotation input -------------------
+    let pacer_cell = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let identity = RunIdentity {
+        run_id: rig.spec.run_id.0,
+        epoch: 0,
+        role: "coordinator".into(),
+        instance: 1,
+        module: rig.spec.module_hash.0,
+    };
+    let jdir = journal_dir(&root, RUN_LABEL, "coordinator", 1);
+    let sink = DurableSink::open_with_policy(
+        &jdir,
+        &identity,
+        [0x5C; 32],
+        daemon_vhc_journal::RotatePolicy {
+            max_records: 100_000, // never reached — recovery points come from pacing alone
+            max_open: None,
+            roll_request: Some(pacer_cell.clone()),
+        },
+    )
+    .expect("paced journal open");
+    let chain1 = sink.founding_instance();
+    let primary_key_seed = *blake3::hash(b"reconstruct/catch-up/primary").as_bytes();
+    let mut primary = Coordinator::start_with_sink(
+        &rig.wasm,
+        &rig.spec,
+        phase_a_grants(),
+        1,
+        primary_key_seed,
+        Box::new(sink),
+    )
+    .unwrap();
+    let mut decisions = 0usize;
+    for round in 0..PRE {
+        // Round 0's script carries the join/readiness preamble; later rounds are commitments +
+        // the receipt only (`build_script` keys the preamble off `rounds.start == 0`).
+        for sm in &build_script(&rig.worker_keys, round..round + 1) {
+            primary.deliver(&sm.key, &sm.msg).expect("primary deliver");
+        }
+        while decisions < decision_count(round + 1, true) {
+            primary
+                .next_decision(Duration::from_secs(60))
+                .unwrap_or_else(|e| panic!("primary decision {decisions}: {e}"));
+            decisions += 1;
+        }
+        // The SealPacer's move: the committed-round watermark drifted past the archive tip —
+        // request a recovery point (honored at the next append, exactly like production).
+        if round % 2 == 1 {
+            pacer_cell.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    let end = primary.kill().expect("primary killed");
+    assert!(matches!(end, RunEnd::Outcome(_)), "guest thread joined");
+
+    // Pacing (not count, not age) produced the sealed prefix.
+    {
+        let paths = daemon_vhc_journal::JournalPaths::open(&jdir).expect("journal home");
+        let ordinals = paths.existing_segments().expect("segment listing");
+        let sealed = ordinals
+            .iter()
+            .filter(|&&ord| {
+                daemon_vhc_journal::scan_file(paths.segment(ord))
+                    .expect("scan")
+                    .sealed
+            })
+            .count();
+        assert!(
+            sealed >= 3,
+            "round-aware seal pacing produced the archive prefix (sealed={sealed})"
+        );
+    }
+    seal_tail(&root, &rig.spec, 1);
+
+    // -- the sealed chain publishes through the product publisher onto the FS content plane ------
+    let seg_root = root.join("segments");
+    let fs_plane = Arc::new(FsContentStore::open(&seg_root).expect("fs content plane"));
+    let heads = publish_prefix(
+        &root,
+        rig.spec.run_id,
+        rig.spec.module_hash,
+        &rig.base_key,
+        chain1,
+        fs_plane.clone(),
+        &root.join("heads"),
+    )
+    .await;
+    assert!(heads.len() >= 4, "every paced recovery point published");
+
+    // -- the cold rejoiner (no local disk) extracts the staged catch-up past its fence ------------
+    let spec = CatchUpSpec {
+        heads: heads.clone(),
+        run_id: rig.spec.run_id,
+        trusted: vec![rig.base_id],
+        run_label: RUN_LABEL.into(),
+        journal_root: None,
+        after_round: FENCE,
+    };
+    let frames = extract_catch_up_frames(&spec, fs_plane.as_ref())
+        .await
+        .expect("the archived stream bridges the fence");
+    let rounds: Vec<u64> = frames.iter().map(|f| f.round).collect();
+    let expected: Vec<u64> = (FENCE + 1..PRE).collect();
+    assert_eq!(
+        rounds, expected,
+        "exactly the post-fence committed rounds, ascending"
+    );
+    for f in &frames {
+        // The staged frame carries the guest's GENUINE module payload — the canonical
+        // VhcMessage::RoundRecord the coordinator authored, not a probe artifact.
+        let msg: VhcMessage =
+            daemon_vhc_proto::from_canonical_slice(&f.payload).expect("module payload decodes");
+        assert!(
+            matches!(&msg, VhcMessage::RoundRecord(r) if r.round == f.round),
+            "round {} carries its own RoundRecord",
+            f.round
+        );
+    }
+
+    // -- the retention wall: prune one attested segment from the fs plane ------------------------
+    let victim = heads.last().expect("heads exist");
+    let pruned = seg_root.join(hex_of(&victim.body.segment_hash));
+    assert!(pruned.is_file(), "the archived segment object exists");
+    std::fs::remove_file(&pruned).expect("retention prunes the object");
+    let err = extract_catch_up_frames(&spec, fs_plane.as_ref())
+        .await
+        .expect_err("a pruned segment is a genuine archive gap");
+    assert!(
+        matches!(
+            &err,
+            ReconstructError::Segment { segment, .. } if *segment == victim.body.segment
+        ),
+        "typed segment refusal naming the missing closure, got {err}"
+    );
+}
+
+/// **Gate A/E: archive-only recovery under a DIFFERENT base identity.** The two-chain lineage
+/// crosses ATTESTORS: chain 1 is attested by the founding box's base key, chain 2 — the
+/// successor incarnation on another box — publishes under a SECOND genesis-trusted base
+/// identity. After deleting all local run state, a third party holding only the genesis trust
+/// set and the product archive reconstructs the full lineage to the recorded head. No key
+/// material, no journal, no sidecar of either box survives; the trust anchors are public.
+#[tokio::test(flavor = "multi_thread")]
+async fn archive_only_recovery_reconstructs_across_a_second_trusted_base_identity() {
+    const PRE: u64 = 6;
+    const POST: u64 = 2;
+    let rig = rig();
+    let root = tempdir();
+    // The successor box's own base identity — trusted by genesis, distinct from the founder's.
+    let base_b = SigningKey::from_bytes(blake3::hash(b"reconstruct/second-base").as_bytes());
+    let base_b_id = peer_id(&base_b);
+    let trusted = vec![rig.base_id, base_b_id];
+
+    // -- chain 1 (box A): the primary drives PRE rounds, crashes; tail seals; base A attests -----
+    let primary_key_seed = *blake3::hash(b"reconstruct/two-bases/primary").as_bytes();
+    let (sink, chain1) = open_live_sink(&root, &rig.spec);
+    let mut primary = Coordinator::start_with_sink(
+        &rig.wasm,
+        &rig.spec,
+        phase_a_grants(),
+        1,
+        primary_key_seed,
+        Box::new(sink),
+    )
+    .unwrap();
+    for sm in &build_script(&rig.worker_keys, 0..PRE) {
+        primary.deliver(&sm.key, &sm.msg).expect("primary deliver");
+    }
+    for i in 0..decision_count(PRE, true) {
+        primary
+            .next_decision(Duration::from_secs(60))
+            .unwrap_or_else(|e| panic!("primary decision {i}: {e}"));
+    }
+    let end = primary.kill().expect("primary killed");
+    assert!(matches!(end, RunEnd::Outcome(_)), "guest thread joined");
+    seal_tail(&root, &rig.spec, 1);
+
+    let heads_dir = root.join("heads");
+    let segments = Arc::new(MemoryContentStore::new());
+    let heads = publish_prefix(
+        &root,
+        rig.spec.run_id,
+        rig.spec.module_hash,
+        &rig.base_key,
+        chain1,
+        segments.clone(),
+        &heads_dir,
+    )
+    .await;
+    assert!(!heads.is_empty(), "chain 1 attested under base A");
+
+    // -- the successor (box B) reconstructs COLD from the archive and resumes --------------------
+    let store: Arc<dyn ContentStore> = segments.clone();
+    let capture = reconstruct_coordinator(
+        ReconstructSpec {
+            heads: heads.clone(),
+            run_id: rig.spec.run_id,
+            trusted: trusted.clone(),
+            role: "coordinator".into(),
+            run_label: RUN_LABEL.into(),
+            journal_root: None,
+            module: rig.wasm.clone(),
+            config: rig.spec.config_bytes.clone(),
+            grants: phase_a_grants(),
+            incarnation: 2,
+            restore: None,
+            sidecar_key: None,
+            deadline_ms: 60_000,
+        },
+        store,
+    )
+    .await
+    .expect("box B reconstructs cold from box A's attested archive");
+    let standby_key_seed = *blake3::hash(b"reconstruct/two-bases/standby").as_bytes();
+    let (sink2, chain2) = open_live_sink_of(&root, &rig.spec, 2, 8);
+    let mut standby = Coordinator::start_migrating_with_sink(
+        &rig.wasm,
+        &rig.spec,
+        phase_a_grants(),
+        2,
+        standby_key_seed,
+        capture,
+        Box::new(sink2),
+    )
+    .unwrap();
+    for sm in &build_script(&rig.worker_keys, PRE..PRE + POST) {
+        standby.deliver(&sm.key, &sm.msg).expect("standby deliver");
+    }
+    for i in 0..decision_count(POST, false) {
+        standby
+            .next_decision(Duration::from_secs(60))
+            .unwrap_or_else(|e| panic!("standby decision {i}: {e}"));
+    }
+    let end = standby.kill().expect("standby killed");
+    assert!(
+        matches!(end, RunEnd::Outcome(_)),
+        "standby guest thread joined"
+    );
+    seal_tail(&root, &rig.spec, 2);
+
+    // -- chain 2 attests under base B: the lineage now crosses base identities -------------------
+    let heads = publish_prefix_of(
+        &root,
+        rig.spec.run_id,
+        rig.spec.module_hash,
+        &base_b,
+        2,
+        chain2,
+        segments.clone(),
+        &heads_dir,
+        // Base B's publisher links its founding head to base A's terminal head THROUGH the
+        // genesis-trusted set — the seat's recovery lineage survives the box move.
+        trusted.clone(),
+    )
+    .await;
+    assert!(
+        heads.iter().any(|h| h.body.chain_instance == chain2),
+        "chain 2 attested under base B into the shared store"
+    );
+
+    // -- DELETE all local run state; a third party recovers on the public trust set alone --------
+    let run_state = daemon_vhc_session::journal_home::run_state_dir(&root, RUN_LABEL);
+    std::fs::remove_dir_all(&run_state).expect("local run state deleted");
+    let store: Arc<dyn ContentStore> = segments;
+    let capture2 = reconstruct_coordinator(
+        ReconstructSpec {
+            heads,
+            run_id: rig.spec.run_id,
+            trusted,
+            role: "coordinator".into(),
+            run_label: RUN_LABEL.into(),
+            journal_root: None,
+            module: rig.wasm.clone(),
+            config: rig.spec.config_bytes.clone(),
+            grants: phase_a_grants(),
+            incarnation: 3,
+            restore: None,
+            sidecar_key: None,
+            deadline_ms: 60_000,
+        },
+        store,
+    )
+    .await
+    .expect("the cross-attestor lineage reconstructs from the archive alone");
+    let state = coordinator_state_from_capture(&capture2).expect("exported state decodes");
+    assert_eq!(
+        state.round,
+        PRE + POST,
+        "the rebuilt seat stands at the recorded head across BOTH base identities"
+    );
+}
+
+/// **Gate E: trainer churn during recovery — the c15b livelock shape through the PRODUCT
+/// path.** A trainer whose session churned across the coordinator's crash re-announces the
+/// same `Join` it always sends, and it lands on the freshly RECONSTRUCTED coordinator. The
+/// resumed seat must serve it as an idempotent catch-up — the retained committed records,
+/// ascending, then the standing `RoundOpen` of the active round, byte-identical to the
+/// pre-crash flood (frozen at open, never rebuilt from post-churn state) — and the churn must
+/// not perturb consensus: the rounds that follow commit byte-identically to an uninterrupted
+/// reference. (The tick-level contract is pinned in `tick_lifecycle`; this asserts it holds
+/// for a seat that just came back through heads + segments + tail replay.)
+#[tokio::test(flavor = "multi_thread")]
+async fn a_trainer_rejoin_during_recovery_catches_up_idempotently_on_the_reconstructed_seat() {
+    let rig = rig();
+    let root = tempdir();
+    let pre_kill = build_script(&rig.worker_keys, 0..ROUNDS_BEFORE_KILL);
+
+    // -- the primary drives rounds under the live driver, then crashes ---------------------------
+    let primary_key_seed = *blake3::hash(b"reconstruct/churn/primary").as_bytes();
+    let (sink, chain_instance) = open_live_sink(&root, &rig.spec);
+    let mut primary = Coordinator::start_with_sink(
+        &rig.wasm,
+        &rig.spec,
+        phase_a_grants(),
+        1,
+        primary_key_seed,
+        Box::new(sink),
+    )
+    .unwrap();
+    for sm in &pre_kill {
+        primary.deliver(&sm.key, &sm.msg).expect("primary deliver");
+    }
+    let mut primary_decisions = Vec::new();
+    while primary_decisions.len() < decision_count(ROUNDS_BEFORE_KILL, true) {
+        let (_, _, msg) = primary
+            .next_decision(Duration::from_secs(60))
+            .expect("primary decision");
+        primary_decisions.push(msg);
+    }
+    let standing_open = primary_decisions
+        .last()
+        .cloned()
+        .expect("the trailing RoundOpen");
+    assert!(
+        matches!(&standing_open, VhcMessage::RoundOpen(ro) if ro.round == ROUNDS_BEFORE_KILL),
+        "the pre-crash trailing decision is the active round's open"
+    );
+
+    let segments = Arc::new(MemoryContentStore::new());
+    let heads = publish_prefix(
+        &root,
+        rig.spec.run_id,
+        rig.spec.module_hash,
+        &rig.base_key,
+        chain_instance,
+        segments.clone(),
+        &root.join("heads"),
+    )
+    .await;
+    assert!(!heads.is_empty(), "the sealed prefix published");
+
+    let store: Arc<dyn ContentStore> = segments;
+    let capture = reconstruct_coordinator(
+        ReconstructSpec {
+            heads,
+            run_id: rig.spec.run_id,
+            trusted: vec![rig.base_id],
+            role: "coordinator".into(),
+            run_label: RUN_LABEL.into(),
+            journal_root: Some(root.clone()),
+            module: rig.wasm.clone(),
+            config: rig.spec.config_bytes.clone(),
+            grants: phase_a_grants(),
+            incarnation: 1,
+            restore: None,
+            sidecar_key: Some([0x5C; 32]),
+            deadline_ms: 60_000,
+        },
+        store,
+    )
+    .await
+    .expect("the product reconstruction succeeds");
+    let end = primary.kill().expect("primary killed");
+    assert!(matches!(end, RunEnd::Outcome(_)), "guest thread joined");
+
+    // -- the standby resumes; the churned trainer's re-join lands FIRST --------------------------
+    let standby_key_seed = *blake3::hash(b"reconstruct/churn/standby").as_bytes();
+    let mut standby = Coordinator::start_migrating(
+        &rig.wasm,
+        &rig.spec,
+        phase_a_grants(),
+        1,
+        standby_key_seed,
+        capture,
+    )
+    .unwrap();
+    let churned = &rig.worker_keys[0];
+    standby
+        .deliver(
+            churned,
+            &VhcMessage::Join(Join {
+                run_id: RUN_LABEL.into(),
+                iroh_id: IrohId([0x44; 32]),
+                class: ThroughputClass::C1,
+                capabilities: CapabilitySet::new(),
+                envelope_hash: None,
+            }),
+        )
+        .expect("the churned trainer's re-join delivers");
+    // The idempotent catch-up: every retained committed record, ascending, then the standing
+    // open — served by the reconstructed seat exactly as a never-crashed one would.
+    let mut catch_up = Vec::new();
+    for _ in 0..=ROUNDS_BEFORE_KILL {
+        let (_, _, msg) = standby
+            .next_decision(Duration::from_secs(60))
+            .expect("rejoin catch-up decision");
+        catch_up.push(msg);
+    }
+    let replayed: Vec<u64> = catch_up
+        .iter()
+        .filter_map(|m| match m {
+            VhcMessage::RoundRecord(rr) => Some(rr.round),
+            _ => None,
+        })
+        .collect();
+    let expected: Vec<u64> = (0..ROUNDS_BEFORE_KILL).collect();
+    assert_eq!(
+        replayed, expected,
+        "the retained committed records replay ascending"
+    );
+    let reopened = catch_up.last().expect("the standing open closes the flood");
+    assert_eq!(
+        to_canonical_vec(reopened).unwrap(),
+        to_canonical_vec(&standing_open).unwrap(),
+        "the standing open re-publishes byte-identical to the pre-crash flood"
+    );
+
+    // -- consensus is unperturbed: the following rounds commit byte-identically ------------------
+    let post_kill = build_script(
+        &rig.worker_keys,
+        ROUNDS_BEFORE_KILL..ROUNDS_BEFORE_KILL + ROUNDS_AFTER,
+    );
+    for sm in &post_kill {
+        standby.deliver(&sm.key, &sm.msg).expect("standby deliver");
+    }
+    let mut standby_decisions = Vec::new();
+    for i in 0..decision_count(ROUNDS_AFTER, false) {
+        let (_, _, msg) = standby
+            .next_decision(Duration::from_secs(60))
+            .unwrap_or_else(|e| panic!("standby decision {i}: {e}"));
+        standby_decisions.push(msg);
+    }
+    standby.stop().expect("standby stops clean");
+
+    // The oracle is an UNINTERRUPTED coordinator fed the identical stream — including the
+    // rejoin at the same position (every delivered frame advances the deterministic clock, so
+    // the churn is part of the timeline, crashed or not). The reconstructed seat must serve
+    // the whole thing byte-identically to the seat that never went down.
+    let total_rounds = ROUNDS_BEFORE_KILL + ROUNDS_AFTER;
+    let mut reference_script = build_script(&rig.worker_keys, 0..total_rounds);
+    reference_script.insert(
+        pre_kill.len(),
+        ScriptMsg {
+            key: churned.clone(),
+            msg: VhcMessage::Join(Join {
+                run_id: RUN_LABEL.into(),
+                iroh_id: IrohId([0x44; 32]),
+                class: ThroughputClass::C1,
+                capabilities: CapabilitySet::new(),
+                envelope_hash: None,
+            }),
+        },
+    );
+    let catch_up_publishes = ROUNDS_BEFORE_KILL as usize + 1; // the records + the standing open
+    let uninterrupted = wasm_reference(
+        &rig.wasm,
+        &rig.spec,
+        primary_key_seed,
+        &reference_script,
+        decision_count(total_rounds, true) + catch_up_publishes,
+    );
+    let tail = &uninterrupted[decision_count(ROUNDS_BEFORE_KILL, true)..];
+    let resumed: Vec<&VhcMessage> = catch_up.iter().chain(standby_decisions.iter()).collect();
+    assert_eq!(tail.len(), resumed.len());
+    for (a, b) in tail.iter().zip(resumed.iter()) {
+        assert_eq!(
+            to_canonical_vec(a).unwrap(),
+            to_canonical_vec(b).unwrap(),
+            "the reconstructed seat serves mid-recovery churn byte-identically to a seat \
+             that never crashed"
+        );
+    }
 }

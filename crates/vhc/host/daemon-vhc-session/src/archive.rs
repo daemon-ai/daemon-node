@@ -145,6 +145,13 @@ pub struct ArchiveSpec {
     /// reads `round_claim - archived_round` as the live archive/ring overlap lag (Gate B') and
     /// requests a recovery point when it drifts.
     pub archived_round: Arc<AtomicU64>,
+    /// The genesis-trusted base identities (ABI §8.8 \[AR-4\]): the succession-link resolution
+    /// considers a predecessor chain published under a DIFFERENT trusted base — a seat that
+    /// moved boxes links its founding head to the prior box's terminal head (the recovery
+    /// lineage is the SEAT's, not one base's). Candidates under a foreign base must authorize
+    /// against this set (an unverifiable store row must never shape our signed head). Empty =
+    /// own-base linking only.
+    pub trusted: Vec<daemon_vhc_proto::PeerId>,
 }
 
 /// Capped exponential backoff for the publisher's retry loops: transient store/registry faults
@@ -204,6 +211,7 @@ pub fn spawn_archive_publisher(
             bindings,
             round_claim: spec.round_claim,
             archived_round: spec.archived_round,
+            trusted: spec.trusted,
             published_tip: None,
             predecessor: None,
             ledger,
@@ -242,6 +250,9 @@ struct Publisher {
     /// The archive-tip watermark (same encoding), advanced on each ACKNOWLEDGED head to the
     /// claim it stamped — the seal pacer's overlap-lag input.
     archived_round: Arc<AtomicU64>,
+    /// The genesis-trusted attestor set for CROSS-BASE succession-link resolution (see
+    /// [`ArchiveSpec::trusted`]).
+    trusted: Vec<daemon_vhc_proto::PeerId>,
     /// The highest head ordinal the store holds for this chain (`None` = nothing published).
     published_tip: Option<u64>,
     /// The predecessor chain's terminal head address (segment 0's succession link), resolved
@@ -316,11 +327,24 @@ impl Publisher {
                 .fetch_max(round.saturating_add(1), Ordering::Relaxed);
         }
         // The succession link: our founding head names the predecessor chain's last published
-        // head by content address (`None` when this base+role has no earlier chain).
+        // head by content address (`None` when this run+role has no earlier chain). Candidates
+        // are NOT scoped to our own base: a seat that moved boxes (a new base identity per
+        // ABI §8.8 recovery) must link its founding head to the prior box's terminal head, or
+        // the reader's lineage fold sees two founding chains and refuses. A foreign-base
+        // candidate is only linkable when it AUTHORIZES against the genesis-trusted set — an
+        // unverifiable store row must never shape our signed head. Own-base rows are ours by
+        // construction (the store keyed them under our certificate chain).
         if self.published_tip.is_none() {
+            let linkable = |h: &&ArchiveHeadRecord| {
+                h.body.run_id == self.run_id
+                    && h.body.role == self.role
+                    && (h.certificate.base_identity == base
+                        || (self.trusted.contains(&h.certificate.base_identity)
+                            && h.authorize(&self.trusted).is_ok()))
+            };
             let predecessor_tip = stored
                 .iter()
-                .filter(own)
+                .filter(linkable)
                 .filter(|h| h.body.chain_instance < self.chain_instance)
                 .max_by_key(|h| (h.body.chain_instance, h.body.segment));
             self.predecessor = match predecessor_tip.map(ArchiveHeadRecord::content_address) {
@@ -743,6 +767,7 @@ mod tests {
                 chain_instance: sink.founding_instance(),
                 round_claim: Arc::new(AtomicU64::new(0)),
                 archived_round: Arc::new(AtomicU64::new(0)),
+                trusted: Vec::new(),
             },
             heads.clone(),
             segments.clone(),
@@ -791,6 +816,7 @@ mod tests {
                 chain_instance: 1,
                 round_claim: Arc::new(AtomicU64::new(0)),
                 archived_round: Arc::new(AtomicU64::new(0)),
+                trusted: Vec::new(),
             },
             heads.clone(),
             segments.clone(),
@@ -852,6 +878,7 @@ mod tests {
                 chain_instance: sink.founding_instance(),
                 round_claim: Arc::new(AtomicU64::new(0)),
                 archived_round: Arc::new(AtomicU64::new(0)),
+                trusted: Vec::new(),
             },
             heads.clone(),
             segments.clone(),

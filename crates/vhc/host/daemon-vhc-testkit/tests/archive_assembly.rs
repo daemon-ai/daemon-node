@@ -248,6 +248,7 @@ fn product_archive_assembles_and_replays_green() {
                 chain_instance: 0,
                 round_claim: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 archived_round: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                trusted: Vec::new(),
             },
             Arc::clone(&heads_store),
             content_store.clone(),

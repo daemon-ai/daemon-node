@@ -139,7 +139,7 @@ async fn join_live(
         .into());
     }
     let binding = backend::role_binding(resolved, genesis, run_id, incarnation)?;
-    let (journal, archive) = journal_sink(run_id, &binding.run.identity)?;
+    let (journal, archive) = journal_sink(run_id, &binding.run.identity, &binding.trusted_bases)?;
     let keystore = daemon_vhc_session::keystore::VhcKeystore::from_env()
         .map_err(|e| format!("identity store: {e}"))?;
     let announcement =
@@ -370,6 +370,7 @@ fn verify_restore_manifest_schema(
 fn journal_sink(
     run_label: &str,
     identity: &daemon_vhc_host::run::RunIdentity,
+    trusted_bases: &[daemon_vhc_proto::PeerId],
 ) -> Result<
     (
         Box<dyn daemon_vhc_host::run::JournalSink>,
@@ -401,6 +402,10 @@ fn journal_sink(
         chain_instance: sink.founding_instance(),
         round_claim: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         archived_round: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        // The genesis-trusted attestor set: the publisher's succession-link resolution may
+        // link a predecessor chain published under a DIFFERENT trusted base (a seat that
+        // moved boxes keeps ONE recovery lineage).
+        trusted: trusted_bases.to_vec(),
     };
     Ok((Box::new(sink), Some(archive)))
 }
@@ -940,14 +945,17 @@ async fn main() {
                 if in_process_plane_selected() {
                     match backend::role_binding(resolved, genesis, &run_id, expected.incarnation) {
                         Ok(binding) => {
-                            let (journal, archive) =
-                                match journal_sink(&run_id, &binding.run.identity) {
-                                    Ok(parts) => parts,
-                                    Err(detail) => {
-                                        send(&writer, &worker_error(&detail)).await;
-                                        continue;
-                                    }
-                                };
+                            let (journal, archive) = match journal_sink(
+                                &run_id,
+                                &binding.run.identity,
+                                &binding.trusted_bases,
+                            ) {
+                                Ok(parts) => parts,
+                                Err(detail) => {
+                                    send(&writer, &worker_error(&detail)).await;
+                                    continue;
+                                }
+                            };
                             // The measured backend selection materialized (no fallback: an
                             // unavailable admitted backend refuses the join typed).
                             let engine = match backend::engine_for_join(

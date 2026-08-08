@@ -355,6 +355,14 @@ chain's heads and segments land in the layout — but `vhc-replay` refuses it ty
 cross-chain replay lands with sandboxed coordinator reconstruction (the join-transaction rebuild),
 which owns the seam semantics.
 
+A succession may also cross **base identities** (the seat moved boxes): the publisher's
+succession-link resolution considers a predecessor chain published under a DIFFERENT
+genesis-trusted base — a foreign-base candidate must `authorize` against the trusted set before
+it may shape the founding head's link (an unverifiable store row never does) — so the reader's
+lineage fold still sees exactly one founding chain per seat. Own-base linking needs no trusted
+set; the cross-attestor case is pinned by the `reconstruct_product` matrix
+(`archive_only_recovery_reconstructs_across_a_second_trusted_base_identity`).
+
 ### 3.5 The per-round digest on the product API
 
 The per-round det-state digest each peer produces (§5.6 of the architecture) is surfaced on the node
