@@ -3039,13 +3039,20 @@ impl VhcService {
         }
     }
 
-    /// Resolve the late-join checkpoint restore for a run (spec §9): the registry's best
-    /// pointer FOR THIS ROLE FAMILY — the freshest live pointer across the per-seat siblings
-    /// (the elected slot publisher uploads the IDENTICAL deterministic state on behalf of every
-    /// seat: [`crate::discovery::best_restore_pointer`]), else the freshest drain snapshot; a
-    /// pointer outside the family is never consulted for the restore itself — decoded to the
-    /// wire restore form (`None` = fresh start / no discovery / nothing published for the
-    /// family). A malformed pointer hash is dropped (fresh start), never a hard join failure.
+    /// Resolve the late-join checkpoint restore for a run (spec §9, Gate D' order): the seat's
+    /// OWN pointer first (correct replica-local semantics), falling back to a sibling seat in
+    /// the same role family only when the seat has published nothing
+    /// ([`crate::discovery::best_restore_pointer`]); a pointer outside the family is never
+    /// consulted for the restore itself — decoded to the wire restore form (`None` = fresh
+    /// start / no discovery / nothing published for the family). A malformed pointer hash is
+    /// dropped (fresh start), never a hard join failure.
+    ///
+    /// A SIBLING adoption is a recorded posture, never a silent equivalence: the sibling's doc
+    /// carries its class-1 replica-local sections (optimizer moments, error feedback — per-seat
+    /// trajectories), so the adoption emits a persisted `sibling_restore_adopted` warning
+    /// (windowed into `vhc detail`'s recent events) naming both seats and the adopted round.
+    /// Consensus safety is unaffected (round digests cover exactly the class-0 consensus
+    /// sections; c15g proved live agreement).
     ///
     /// **Join-time cadence-vs-ring reachability** (the recovery-honesty check): a restorer
     /// replays forward across the coordinator's retained record ring
@@ -3104,9 +3111,32 @@ impl VhcService {
                 }
             }
         }
-        // The node resolved this role's freshest restore pointer (spec §9); the joining worker
-        // fetches its by-reference checkpoint document and streams each family's windows via
+        // The node resolved this role's restore pointer (spec §9); the joining worker fetches
+        // its by-reference checkpoint document and streams each family's windows via
         // chunk-keyed rehydration ([SF-6]). This is the node-visible half of the restore path.
+        if pointer.role != role {
+            let mut emitted = Vec::new();
+            let _ = self.emit(
+                VhcEvent::Warning {
+                    run_id: run_id.to_string(),
+                    class: "sibling_restore_adopted".to_string(),
+                    detail: format!(
+                        "{role} has no published checkpoint; restoring from sibling seat \
+                         {}'s round-{} doc — adopting its replica-local (class-1) sections \
+                         (consensus class-0 state is digest-covered and identical)",
+                        pointer.role, pointer.round
+                    ),
+                },
+                &mut emitted,
+            );
+            tracing::warn!(
+                run = run_id,
+                role,
+                sibling = pointer.role,
+                round = pointer.round,
+                "sibling-seat checkpoint adopted for restore (no own-seat doc published)"
+            );
+        }
         tracing::info!(
             run = run_id,
             role,
@@ -4842,6 +4872,74 @@ mod storage_gate_tests {
             "a transport outage never escalates to failed_terminal"
         );
         assert_eq!(row.retry_count, 0, "…and never consumes budget");
+    }
+
+    /// Gate D' restore honesty: adopting a SIBLING seat's checkpoint doc (the fallback when the
+    /// seat itself published nothing) is a recorded posture — a persisted
+    /// `sibling_restore_adopted` warning naming both seats and the adopted round — because the
+    /// doc carries the sibling's class-1 replica-local sections. An own-seat restore records
+    /// nothing (nothing foreign was adopted).
+    #[tokio::test]
+    async fn a_sibling_restore_adoption_is_recorded_as_a_persisted_warning() {
+        struct SiblingOnly;
+        #[async_trait]
+        impl crate::discovery::RunDiscovery for SiblingOnly {
+            async fn list_runs(&self) -> Result<Vec<crate::discovery::DiscoveredRun>, VhcError> {
+                Ok(Vec::new())
+            }
+            async fn get_run(
+                &self,
+                _run_id: &str,
+            ) -> Result<Option<crate::discovery::DiscoveredRun>, VhcError> {
+                Ok(None)
+            }
+            async fn fetch_envelope(&self, _run_id: &str) -> Result<Vec<u8>, VhcError> {
+                Ok(Vec::new())
+            }
+            async fn fetch_checkpoint(
+                &self,
+                _run_id: &str,
+                role: &str,
+            ) -> Result<Option<crate::discovery::CheckpointPointer>, VhcError> {
+                // Seat 1 published nothing; seat 0's doc stands (the Gate D' fallback shape).
+                // The coordinator has no pointer, so no staleness evidence exists.
+                if role == "coordinator" {
+                    return Ok(None);
+                }
+                Ok(Some(crate::discovery::CheckpointPointer {
+                    role: "trainer-0".into(),
+                    kind: "live".into(),
+                    round: 8,
+                    hash: "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262".into(),
+                    size: 2048,
+                }))
+            }
+        }
+
+        let mut svc = coordinator_trainer_service(OwnerBudget::unbounded());
+        svc.discovery = Some(Arc::new(SiblingOnly));
+
+        let restore = svc
+            .resolve_restore("run-d", "trainer-1", None)
+            .await
+            .expect("the sibling fallback resolves")
+            .expect("a restore pointer stands");
+        assert_eq!(restore.round, 8);
+
+        let events = svc.store.recent_events("run-d", 16).expect("events read");
+        let warning = events
+            .iter()
+            .find_map(|e| match e {
+                VhcEvent::Warning { class, detail, .. } if class == "sibling_restore_adopted" => {
+                    Some(detail.clone())
+                }
+                _ => None,
+            })
+            .expect("the adoption is a persisted warning");
+        assert!(
+            warning.contains("trainer-1") && warning.contains("trainer-0"),
+            "the warning names both seats: {warning}"
+        );
     }
 
     /// An ordinary retryable terminal is unchanged by the taxonomy: budget consumed, no gate.

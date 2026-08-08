@@ -1082,21 +1082,53 @@ async fn checkpoint_pointers_are_role_and_kind_scoped() {
         .is_none());
 }
 
-/// Defect 8 of the c15g drill: per-seat trainer roles share one restore FAMILY. The elected
-/// slot publisher uploads the identical deterministic state on behalf of every seat, so a
-/// crashed seat restores from a SIBLING seat's fresher live pointer — exact-role scoping left
-/// `trainer-1` on its own round-4 pointer while `trainer-0`'s round-8 pointer stood published,
-/// and every rejoin refused `CheckpointStale` (fence 4 vs head 12, horizon 4) although a
-/// horizon-reachable restore source existed.
+/// Gate D' restore honesty (re-adjudicating the c15g defect-8 fix): the OWN seat's pointer is
+/// preferred whenever it exists — even against a fresher sibling — because a checkpoint doc
+/// carries class-1 replica-local sections (optimizer moments, error feedback) that are the
+/// seat's own trajectory; own-pointer staleness is bridged by archive catch-up (Gate B'),
+/// never by silently adopting a sibling's replica-local state.
 #[tokio::test]
-async fn checkpoint_restore_reads_across_the_seat_family() {
+async fn checkpoint_restore_prefers_the_own_seat_pointer_over_a_fresher_sibling() {
+    let d = CheckpointDiscovery::default();
+    let own_hash = "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262";
+
+    // The c15g shape: alternating slot election left seat 0 with the fresher live pointer —
+    // but seat 1 HAS its own doc, so its own doc wins.
+    RunDiscovery::publish_checkpoint(&d, "run-seat", "trainer-1", "live", 4, own_hash, 2048)
+        .await
+        .unwrap();
+    RunDiscovery::publish_checkpoint(&d, "run-seat", "trainer-0", "live", 8, "bb", 2048)
+        .await
+        .unwrap();
+
+    let pointer = RunDiscovery::fetch_checkpoint(&d, "run-seat", "trainer-1")
+        .await
+        .unwrap()
+        .expect("the seat's own pointer is published");
+    assert_eq!(pointer.role, "trainer-1");
+    assert_eq!(pointer.round, 4);
+    assert_eq!(pointer.hash, own_hash);
+
+    // Within the own scope the live/drain rule holds: an own drain never shadows an own live.
+    RunDiscovery::publish_checkpoint(&d, "run-seat", "trainer-1", "drain", 6, "dd", 2048)
+        .await
+        .unwrap();
+    let pointer = RunDiscovery::fetch_checkpoint(&d, "run-seat", "trainer-1")
+        .await
+        .unwrap()
+        .expect("still resolved");
+    assert_eq!((pointer.kind.as_str(), pointer.round), ("live", 4));
+}
+
+/// The defect-8 lesson survives as the FALLBACK (Gate D'): a seat whose own slot was never
+/// published (alternating publisher election) restores from a family sibling's pointer instead
+/// of wedging `CheckpointStale` — recorded by the caller as adopting sibling replica-local
+/// state — and family scope never crosses role kinds.
+#[tokio::test]
+async fn checkpoint_restore_falls_back_to_a_sibling_only_without_an_own_doc() {
     let d = CheckpointDiscovery::default();
     let live_hash = "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262";
 
-    // The c15g shape: alternating slot election left seat 0 with the freshest live pointer.
-    RunDiscovery::publish_checkpoint(&d, "run-seat", "trainer-1", "live", 4, "dd", 2048)
-        .await
-        .unwrap();
     RunDiscovery::publish_checkpoint(&d, "run-seat", "trainer-0", "live", 8, live_hash, 2048)
         .await
         .unwrap();
@@ -1104,8 +1136,8 @@ async fn checkpoint_restore_reads_across_the_seat_family() {
         .await
         .unwrap();
 
-    // The rejoining seat 1 restores from seat 0's fresher pointer (same family), and the
-    // coordinator's even fresher pointer never crosses the family boundary.
+    // Seat 1 published nothing — the sibling's pointer is adopted; the coordinator's even
+    // fresher pointer never crosses the family boundary.
     let pointer = RunDiscovery::fetch_checkpoint(&d, "run-seat", "trainer-1")
         .await
         .unwrap()

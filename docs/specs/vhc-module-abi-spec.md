@@ -2262,6 +2262,19 @@ state-section-decl = {
 }
 ```
 
+**The restore-time schema gate (normative).** The manifest's `schema` is module-authored, but
+the restore protocol AROUND the manifest — this document form, the untagged inline/by-ref
+migration-section shapes, the `read_back(kind = 3)` staging discipline — is defined against
+**state-manifest schema major 1**. Before a late-join restore hands a fetched checkpoint
+document to `da_migrate`, the worker decodes the manifest header value-level (the bytes stay
+verbatim for the guest — the host still never links the SDK's typed manifest) and **fails
+closed**: an unreadable header, or a declared schema major other than the one this build has
+defined restore semantics for, is a typed refusal — never an undefined in-guest restore.
+Binding the manifest's `module` commitment through the epoch transition chain is deferred
+(the guest currently authors a zeroed module hash; fixing it requires passing the admitted
+hash through immutable guest init config — the host never mutates guest-authored manifest
+bytes).
+
 **Producing side (old module).** During a `Quiesce{Upgrade}` drain the guest materializes each
 section's bytes host-side with the **Phase-A staging import** (resolution of the migration
 bootstrap review):

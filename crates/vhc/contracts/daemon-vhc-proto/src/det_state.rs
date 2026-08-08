@@ -751,6 +751,63 @@ pub fn decode_checkpoint_doc(
     Ok((manifest, sections))
 }
 
+/// The §10.2 state-manifest schema major this host stack has DEFINED restore semantics for.
+///
+/// The manifest's `schema` is module-authored, but the restore protocol around it — the v2
+/// checkpoint-document form ([`encode_checkpoint_doc`]), the untagged inline/by-ref
+/// migration-section shapes, the `read_back(kind = 3)` staging discipline — is defined against
+/// this major. A checkpoint document declaring any other major has NO defined restore path in
+/// this build, so the worker refuses it typed at restore (fail-closed, Gate D') instead of
+/// handing a future-format doc to `da_migrate` and hoping. Analogous to `GENESIS_SCHEMA_MAJOR`:
+/// a structural version gate the host may read without interpreting module state. Module-hash
+/// binding via the epoch transition chain is deferred (post-C2, with the compatibility-class
+/// work — it requires passing the admitted hash through guest init config to fix the zeroed
+/// tiny-llama module commitment).
+pub const STATE_MANIFEST_SCHEMA_MAJOR: u64 = 1;
+
+/// Decode the §10.2 `state-manifest`'s header fields — `(schema, producing module hash)` —
+/// from its verbatim CBOR bytes. Value-level like the other doc codecs here (the host never
+/// links the SDK's typed manifest; the bytes stay verbatim for the guest). Fails typed on any
+/// structural surprise — a manifest the host cannot even read the version of is never handed
+/// to a restore.
+pub fn decode_manifest_header(manifest: &[u8]) -> Result<(u64, Hash), VhcProtoError> {
+    use ciborium::value::Value;
+    let v: Value = ciborium::de::from_reader(manifest)
+        .map_err(|e| VhcProtoError::Validation(format!("state-manifest decode: {e}")))?;
+    let Value::Map(entries) = v else {
+        return Err(VhcProtoError::Validation(
+            "state-manifest is not a map".into(),
+        ));
+    };
+    let field = |name: &str| {
+        entries.iter().find_map(|(k, val)| match k {
+            Value::Text(t) if t == name => Some(val),
+            _ => None,
+        })
+    };
+    let schema = match field("schema") {
+        Some(Value::Integer(i)) => u64::try_from(i128::from(*i)).map_err(|_| {
+            VhcProtoError::Validation("state-manifest `schema` out of range".into())
+        })?,
+        _ => {
+            return Err(VhcProtoError::Validation(
+                "state-manifest missing `schema`".into(),
+            ))
+        }
+    };
+    let module: [u8; 32] = match field("module") {
+        Some(Value::Bytes(b)) => b.as_slice().try_into().map_err(|_| {
+            VhcProtoError::Validation("state-manifest `module` is not 32 bytes".into())
+        })?,
+        _ => {
+            return Err(VhcProtoError::Validation(
+                "state-manifest missing `module`".into(),
+            ))
+        }
+    };
+    Ok((schema, Hash(module)))
+}
+
 /// The profile-chunk constraint (genesis-authoring rule): the compression profile's `chunk`
 /// MUST divide every parameter's numel — the det kernels refuse a non-multiple layout only at
 /// first use, so authoring validates it up front. For the ceremony geometry every numel is a
@@ -1056,6 +1113,61 @@ mod tests {
         // A truncated / non-array doc is a typed refusal, never a partial capture.
         assert!(decode_checkpoint_doc(&doc[..doc.len() - 1]).is_err());
         assert!(decode_checkpoint_doc(b"\x01").is_err());
+    }
+
+    #[test]
+    fn the_manifest_header_decodes_value_level_and_fails_typed() {
+        use ciborium::value::Value;
+        // The SDK's `StateManifest` canonical shape, built value-level here (this crate never
+        // links the SDK — the same wall the production restore gate respects).
+        let manifest = Value::Map(vec![
+            (Value::Text("schema".into()), Value::Integer(1.into())),
+            (Value::Text("module".into()), Value::Bytes(vec![0xAB; 32])),
+            (Value::Text("sections".into()), Value::Array(Vec::new())),
+        ]);
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&manifest, &mut bytes).unwrap();
+        let (schema, module) = decode_manifest_header(&bytes).unwrap();
+        assert_eq!(schema, STATE_MANIFEST_SCHEMA_MAJOR);
+        assert_eq!(module, Hash([0xAB; 32]));
+
+        // …and it round-trips the REAL typed manifest encoding: the SDK serializes the same
+        // struct shape through the shared canonical codec, so a serde-encoded map decodes too.
+        #[derive(serde::Serialize)]
+        struct ManifestShape {
+            schema: u64,
+            module: Hash,
+            sections: Vec<u8>,
+        }
+        let typed = to_canonical_vec(&ManifestShape {
+            schema: 3,
+            module: Hash([0x5D; 32]),
+            sections: Vec::new(),
+        })
+        .unwrap();
+        assert_eq!(
+            decode_manifest_header(&typed).unwrap(),
+            (3, Hash([0x5D; 32]))
+        );
+
+        // Typed refusals: not CBOR, not a map, missing/short fields.
+        assert!(decode_manifest_header(b"not-cbor").is_err());
+        let arr = to_canonical_vec(&vec![1u64]).unwrap();
+        assert!(decode_manifest_header(&arr).is_err());
+        let no_schema = Value::Map(vec![(
+            Value::Text("module".into()),
+            Value::Bytes(vec![0; 32]),
+        )]);
+        let mut b = Vec::new();
+        ciborium::into_writer(&no_schema, &mut b).unwrap();
+        assert!(decode_manifest_header(&b).is_err());
+        let short_module = Value::Map(vec![
+            (Value::Text("schema".into()), Value::Integer(1.into())),
+            (Value::Text("module".into()), Value::Bytes(vec![0; 4])),
+        ]);
+        let mut b = Vec::new();
+        ciborium::into_writer(&short_module, &mut b).unwrap();
+        assert!(decode_manifest_header(&b).is_err());
     }
 
     #[test]

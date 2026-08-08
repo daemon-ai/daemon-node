@@ -961,15 +961,27 @@ from silence.
   the command — and the record mirror plus the advanced execution identity persist only on
   activation. A post-fence exit that leaves the run persists no advance: the run-level record
   stays committed; only this node's instance left.
-- **[RL-8]** **Restore pointers are role- and kind-scoped, with a periodic live cadence.**
-  Published checkpoint pointers are keyed per `(role, kind)`: a joining instance restores only
-  from its own role's slots — a coordinator drain snapshot can never shadow a trainer restore
-  source — preferring the freshest `live` pointer and falling back to the freshest `drain`
-  snapshot. Because a drain snapshot exists only when an instance drains (a hard-crashed peer
-  never drains), the trainer exports its full restorable state on a configured ingested-round
-  cadence as a live checkpoint; within a replicated trainer group any peer's fresher live
-  checkpoint is a valid restore source for a rejoiner, so a hard-crashed peer resumes from state
-  that already folds the rounds it missed and its digests stay continuous with the survivors.
+- **[RL-8]** **Restore pointers are role- and kind-scoped, own-seat-first, with a periodic live
+  cadence.** Published checkpoint pointers are keyed per `(role, kind)`: a joining instance
+  restores only from its own role family's slots — a coordinator drain snapshot can never shadow
+  a trainer restore source. Selection is **own-seat-first**: the seat's OWN pointers are
+  preferred whenever any exists (freshest `live`, else `drain` — a drain snapshot exists only
+  when an instance drains; a hard-crashed peer never drains), because a checkpoint document
+  carries the producing seat's **replica-local (class-1) sections** — optimizer moments, error
+  feedback — which are that seat's own training trajectory, and an own pointer's extra staleness
+  is bridged by replay/catch-up, never by adopting foreign local state. A **sibling seat's**
+  pointer in the same role family is a FALLBACK taken only when the seat itself has published
+  nothing (e.g. alternating publisher election with a crash before the seat's first slot): the
+  sibling's class-0 consensus-canonical sections are digest-identical by the deterministic-state
+  contract, but the restore adopts the sibling's class-1 sections — consensus-safe, and always
+  RECORDED (a persisted `sibling_restore_adopted` warning naming both seats and the round),
+  never a silent equivalence. At restore the worker additionally fails closed on the document's
+  state-manifest: an unreadable manifest header or a schema major this build has no defined
+  restore semantics for is a typed refusal before the module ever sees the document
+  (module-hash binding through the epoch transition chain is deferred work). The trainer exports
+  its full restorable state on a configured ingested-round cadence as a live checkpoint, so a
+  hard-crashed peer resumes from state that already folds the rounds it missed and its digests
+  stay continuous with the survivors.
   The cadence separates **sealing from publishing**: sealing a checkpoint locally is cheap
   (state the host already holds) and may happen every cadence round, while **remote upload**
   obeys a byte budget — one deterministically designated publisher per cadence slot (derivable

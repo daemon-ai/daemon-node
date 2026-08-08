@@ -87,6 +87,7 @@ fn in_process_providers() -> RoleProviders {
 /// re-converges under its retry budget — while everything else keeps the module class. Without it
 /// every attach failure looked the same to the node.
 #[cfg(feature = "vhc-net")]
+#[derive(Debug)]
 struct AttachRefusal {
     class: ErrorClass,
     detail: String,
@@ -204,6 +205,7 @@ async fn join_live(
                 }
             })?;
             let capture = daemon_vhc_session::role_session::decode_snapshot_doc(&bytes)?;
+            verify_restore_manifest_schema(&capture.manifest, &hash, r.round)?;
             Some(daemon_vhc_host::run::MigrationInput {
                 capture,
                 restore: true,
@@ -295,6 +297,37 @@ async fn join_live(
         admitted_quotas: binding.quotas,
         archive,
     })
+}
+
+/// Fail closed at restore (Gate D', ABI §10.2): a checkpoint doc whose state-manifest this
+/// build cannot read — or that declares a schema major with no defined restore semantics here
+/// ([`daemon_vhc_proto::det_state::STATE_MANIFEST_SCHEMA_MAJOR`]) — is refused typed BEFORE
+/// `da_migrate` sees it. Value-level header decode only; the manifest bytes stay verbatim for
+/// the guest. Module-hash binding via the epoch transition chain is deferred (post-C2; see the
+/// constant's docs — tiny-llama's manifest module commitment is currently zeroed and needs the
+/// admitted hash in guest init config first).
+#[cfg(feature = "vhc-net")]
+fn verify_restore_manifest_schema(
+    manifest: &[u8],
+    doc_hash: &daemon_vhc_proto::Hash,
+    round: u64,
+) -> Result<(), AttachRefusal> {
+    let (schema, _module) =
+        daemon_vhc_proto::det_state::decode_manifest_header(manifest).map_err(|e| {
+            AttachRefusal::from(format!(
+                "restore checkpoint {} (round {round}): state-manifest: {e}",
+                doc_hash.to_hex()
+            ))
+        })?;
+    if schema != daemon_vhc_proto::det_state::STATE_MANIFEST_SCHEMA_MAJOR {
+        return Err(AttachRefusal::from(format!(
+            "restore checkpoint {} (round {round}): state-manifest schema {schema} has no \
+             defined restore semantics in this build (understood: {})",
+            doc_hash.to_hex(),
+            daemon_vhc_proto::det_state::STATE_MANIFEST_SCHEMA_MAJOR
+        )));
+    }
+    Ok(())
 }
 
 /// The role session's journal sink: the node-delivered DURABLE per-incarnation home
@@ -1116,5 +1149,57 @@ pub(crate) async fn send(writer: &CutWriter, event: &Event) {
             let _ = writer.send(&bytes).await;
         }
         Err(e) => eprintln!("daemon-vhc-worker: encode event: {e}"),
+    }
+}
+
+#[cfg(all(test, feature = "vhc-net"))]
+mod restore_gate_tests {
+    use super::verify_restore_manifest_schema;
+
+    /// A minimal §10.2 state-manifest at the given schema, built at the CBOR-value level (the
+    /// worker links no SDK manifest type — the same wall the production decode respects).
+    fn manifest_bytes(schema: u64) -> Vec<u8> {
+        use ciborium::value::Value;
+        let manifest = Value::Map(vec![
+            (Value::Text("schema".into()), Value::Integer(schema.into())),
+            (Value::Text("module".into()), Value::Bytes(vec![0u8; 32])),
+            (Value::Text("sections".into()), Value::Array(Vec::new())),
+        ]);
+        let mut out = Vec::new();
+        ciborium::into_writer(&manifest, &mut out).expect("manifest encodes");
+        out
+    }
+
+    #[test]
+    fn a_known_schema_manifest_passes_the_restore_gate() {
+        let bytes = manifest_bytes(daemon_vhc_proto::det_state::STATE_MANIFEST_SCHEMA_MAJOR);
+        verify_restore_manifest_schema(&bytes, &daemon_vhc_proto::Hash([7; 32]), 4)
+            .expect("the understood schema major restores");
+    }
+
+    #[test]
+    fn an_unknown_schema_major_is_refused_typed_before_da_migrate() {
+        // Fail closed (Gate D'): a future-format doc meets a typed refusal naming both the
+        // declared and the understood major — never an undefined in-guest restore.
+        let bytes = manifest_bytes(2);
+        let refusal = verify_restore_manifest_schema(&bytes, &daemon_vhc_proto::Hash([7; 32]), 4)
+            .expect_err("schema 2 has no defined restore semantics in this build");
+        assert!(
+            refusal.detail.contains("schema 2") && refusal.detail.contains("understood: 1"),
+            "the refusal names the majors: {}",
+            refusal.detail
+        );
+    }
+
+    #[test]
+    fn an_unreadable_manifest_is_refused_typed() {
+        let refusal =
+            verify_restore_manifest_schema(b"not-cbor", &daemon_vhc_proto::Hash([7; 32]), 4)
+                .expect_err("garbage never reaches da_migrate");
+        assert!(
+            refusal.detail.contains("state-manifest"),
+            "the refusal is attributed to the manifest decode: {}",
+            refusal.detail
+        );
     }
 }
