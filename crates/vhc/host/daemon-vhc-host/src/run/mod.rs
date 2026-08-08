@@ -43,7 +43,7 @@ pub use driver::{
 };
 pub use event::{decode_event_frame, encode_event_frame, EventCodecError, PayloadMeta, RunEvent};
 pub use journal::RunHeaderResources;
-pub use journal::{Dropped, JournalSink, MemorySink, SinkEntry, SinkError, StorageFault};
+pub use journal::{Dropped, JournalSink, MemorySink, SinkEntry, SinkError, StorageFault, TeeSink};
 pub use ops::{OpRequest, OpTable};
 pub use replay::{
     replay, replay_migrating, ReplayEnd, ReplayMigration, ReplayScript, ReplayedDecision,

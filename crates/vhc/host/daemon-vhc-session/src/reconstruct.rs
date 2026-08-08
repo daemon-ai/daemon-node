@@ -17,33 +17,44 @@
 //!    journal home's file (hash-verified against the head) and falling back to the content
 //!    plane; then the newest chain's LOCAL unsealed tail, chained via `prev_blake3` off the
 //!    last attested segment — a torn tail contributes its intact prefix only (§8.2).
-//! 3. **Replay through the sandbox**: boot a throwaway instance of the pinned module under the
-//!    production event-loop driver — from the genesis config (`da_init`), or migrated from a
-//!    matching anchor capture when the stream's last tag-10 proves one — deliver the recovered
-//!    tag-12 signed frames verbatim (original senders/seqs — a re-signed frame would corrupt
-//!    per-peer accounting), then quiesce and export the rebuilt state via the typed §10.2
-//!    snapshot path.
+//! 3. **Replay the FULL RECORD STREAM through the §8.7 input-replay engine** — the same
+//!    journal-answers-everything semantics the D2 oracle proves: delivered events verbatim
+//!    (inbound frames, timer fires, **capability-op completions in journaled order** — a
+//!    ceremony coordinator's §6.4 I6 storage receipts are its OWN `payload_get` completions,
+//!    which exist nowhere in the frame stream), recorded read-backs, clock readings and timer
+//!    arms. At the stream's end (the crash cut) a synthetic Quiesce drives the guest's own
+//!    §10.2 snapshot path, and the engine assembles the exported capture.
+//! 4. **Gate on decision equivalence**: every recorded outbound `Publish` (channel, seq,
+//!    payload hash) must be reproduced by the replayed guest, in order. A replay that folds
+//!    the history but does not re-derive the recorded decisions did NOT rebuild the recorded
+//!    state — the join refuses typed. (The c15-20260806g corruption: a frames-only replay
+//!    starved of its completion-borne receipts silently exported a round-0 state and the
+//!    resumed coordinator re-ran the run from round 0 on a successor chain.)
 //!
 //! The exported capture becomes the REAL instance's [`daemon_vhc_host::run::MigrationInput`]
 //! (`anchor: true` — the reconstruction founds a fresh journal chain, §8.3). Frames inside an
 //! attested segment need no per-frame re-verification: the segment bytes hash-match a head
 //! signed by a certificate chained to the genesis-trusted base, and the recording relay already
-//! verified each frame above the pump before journaling it.
+//! verified each frame above the pump before journaling it. Bulk payload bytes are NOT
+//! re-fetched: the recorded completion is the guest-visible evidence, and a guest that would
+//! actually READ the missing bytes ends the replay typed
+//! ([`daemon_vhc_host::run::ReplayScript::missing_payload_placeholders`]).
 //!
-//! The replay is bounded by the archived history's length. A checkpoint-anchored fast path
-//! engages when the caller supplies the resolved restore capture AND the recovered stream's
-//! last tag-10 manifest byte-matches it (the proof the capture IS that journal position);
-//! otherwise the full lineage replays from genesis — always correct by policy determinism.
+//! The replay is bounded by the archived history's length and replays from the lineage's
+//! beginning — always correct by policy determinism. Incarnation seams inside the stream
+//! (tag-13 records) split it into spans replayed sequentially: a reason-2 (upgrade-activation)
+//! span migrates from the previous span's exported capture (or the node-resolved restore
+//! capture when the lineage itself begins mid-history), everything else boots fresh.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use daemon_vhc_host::run::{
-    start_run_migrating, DeliverVerdict, MemorySink, MigrationInput, OpOutcome, PumpHandle, Run,
-    RunConfig, RunEnd, RunIdentity, SnapshotCapture,
+    replay_migrating, ReplayEnd, ReplayMigration, ReplayScript, ReplayedRun, RunIdentity,
+    SnapshotCapture,
 };
 use daemon_vhc_host::{select_driver, EngineConfig, Worker};
-use daemon_vhc_journal::{scan_bytes, scan_file, Body, JournalPaths};
+use daemon_vhc_journal::{scan_bytes, scan_file, Body, JournalPaths, Record};
 use daemon_vhc_net::{ContentHash, ContentStore};
 use daemon_vhc_proto::{
     coordinator_lineage, verify_chains, ArchiveHeadRecord, ChainVerifyError, Hash, PeerId,
@@ -105,26 +116,6 @@ pub struct ReconstructSpec {
     pub deadline_ms: u64,
 }
 
-/// One recovered authoritative frame (a tag-12 record), verbatim.
-struct RecoveredFrame {
-    channel: u32,
-    seq: u64,
-    sender: [u8; 32],
-    payload: Vec<u8>,
-    original: Vec<u8>,
-}
-
-/// What the record recovery produced: the frames to replay and the anchor judgment.
-struct RecoveredStream {
-    /// Frames BEFORE the anchor cut (replayed only on the genesis path).
-    prefix: Vec<RecoveredFrame>,
-    /// Frames AFTER the anchor cut (always replayed).
-    tail: Vec<RecoveredFrame>,
-    /// Whether the caller's restore capture byte-matched the stream's last tag-10 (the proof
-    /// the capture is exactly the state at the cut — the fast path's engagement condition).
-    anchored: bool,
-}
-
 /// Rebuild the seat's consensus state from its published journal lineage through the sandbox and
 /// return the exported [`SnapshotCapture`] — the real instance's migration input (`anchor: true`).
 ///
@@ -139,20 +130,18 @@ pub async fn reconstruct_coordinator(
     let lineage = coordinator_lineage(&chains, &spec.role)?;
 
     // -- 2. recover the verified record stream (attested segments + the local unsealed tail) -----
-    let stream = recover_stream(&spec, &lineage, segments.as_ref()).await?;
+    let records = recover_records(&spec, &lineage, segments.as_ref()).await?;
 
     tracing::info!(
         run = spec.run_label,
         role = spec.role,
         chains = lineage.len(),
-        anchored = stream.anchored,
-        prefix_frames = stream.prefix.len(),
-        tail_frames = stream.tail.len(),
-        "coordinator reconstruction: replaying the recovered lineage through the sandbox"
+        records = records.len(),
+        "coordinator reconstruction: replaying the recovered record stream through the sandbox"
     );
-    // -- 3. the sandboxed replay (blocking: the driver runs a guest thread) ----------------------
+    // -- 3+4. full-record input replay + decision gate (blocking: synchronous wasm drive) --------
     let restore = spec.restore.clone();
-    tokio::task::spawn_blocking(move || replay_capture(&spec, restore, stream))
+    tokio::task::spawn_blocking(move || replay_capture(&spec, restore, records))
         .await
         .map_err(|e| ReconstructError::Sandbox(format!("replay task: {e}")))?
 }
@@ -201,52 +190,15 @@ fn read_local(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
 }
 
 /// Walk the verified lineage: scan every attested segment (cross-checking `prev_blake3` against
-/// the head), then chain the newest chain's LOCAL unsealed tail; split the frames at the anchor
-/// cut (the last tag-10 whose manifest byte-matches the caller's restore capture).
-async fn recover_stream(
+/// the head), then chain the newest chain's LOCAL unsealed tail — collecting the FULL record
+/// stream in order (the §8.7 input-replay engine consumes events, read-backs, clocks and timer
+/// arms; tag-12 evidence and tag-4 publishes feed the decision gate).
+async fn recover_records(
     spec: &ReconstructSpec,
     lineage: &[&daemon_vhc_proto::VerifiedChain],
     segments: &dyn ContentStore,
-) -> Result<RecoveredStream, ReconstructError> {
-    let anchor_manifest = spec.restore.as_ref().map(|c| c.manifest.as_slice());
-    let mut prefix: Vec<RecoveredFrame> = Vec::new();
-    let mut tail: Vec<RecoveredFrame> = Vec::new();
-    let mut anchored = false;
-
-    let fold_records = |records: &[daemon_vhc_journal::Record],
-                        prefix: &mut Vec<RecoveredFrame>,
-                        tail: &mut Vec<RecoveredFrame>,
-                        anchored: &mut bool| {
-        for record in records {
-            match &record.body {
-                Body::Snapshot(snap) => {
-                    // The anchor judgment: a tag-10 that byte-matches the resolved restore
-                    // capture's manifest proves the capture IS this journal position — every
-                    // frame before it is already folded into the capture.
-                    if anchor_manifest.is_some_and(|m| m == snap.manifest.as_slice()) {
-                        prefix.append(tail);
-                        *anchored = true;
-                    }
-                }
-                Body::SignedFrame(sf) => {
-                    let Some(original) = &sf.frame else {
-                        continue; // an evidence-by-reference record (Phase D) carries no bytes
-                    };
-                    let Some(payload) = frame_payload(original) else {
-                        continue; // structurally foreign evidence — never a replay input
-                    };
-                    tail.push(RecoveredFrame {
-                        channel: u32::try_from(sf.channel).unwrap_or(u32::MAX),
-                        seq: sf.seq,
-                        sender: sf.sender.0,
-                        payload,
-                        original: original.clone(),
-                    });
-                }
-                _ => {}
-            }
-        }
-    };
+) -> Result<Vec<Record>, ReconstructError> {
+    let mut records: Vec<Record> = Vec::new();
 
     for chain in lineage {
         let mut last_complete: Option<[u8; 32]> = None;
@@ -264,8 +216,8 @@ async fn recover_stream(
                     detail: "segment header's prev link disagrees with the attested head".into(),
                 });
             }
-            fold_records(&scan.records, &mut prefix, &mut tail, &mut anchored);
             last_complete = Some(scan.complete_file_blake3);
+            records.extend(scan.records);
         }
 
         // The NEWEST chain's local unsealed tail: segments past the last attested head, chained
@@ -319,39 +271,142 @@ async fn recover_stream(
                 );
                 break;
             }
-            fold_records(&scan.records, &mut prefix, &mut tail, &mut anchored);
             prev = Some(scan.complete_file_blake3);
+            records.extend(scan.records);
         }
     }
 
-    Ok(RecoveredStream {
-        prefix,
-        tail,
-        anchored,
-    })
+    Ok(records)
 }
 
-/// Extract the module-authored payload bytes from a §12.1 signed wire frame
-/// (`[envelope, payload, sig]`) — structural CBOR, never a round schema.
-fn frame_payload(frame: &[u8]) -> Option<Vec<u8>> {
-    let v: ciborium::value::Value = ciborium::de::from_reader(frame).ok()?;
-    let ciborium::value::Value::Array(parts) = v else {
-        return None;
-    };
-    match parts.into_iter().nth(1)? {
-        ciborium::value::Value::Bytes(payload) => Some(payload),
-        _ => None,
+/// One incarnation's slice of the recovered stream: its tag-0 header, its instantiation reason
+/// (0 initial, 1 trap-restart, 2 upgrade-activation) and its records.
+struct Span {
+    header: Box<daemon_vhc_journal::record::RunHeader>,
+    reason: u64,
+    records: Vec<Record>,
+}
+
+/// Split the recovered stream at incarnation seams: every tag-0 run header starts a span (the
+/// driver journals the header before the tag-13 instantiation, which carries the reason).
+fn split_spans(records: Vec<Record>) -> Result<Vec<Span>, ReconstructError> {
+    let mut spans: Vec<Span> = Vec::new();
+    for record in records {
+        if let Body::RunHeader(header) = &record.body {
+            spans.push(Span {
+                header: header.clone(),
+                reason: 0,
+                records: Vec::new(),
+            });
+            continue;
+        }
+        let Some(span) = spans.last_mut() else {
+            return Err(ReconstructError::Sandbox(
+                "the recovered stream begins without a tag-0 run header — not a \
+                 production journal lineage"
+                    .into(),
+            ));
+        };
+        if let Body::Instantiation(inst) = &record.body {
+            span.reason = inst.reason;
+        }
+        span.records.push(record);
     }
+    if spans.is_empty() {
+        return Err(ReconstructError::Sandbox(
+            "the recovered stream carries no records — nothing to reconstruct".into(),
+        ));
+    }
+    Ok(spans)
 }
 
-/// Boot the throwaway sandbox instance, replay the recovered frames, quiesce, export.
+/// The §8.7 record → [`ReplayScript`] mapping (the same split the D2 archive replay uses):
+/// delivered events verbatim (frames, timer fires, completions — in journaled order),
+/// read-backs routed by kind, clock readings, timer arms/cancels, device profiles.
+fn build_script(records: &[Record]) -> Result<ReplayScript, ReconstructError> {
+    let mut script = ReplayScript::default();
+    for record in records {
+        match &record.body {
+            Body::Event(e) => script.events.push_back((e.at, e.frame.clone())),
+            Body::ReadBack(r) => {
+                if r.sidecar.is_some() {
+                    return Err(ReconstructError::Sandbox(format!(
+                        "record {}: sidecar-referenced read-back values are not available to \
+                         a reconstruction (no sidecar key material rides the archive)",
+                        record.ord
+                    )));
+                }
+                let value = r.value.clone().unwrap_or_default();
+                if r.kind >= 128 {
+                    // The retired bridge's reserved journal kinds: never re-fed.
+                } else if r.kind == u64::from(daemon_vhc_abi::READBACK_KIND_STREAM_BYTES) {
+                    script.stream_bytes.push_back((r.src, value));
+                } else if r.kind == u64::from(daemon_vhc_abi::READBACK_KIND_TENSOR_EXPORT) {
+                    script.tensor_exports.push_back((r.src, value));
+                } else if r.kind == u64::from(daemon_vhc_abi::READBACK_KIND_STATE_SEAL) {
+                    script.state_seals.push_back((r.src, value));
+                } else {
+                    script.readbacks.push_back((r.src, r.kind, value));
+                }
+            }
+            Body::Clock(c) => script.clocks.push_back(c.now),
+            Body::TimerArm(t) => script.timer_arms.push_back((t.id, t.delay)),
+            Body::TimerCancel(t) => script.timer_cancels.push_back((t.id, t.status)),
+            Body::DeviceProfile(d) => script.device_profiles.push_back(d.profile.clone()),
+            _ => {}
+        }
+    }
+    Ok(script)
+}
+
+/// The decision gate: every recorded outbound publish `(channel, seq, payload hash)` of the
+/// span must be reproduced by the replayed guest, in order. The replay may legitimately
+/// produce MORE than the record (a decision whose publish record was lost to the crash cut
+/// re-derives), never fewer and never different — a mismatch means the replay did NOT rebuild
+/// the recorded state, and resuming from it would fork the run behind its own durable record.
+fn verify_decisions(
+    span_index: usize,
+    records: &[Record],
+    replayed: &ReplayedRun,
+) -> Result<(), ReconstructError> {
+    let recorded: Vec<(u64, u64, [u8; 32], u64)> = records
+        .iter()
+        .filter_map(|r| match &r.body {
+            Body::Publish(p) => Some((p.channel, p.seq, p.hash.0, r.ord)),
+            _ => None,
+        })
+        .collect();
+    if replayed.decisions.len() < recorded.len() {
+        return Err(ReconstructError::Sandbox(format!(
+            "span {span_index}: the replay reproduced {} of {} recorded publishes — the \
+             rebuilt state is BEHIND the durable record (resuming would fork the run)",
+            replayed.decisions.len(),
+            recorded.len()
+        )));
+    }
+    for (i, (rec, got)) in recorded.iter().zip(&replayed.decisions).enumerate() {
+        if got.channel != rec.0 || got.seq != rec.1 || got.payload_hash != rec.2 {
+            return Err(ReconstructError::Sandbox(format!(
+                "span {span_index}: replayed decision {i} (channel {}, seq {}) diverges from \
+                 the recorded publish at ordinal {} (channel {}, seq {}) — the replay did not \
+                 re-derive the recorded history",
+                got.channel, got.seq, rec.3, rec.0, rec.1
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Re-drive the recovered record stream through the §8.7 input-replay engine, span by span,
+/// gate each span's decisions against its recorded publishes, and export the final state via
+/// the guest's own §10.2 snapshot path (driven by the synthetic exhaustion Quiesce).
 ///
-/// Synchronous (the driver runs the guest on its own thread; delivery back-pressure sleeps) —
+/// Synchronous (a replay can never block — every input it may wait for is in the script) —
 /// called from `spawn_blocking`.
 fn replay_capture(
     spec: &ReconstructSpec,
     restore: Option<SnapshotCapture>,
-    stream: RecoveredStream,
+    records: Vec<Record>,
 ) -> Result<SnapshotCapture, ReconstructError> {
     let sandbox = |e: String| ReconstructError::Sandbox(e);
 
@@ -367,194 +422,103 @@ fn replay_capture(
         )));
     }
 
-    // The anchor decision (see module docs): migrate from the proven capture and replay only
-    // the post-anchor tail, or genesis-boot and replay everything.
-    let (migration, frames) = if stream.anchored {
-        let capture = restore.expect("anchored implies a restore capture");
-        (
-            Some(MigrationInput {
-                capture,
-                restore: true,
-                migrate_fuel: None,
-                carried_state: Vec::new(),
-                // The SANDBOX journal is in-memory and discarded; the anchor obligation
-                // belongs to the REAL instance's founding migration, not this throwaway.
-                anchor: false,
-            }),
-            stream.tail,
-        )
-    } else {
-        let mut all = stream.prefix;
-        all.extend(stream.tail);
-        (None, all)
-    };
+    let spans = split_spans(records)?;
+    let total = spans.len();
 
-    // A throwaway identity: the sandbox's publishes are discarded and its journal is in-memory —
-    // nothing it signs ever leaves this process.
-    let identity = RunIdentity {
-        run_id: spec.run_id.0,
-        epoch: 0,
-        role: spec.role.clone(),
-        instance: spec.incarnation,
-        module: module_hash,
-    };
-    let signing_seed =
-        *blake3::hash(&[&spec.run_id.0[..], b"reconstruct-sandbox"].concat()).as_bytes();
-    let mut run_cfg = RunConfig::new(
-        identity,
-        signing_seed,
-        spec.config.clone(),
-        spec.grants.clone(),
-    );
-    // The outstanding-op ceiling is LIFTED for the sandbox (`0` = unbounded). The ceiling
-    // protects the host's async runtime from runaway live-service concurrency — but this
-    // instance's ops are never serviced, only failed (`fail_pending_ops`), so the bound
-    // protects nothing here and turns replay into a scheduling race: the drain is host-side
-    // POLLING, while the guest folds the spooled lineage back-to-back and can issue one
-    // availability `payload_get` per Commitment faster than any poll cadence — observed live
-    // (c15-20260806g, head 12: the fold burst crossed 16 outstanding between two 2ms drains
-    // and trapped `GrantViolation` mid-replay on every retry, despite the prompt-failure
-    // drain landing for c15-20260806b). The guest still sees the ADMITTED grants bytes
-    // unchanged; only the host-side enforcement bound is inapplicable to the hermetic
-    // throwaway.
-    run_cfg.max_outstanding_ops = 0;
-    let run = start_run_migrating(
-        &engine,
-        &spec.module,
-        run_cfg,
-        Box::new(MemorySink::new()),
-        migration,
-    )
-    .map_err(|e| sandbox(format!("start: {e}")))?;
-    let pump = run.pump.clone();
+    // The capture carried across spans: a reason-2 (upgrade-activation) span migrates from its
+    // predecessor's export; the LEADING span may instead migrate from the node-resolved restore
+    // capture (a lineage that begins mid-history). Anything else boots fresh from genesis.
+    let mut carried: Option<SnapshotCapture> = restore;
+    let mut exported: Option<SnapshotCapture> = None;
 
-    // Deliver the recovered frames verbatim (original senders/seqs), back-pressuring on
-    // SpoolFull/SenderQuota per §4.7 — never dropping, bounded per stall. Capability ops the
-    // guest issues along the way are failed promptly (`fail_pending_ops`), and a guest thread
-    // that ENDS mid-replay surfaces its own end at once — a dead guest can never drain the
-    // queue, so waiting out the stall ceiling would report the symptom and mask the cause
-    // (observed live, c15-20260806b: the un-serviced availability `payload_get` queue crossed
-    // the `grant-bound.n` outstanding-op ceiling, the guest trapped GrantViolation, and every
-    // retry burned the full ceiling before reporting a frame-consumption stall).
-    const STALL_CEILING: std::time::Duration = std::time::Duration::from_secs(60);
-    for frame in frames {
-        fail_pending_ops(&pump);
-        if run.is_finished() {
-            return Err(guest_end_mid_replay(run));
-        }
-        let deadline = std::time::Instant::now() + STALL_CEILING;
-        loop {
-            match pump
-                .deliver_frame(
-                    frame.channel,
-                    frame.seq,
-                    frame.sender,
-                    frame.payload.clone(),
-                    frame.original.clone(),
-                )
-                .map_err(|e| sandbox(format!("deliver: {e}")))?
-            {
-                DeliverVerdict::Accepted => break,
-                DeliverVerdict::SpoolFull | DeliverVerdict::SenderQuota => {
-                    fail_pending_ops(&pump);
-                    if run.is_finished() {
-                        return Err(guest_end_mid_replay(run));
-                    }
-                    if std::time::Instant::now() >= deadline {
-                        return Err(sandbox("replay spool never drained (back-pressure)".into()));
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(2));
-                }
-                other => return Err(sandbox(format!("unexpected deliver verdict: {other:?}"))),
-            }
-        }
-    }
-
-    // The PRE-QUIESCE BARRIER: opening the drain freezes still-queued frames (they spool for a
-    // successor instead of folding, §4.4 — `next_event` skips `Frame` events while draining), so
-    // the export must wait until the guest has PULLED every recovered frame. The guest folds each
-    // frame before pulling the next event, so an empty frame queue means the last fold completes
-    // before the Quiesce is observed — the exported state covers the whole recovered stream.
-    let deadline = std::time::Instant::now() + STALL_CEILING;
-    while pump.pending_frames() > 0 {
-        fail_pending_ops(&pump);
-        if run.is_finished() {
-            return Err(guest_end_mid_replay(run));
-        }
-        if std::time::Instant::now() >= deadline {
+    for (i, span) in spans.into_iter().enumerate() {
+        // The header is the journal's own claim of what ran — cross-check it against the
+        // directive before re-driving anything from it (a foreign journal is a refusal, not
+        // an input).
+        if span.header.module.0 != module_hash {
             return Err(sandbox(format!(
-                "the reconstruction instance never consumed the recovered frames \
-                 ({} still pending at the stall ceiling)",
-                pump.pending_frames()
+                "span {i}: the recorded module {} is not the genesis-pinned coordinator",
+                span.header.module.to_hex()
             )));
         }
-        std::thread::sleep(std::time::Duration::from_millis(2));
-    }
-    fail_pending_ops(&pump);
-
-    // Quiesce → export (§10.2).
-    pump.quiesce(daemon_vhc_abi::QUIESCE_REASON_UPGRADE, spec.deadline_ms)
-        .map_err(|e| sandbox(format!("quiesce: {e}")))?;
-    let end = run
-        .wait()
-        .map_err(|e| sandbox(format!("guest thread: {e}")))?;
-    match end {
-        RunEnd::Outcome(code)
-            if u64::from(code) == u64::from(daemon_vhc_abi::OUTCOME_QUIESCE_READY) => {}
-        other => {
+        if span.header.run_id != spec.run_id {
             return Err(sandbox(format!(
-                "the reconstruction instance did not quiesce cleanly: {other:?}"
-            )))
+                "span {i}: the recorded run id {} is not this run",
+                span.header.run_id.to_hex()
+            )));
+        }
+        if span.header.config != spec.config {
+            return Err(sandbox(format!(
+                "span {i}: the recorded da_init config differs from the genesis role config \
+                 — a journal recorded under foreign configuration cannot rebuild this seat"
+            )));
+        }
+
+        let mut script = build_script(&span.records)?;
+        script.identity = Some(RunIdentity {
+            run_id: span.header.run_id.0,
+            epoch: span.header.epoch,
+            role: span.header.role.clone(),
+            instance: span.header.instance,
+            module: span.header.module.0,
+        });
+        // At the recorded stream's end (the crash cut) the guest quiesces through its own
+        // §10.2 snapshot path and the engine assembles the export. Payload bytes are not
+        // re-fetched: the recorded completion is the evidence (module docs).
+        script.quiesce_at_exhaustion = Some(spec.deadline_ms);
+        script.missing_payload_placeholders = true;
+
+        let migration = if span.reason == 2 {
+            let capture = carried.take().ok_or_else(|| {
+                sandbox(format!(
+                    "span {i} is an upgrade-activation but no predecessor capture is \
+                     available (the lineage begins mid-history and the node resolved no \
+                     restore) — the lineage does not anchor"
+                ))
+            })?;
+            Some(ReplayMigration {
+                capture,
+                migrate_fuel: None,
+            })
+        } else {
+            None
+        };
+
+        let replayed = replay_migrating(
+            &engine,
+            &spec.module,
+            &span.header.config,
+            &span.header.grants,
+            script,
+            migration,
+        )
+        .map_err(|e| sandbox(format!("span {i} replay: {e}")))?;
+
+        verify_decisions(i, &span.records, &replayed)?;
+
+        let is_final = i + 1 == total;
+        match &replayed.end {
+            ReplayEnd::Outcome(code)
+                if u64::from(*code) == u64::from(daemon_vhc_abi::OUTCOME_QUIESCE_READY) => {}
+            // A mid-lineage span may end exactly as the recording did (a trap that caused the
+            // reason-1 restart, a recorded terminal outcome) — the successor span rebuilds
+            // from scratch, as the live restart did.
+            ReplayEnd::Outcome(_) | ReplayEnd::Trapped(_) if !is_final => {}
+            other => {
+                return Err(sandbox(format!(
+                    "span {i}: the reconstruction replay did not reach the §10.2 export: \
+                     {other:?}"
+                )));
+            }
+        }
+
+        carried = replayed.capture.clone();
+        if is_final {
+            exported = replayed.capture;
         }
     }
-    pump.snapshot_capture()
-        .ok_or_else(|| sandbox("the reconstruction instance staged no snapshot".into()))
-}
 
-/// Fail every capability op the sandbox guest has issued, promptly and typed.
-///
-/// The replay is HERMETIC by design: the sandbox instance's only inputs are the recovered
-/// journal frames — consensus finality for every closed round rides the journaled records
-/// (its own attested `RoundRecord` publications fold back in as frames), which is exactly the
-/// equivalence the D2 replay oracle proves. A capability op at replay (the quorum coordinator's
-/// availability-check `payload_get` per Commitment, §6.4 I6) is therefore NOT re-serviced
-/// against the content plane: a re-fetch could not change any closed round (the record is
-/// already folded), it would couple crash-recovery latency to payload sizes and re-introduce
-/// remote failure modes mid-join, and by module policy a failed fetch is simply "no evidence".
-///
-/// The completions must still be DELIVERED — the guest's own bookkeeping
-/// (`pending_availability`) and the pump's op table drain only through completions, and a
-/// guest awaiting evidence it will never receive quiesces against a non-empty outstanding
-/// set. Note the ceiling itself is lifted for the sandbox (`max_outstanding_ops = 0` at
-/// construction): completing ops promptly is necessary but NOT sufficient against the
-/// `GrantViolation` trap, because this drain is polled host-side while the guest's fold
-/// burst is synchronous (observed live twice: c15-20260806b round 9, the un-serviced queue;
-/// c15-20260806g head 12, the fold burst outrunning a 2ms drain cadence).
-fn fail_pending_ops(pump: &PumpHandle) {
-    for (op, _request) in pump.take_op_requests() {
-        // A completion refused by the pump (guest already gone) is moot — the guest-end check
-        // at the call sites surfaces that path.
-        let _ = pump.complete_op(
-            op,
-            OpOutcome::Failed {
-                code: daemon_vhc_abi::COMP_ERR_STORE_REFUSED,
-                detail: "reconstruction sandbox: capability ops are not serviced at replay \
-                         (a failed availability fetch is no evidence)"
-                    .into(),
-            },
-        );
-    }
-}
-
-/// The guest thread ended while frames were still being replayed: surface ITS end — the
-/// drain stall is the symptom, the guest's own trap/outcome is the cause.
-fn guest_end_mid_replay(run: Run) -> ReconstructError {
-    match run.wait() {
-        Ok(end) => ReconstructError::Sandbox(format!(
-            "the reconstruction instance ended mid-replay: {end:?}"
-        )),
-        Err(e) => ReconstructError::Sandbox(format!(
-            "the reconstruction instance faulted mid-replay: {e}"
-        )),
-    }
+    exported.ok_or_else(|| {
+        sandbox("the reconstruction instance staged no snapshot (§10.2 export missing)".into())
+    })
 }

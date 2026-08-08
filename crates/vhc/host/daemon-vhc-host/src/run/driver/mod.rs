@@ -70,6 +70,6 @@ pub use config::{
 };
 pub use host::{derive_rng_seed, host_crypto_hash, host_crypto_verify};
 pub use lifecycle::{start_run, start_run_migrating, Run};
-pub(crate) use migration::{build_migration_descriptor, RestoreBinding};
+pub(crate) use migration::{build_migration_descriptor, decode_manifest_sections, RestoreBinding};
 pub(crate) use pump::BufferStreams;
 pub use pump::PumpHandle;

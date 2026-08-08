@@ -156,6 +156,21 @@ impl DurableSink {
         identity: &RunIdentity,
         sidecar_key: [u8; 32],
     ) -> Result<Self, JournalError> {
+        Self::open_with_policy(dir, identity, sidecar_key, production_rotate_policy())
+    }
+
+    /// [`Self::open`] under an explicit rotate policy — the harness seat: a crash-reconstruction
+    /// drill seals segments on a small record count so a short run still exercises the
+    /// sealed-prefix + unsealed-tail recovery shape. Production callers use [`Self::open`].
+    ///
+    /// # Errors
+    /// [`JournalError`] as for [`Self::open`].
+    pub fn open_with_policy(
+        dir: &Path,
+        identity: &RunIdentity,
+        sidecar_key: [u8; 32],
+        policy: daemon_vhc_journal::RotatePolicy,
+    ) -> Result<Self, JournalError> {
         let id = ExecIdentity {
             run_id: Hash(identity.run_id),
             epoch: identity.epoch,
@@ -163,12 +178,7 @@ impl DurableSink {
             instance: identity.instance,
             module: Hash(identity.module),
         };
-        let journal = Journal::open(
-            dir,
-            id.clone(),
-            StaticKey::new(sidecar_key),
-            production_rotate_policy(),
-        )?;
+        let journal = Journal::open(dir, id.clone(), StaticKey::new(sidecar_key), policy)?;
         Ok(Self { journal, id })
     }
 

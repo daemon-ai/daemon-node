@@ -99,6 +99,24 @@ pub struct ReplayScript {
     /// run (the §8.8 sealed-segment archive never carries the live unsealed tail) legitimately
     /// ends mid-stream, and the verdict covers every recorded decision up to that point.
     pub stop_at_exhaustion: bool,
+    /// RECONSTRUCTION mode (crash recovery, not verification): when the recorded stream
+    /// exhausts, deliver ONE synthetic `Quiesce { reason: Upgrade, deadline_ms }` event instead
+    /// of ending, so the replayed guest stages its state (§10.2) and the run ends at
+    /// `OUTCOME_QUIESCE_READY` with [`ReplayedRun::capture`] holding the exported snapshot —
+    /// the migration input for the real resuming instance. `stage_state` bytes are collected
+    /// and `snapshot_state` verifies + assembles the capture exactly as the live driver does
+    /// (content-hash match per declared section; by-ref families from the replay-side state
+    /// store). Takes precedence over [`Self::stop_at_exhaustion`] at the exhaustion point.
+    pub quiesce_at_exhaustion: Option<u64>,
+    /// RECONSTRUCTION mode payload policy: a `payload_get` success completion whose content
+    /// hash is absent from [`Self::payloads`] materializes a POISONED placeholder instead of
+    /// the typed `ReplayMissingPayload` divergence — any guest READ of that buffer is still a
+    /// typed divergence. A crash reconstruction replays evidence, not bulk content: the
+    /// recorded completion IS the guest-visible result (the ceremony coordinator's §6.4 I6
+    /// availability check releases the fetched buffer unread), and re-fetching every committed
+    /// payload would couple recovery latency to payload sizes. Verification replays (the D2
+    /// oracle) keep the strict table.
+    pub missing_payload_placeholders: bool,
 }
 
 impl ReplayScript {
@@ -184,6 +202,10 @@ pub struct ReplayedRun {
     pub events_delivered: usize,
     /// How the run ended.
     pub end: ReplayEnd,
+    /// The snapshot the replayed guest's LAST accepted `snapshot_state` assembled (§10.2) —
+    /// populated only under [`ReplayScript::quiesce_at_exhaustion`], where the run ends at
+    /// `OUTCOME_QUIESCE_READY` and this capture is the reconstruction's migration input.
+    pub capture: Option<super::driver::SnapshotCapture>,
 }
 
 struct ReplayHost {
@@ -239,6 +261,18 @@ struct ReplayHost {
     /// Budgets zero (replay is not the gate) and retention unbounded (a fold the recording
     /// evicted was already un-fetchable there — nothing completes against it).
     state: crate::run::state_store::StateStore,
+    /// Reconstruction mode ([`ReplayScript::quiesce_at_exhaustion`]): whether the synthetic
+    /// Quiesce was already delivered — a guest pull past it is a genuine divergence (a
+    /// quiescing guest returns from `da_run`, it does not pull again).
+    synthetic_quiesce_delivered: bool,
+    /// Reconstruction mode: `stage_state` bytes in staging order (the §10.2 guest-staged
+    /// sections `snapshot_state` verifies by content hash).
+    staged: Vec<Vec<u8>>,
+    /// Reconstruction mode: the last accepted `snapshot_state` capture (manifest + sections).
+    capture: Option<super::driver::SnapshotCapture>,
+    /// Reconstruction mode ([`ReplayScript::missing_payload_placeholders`]): completion-minted
+    /// buffer handles whose bytes were NOT materialized — a guest read is a typed divergence.
+    poisoned_buffers: std::collections::HashSet<u64>,
 }
 
 fn diverged(msg: impl std::fmt::Display) -> wasmtime::Error {
@@ -252,6 +286,20 @@ fn resolve_replay_buffer(host: &ReplayHost, handle: u64) -> Option<Arc<Vec<u8>>>
         .resolve(handle)
         .ok()
         .or_else(|| host.host_buffers.get(&handle).cloned())
+}
+
+/// Refuse a byte-consuming use of a poisoned placeholder buffer
+/// ([`ReplayScript::missing_payload_placeholders`]): the reconstruction replayed the completion
+/// as evidence without the bulk bytes — a guest that actually CONSUMES them cannot be
+/// reconstructed this way, and pretending with empty bytes would corrupt state silently.
+fn ensure_unpoisoned(host: &ReplayHost, handle: u64, import: &str) -> Result<(), wasmtime::Error> {
+    if host.poisoned_buffers.contains(&handle) {
+        return Err(diverged(format!(
+            "{import} on buffer {handle:#x}, whose payload bytes were not materialized \
+             (reconstruction replays completions as evidence; the content was not re-fetched)"
+        )));
+    }
+    Ok(())
 }
 
 fn hex8(hash: &[u8; 32]) -> String {
@@ -322,15 +370,42 @@ fn dispatch(
             let host = caller.data_mut();
             let frame = match host.pending_event.take() {
                 Some(f) => f,
-                None => host.script.events.pop_front().ok_or_else(|| {
-                    if host.script.stop_at_exhaustion {
-                        wasmtime::Error::msg(EXHAUSTION_MARKER)
-                    } else {
-                        diverged(
-                            "guest pulled an event beyond the recorded stream (tag 1 exhausted)",
-                        )
-                    }
-                })?,
+                None => match host.script.events.pop_front() {
+                    Some(f) => f,
+                    None => match host.script.quiesce_at_exhaustion {
+                        // Reconstruction: the recorded stream is consumed — open the §10.2
+                        // drain so the guest stages its state and the run ends at
+                        // OUTCOME_QUIESCE_READY with the capture assembled.
+                        Some(deadline_ms) if !host.synthetic_quiesce_delivered => {
+                            host.synthetic_quiesce_delivered = true;
+                            let frame = crate::run::event::encode_event_frame(
+                                &crate::run::event::RunEvent::Quiesce {
+                                    reason: daemon_vhc_abi::QUIESCE_REASON_UPGRADE,
+                                    deadline_ms,
+                                },
+                            )
+                            .map_err(|e| {
+                                wasmtime::Error::msg(format!("synthetic quiesce encode: {e}"))
+                            })?;
+                            (0, frame)
+                        }
+                        Some(_) => {
+                            return Err(diverged(
+                                "guest pulled an event past the reconstruction Quiesce (a \
+                                 quiescing guest returns from da_run, §10.2)",
+                            ))
+                        }
+                        None if host.script.stop_at_exhaustion => {
+                            return Err(wasmtime::Error::msg(EXHAUSTION_MARKER))
+                        }
+                        None => {
+                            return Err(diverged(
+                                "guest pulled an event beyond the recorded stream (tag 1 \
+                                 exhausted)",
+                            ))
+                        }
+                    },
+                },
             };
             if deliver_span(caller, &frame.1.clone(), ptr, cap, results)? {
                 caller.data_mut().events_delivered += 1;
@@ -344,14 +419,25 @@ fn dispatch(
                     host.ops.finish(op);
                     if let CompletionResult::Ok(SuccessPayload::Handle(h)) = result {
                         if let Some(hash) = host.op_hashes.remove(&op) {
-                            let Some(bytes) = host.script.payloads.get(&hash) else {
-                                return Err(diverged(format!(
-                                    "ReplayMissingPayload: completion for op {op:#x} names \
-                                     content {} but the replay payload table lacks it",
-                                    hex8(&hash)
-                                )));
-                            };
-                            host.host_buffers.insert(h, Arc::new(bytes.clone()));
+                            match host.script.payloads.get(&hash) {
+                                Some(bytes) => {
+                                    host.host_buffers.insert(h, Arc::new(bytes.clone()));
+                                }
+                                // Reconstruction: the completion is the evidence; the bytes
+                                // are only needed if the guest READS them (poisoned — a read
+                                // is the typed divergence in `resolve_replay_buffer` callers).
+                                None if host.script.missing_payload_placeholders => {
+                                    host.poisoned_buffers.insert(h);
+                                    host.host_buffers.insert(h, Arc::new(Vec::new()));
+                                }
+                                None => {
+                                    return Err(diverged(format!(
+                                        "ReplayMissingPayload: completion for op {op:#x} names \
+                                         content {} but the replay payload table lacks it",
+                                        hex8(&hash)
+                                    )));
+                                }
+                            }
                         } else if let Some((hash, off, len)) = host.op_fetches.remove(&op) {
                             // A data.fetch success materializes the RANGE SLICE the recording
                             // delivered. Self-sealed state fold ([SF-R1]): materialize from the
@@ -552,6 +638,16 @@ fn dispatch(
             // The §10.2 producing import: a prompt, deterministic guest-created staging id
             // (`(1 << 63) | n`, monotone from 1) — no journal record, re-minted identically at
             // replay. The bytes are replay-reproduced guest memory; the id is counter-derived.
+            // Reconstruction mode additionally KEEPS the staged bytes: the exhaustion Quiesce's
+            // `snapshot_state` verifies + captures them as the exported sections.
+            let (ptr, len) = (p_u32(params, 0), p_u32(params, 1));
+            if caller.data().script.quiesce_at_exhaustion.is_some() {
+                let mem = mem_of(caller)?;
+                let mut bytes = vec![0u8; len as usize];
+                mem.read(&mut *caller, ptr as usize, &mut bytes)
+                    .map_err(|e| wasmtime::Error::msg(format!("stage_state read: {e}")))?;
+                caller.data_mut().staged.push(bytes);
+            }
             let host = caller.data_mut();
             let id = (1u64 << 63) | host.next_guest_staging_id;
             host.next_guest_staging_id += 1;
@@ -633,6 +729,62 @@ fn dispatch(
             // The §10.2 submission: the host verified + accepted it at record time (the journal
             // carries the accepted manifest, tag 10) — deterministic given the manifest, so replay
             // re-derives `Accepted` (0). A rejected submission would have retried in the recording.
+            //
+            // Reconstruction mode: verify + assemble the capture exactly as the live driver does
+            // (content-hash match per declared section against the staged bytes; by-ref families
+            // from the replay-side state store), because THIS capture is the real resuming
+            // instance's migration input — a mismatch here is fail-loud, never a silent accept.
+            if caller.data().script.quiesce_at_exhaustion.is_some() {
+                let (ptr, len) = (p_u32(params, 0), p_u32(params, 1));
+                let mem = mem_of(caller)?;
+                let mut manifest = vec![0u8; len as usize];
+                mem.read(&mut *caller, ptr as usize, &mut manifest)
+                    .map_err(|e| wasmtime::Error::msg(format!("snapshot_state read: {e}")))?;
+                let decls = super::driver::decode_manifest_sections(&manifest)
+                    .map_err(|detail| diverged(format!("malformed state-manifest: {detail}")))?;
+                let host = caller.data_mut();
+                let mut sections: Vec<daemon_vhc_proto::det_state::CkptDocSection> =
+                    Vec::with_capacity(decls.len());
+                for decl in &decls {
+                    let inline = host
+                        .staged
+                        .iter()
+                        .find(|bytes| {
+                            bytes.len() as u64 == decl.size
+                                && blake3::hash(bytes).as_bytes() == &decl.hash
+                        })
+                        .cloned();
+                    if let Some(bytes) = inline {
+                        sections.push(daemon_vhc_proto::det_state::CkptDocSection::Inline(
+                            decl.name.clone(),
+                            bytes,
+                        ));
+                        continue;
+                    }
+                    if let Some(fref) = host.state.sealed_family_ref(&decl.hash) {
+                        if fref.byte_len != decl.size {
+                            return Err(diverged(format!(
+                                "snapshot section `{}`: by-ref family byte_len {} disagrees \
+                                 with the declared size {}",
+                                decl.name, fref.byte_len, decl.size
+                            )));
+                        }
+                        sections.push(daemon_vhc_proto::det_state::CkptDocSection::ByRef(
+                            decl.name.clone(),
+                            fref,
+                        ));
+                        continue;
+                    }
+                    return Err(diverged(format!(
+                        "snapshot section `{}` ({} bytes) matches no staged bytes and no \
+                         self-sealed state family — the replayed guest's export is not \
+                         capturable",
+                        decl.name, decl.size
+                    )));
+                }
+                host.staged.clear();
+                host.capture = Some(super::driver::SnapshotCapture { manifest, sections });
+            }
             results[0] = Val::I32(0);
             Ok(())
         }
@@ -688,6 +840,7 @@ fn dispatch(
         ("vhc@2", "read_into") => {
             let (buffer, offset) = (p_u64(params, 0), p_u64(params, 1));
             let (ptr, cap) = (p_u32(params, 2), p_u32(params, 3));
+            ensure_unpoisoned(caller.data(), buffer, "read_into")?;
             let data = resolve_replay_buffer(caller.data(), buffer)
                 .ok_or_else(|| diverged(format!("read_into on unknown buffer {buffer:#x}")))?;
             let start = usize::try_from(offset)
@@ -705,6 +858,7 @@ fn dispatch(
         }
         ("vhc@2", "buffer_len") => {
             let buffer = p_u64(params, 0);
+            ensure_unpoisoned(caller.data(), buffer, "buffer_len")?;
             let data = resolve_replay_buffer(caller.data(), buffer)
                 .ok_or_else(|| diverged(format!("buffer_len on unknown buffer {buffer:#x}")))?;
             results[0] = Val::I64(data.len() as i64);
@@ -713,6 +867,7 @@ fn dispatch(
         ("vhc@2", "buffer_release") => {
             let buffer = p_u64(params, 0);
             let host = caller.data_mut();
+            host.poisoned_buffers.remove(&buffer);
             if host.buffers.release(buffer).is_err() && host.host_buffers.remove(&buffer).is_none()
             {
                 return Err(diverged(format!(
@@ -744,6 +899,7 @@ fn dispatch(
         }
         ("net@2", "payload_put") => {
             let buffer = p_u64(params, 0);
+            ensure_unpoisoned(caller.data(), buffer, "payload_put")?;
             let bytes = resolve_replay_buffer(caller.data(), buffer)
                 .ok_or_else(|| diverged(format!("payload_put on unknown buffer {buffer:#x}")))?;
             let op = caller
@@ -850,6 +1006,7 @@ fn dispatch(
         }
         ("net@2", "stream_write") => {
             let (stream, buffer) = (p_u64(params, 0), p_u64(params, 1));
+            ensure_unpoisoned(caller.data(), buffer, "stream_write")?;
             let bytes = resolve_replay_buffer(caller.data(), buffer)
                 .ok_or_else(|| diverged(format!("stream_write on unknown buffer {buffer:#x}")))?;
             let op = caller
@@ -1177,6 +1334,10 @@ pub fn replay_migrating(
         buffer_streams: crate::run::driver::BufferStreams::default(),
         host_buffers: HashMap::new(),
         state,
+        synthetic_quiesce_delivered: false,
+        staged: Vec::new(),
+        capture: None,
+        poisoned_buffers: std::collections::HashSet::new(),
     };
     let mut store = Store::new(worker.engine(), host);
     // Replay is not the sandbox gate — the recording already enforced budgets; give the replay
@@ -1217,6 +1378,7 @@ pub fn replay_migrating(
             decisions: host.decisions,
             events_delivered: host.events_delivered,
             end,
+            capture: host.capture,
         })
     };
     let classify = |e: &wasmtime::Error| -> ReplayEnd {

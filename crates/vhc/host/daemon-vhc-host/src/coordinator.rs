@@ -240,7 +240,26 @@ impl Coordinator {
         instance: u64,
         key_seed: [u8; 32],
     ) -> Result<Self, String> {
-        Self::start_inner(wasm, spec, grants, instance, key_seed, None)
+        Self::start_inner(wasm, spec, grants, instance, key_seed, None, None)
+    }
+
+    /// [`Coordinator::start`] over a caller-supplied journal sink — the PRODUCTION-journal
+    /// harness shape: the run's records (header, delivered events incl. completions, clocks,
+    /// timer arms, publishes) land in `sink` exactly as a live node's `DurableSink` receives
+    /// them, so a crash-reconstruction drill can consume a real journal, not a synthetic one.
+    /// [`Coordinator::sink_entries`] is empty in this mode (the mirror is the external sink).
+    ///
+    /// # Errors
+    /// A `String` on selection/start failure (harness-level).
+    pub fn start_with_sink(
+        wasm: &[u8],
+        spec: &CoordinatorSpec,
+        grants: Vec<u8>,
+        instance: u64,
+        key_seed: [u8; 32],
+        sink: Box<dyn crate::run::JournalSink>,
+    ) -> Result<Self, String> {
+        Self::start_inner(wasm, spec, grants, instance, key_seed, None, Some(sink))
     }
 
     /// Re-instantiate the coordinator module from a state-export (the standby / restart path,
@@ -275,6 +294,7 @@ impl Coordinator {
                 // A from-capture (re)start founds its own journal chain — anchor it (§8.3/§8.8).
                 anchor: true,
             }),
+            None,
         )
     }
 
@@ -285,6 +305,7 @@ impl Coordinator {
         instance: u64,
         key_seed: [u8; 32],
         migration: Option<MigrationInput>,
+        external_sink: Option<Box<dyn crate::run::JournalSink>>,
     ) -> Result<Self, String> {
         let module_hash = *blake3::hash(wasm).as_bytes();
         if module_hash != spec.module_hash.0 {
@@ -311,8 +332,17 @@ impl Coordinator {
             module: module_hash,
         };
         let sink = Arc::new(Mutex::new(MemorySink::new()));
+        // The MemorySink is the harness's observation surface either way; an external sink
+        // (the production-journal shape) becomes the authoritative primary of a tee.
+        let driver_sink: Box<dyn crate::run::JournalSink> = match external_sink {
+            Some(primary) => Box::new(crate::run::journal::TeeSink {
+                primary,
+                mirror: Box::new(sink.clone()),
+            }),
+            None => Box::new(sink.clone()),
+        };
         let run_cfg = RunConfig::new(identity, key_seed, spec.config_bytes.clone(), grants);
-        let run = start_run_migrating(&engine, wasm, run_cfg, Box::new(sink.clone()), migration)
+        let run = start_run_migrating(&engine, wasm, run_cfg, driver_sink, migration)
             .map_err(|e| format!("coordinator start_run: {e}"))?;
         Ok(Self {
             pump: run.pump.clone(),
@@ -503,6 +533,39 @@ impl Coordinator {
         self.pump
             .snapshot_capture()
             .ok_or_else(|| "coordinator produced no accepted snapshot in the drain".to_string())
+    }
+
+    /// Service the guest's outstanding `payload_get` ops from a content table — the storage
+    /// seat of an availability-verifying coordinator (§6.4 I6: its round-closure evidence is
+    /// its OWN completions). A requested hash absent from `payloads` is an error (the harness
+    /// authored every commitment it delivered); any other op kind is unexpected here.
+    /// Returns how many gets were completed.
+    ///
+    /// # Errors
+    /// A `String` on an unknown hash, an unexpected op kind, or a completion failure.
+    pub fn service_payload_gets(
+        &mut self,
+        payloads: &BTreeMap<[u8; 32], Vec<u8>>,
+    ) -> Result<usize, String> {
+        let mut serviced = 0;
+        for (op, request) in self.pump.take_op_requests() {
+            match request {
+                crate::run::OpRequest::PayloadGet { hash } => {
+                    let bytes = payloads
+                        .get(&hash)
+                        .ok_or_else(|| {
+                            format!("payload_get for unknown content {}", Hash(hash).to_hex())
+                        })?
+                        .clone();
+                    self.pump
+                        .complete_op(op, crate::run::OpOutcome::GetDone { bytes })
+                        .map_err(|e| format!("get completion: {e}"))?;
+                    serviced += 1;
+                }
+                other => return Err(format!("unexpected coordinator op: {other:?}")),
+            }
+        }
+        Ok(serviced)
     }
 
     /// Kill the coordinator abruptly (the failover drill's "kill coordinator node"): stop the run

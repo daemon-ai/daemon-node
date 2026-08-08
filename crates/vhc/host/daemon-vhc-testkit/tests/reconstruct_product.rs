@@ -6,24 +6,31 @@
 // oracle journal (`daemon-vhc-observe` records, `AttestedHead`s, testkit chain recovery), this
 // drill proves the PRODUCTION machinery end to end:
 //
-// 1. A primary `coordinator_quorum.wasm` drives rounds; its authoritative inputs are journaled
-//    into the SESSION's durable journal home (`DurableSink`) as tag-12 signed-frame records in
-//    the live §12.1 wire shape — a sealed prefix plus an unsealed local tail, exactly the disk
-//    state a crash leaves.
+// 1. A primary `coordinator_quorum.wasm` drives rounds under the LIVE driver with the
+//    SESSION's durable journal home (`DurableSink`) as its authoritative sink — so the disk
+//    carries the real production record stream (run header, delivered events including
+//    capability-op completions, tag-12 signed frames, publishes, clocks, timer arms): a sealed
+//    prefix plus an unsealed local tail, exactly the state a crash leaves. No synthetic
+//    journal: the c15-20260806g corruption proved a hand-written frames-only fixture models an
+//    evidence path the production ceremony does not use.
 // 2. The sealed prefix publishes through the PRODUCT archive publisher
 //    (`daemon_vhc_session::archive::spawn_archive_publisher`): content-addressed segments on a
 //    `ContentStore` + `ArchiveHeadRecord`s attested under a base-issued run-key certificate.
-// 3. The primary is killed mid-round-stream.
+// 3. The primary crashes mid-round-stream (nothing seals; no terminal is written).
 // 4. `daemon_vhc_session::reconstruct::reconstruct_coordinator` — the executor the worker's
 //    join path runs on a `CoordinatorRecovery` directive — re-verifies the heads against the
-//    trusted base, recovers the record stream (attested segments + the chained local tail),
-//    replays it through a sandboxed instance of the pinned module, and exports the rebuilt
-//    state via the typed quiesce→snapshot path.
+//    trusted base, recovers the FULL record stream (attested segments + the chained local
+//    tail), re-drives it through the §8.7 input-replay engine, gates the replayed decisions
+//    against the recorded publishes, and exports the rebuilt state via the typed
+//    quiesce→snapshot path.
 // 5. A standby boots FROM that capture (`da_migrate`) and resumes; its decisions must be
 //    byte-identical to an uninterrupted reference run's — resumption, not approximation.
 //
-// Also pinned here: the CONFLICTING-HEAD refusal (fork evidence never reconstructs) and the
-// untrusted-attestor refusal (a head signed outside the genesis trust never reconstructs).
+// Also pinned here: the completion-borne availability-evidence lineage (a §6.4 I6 coordinator
+// whose round closure rides its OWN `payload_get` completions — the c15-20260806g shape — must
+// reconstruct to the recorded round, never a silent round-0 rebirth), the CONFLICTING-HEAD
+// refusal (fork evidence never reconstructs) and the untrusted-attestor refusal (a head signed
+// outside the genesis trust never reconstructs).
 //
 // Dev/test harness: shells `cargo build` for guests; journal writes real files.
 #![allow(clippy::disallowed_methods)]
@@ -330,16 +337,79 @@ async fn publish_prefix(
     heads.fetch_heads().await.expect("stored heads")
 }
 
+/// Open the primary's durable journal home (instance 1) under a SMALL rotate policy, so a short
+/// drill still leaves the §8 crash shape on disk: sealed segments (the publishable prefix) plus
+/// an unsealed local tail. Returns the sink and its founding chain instance.
+fn open_live_sink(root: &std::path::Path, spec: &CoordinatorSpec) -> (DurableSink, u64) {
+    let identity = RunIdentity {
+        run_id: spec.run_id.0,
+        epoch: 0,
+        role: "coordinator".into(),
+        instance: 1,
+        module: spec.module_hash.0,
+    };
+    let jdir = journal_dir(root, RUN_LABEL, "coordinator", 1);
+    let sink = DurableSink::open_with_policy(
+        &jdir,
+        &identity,
+        [0x5C; 32],
+        daemon_vhc_journal::RotatePolicy {
+            max_records: 24,
+            max_open: None,
+        },
+    )
+    .expect("journal open");
+    let instance = sink.founding_instance();
+    (sink, instance)
+}
+
+/// Pin the §8 crash shape the live primary left on disk: at least one sealed (publishable)
+/// segment, an unsealed final tail, and every delivered tag-12 frame present inline across the
+/// series — the exact input surface the reconstruction recovers.
+fn assert_crash_shape(root: &std::path::Path, expected_frames: usize) {
+    let jdir = journal_dir(root, RUN_LABEL, "coordinator", 1);
+    let paths = daemon_vhc_journal::JournalPaths::open(&jdir).expect("journal home");
+    let ordinals = paths.existing_segments().expect("segment listing");
+    assert!(ordinals.len() >= 2, "the rotate policy sealed a prefix");
+    let mut sealed = 0;
+    let mut frames = 0;
+    let mut tail_sealed = true;
+    for &ord in &ordinals {
+        let scan = daemon_vhc_journal::scan_file(paths.segment(ord)).expect("scan");
+        sealed += usize::from(scan.sealed);
+        tail_sealed = scan.sealed;
+        frames += scan
+            .records
+            .iter()
+            .filter(|r| {
+                matches!(&r.body,
+                    daemon_vhc_journal::Body::SignedFrame(sf) if sf.frame.is_some())
+            })
+            .count();
+    }
+    assert!(sealed >= 1, "at least one segment sealed (publishable)");
+    assert!(!tail_sealed, "the final segment is the unsealed local tail");
+    assert_eq!(frames, expected_frames, "every delivered frame is on disk");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn crash_restart_reconstructs_through_the_product_path_and_resumes_byte_identically() {
     let rig = rig();
     let root = tempdir();
     let pre_kill = build_script(&rig.worker_keys, 0..ROUNDS_BEFORE_KILL);
 
-    // -- 1. the primary drives rounds; the same inputs land in the durable journal home ----------
+    // -- 1. the primary drives rounds under the LIVE driver, journaling into the durable home ----
     let primary_key_seed = *blake3::hash(b"reconstruct/primary-key").as_bytes();
-    let mut primary =
-        Coordinator::start(&rig.wasm, &rig.spec, phase_a_grants(), 0, primary_key_seed).unwrap();
+    let (sink, chain_instance) = open_live_sink(&root, &rig.spec);
+    let mut primary = Coordinator::start_with_sink(
+        &rig.wasm,
+        &rig.spec,
+        phase_a_grants(),
+        1,
+        primary_key_seed,
+        Box::new(sink),
+    )
+    .unwrap();
     for sm in &pre_kill {
         primary.deliver(&sm.key, &sm.msg).expect("primary deliver");
     }
@@ -351,42 +421,8 @@ async fn crash_restart_reconstructs_through_the_product_path_and_resumes_byte_id
             .expect("primary decision");
         primary_decisions.push(msg);
     }
-    // The durable journal a crash leaves: sealed prefix (2/3 of the frames) + unsealed tail.
-    let archive_cut = pre_kill.len() * 2 / 3;
-    let chain_instance = write_crashed_journal(
-        &root,
-        rig.spec.run_id,
-        rig.spec.module_hash,
-        &pre_kill,
-        archive_cut,
-    );
-    // The fixture's on-disk shape IS the §8 crash contract — pin it before reconstructing.
-    {
-        let jdir = journal_dir(&root, RUN_LABEL, "coordinator", 1);
-        let paths = daemon_vhc_journal::JournalPaths::open(&jdir).expect("journal home");
-        let frames_of = |ord: u64| {
-            let scan = daemon_vhc_journal::scan_file(paths.segment(ord)).expect("scan");
-            let frames = scan
-                .records
-                .iter()
-                .filter(|r| {
-                    matches!(&r.body,
-                        daemon_vhc_journal::Body::SignedFrame(sf) if sf.frame.is_some())
-                })
-                .count();
-            (scan.sealed, frames)
-        };
-        assert_eq!(
-            frames_of(0),
-            (true, archive_cut),
-            "the sealed prefix carries the pre-cut tag-12 frames inline"
-        );
-        assert_eq!(
-            frames_of(1),
-            (false, pre_kill.len() - archive_cut),
-            "the unsealed local tail carries the post-cut tag-12 frames inline"
-        );
-    }
+    // The disk now carries the §8 crash shape (no terminal was ever written) — pin it.
+    assert_crash_shape(&root, pre_kill.len());
 
     // -- 2. the sealed prefix publishes through the product publisher ----------------------------
     let segments = Arc::new(MemoryContentStore::new());
@@ -402,9 +438,9 @@ async fn crash_restart_reconstructs_through_the_product_path_and_resumes_byte_id
     .await;
     assert!(!heads.is_empty(), "the sealed prefix published");
 
-    // -- 3. kill the primary mid-stream -----------------------------------------------------------
-    let end = primary.kill().expect("primary killed");
-    assert!(matches!(end, RunEnd::Outcome(_)), "guest thread joined");
+    // -- 3. the crash: the primary halts with no drain, no seal, no terminal ----------------------
+    // (Reconstruction runs against the exact bytes the run left behind; the guest thread is
+    // reaped only after — its Stop/terminal records land past the recovery read and are inert.)
 
     // -- 4. the PRODUCT executor reconstructs from heads + segments + the local tail -------------
     let store: Arc<dyn ContentStore> = segments.clone();
@@ -459,6 +495,11 @@ async fn crash_restart_reconstructs_through_the_product_path_and_resumes_byte_id
         cold_state.round <= state.round,
         "the archive-only rebuild never overtakes the tail-inclusive one"
     );
+
+    // Reap the crashed primary's guest thread (post-reconstruction: its Stop/terminal records
+    // land after the recovery read and change nothing it consumed).
+    let end = primary.kill().expect("primary killed");
+    assert!(matches!(end, RunEnd::Outcome(_)), "guest thread joined");
 
     // -- 5. a standby boots FROM the reconstructed capture and resumes ---------------------------
     let standby_key_seed = *blake3::hash(b"reconstruct/standby-key").as_bytes();
@@ -526,32 +567,127 @@ fn with_verify_availability(config: &[u8]) -> Vec<u8> {
     to_canonical_vec(&v).expect("config re-encodes")
 }
 
-/// The c15-20260806b/g regression: a coordinator whose config enables availability
-/// verification (coordinator-as-storage-client, §6.4 I6 — the fleet ceremony's shape) issues
-/// one `payload_get` per replayed Commitment. The reconstruction sandbox services no
-/// capability providers; ops are completed promptly as typed failures AND the sandbox lifts
-/// the `max_outstanding` ceiling (`max_outstanding_ops = 0`), because prompt completion
-/// alone is a scheduling race: the host-side drain is polled, while the guest folds the
-/// spooled lineage synchronously and can burst one `payload_get` per Commitment past any
-/// poll cadence (c15-20260806b: the un-serviced queue crossed 16; c15-20260806g head 12:
-/// the fold burst outran the 2ms drain and trapped `GrantViolation` on every retry until
-/// the run went terminal). Eighty commitments (40 rounds x 2 workers) cross the default
-/// ceiling many times over; the reconstruction must still complete and stand at the next
-/// un-opened round.
+/// The c15-20260806g regression (Defect 12 — the CONSENSUS-CORRUPTION shape): a coordinator
+/// whose config enables availability verification (coordinator-as-storage-client, §6.4 I6 —
+/// the fleet ceremony's shape) closes rounds on its OWN `payload_get` completions. No
+/// `StorageReceipt` frame ever crosses the wire: the closure evidence exists ONLY as tag-14
+/// completion records in the journal. The frames-only reconstruction starved of them could
+/// never close a round — it silently exported a round-0 state, the join accepted it, and the
+/// resumed coordinator re-ran the run from round 0 on a successor chain. The full-record
+/// replay must reconstruct this lineage to the RECORDED round, and the decision gate must hold
+/// (every recorded publish re-derived, in order).
 #[tokio::test(flavor = "multi_thread")]
-async fn availability_checked_lineage_reconstructs_past_the_op_ceiling() {
-    const ROUNDS: u64 = 40;
+async fn completion_borne_availability_evidence_reconstructs_to_the_recorded_round() {
+    const ROUNDS: u64 = 6;
     let rig = rig();
-    let config = with_verify_availability(&rig.spec.config_bytes);
+    // The ceremony config shape: availability verification ON.
+    let mut spec = rig.spec.clone();
+    spec.config_bytes = with_verify_availability(&rig.spec.config_bytes);
     let root = tempdir();
-    let script = build_script(&rig.worker_keys, 0..ROUNDS);
-    let chain_instance = write_crashed_journal(
-        &root,
-        rig.spec.run_id,
-        rig.spec.module_hash,
-        &script,
-        script.len() * 2 / 3,
-    );
+
+    // The wire carries NO StorageReceipt frames — only joins, readiness and per-round
+    // commitments, sent INTO THE OPEN ROUND as live trainers do (the guest's availability
+    // receipt is round-scoped at fetch completion). The committed bytes live in a content
+    // table the harness serves.
+    let mut payloads: std::collections::BTreeMap<[u8; 32], Vec<u8>> =
+        std::collections::BTreeMap::new();
+    let primary_key_seed = *blake3::hash(b"reconstruct/availability-key").as_bytes();
+    let (sink, chain_instance) = open_live_sink(&root, &spec);
+    let mut primary = Coordinator::start_with_sink(
+        &rig.wasm,
+        &spec,
+        phase_a_grants(),
+        1,
+        primary_key_seed,
+        Box::new(sink),
+    )
+    .unwrap();
+    let mut frames = 0;
+    for sm in &build_script(&rig.worker_keys, 0..0) {
+        primary.deliver(&sm.key, &sm.msg).expect("primary deliver");
+        frames += 1;
+    }
+    // Serve the guest's payload_get ops while waiting for its decisions — the §6.4 I6
+    // evidence loop, journaled as completions by the real driver.
+    let mut decisions = 0;
+    let wait_for = |primary: &mut Coordinator,
+                    payloads: &std::collections::BTreeMap<[u8; 32], Vec<u8>>,
+                    decisions: &mut usize,
+                    upto: usize| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        while *decisions < upto {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the primary closed {decisions}/{upto} decisions before the drive deadline"
+            );
+            primary
+                .service_payload_gets(payloads)
+                .expect("storage seat services the guest's gets");
+            if primary.next_decision(Duration::from_millis(100)).is_ok() {
+                *decisions += 1;
+            }
+        }
+    };
+    wait_for(&mut primary, &payloads, &mut decisions, 1); // RoundOpen(0)
+    for round in 0..ROUNDS {
+        for (i, k) in rig.worker_keys.iter().enumerate() {
+            let bytes = format!("update/{i}/{round}").into_bytes();
+            let hash = blake3_hash(&bytes);
+            payloads.insert(hash.0, bytes.clone());
+            primary
+                .deliver(
+                    k,
+                    &VhcMessage::Commitment(Commitment {
+                        round,
+                        payload: hash,
+                        size: bytes.len() as u64,
+                        locators: Vec::new(),
+                    }),
+                )
+                .expect("primary deliver");
+            frames += 1;
+        }
+        // RoundRecord(round) + RoundOpen(round + 1) close on the completion-borne receipts.
+        wait_for(
+            &mut primary,
+            &payloads,
+            &mut decisions,
+            decision_count(round + 1, true),
+        );
+    }
+    assert_crash_shape(&root, frames);
+
+    // The journal IS the c15-20260806g shape: closure evidence exists ONLY as completions.
+    {
+        let jdir = journal_dir(&root, RUN_LABEL, "coordinator", 1);
+        let paths = daemon_vhc_journal::JournalPaths::open(&jdir).expect("journal home");
+        let mut completions = 0;
+        for ord in paths.existing_segments().expect("segment listing") {
+            let scan = daemon_vhc_journal::scan_file(paths.segment(ord)).expect("scan");
+            for r in &scan.records {
+                match &r.body {
+                    daemon_vhc_journal::Body::Completion(_) => completions += 1,
+                    daemon_vhc_journal::Body::SignedFrame(sf) => {
+                        // The harness relay journals the evidence as a canonical SignedMessage.
+                        let frame = sf.frame.as_deref().expect("tag-12 frame inline");
+                        let signed: SignedMessage = daemon_vhc_proto::from_canonical_slice(frame)
+                            .expect("journaled evidence decodes");
+                        assert!(
+                            !matches!(signed.payload, VhcMessage::StorageReceipt(_)),
+                            "no receipt frame may exist in this lineage — the evidence is \
+                             completion-borne by construction"
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(
+            completions >= (ROUNDS * 2) as usize,
+            "one journaled payload_get completion per commitment, got {completions}"
+        );
+    }
+
     let segments = Arc::new(MemoryContentStore::new());
     let heads = publish_prefix(
         &root,
@@ -575,7 +711,7 @@ async fn availability_checked_lineage_reconstructs_past_the_op_ceiling() {
             run_label: RUN_LABEL.into(),
             journal_root: Some(root),
             module: rig.wasm.clone(),
-            config,
+            config: spec.config_bytes.clone(),
             grants: phase_a_grants(),
             incarnation: 1,
             restore: None,
@@ -584,12 +720,16 @@ async fn availability_checked_lineage_reconstructs_past_the_op_ceiling() {
         store,
     )
     .await
-    .expect("an availability-checking lineage reconstructs past the op ceiling");
+    .expect("a completion-borne availability lineage reconstructs");
     let state = coordinator_state_from_capture(&capture).expect("exported state decodes");
     assert_eq!(
         state.round, ROUNDS,
-        "the reconstructed state stands at the next un-opened round"
+        "the reconstructed state stands at the RECORDED next un-opened round — \
+         never a silent round-0 rebirth"
     );
+
+    let end = primary.kill().expect("primary killed");
+    assert!(matches!(end, RunEnd::Outcome(_)), "guest thread joined");
 }
 
 /// Fork evidence never reconstructs: two attested heads at the same height that do not extend

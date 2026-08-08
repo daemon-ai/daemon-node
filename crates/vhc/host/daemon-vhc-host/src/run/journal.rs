@@ -539,6 +539,138 @@ impl SinkEntry {
     }
 }
 
+/// A two-way [`JournalSink`] fan-out: every record goes to `primary` first (the authoritative,
+/// durable sink — its failures are the run's failures and it answers [`JournalSink::next_seq`]),
+/// then to `mirror` (an observation copy, e.g. a [`MemorySink`] a harness inspects while a
+/// production `DurableSink` owns the real journal).
+pub struct TeeSink {
+    /// The authoritative sink: commit barriers and seq recovery live here.
+    pub primary: Box<dyn JournalSink>,
+    /// The observation copy; receives every record after `primary` accepts it.
+    pub mirror: Box<dyn JournalSink>,
+}
+
+impl JournalSink for TeeSink {
+    fn run_header(
+        &mut self,
+        abi: u64,
+        worlds: &[(String, u64)],
+        bridge: bool,
+        manifest: &[u8],
+        config: &[u8],
+        grants: &[u8],
+        resources: RunHeaderResources<'_>,
+        channels: &[u8],
+        device: &[u8],
+    ) -> Result<(), SinkError> {
+        self.primary.run_header(
+            abi, worlds, bridge, manifest, config, grants, resources, channels, device,
+        )?;
+        self.mirror.run_header(
+            abi, worlds, bridge, manifest, config, grants, resources, channels, device,
+        )
+    }
+    fn instantiation(&mut self, counter: u64, reason: u64, at: u64) -> Result<(), SinkError> {
+        self.primary.instantiation(counter, reason, at)?;
+        self.mirror.instantiation(counter, reason, at)
+    }
+    fn init(
+        &mut self,
+        config_hash: [u8; 32],
+        grants_hash: [u8; 32],
+        status: u64,
+    ) -> Result<(), SinkError> {
+        self.primary.init(config_hash, grants_hash, status)?;
+        self.mirror.init(config_hash, grants_hash, status)
+    }
+    fn execution_grant(
+        &mut self,
+        execution_grant_hash: [u8; 32],
+        status: u64,
+    ) -> Result<(), SinkError> {
+        self.primary.execution_grant(execution_grant_hash, status)?;
+        self.mirror.execution_grant(execution_grant_hash, status)
+    }
+    fn event(&mut self, at: u64, frame: &[u8]) -> Result<(), SinkError> {
+        self.primary.event(at, frame)?;
+        self.mirror.event(at, frame)
+    }
+    fn signed_frame(
+        &mut self,
+        channel: u64,
+        seq: u64,
+        sender: [u8; 32],
+        frame: &[u8],
+    ) -> Result<(), SinkError> {
+        self.primary.signed_frame(channel, seq, sender, frame)?;
+        self.mirror.signed_frame(channel, seq, sender, frame)
+    }
+    fn next_seq(&mut self, channel: u64) -> u64 {
+        self.primary.next_seq(channel)
+    }
+    fn publish(
+        &mut self,
+        channel: u64,
+        seq: u64,
+        payload: &[u8],
+        frame: &[u8],
+    ) -> Result<(), SinkError> {
+        self.primary.publish(channel, seq, payload, frame)?;
+        self.mirror.publish(channel, seq, payload, frame)
+    }
+    fn clock(&mut self, now: u64) -> Result<(), SinkError> {
+        self.primary.clock(now)?;
+        self.mirror.clock(now)
+    }
+    fn timer_arm(&mut self, id: u64, delay: u64, armed_at: u64) -> Result<(), SinkError> {
+        self.primary.timer_arm(id, delay, armed_at)?;
+        self.mirror.timer_arm(id, delay, armed_at)
+    }
+    fn timer_cancel(&mut self, id: u64, status: u64) -> Result<(), SinkError> {
+        self.primary.timer_cancel(id, status)?;
+        self.mirror.timer_cancel(id, status)
+    }
+    fn read_back(
+        &mut self,
+        src: u64,
+        kind: u64,
+        status: u64,
+        value: &[u8],
+    ) -> Result<(), SinkError> {
+        self.primary.read_back(src, kind, status, value)?;
+        self.mirror.read_back(src, kind, status, value)
+    }
+    fn device_profile(&mut self, profile: &[u8]) -> Result<(), SinkError> {
+        self.primary.device_profile(profile)?;
+        self.mirror.device_profile(profile)
+    }
+    fn drop_coalesced(&mut self, class: u64, rule: u64, dropped: Dropped) -> Result<(), SinkError> {
+        self.primary.drop_coalesced(class, rule, dropped)?;
+        self.mirror.drop_coalesced(class, rule, dropped)
+    }
+    fn condition(&mut self, code: &str, detail: &str) -> Result<(), SinkError> {
+        self.primary.condition(code, detail)?;
+        self.mirror.condition(code, detail)
+    }
+    fn completion(&mut self, op: u64, result: &[u8]) -> Result<(), SinkError> {
+        self.primary.completion(op, result)?;
+        self.mirror.completion(op, result)
+    }
+    fn snapshot(&mut self, manifest: &[u8]) -> Result<(), SinkError> {
+        self.primary.snapshot(manifest)?;
+        self.mirror.snapshot(manifest)
+    }
+    fn terminal(
+        &mut self,
+        kind: u64,
+        outcome: Option<u64>,
+        trap: Option<(String, String, String, String)>,
+    ) -> Result<(), SinkError> {
+        self.primary.terminal(kind, outcome, trap.clone())?;
+        self.mirror.terminal(kind, outcome, trap)
+    }
+}
+
 /// The in-memory [`JournalSink`] test double: append-order entries + per-channel seq counters.
 #[derive(Debug, Default)]
 pub struct MemorySink {
