@@ -69,7 +69,15 @@ use crate::protocol::{AdmittedTuple, Event, LeaveMode, TerminalOutcome};
 const GAP_DEADLINE: Duration = Duration::from_secs(20);
 
 /// The bounded hold for gapped/back-pressured frames awaiting re-presentation.
-const HELD_FRAMES_MAX: usize = 256;
+///
+/// Sized for the post-catch-up backlog, not just transient reorders (defect 22, c15m): a
+/// staged archive catch-up holds the live loop off for as long as the guest's folds take
+/// (minutes at ceremony scale), and every live frame the coordinator published meanwhile —
+/// heartbeats every few seconds, opens, records — lands here at once when the loop starts.
+/// At 256 the overflow pop dropped the OLDEST frames, which is precisely where the round
+/// records sat, manufacturing the very sequence gaps the hold exists to ride out. Frames are
+/// KBs; the memory bound stays trivial.
+const HELD_FRAMES_MAX: usize = 4096;
 
 /// The session's internal tick (pending-frame retries, guest-end polling, gap aging).
 const TICK: Duration = Duration::from_millis(50);
@@ -1744,23 +1752,36 @@ fn hold_frame(held: &mut VecDeque<(std::time::Instant, Vec<u8>)>, frame: &[u8]) 
 /// incarnation (checkpoint restore + semantic catch-up) — see [`GAP_DEADLINE`] for why the
 /// in-session repair lane (exact-frame backfill from a durable archive) is future work, not
 /// this path.
+///
+/// Back-pressure is NOT a gap (defect 22, c15m): while the guest's spool is full — the whole
+/// post-catch-up backlog drain, where a slow fold can hold the spool for minutes — the front
+/// frame verdicts `Backpressure` and, because the attach rewinds its cursor for it, every frame
+/// BEHIND it shadows as `Gap` even though nothing is missing. Aging those shadows against
+/// [`GAP_DEADLINE`] killed the session 20 s into every backlog drain ("inbound sequence gap
+/// unrecoverable"), and the respawn re-staged the same catch-up from the same fence — a
+/// livelock. A pass that observed back-pressure therefore re-arms every held frame's clock;
+/// only a pass whose gaps stand WITHOUT any back-pressure ages them, which is the genuine
+/// missing-frame shape the deadline was built for.
 fn retry_held(
     attach: &mut Attach,
     held: &mut VecDeque<(std::time::Instant, Vec<u8>)>,
     own_sender: PeerId,
 ) -> Option<String> {
-    let mut still_held = VecDeque::new();
+    let mut still_held: VecDeque<(std::time::Instant, Vec<u8>)> = VecDeque::new();
+    let mut saw_backpressure = false;
+    let mut aged_out = false;
     while let Some((since, frame)) = held.pop_front() {
         if envelope_sender(&frame) == Some(own_sender.0) {
             continue;
         }
         match attach.deliver(&frame) {
-            Ok(InboundVerdict::Gap { .. } | InboundVerdict::Backpressure { .. }) => {
+            Ok(InboundVerdict::Backpressure { .. }) => {
+                saw_backpressure = true;
+                still_held.push_back((since, frame));
+            }
+            Ok(InboundVerdict::Gap { .. }) => {
                 if since.elapsed() > GAP_DEADLINE {
-                    return Some(
-                        "inbound sequence gap unrecoverable (no backfill within the deadline)"
-                            .into(),
-                    );
+                    aged_out = true;
                 }
                 still_held.push_back((since, frame));
             }
@@ -1768,6 +1789,16 @@ fn retry_held(
             Ok(_) => {}
             Err(_) => return Some("held frame delivery failed".into()),
         }
+    }
+    if saw_backpressure {
+        // Spool-bound pass: the gaps are (or may be) shadows of the undelivered front frame.
+        // Re-arm every clock; the deadline only measures gaps that stand on their own.
+        let now = std::time::Instant::now();
+        for (since, _) in &mut still_held {
+            *since = now;
+        }
+    } else if aged_out {
+        return Some("inbound sequence gap unrecoverable (no backfill within the deadline)".into());
     }
     *held = still_held;
     None
