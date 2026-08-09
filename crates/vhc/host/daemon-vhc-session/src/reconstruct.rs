@@ -768,7 +768,14 @@ pub struct CatchUpSpec {
     /// The durable run-state root for local segment reuse. `None` / no local copy = every
     /// sealed segment fetches from the content plane.
     pub journal_root: Option<PathBuf>,
-    /// The restore fence: only rounds STRICTLY ABOVE this extract.
+    /// The restore fence: rounds AT OR ABOVE this extract. The fence round itself rides along
+    /// (defect 20, c15m): a `round = 0` checkpoint pointer is AMBIGUOUS — the boot snapshot
+    /// (nothing folded; the guest's next expected round IS 0) and a post-round-0 capture
+    /// encode the same fence. Excluding the fence round starved the boot-restored guest of
+    /// round 0 and its very first staged record gap-refused (`OUTCOME_STALE_RESTORE`, looping
+    /// the respawn lane). Inclusion is safe in BOTH readings: a genuinely folded fence round
+    /// deduplicates against the guest's resync guard (records at or below the watermark are
+    /// skipped, never gap-refused).
     pub after_round: u64,
 }
 
@@ -833,7 +840,7 @@ pub async fn extract_catch_up_frames(
                 let Some((round, sender, payload)) = round_record_frame(&p.frame) else {
                     continue;
                 };
-                if round > spec.after_round && seen.insert(round) {
+                if round >= spec.after_round && seen.insert(round) {
                     frames.push(CatchUpFrame {
                         channel: p.channel,
                         seq: p.seq,
@@ -1145,8 +1152,10 @@ mod catch_up_tests {
         let rounds: Vec<u64> = frames.iter().map(|f| f.round).collect();
         assert_eq!(
             rounds,
-            vec![2, 3],
-            "post-fence only, the replay-forward duplicate deduplicated, ascending"
+            vec![1, 2, 3],
+            "fence-inclusive (defect 20: the boot-ambiguous fence needs its own round; a \
+             folded one deduplicates guest-side), the replay-forward duplicate deduplicated, \
+             ascending"
         );
         for f in &frames {
             assert_eq!(f.sender, SENDER, "the sender parses out of the envelope");

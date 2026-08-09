@@ -1678,10 +1678,11 @@ async fn a_trainer_fence_past_the_ring_bridges_from_the_paced_archive_until_the_
         .await
         .expect("the archived stream bridges the fence");
     let rounds: Vec<u64> = frames.iter().map(|f| f.round).collect();
-    let expected: Vec<u64> = (FENCE + 1..PRE).collect();
+    let expected: Vec<u64> = (FENCE..PRE).collect();
     assert_eq!(
         rounds, expected,
-        "exactly the post-fence committed rounds, ascending"
+        "the fence-inclusive committed rounds, ascending (defect 20: the fence round rides \
+         along for the boot-ambiguous case; a folded one deduplicates guest-side)"
     );
     for f in &frames {
         // The staged frame carries the guest's GENUINE module payload — the canonical

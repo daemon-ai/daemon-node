@@ -658,6 +658,15 @@ reconstruction staged nothing and the respawned trainer looped `OUTCOME_STALE_RE
 through the paced-respawn lane indefinitely. A within-ring gap with no published archive
 proceeds bare (a young run); a past-ring gap without archive reach refuses typed.
 
+**Catch-up extraction is fence-INCLUSIVE (defect 20, c15m).** A `round = 0` checkpoint
+pointer is ambiguous: the boot snapshot (nothing folded — the guest's next expected round IS
+0) and a post-round-0 capture encode the same fence. Extraction that started strictly above
+the fence starved a boot-restored guest of round 0, and its very first staged record
+gap-refused (`OUTCOME_STALE_RESTORE`) — both trainers respawn-looped sub-second deaths
+despite correct staging. The fence round now rides along unconditionally: a genuinely folded
+fence round deduplicates against the guest's resync guard (records at or below the watermark
+are skipped, never gap-refused), so inclusion is safe in both readings.
+
 **Seat replacement owns sibling replacement (defect 19, c15m).** Three invariants keep the
 co-located trainer alive across seat churn: (a) an explicit join's coalesce-vs-mint decision
 happens INSIDE the bring-up guard, so a join racing a completing bring-up coalesces with the
