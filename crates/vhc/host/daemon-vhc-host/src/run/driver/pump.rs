@@ -771,6 +771,32 @@ impl PumpHandle {
         std::mem::take(&mut self.shared.state.lock().expect("pump lock").op_requests)
     }
 
+    /// Op requests issued by the guest and not yet drained by [`PumpHandle::take_op_requests`].
+    /// Together with [`PumpHandle::queued_events`], the embedder's guest-quiescence probe: zero
+    /// on both (after the embedder has serviced everything it took) means the guest has consumed
+    /// every delivered event and is blocked in `next_event` with no work in flight.
+    #[must_use]
+    pub fn pending_ops(&self) -> usize {
+        self.shared
+            .state
+            .lock()
+            .expect("pump lock")
+            .op_requests
+            .len()
+    }
+
+    /// Events delivered but not yet PULLED by the guest — every queued kind (frames, op
+    /// completions, timers, ...), unlike [`PumpHandle::pending_frames`] which counts only the
+    /// authoritative signed frames. The staged archive catch-up's delivery fence reads this: a
+    /// restored guest that pre-fetches a record's committed payloads before folding must see
+    /// round r's completions BEFORE round r+1's record, or an empty-entry (stalled) record
+    /// dispatches into its round driver ahead of a still-fetching earlier round and trips the
+    /// contiguity guard (defect 21, c15m).
+    #[must_use]
+    pub fn queued_events(&self) -> usize {
+        self.shared.state.lock().expect("pump lock").queue.len()
+    }
+
     /// Re-pin the freshest (role,kind) checkpoint's referenced folds (design §8.2, C6): keep the
     /// current checkpoint's families exempt from retention eviction and release a superseded
     /// checkpoint's now-unreferenced folds. Driven by the checkpoint publication seam.

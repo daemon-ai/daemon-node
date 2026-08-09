@@ -1801,6 +1801,20 @@ fn envelope_sender(frame: &[u8]) -> Option<[u8; 32]> {
 /// fidelity), honors spool backpressure by re-presenting the same frame, and services guest
 /// egress between attempts (the fold's `payload_get`s resolve from the content plane exactly as
 /// in live operation).
+///
+/// Delivery is PACED on guest quiescence (defect 21, c15m): the trainer guest pre-fetches a
+/// record's committed payloads and holds the record OUTSIDE its round driver until they land,
+/// but an empty-entry record (a stalled round — no commits, nothing to fetch) dispatches into
+/// the driver immediately. Presented back-to-back, a stalled round r+k therefore enters the
+/// driver AHEAD of a still-fetching round r and trips the driver's forward-contiguity guard —
+/// `GapRefused` → `OUTCOME_STALE_RESTORE`, respawn-looping the very rejoin the catch-up exists
+/// to serve (c15m: fence 0, staged 0..=7, rounds 4..=7 stalled during the defect-19 wedge; the
+/// guest died ~1 s after the fold began, every respawn). Live operation never shows this shape
+/// because round cadence spaces the records out; the fence below reproduces that spacing by
+/// waiting until the guest has consumed every delivered event and issued no further ops before
+/// presenting the next frame. Worst case (a fold that keeps its op lane busy) this waits out
+/// the fold — pacing costs seconds and only on the catch-up path; the refusal it prevents
+/// costs the seat.
 async fn staged_catch_up(
     pump: &PumpHandle,
     providers: &RoleProviders,
@@ -1837,6 +1851,23 @@ async fn staged_catch_up(
                     ));
                 }
             }
+        }
+        // The quiescence fence (defect 21): don't present the NEXT round's record until the
+        // guest has drained THIS one — every queued event pulled, every issued op serviced,
+        // and a settle beat confirming no follow-on op materialized (a payload completion can
+        // synchronously spawn the next range read). Quiescent-and-skipped (a fence-round
+        // record at/below the resync watermark) and quiescent-and-dispatched both pass;
+        // either way the round has entered (or been judged by) the driver, so the next
+        // record can no longer overtake it.
+        let mut settled = 0u32;
+        while settled < 2 {
+            relay_egress(pump, providers, cursors, events, generation, pacer).await?;
+            if pump.queued_events() == 0 && pump.pending_ops() == 0 {
+                settled += 1;
+            } else {
+                settled = 0;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
     }
     // One egress pass after the last delivery so ops the fold already issued are in flight
