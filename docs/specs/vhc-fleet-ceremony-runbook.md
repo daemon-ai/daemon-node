@@ -696,6 +696,19 @@ rounds interleaved with fetching ones; the module-side fix (hand records to the 
 immediately and let the mint's stall ladder own missing payloads) changes the module hash
 and is deferred to the compatibility-class work.
 
+**Back-pressure is not a gap (defect 22, c15m).** After a staged catch-up the live loop
+drains a minutes-long backlog through a spool the guest empties one slow fold at a time. The
+undelivered front frame verdicts `Backpressure` and — because the attach rewinds its cursor
+for it — every frame behind it shadows as `Gap`; aging those shadows against the 20 s gap
+deadline killed the session at every backlog drain, and the respawn re-staged the same
+catch-up from the same fence (no checkpoint had sealed yet): a livelock. The held-frame
+retry now re-arms every clock on any back-pressured pass and ages only gaps that stand
+without back-pressure — the genuine missing-frame shape the deadline was built for. The
+hold bound is sized for the backlog (4096), because an overflow pop drops the oldest frames
+— exactly where the round records sit — manufacturing the very gaps the hold rides out.
+Convergence proof (c15m live): once a fold survived attach, the trainer sealed and published
+a live checkpoint at round 8, and the next respawn staged 2 records instead of 10.
+
 ### 5.6 Completion
 
 `--stop-rounds 48` → the run reaches its terminal state on every box; `daemon-cli vhc detail`
