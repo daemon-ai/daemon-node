@@ -679,6 +679,23 @@ Pre-fix, the lane was cleared mid-churn and the stale sibling blocked every resp
 peerless coordinator idled for hours while five seat replacements each failed to bring the
 trainer back.
 
+**Staged catch-up delivery paces on guest quiescence (defect 21, c15m).** The trainer guest
+pre-fetches a record's committed payloads and holds the record OUTSIDE its round driver
+until they land — but an empty-entry record (a stalled round: no commits, nothing to fetch)
+dispatches into the driver immediately. Presented back-to-back, a stalled round r+k enters
+the driver ahead of a still-fetching round r and trips the driver's forward-contiguity
+guard: `GapRefused` → `OUTCOME_STALE_RESTORE`, respawn-looping the very rejoin the catch-up
+serves (c15m: fence 0, staged 0..=7 with rounds 4..=7 stalled during the defect-19 wedge —
+the guest died ~1 s into every fold). Live operation never shows the shape because round
+cadence spaces records out; the staged path now reproduces that spacing — after each frame
+the session waits until the guest has pulled every queued event and issued no further ops
+(a two-beat settle) before presenting the next (`PumpHandle::queued_events` /
+`pending_ops`). Recorded non-claim: the coordinator's live ring replay on attach delivers
+the same back-to-back burst and would hit the same guard if the retained ring held stalled
+rounds interleaved with fetching ones; the module-side fix (hand records to the driver
+immediately and let the mint's stall ladder own missing payloads) changes the module hash
+and is deferred to the compatibility-class work.
+
 ### 5.6 Completion
 
 `--stop-rounds 48` → the run reaches its terminal state on every box; `daemon-cli vhc detail`
