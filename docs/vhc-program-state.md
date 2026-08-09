@@ -153,7 +153,24 @@ telemetry, and docs surface.
   `last_round` now advances monotonically from every `RoundOutcome` (`VhcStore::
   advance_round`); previously only lifecycle-edge `RunPhase` snapshots wrote it, so a
   training run read `round=0` on the operator surface for its whole life. Regression:
-  `lifecycle.rs::round_outcomes_advance_the_durable_round_head`.
+  `lifecycle.rs::round_outcomes_advance_the_durable_round_head`. Verified live on the
+  Windows smoke (the counter advanced 0→1→2→3 on the operator surface).
+- **Windows 5090 full node GREEN (2026-08-09, Phase 3 of the closure plan)** — the last
+  seat runs the full product node. Sealed cross-builds at `851a2ef6` (never on-box),
+  SHA-256 verified both sides; `vhc hardware` through the running node names dx12; fit
+  probe GREEN on native DX12 at the final worker revision (pinned c15 modules, peak
+  43,319,296 B — bit-identical to Strix/M4); single-peer smoke `windows-dx12-smoke-k`
+  (run `97512137…`) COMPLETED 4/4 rounds through the full product path (real corpus over
+  R2, cadence-2 checkpoint pointers in the registry, steady-state round wall ≈ 8–10 min
+  with the 12.6 GB checkpoint walks overlapped). **Its pulled archive is the program's
+  FIRST `terminal(0)`-closure certification** — the `f1e43a2e` drain-before-`RunTerminated`
+  fix proven live (node log: "archive publisher drained; chain is current" precedes the
+  event on both roles), and the C2 evidence gate's required closure class demonstrated end
+  to end. Box parked clean (run scope wiped via `vhc wipe`, 31 GB reclaimed, base.key
+  `884d77e4…` + dx12 profile + sealed binaries retained; the box profile moved to
+  `C:\Users\Administrator` — the old `usergpu356` identity is gone). Evidence:
+  `~/experiments/ceremony-artifacts/windows-851a2ef6/VERDICT.md` (+ verdict JSON, sha256
+  `1c990713…`).
 - The pre-c15 hardening waves (One-Lifecycle/Two-Identities, checkpoint durability seam,
   typed storage taxonomy + disk custodian [AR-9], deaf-path relay-first DO + heartbeat +
   deafness verdict, incremental authenticated archive publication [AR-1..6], product
@@ -182,10 +199,12 @@ telemetry, and docs surface.
   6. Certification completeness is relative to the SUPPLIED heads snapshot: a withheld
      fork is out of scope (fork evidence within the snapshot refuses typed).
   7. c15m's archive certifies as a verified sealed prefix (terminal head unpublished,
-     unrecoverable post-sweep — see above); completeness claims start with C2.
+     unrecoverable post-sweep — see above); the `terminal` closure class is since
+     demonstrated live (the Windows smoke), and C2's gate requires it.
 - C0: green and pinned. C1: green on hardware. C1.5 recovery-first: **closed at
-  `068873f2`** (c15 series). Remaining rungs: Windows 5090 full node → three-seat smoke →
-  freeze → C2 → closure (plan `cross-chain_certification_and_c2_closure_82651370`).
+  `068873f2`** (c15 series). Windows 5090 full node: **GREEN (above)**. Remaining rungs:
+  three-seat smoke → freeze → C2 → closure (plan
+  `cross-chain_certification_and_c2_closure_82651370`).
 - Program archive: frozen and locked read-only 2026-07-27.
 
 <details>
@@ -453,7 +472,7 @@ a session then declared reachable boxes unreachable — access facts live here, 
 |---|---|---|---|---|
 | Strix Halo (build host) | local | AMD Strix Halo, 128 GiB UMA, RADV | trainer + coordinator seat + operator seat | wgpu/Vulkan |
 | M4 Mac | `ssh m1@62.210.193.129` | Apple M4, 32 GiB unified (memory floor) | trainer | wgpu/Metal |
-| Windows 5090 | `ssh usergpu356@37.230.134.194` (cmd.exe; build via sealed Nix cross-build, never on-box) | RTX 5090 32 GiB, Server 2022 | trainer | wgpu/DX12 |
+| Windows 5090 | `ssh usergpu356@37.230.134.194` (cmd.exe; the profile is `C:\Users\Administrator`; build via sealed Nix cross-build, never on-box) | RTX 5090 32 GiB, Server 2022 | trainer | wgpu/DX12 |
 | M1 mini | `ssh m1@51.159.120.241` | Apple M1, 8 GiB | iroh relay only | — |
 
 All four answer ssh (verified 2026-08-04). Next actions (in order; the active plan is
@@ -469,10 +488,11 @@ All four answer ssh (verified 2026-08-04). Next actions (in order; the active pl
    `068873f2` (§7).
 5. ~~Cross-chain replay certification~~ DONE — kernel + 15-case gate + c15m certified
    (`prefix`, why recorded); commits `f1e43a2e` + `46df0409` (§7).
-6. Windows 5090 full node: sealed cross-builds at the final candidate commit (features +
-   hashes verified on-box), node config + keystore + trust set, DX12 profile + fit probe
-   at the final worker revision, single-peer smoke, timer recalibration from the slowest
-   platform.
+6. ~~Windows 5090 full node~~ DONE — sealed cross-builds at `851a2ef6` hash-verified
+   on-box, full node + keystore (base identity `884d77e4…`), fit probe GREEN native DX12
+   at the final worker revision, single-peer smoke COMPLETED 4/4 with the program's first
+   `terminal(0)`-closure certification; round wall ≈ 8–10 min (checkpoint-overlapped) —
+   timers finalized at Phase-5 authoring from the three-seat smoke (§7).
 7. Three-seat smoke (Strix coordinator+trainer, M4 trainer, Windows DX12 trainer):
    three-way byte-identical digests before committing to ceremony geometry; hygiene +
    park.
