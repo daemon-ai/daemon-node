@@ -171,6 +171,29 @@ telemetry, and docs surface.
   `C:\Users\Administrator` — the old `usergpu356` identity is gone). Evidence:
   `~/experiments/ceremony-artifacts/windows-851a2ef6/VERDICT.md` (+ verdict JSON, sha256
   `1c990713…`).
+- **Three-seat smoke GREEN (2026-08-09, Phase 4 of the closure plan)** — `three-seat-smoke-a`
+  (run `bd85e26a…`, all three boxes at `851a2ef6`): Strix coordinator+trainer (Vulkan), M4
+  trainer (Metal), Windows 5090 trainer (DX12); min=max=3, stop 6, cadence 4. **COMPLETED
+  6/6 rounds, three-way byte-identical digests every round** (`bf057944…` → `12aac917…`),
+  clean teardown order on all four role instances, and the pulled archive is the program's
+  **first MULTI-SEAM `terminal(0)` certification**: coordinator lineage [217, 219, 222]
+  (2 reconstruction seams, anchors + kind-3 bound), 58,417 records, 5,168 replay-forward
+  duplicates deduplicated, per-peer fold conflict-free over 4 trainer keys. Two incidents,
+  both root-caused FROM THE ARCHIVE (the offline verifier as the forensic instrument, not
+  guesswork): (1) a transient R2 egress fault trapped the tiny-llama guest terminal
+  (frozen-module misclassification, recovered by rejoin); (2) **the `RosterFull`
+  crash-rejoin deadlock** — with a FULL fixed roster (min=max), a crashed trainer's zombie
+  entry holds its slot for `k_absences` rounds, every rejoin Join rejects `RosterFull`
+  (804 ingested, zero accepted), the round-3 finalize drops the zombie → floor breach →
+  `WaitingForMembers` (no timeout) with empty pending, while the rejoined guest had stopped
+  announcing on observing round traffic — a deadly embrace that idled the run ~2 h; plus a
+  recovery corollary, the **trainer-only silent rejoin** (a leave+rejoin inside the seat
+  lease TTL stands down from coordinator duty silently and the resident keeper never
+  retries a run whose admitted role is trainer). Evidence + full mechanism:
+  `~/experiments/ceremony-artifacts/three-seat-20260809/VERDICT.md` (verdict JSON sha256
+  `9ce5a0b4…`). **Consequence bound into Phase 5: the C2 genesis carries churn headroom
+  (`max_peers = min_peers + 1`)** — G-3's trainer kill+rejoin drill re-creates exactly this
+  deadlock on a full roster.
 - The pre-c15 hardening waves (One-Lifecycle/Two-Identities, checkpoint durability seam,
   typed storage taxonomy + disk custodian [AR-9], deaf-path relay-first DO + heartbeat +
   deafness verdict, incremental authenticated archive publication [AR-1..6], product
@@ -200,10 +223,18 @@ telemetry, and docs surface.
      fork is out of scope (fork evidence within the snapshot refuses typed).
   7. c15m's archive certifies as a verified sealed prefix (terminal head unpublished,
      unrecoverable post-sweep — see above); the `terminal` closure class is since
-     demonstrated live (the Windows smoke), and C2's gate requires it.
+     demonstrated live (the Windows smoke `terminal(0)`, then the three-seat multi-seam
+     `terminal(0)`), and C2's gate requires it.
+  8. Frozen tiny-llama module (compatibility-class work, neutralized operationally for C2):
+     (a) a transient IO fault during payload fetch traps the guest as a deterministic
+     terminal (`FailedTerminal`), instead of a retryable straggle; (b) the Join/Heartbeat
+     announce loop stops on OBSERVING round traffic (`admitted` flips on any `RoundOpen`),
+     not on actual admission — an unadmitted rejoiner goes silent and cannot heal a later
+     roster vacancy. Both mitigated by the C2 churn-headroom genesis (non-claim → recorded
+     defect, three-seat smoke).
 - C0: green and pinned. C1: green on hardware. C1.5 recovery-first: **closed at
-  `068873f2`** (c15 series). Windows 5090 full node: **GREEN (above)**. Remaining rungs:
-  three-seat smoke → freeze → C2 → closure (plan
+  `068873f2`** (c15 series). Windows 5090 full node: **GREEN (above)**. Three-seat smoke:
+  **GREEN (above)**. Remaining rungs: freeze → C2 → closure (plan
   `cross-chain_certification_and_c2_closure_82651370`).
 - Program archive: frozen and locked read-only 2026-07-27.
 
@@ -493,13 +524,14 @@ All four answer ssh (verified 2026-08-04). Next actions (in order; the active pl
    at the final worker revision, single-peer smoke COMPLETED 4/4 with the program's first
    `terminal(0)`-closure certification; round wall ≈ 8–10 min (checkpoint-overlapped) —
    timers finalized at Phase-5 authoring from the three-seat smoke (§7).
-7. Three-seat smoke (Strix coordinator+trainer, M4 trainer, Windows DX12 trainer):
-   three-way byte-identical digests before committing to ceremony geometry; hygiene +
-   park.
-8. Freeze (human ratifies `authoring-report.txt` before seeding — runbook §4.7 gate);
-   memoized preflight; run C2 (G-2 transcript, G-3 drills, G-4 restore, completion,
-   archive pull, GREEN `terminal`-closure replay); evidence closure; human-signed master
-   merge.
+7. ~~Three-seat smoke~~ DONE — `three-seat-smoke-a` COMPLETED 6/6, three-way byte-identical
+   digests every round, multi-seam `terminal(0)` certification GREEN; the `RosterFull`
+   crash-rejoin deadlock found + root-caused from the archive, boxes parked (§7).
+8. Freeze (human ratifies `authoring-report.txt` before seeding — runbook §4.7 gate); the
+   C2 genesis MUST carry churn headroom (`max_peers = min_peers + 1` — the three-seat
+   deadlock consequence) and the smoke-calibrated timers; memoized preflight; run C2 (G-2
+   transcript, G-3 drills, G-4 restore, completion, archive pull, GREEN `terminal`-closure
+   replay); evidence closure; human-signed master merge.
 
 ## 9. Agent contract
 

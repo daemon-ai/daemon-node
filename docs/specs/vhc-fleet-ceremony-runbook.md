@@ -526,9 +526,18 @@ Strict order, because the run id (= genesis hash) commits everything and prefixe
 keys:
 
 1. **Author** with the module hashes, the corpus manifest hash, the trust set / roster / upgrade
-   authority, `--min-peers 3 --max-peers 3`, `--ckpt-cadence 4 --payload-retention 64`,
+   authority, `--min-peers 3 --max-peers 4`, `--ckpt-cadence 4 --payload-retention 64`,
    `--stop-rounds 48`, and timers from the smoke calibration (round-max ≈ 3× the slowest measured
    wall; warmup generous). Review `authoring-report.txt`; the human ratifies it before seeding.
+   **Churn headroom is MANDATORY (`max_peers = min_peers + 1`), not tuning.** With a FULL fixed
+   roster (min = max), a crashed trainer's roster entry stays healthy-but-absent for `k_absences`
+   rounds while its rejoined incarnation's every Join rejects `RosterFull`; the eventual drop then
+   breaches the membership floor into `WaitingForMembers` (no timeout) with nothing pending, and
+   the frozen guest's announce loop has already stopped on observing round traffic — a deadly
+   embrace that idles the run indefinitely (found live in the three-seat smoke, 2026-08-09; the
+   full mechanism is in that run's VERDICT). G-3's kill+rejoin drill re-creates exactly this
+   shape; the churn slot admits the new incarnation while the zombie decays. The authoring
+   cadence check already budgets one churn slot against retention.
    **Cadence wiring check:** `--ckpt-cadence` must land in the trainer role's `live` config as
    `remote_ckpt_every` (ABI §12.14 [SF-6] wiring note) — a validated-but-unwired cadence silently
    runs the guest's serde default of 0 (upload at every boundary), so the G-4 gate would never
@@ -669,9 +678,12 @@ never wait it out.
   the node observes the worker death, respawns, re-admits under a new incarnation, restores from the
   live checkpoint, rejoins; digests agree from the restore round onward.
 - **Graceful leave/rejoin drill at ~round 24:** on Windows, `daemon-cli vhc leave <run-id>`
-  (graceful). With `min = max = 3` the run parks below the floor — confirm the parked state via
+  (graceful). With `min_peers = 3` the run parks below the floor — confirm the parked state via
   `detail` for a bounded interval (2× the calibrated round wall), then `daemon-cli vhc join <run-id>`
-  → restore from checkpoint → resume. Zero digest disagreement across the seam.
+  → restore from checkpoint → resume. Zero digest disagreement across the seam. The rejoin is
+  admitted through the genesis churn slot (`max_peers = min_peers + 1`, §4.7) — on a FULL fixed
+  roster it would reject `RosterFull` until the zombie entry decays and the floor breach lands
+  the coordinator in a timeoutless `WaitingForMembers` (the three-seat-smoke deadlock).
 - **Coordinator crash drill** (ABI §8.8 [AR-8]): hard-kill the COORDINATOR's worker after at
   least one sealed segment has published (`GET …/archive/heads` non-empty). Expected: the
   node's rejoin resolves + verifies the head lineage, the fresh worker reconstructs the
@@ -681,6 +693,13 @@ never wait it out.
   already committed — digest agreement from the next round onward. A join refused with a
   head-verification error is the fork/corruption fail-closed path: adjudicate the archive
   (§5.7), never force a fresh seat.
+- **Seat-role leave/rejoin caution (three-seat smoke, 2026-08-09):** a `vhc leave --immediate`
+  + `vhc join` cycle on the SEAT box inside the coordinator seat-lease TTL comes up
+  TRAINER-ONLY, silently — `claim_now` stands down to the live-looking dead lease, and the
+  resident keeper never retries a run whose admitted role is trainer. After ANY seat-box
+  rejoin, VERIFY coordinator duty resumed (the "resolved coordinator reconstruction directive"
+  log line, or a fresh `coordinator-<incarnation>` run directory) before trusting progress;
+  if it came up trainer-only, wait out the lease TTL and cycle leave/join once more.
 
 **Bring-up serialization (defect 17, c15k).** One bring-up transaction per run per node: an
 explicit `daemon-cli vhc join` issued while the node's auto-resume reconvergence is in flight
