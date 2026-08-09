@@ -141,7 +141,9 @@ fn build_archived(fx: Fixture) -> Archived {
                 segment: ord,
                 segment_hash: addr,
                 prev_hash: prev,
-                records: scan.records.len() as u64,
+                // The production head convention (§8.8): the record count EXCLUDES the seal —
+                // the head↔segment binding refuses a head that counts the seal record.
+                records: scan.records.len() as u64 - 1,
             },
         )
         .expect("attest head");

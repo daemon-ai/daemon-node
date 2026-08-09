@@ -38,6 +38,7 @@
 #![allow(clippy::disallowed_methods)]
 #![forbid(unsafe_code)]
 
+pub mod binding;
 pub mod record;
 pub mod segment;
 pub mod sidecar;
@@ -47,6 +48,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+pub use binding::{verify_head_binding, HeadBindingError, HeadClaim};
 pub use record::{Body, ExecIdentity, Record};
 pub use segment::{scan_bytes, scan_file, ScanResult, SegmentHeader, SegmentWriter};
 pub use sidecar::{KeyProvider, SidecarError, SidecarStore, StaticKey};

@@ -16,18 +16,21 @@
 //!   replication/retention policy.
 //! * [`assemble`] — product-archive assembly: verify a run's published ABI §8.8 head records +
 //!   content objects into the §3.4 replay layout.
+//! * [`certify`] — the lineage semantic fold: `RoundRecord` equivocation, round continuity,
+//!   peer-digest conflicts (the certification kernel's round-vocabulary half).
 //! * [`consensus`] — consensus replay from an archive through the sandboxed coordinator module.
 //! * [`oracle`] — the coordinator-oracle migration: the replay oracle over journal-backed capture.
 //! * [`verifier`] — the worker input-replay verifier skeleton (types + a sim-fed harness shape).
 
 pub mod archive;
 pub mod assemble;
+pub mod certify;
 pub mod consensus;
 pub mod oracle;
 pub mod verifier;
 
 // The substrate, at its original paths (`journal::record`, `journal::segment`, …).
-pub use daemon_vhc_journal::{record, segment, sidecar, store};
+pub use daemon_vhc_journal::{binding, record, segment, sidecar, store};
 
 pub use archive::{
     detect_fork, ArchiveError, AttestedHead, ChainHead, ForkEvidence, RecordArchive,
@@ -37,6 +40,7 @@ pub use assemble::{
     assemble_archive, coordinator_lineage, envelope_trusted_bases, verify_chains, AssembleError,
     AssembleReport, VerifiedChain,
 };
+pub use certify::{semantic_fold, SemanticFold, SemanticFoldError};
 pub use consensus::{
     extract_consensus_capture, extract_wire_capture, records_are_wire_form,
     recover_chain_from_archive, recover_chain_from_verified_heads, replay_consensus_from_archive,
@@ -45,7 +49,7 @@ pub use consensus::{
     WirePublish,
 };
 pub use daemon_vhc_journal::{
-    format_version, scan_bytes, scan_file, Body, ExecIdentity, Journal, JournalError, JournalPaths,
-    KeyProvider, Record, RotatePolicy, ScanResult, SegmentHeader, SegmentWriter, SidecarError,
-    SidecarStore, StaticKey,
+    format_version, scan_bytes, scan_file, verify_head_binding, Body, ExecIdentity,
+    HeadBindingError, HeadClaim, Journal, JournalError, JournalPaths, KeyProvider, Record,
+    RotatePolicy, ScanResult, SegmentHeader, SegmentWriter, SidecarError, SidecarStore, StaticKey,
 };

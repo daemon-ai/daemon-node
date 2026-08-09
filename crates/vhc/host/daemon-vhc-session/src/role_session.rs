@@ -397,15 +397,16 @@ pub fn spawn_role(
                 &pacer,
             )
             .await;
-            let _ = events.send(Event::RunTerminated {
-                run_id: label,
-                generation: generation.load(Ordering::SeqCst),
-                outcome,
-            });
-            // Drain the archive publisher, bounded. The run's sinks are gone (run_role
-            // returned); releasing the registry's stream handle is what actually closes the
-            // seal channel — then only the in-flight upload tail remains. A deadline miss is
-            // not a loss: the next incarnation's reconciliation republishes from disk.
+            // Drain the archive publisher BEFORE announcing termination. `RunTerminated` is
+            // the node's teardown trigger — on a COMPLETED run it reaps this process at once,
+            // and a drain scheduled after the event loses the race (c15l/c15m: the terminal
+            // tail seal landed on disk but its head never published, so no completed run's
+            // archive ever carried its tag-16 — certification could only reach the `prefix`
+            // closure class). A crash restart is covered by the next incarnation's startup
+            // reconciliation; completion has NO next incarnation, so this bounded drain is the
+            // terminal seal's only ride out. The run's sinks are gone (run_role returned);
+            // releasing the registry's stream handle is what actually closes the seal channel
+            // — then only the in-flight upload tail remains.
             if let Some((journal_dir, publisher)) = archive_publisher {
                 crate::journal_home::DurableSink::release_seal_stream(&journal_dir);
                 if tokio::time::timeout(ARCHIVE_DRAIN, publisher)
@@ -414,10 +415,15 @@ pub fn spawn_role(
                 {
                     tracing::warn!(
                         "archive publisher did not drain within the deadline; \
-                         reconciliation covers the tail"
+                         a crash restart reconciles the tail — a completed run cannot"
                     );
                 }
             }
+            let _ = events.send(Event::RunTerminated {
+                run_id: label,
+                generation: generation.load(Ordering::SeqCst),
+                outcome,
+            });
         })
     };
     RoleHandle {

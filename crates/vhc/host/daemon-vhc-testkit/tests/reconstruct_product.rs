@@ -40,7 +40,9 @@ use std::time::Duration;
 
 use ciborium::value::Value;
 
-use daemon_vhc_host::run::{JournalSink, RunEnd, RunIdentity};
+use daemon_vhc_host::run::{
+    Dropped, JournalSink, RunEnd, RunHeaderResources, RunIdentity, SinkError,
+};
 use daemon_vhc_net::{
     ArchiveHeadStore, ContentStore, FsArchiveHeadStore, FsContentStore, MemoryContentStore,
 };
@@ -56,8 +58,8 @@ use daemon_vhc_session::archive::{spawn_archive_publisher, ArchiveSpec, SignerBi
 use daemon_vhc_session::identity::issue_run_key;
 use daemon_vhc_session::journal_home::{journal_dir, DurableSink};
 use daemon_vhc_session::reconstruct::{
-    extract_catch_up_frames, reconstruct_coordinator, CatchUpSpec, ReconstructError,
-    ReconstructSpec,
+    certify_lineage, extract_catch_up_frames, reconstruct_coordinator, CatchUpSpec, ClosureClass,
+    ReconstructError, ReconstructSpec,
 };
 use daemon_vhc_testkit::genesis_run::{phase_a_grants, EnvelopeInputs};
 use daemon_vhc_testkit::live_genesis::fixture_authored_execution;
@@ -1060,10 +1062,10 @@ async fn a_resumed_seat_with_sidecar_restore_readbacks_reconstructs_after_a_seco
         heads.iter().any(|h| h.body.chain_instance == chain2),
         "the successor chain's sealed prefix published into the shared store"
     );
-    let store: Arc<dyn ContentStore> = segments;
+    let store: Arc<dyn ContentStore> = segments.clone();
     let capture2 = reconstruct_coordinator(
         ReconstructSpec {
-            heads,
+            heads: heads.clone(),
             run_id: rig.spec.run_id,
             trusted: vec![rig.base_id],
             role: "coordinator".into(),
@@ -1086,6 +1088,42 @@ async fn a_resumed_seat_with_sidecar_restore_readbacks_reconstructs_after_a_seco
         state.round,
         PRE + POST,
         "the rebuilt seat stands at the RECORDED next un-opened round across both chains"
+    );
+
+    // -- certification (matrix case 3): the SIDECAR-backed migration capture certifies -----------
+    // The successor's §10.2 restore read-back rode a sidecar (asserted above), so the seam gate
+    // binds it BY HASH against the section staged at that identity — the by-ref half of the
+    // kind-3 check. The successor still runs (its tail is an unsealed prefix), so the closure
+    // class is PREFIX, and completeness is not claimed.
+    let report = certify_lineage(
+        ReconstructSpec {
+            heads,
+            run_id: rig.spec.run_id,
+            trusted: vec![rig.base_id],
+            role: "coordinator".into(),
+            run_label: RUN_LABEL.into(),
+            journal_root: Some(root.clone()),
+            module: rig.wasm.clone(),
+            config: rig.spec.config_bytes.clone(),
+            grants: phase_a_grants(),
+            incarnation: 4,
+            restore: None,
+            sidecar_key: Some([0x5C; 32]),
+            deadline_ms: 60_000,
+        },
+        segments,
+    )
+    .await
+    .expect("a sidecar-backed migration capture certifies GREEN");
+    assert_eq!(report.seams.len(), 1, "the migration seam is bound");
+    assert!(
+        report.seams[0].kind3_checked >= 1,
+        "the sidecar-borne restore read-back was bound to the staged section"
+    );
+    assert_eq!(
+        report.closure,
+        ClosureClass::Prefix,
+        "a still-running lineage is a verified prefix, never claimed complete"
     );
 
     let end = standby.kill().expect("standby killed");
@@ -1504,10 +1542,10 @@ async fn a_consumed_crash_tail_reaches_the_archive_and_the_lineage_reconstructs_
     // -- zero local state: the archive alone rebuilds the whole lineage --------------------------
     let run_state = daemon_vhc_session::journal_home::run_state_dir(&root, RUN_LABEL);
     std::fs::remove_dir_all(&run_state).expect("local run state deleted");
-    let store: Arc<dyn ContentStore> = segments;
+    let store: Arc<dyn ContentStore> = segments.clone();
     let capture2 = reconstruct_coordinator(
         ReconstructSpec {
-            heads,
+            heads: heads.clone(),
             run_id: rig.spec.run_id,
             trusted: vec![rig.base_id],
             role: "coordinator".into(),
@@ -1533,6 +1571,113 @@ async fn a_consumed_crash_tail_reaches_the_archive_and_the_lineage_reconstructs_
         state.round,
         PRE + POST,
         "the rebuilt seat stands at the recorded next un-opened round across both chains"
+    );
+
+    // -- the certification kernel over the SAME lineage (matrix cases 1, 5, 6 + closure class) ---
+    let certify_spec =
+        |heads: Vec<daemon_vhc_proto::ArchiveHeadRecord>, incarnation: u64| ReconstructSpec {
+            heads,
+            run_id: rig.spec.run_id,
+            trusted: vec![rig.base_id],
+            role: "coordinator".into(),
+            run_label: RUN_LABEL.into(),
+            journal_root: None,
+            module: rig.wasm.clone(),
+            config: rig.spec.config_bytes.clone(),
+            grants: phase_a_grants(),
+            incarnation,
+            restore: None,
+            sidecar_key: None,
+            deadline_ms: 60_000,
+        };
+
+    // GREEN (case 1): the same-base two-chain lineage certifies, the seam bound, the closure
+    // class reported. The final span carries the kind-0 terminal the graceful stop journaled,
+    // so certification closes TERMINAL — the archive is a complete record, not merely a prefix.
+    let report = certify_lineage(certify_spec(heads.clone(), 4), segments.clone())
+        .await
+        .expect("the two-chain lineage certifies GREEN");
+    assert_eq!(report.spans.len(), 2, "two incarnation spans replayed");
+    assert_eq!(report.seams.len(), 1, "exactly one reason-2 seam, bound");
+    assert!(
+        report.seams[0].kind3_checked >= 1,
+        "the successor's restore read-backs were bound to the predecessor's export \
+         (checked {})",
+        report.seams[0].kind3_checked
+    );
+    assert!(
+        matches!(report.closure, ClosureClass::Terminal { .. }),
+        "a lineage ending at a recorded kind-0 terminal closes TERMINAL, got {:?}",
+        report.closure
+    );
+
+    // RED (case 5): the consumed crash tail withheld from the head snapshot. The founding
+    // successor head's succession pointer names the ADOPTED tail head by content address, so a
+    // snapshot missing it cannot even splice the lineage — the typed refusal fires BEFORE any
+    // replay. (Were the linkage somehow intact, the span-1 seam anchor gate is the backstop:
+    // the truncated predecessor's export can never match the successor's anchoring tag-10 —
+    // proven at the unit level in `daemon-vhc-session::reconstruct::seam_tests`.)
+    let sans_tail: Vec<_> = heads
+        .iter()
+        .filter(|h| !(h.body.chain_instance == chain1 && h.body.segment == tail_ord))
+        .cloned()
+        .collect();
+    let err = certify_lineage(certify_spec(sans_tail, 5), segments.clone())
+        .await
+        .expect_err("a lineage missing its consumed crash tail must refuse");
+    assert!(
+        matches!(err, ReconstructError::Verify(_)),
+        "the succession link surfaces the missing tail as a typed lineage refusal: {err}"
+    );
+
+    // RED (case 6): every predecessor segment address broken (an empty content plane, zero
+    // local state) — the typed segment refusal fires before any replay, naming the chain.
+    let empty: Arc<dyn ContentStore> = Arc::new(MemoryContentStore::new());
+    let err = certify_lineage(certify_spec(heads.clone(), 6), empty)
+        .await
+        .expect_err("unresolvable segment addresses must refuse before replay");
+    assert!(
+        matches!(err, ReconstructError::Segment { .. }),
+        "a broken predecessor address is a typed segment refusal: {err}"
+    );
+
+    // GREEN closure regression: the same lineage truncated BEFORE the recorded terminal (every
+    // chain-2 segment from the kind-0 terminal onward withheld) still certifies — an archive is
+    // a sealed prefix — but the kernel reports PREFIX closure: the recorded terminal is gone,
+    // so completeness is not claimed.
+    let mut terminal_seg = None;
+    for h in heads.iter().filter(|h| h.body.chain_instance == chain2) {
+        let bytes = segments
+            .get_content(&h.body.segment_hash)
+            .await
+            .expect("attested segment bytes");
+        let scan = daemon_vhc_journal::scan_bytes(&bytes).expect("scan");
+        let has_terminal = scan
+            .records
+            .iter()
+            .any(|r| matches!(&r.body, daemon_vhc_journal::Body::Terminal(t) if t.kind == 0));
+        if has_terminal {
+            terminal_seg =
+                Some(terminal_seg.map_or(h.body.segment, |s: u64| s.min(h.body.segment)));
+        }
+    }
+    let terminal_seg = terminal_seg.expect("the completed chain records its kind-0 terminal");
+    assert!(
+        terminal_seg > 0,
+        "the terminal must not sit in the founding segment for the truncation to leave a chain"
+    );
+    let truncated: Vec<_> = heads
+        .iter()
+        .filter(|h| !(h.body.chain_instance == chain2 && h.body.segment >= terminal_seg))
+        .cloned()
+        .collect();
+    let report = certify_lineage(certify_spec(truncated, 7), segments.clone())
+        .await
+        .expect("a truncated archive is a verified sealed prefix — GREEN");
+    assert_eq!(
+        report.closure,
+        ClosureClass::Prefix,
+        "with the terminal segment withheld the closure class degrades to PREFIX"
     );
 }
 
@@ -1841,12 +1986,12 @@ async fn archive_only_recovery_reconstructs_across_a_second_trusted_base_identit
     // -- DELETE all local run state; a third party recovers on the public trust set alone --------
     let run_state = daemon_vhc_session::journal_home::run_state_dir(&root, RUN_LABEL);
     std::fs::remove_dir_all(&run_state).expect("local run state deleted");
-    let store: Arc<dyn ContentStore> = segments;
+    let store: Arc<dyn ContentStore> = segments.clone();
     let capture2 = reconstruct_coordinator(
         ReconstructSpec {
-            heads,
+            heads: heads.clone(),
             run_id: rig.spec.run_id,
-            trusted,
+            trusted: trusted.clone(),
             role: "coordinator".into(),
             run_label: RUN_LABEL.into(),
             journal_root: None,
@@ -1867,6 +2012,37 @@ async fn archive_only_recovery_reconstructs_across_a_second_trusted_base_identit
         state.round,
         PRE + POST,
         "the rebuilt seat stands at the recorded head across BOTH base identities"
+    );
+
+    // -- certification (matrix case 2): the CROSS-BASE lineage certifies through the kernel ------
+    // Same public trust set, same archive; the kernel binds the seam across the attestor change
+    // and reports the closure class.
+    let report = certify_lineage(
+        ReconstructSpec {
+            heads,
+            run_id: rig.spec.run_id,
+            trusted,
+            role: "coordinator".into(),
+            run_label: RUN_LABEL.into(),
+            journal_root: None,
+            module: rig.wasm.clone(),
+            config: rig.spec.config_bytes.clone(),
+            grants: phase_a_grants(),
+            incarnation: 4,
+            restore: None,
+            sidecar_key: None,
+            deadline_ms: 60_000,
+        },
+        segments,
+    )
+    .await
+    .expect("a successor under a different genesis-trusted base certifies GREEN");
+    assert_eq!(report.spans.len(), 2, "both incarnation spans replayed");
+    assert_eq!(report.seams.len(), 1, "the cross-base seam is bound");
+    assert!(
+        matches!(report.closure, ClosureClass::Terminal { .. }),
+        "the final span's recorded kind-0 terminal closes TERMINAL, got {:?}",
+        report.closure
     );
 }
 
@@ -2059,5 +2235,251 @@ async fn a_trainer_rejoin_during_recovery_catches_up_idempotently_on_the_reconst
             "the reconstructed seat serves mid-recovery churn byte-identically to a seat \
              that never crashed"
         );
+    }
+}
+
+// == The certification kernel over a SINGLE completed chain (matrix cases 15 and 10) ==============
+
+/// Drive one coordinator to a clean stop under the live driver (optionally through `wrap`, a
+/// journaling man-in-the-middle), publish everything through the product publisher, and return
+/// the certification inputs. The graceful stop journals the kind-0 terminal, which SEALS the
+/// final segment — so the reconciliation sweep archives the complete record including the
+/// terminal (the c15l/c15m closure defect's fix, asserted by the TERMINAL closure below).
+async fn certified_single_chain(
+    rig: &Rig,
+    root: &std::path::Path,
+    wrap: impl FnOnce(DurableSink) -> Box<dyn JournalSink>,
+) -> (
+    Vec<daemon_vhc_proto::ArchiveHeadRecord>,
+    Arc<MemoryContentStore>,
+) {
+    const ROUNDS: u64 = 2;
+    let key_seed = *blake3::hash(b"reconstruct/certify/single-chain").as_bytes();
+    let (sink, chain) = open_live_sink(root, &rig.spec);
+    let mut coord = Coordinator::start_with_sink(
+        &rig.wasm,
+        &rig.spec,
+        phase_a_grants(),
+        1,
+        key_seed,
+        wrap(sink),
+    )
+    .unwrap();
+    for sm in &build_script(&rig.worker_keys, 0..ROUNDS) {
+        coord.deliver(&sm.key, &sm.msg).expect("deliver");
+    }
+    for i in 0..decision_count(ROUNDS, false) {
+        coord
+            .next_decision(Duration::from_secs(60))
+            .unwrap_or_else(|e| panic!("decision {i}: {e}"));
+    }
+    let end = coord.stop().expect("clean stop");
+    assert!(
+        matches!(end, RunEnd::Outcome(_)),
+        "the guest returned its recorded outcome"
+    );
+    let segments = Arc::new(MemoryContentStore::new());
+    let heads = publish_prefix(
+        root,
+        rig.spec.run_id,
+        rig.spec.module_hash,
+        &rig.base_key,
+        chain,
+        segments.clone(),
+        &root.join("heads"),
+    )
+    .await;
+    (heads, segments)
+}
+
+fn single_chain_certify_spec(
+    rig: &Rig,
+    heads: Vec<daemon_vhc_proto::ArchiveHeadRecord>,
+) -> ReconstructSpec {
+    ReconstructSpec {
+        heads,
+        run_id: rig.spec.run_id,
+        trusted: vec![rig.base_id],
+        role: "coordinator".into(),
+        run_label: RUN_LABEL.into(),
+        journal_root: None,
+        module: rig.wasm.clone(),
+        config: rig.spec.config_bytes.clone(),
+        grants: phase_a_grants(),
+        incarnation: 2,
+        restore: None,
+        sidecar_key: None,
+        deadline_ms: 60_000,
+    }
+}
+
+/// **Matrix case 15 (the single-chain regression): a COMPLETED run's wire archive certifies
+/// GREEN through the kernel — the degenerate one-chain lineage — with closure class TERMINAL.**
+/// The replay rides the recorded stop into the guest's own `da_run` return and reproduces the
+/// recorded outcome; nothing needed exporting past a terminal.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_completed_single_chain_archive_certifies_terminal_through_the_kernel() {
+    let rig = rig();
+    let root = tempdir();
+    let (heads, segments) = certified_single_chain(&rig, &root, |sink| Box::new(sink)).await;
+    let report = certify_lineage(single_chain_certify_spec(&rig, heads), segments)
+        .await
+        .expect("a completed single-chain archive certifies GREEN");
+    assert_eq!(report.spans.len(), 1, "one span, the whole story");
+    assert!(report.seams.is_empty(), "no seams in a single chain");
+    assert!(
+        matches!(report.closure, ClosureClass::Terminal { .. }),
+        "a completed run's archive closes TERMINAL, got {:?}",
+        report.closure
+    );
+    assert!(
+        report.spans[0].publishes > 0,
+        "the decision gate verified the recorded publishes"
+    );
+}
+
+/// A journaling man-in-the-middle: every record passes through to the durable sink verbatim
+/// EXCEPT the first tag-4 publish, whose recorded payload gets one byte flipped (the wire frame
+/// and everything else stay authentic). The disk then attests a decision hash the deterministic
+/// replay can never re-derive — matrix case 10's mutation, applied at the only layer that can
+/// forge it (the journal substrate itself; the content plane is hash-pinned by the heads).
+struct TamperFirstPublish {
+    inner: DurableSink,
+    tampered: bool,
+}
+
+impl JournalSink for TamperFirstPublish {
+    #[allow(clippy::too_many_arguments)]
+    fn run_header(
+        &mut self,
+        abi: u64,
+        worlds: &[(String, u64)],
+        bridge: bool,
+        manifest: &[u8],
+        config: &[u8],
+        grants: &[u8],
+        resources: RunHeaderResources<'_>,
+        channels: &[u8],
+        device: &[u8],
+    ) -> Result<(), SinkError> {
+        self.inner.run_header(
+            abi, worlds, bridge, manifest, config, grants, resources, channels, device,
+        )
+    }
+    fn instantiation(&mut self, counter: u64, reason: u64, at: u64) -> Result<(), SinkError> {
+        self.inner.instantiation(counter, reason, at)
+    }
+    fn init(
+        &mut self,
+        config_hash: [u8; 32],
+        grants_hash: [u8; 32],
+        status: u64,
+    ) -> Result<(), SinkError> {
+        self.inner.init(config_hash, grants_hash, status)
+    }
+    fn execution_grant(
+        &mut self,
+        execution_grant_hash: [u8; 32],
+        status: u64,
+    ) -> Result<(), SinkError> {
+        self.inner.execution_grant(execution_grant_hash, status)
+    }
+    fn event(&mut self, at: u64, frame: &[u8]) -> Result<(), SinkError> {
+        self.inner.event(at, frame)
+    }
+    fn signed_frame(
+        &mut self,
+        channel: u64,
+        seq: u64,
+        sender: [u8; 32],
+        frame: &[u8],
+    ) -> Result<(), SinkError> {
+        self.inner.signed_frame(channel, seq, sender, frame)
+    }
+    fn next_seq(&mut self, channel: u64) -> u64 {
+        self.inner.next_seq(channel)
+    }
+    fn publish(
+        &mut self,
+        channel: u64,
+        seq: u64,
+        payload: &[u8],
+        frame: &[u8],
+    ) -> Result<(), SinkError> {
+        if !self.tampered && !payload.is_empty() {
+            self.tampered = true;
+            let mut forged = payload.to_vec();
+            forged[0] ^= 0x01;
+            return self.inner.publish(channel, seq, &forged, frame);
+        }
+        self.inner.publish(channel, seq, payload, frame)
+    }
+    fn clock(&mut self, now: u64) -> Result<(), SinkError> {
+        self.inner.clock(now)
+    }
+    fn timer_arm(&mut self, id: u64, delay: u64, armed_at: u64) -> Result<(), SinkError> {
+        self.inner.timer_arm(id, delay, armed_at)
+    }
+    fn timer_cancel(&mut self, id: u64, status: u64) -> Result<(), SinkError> {
+        self.inner.timer_cancel(id, status)
+    }
+    fn read_back(
+        &mut self,
+        src: u64,
+        kind: u64,
+        status: u64,
+        value: &[u8],
+    ) -> Result<(), SinkError> {
+        self.inner.read_back(src, kind, status, value)
+    }
+    fn device_profile(&mut self, profile: &[u8]) -> Result<(), SinkError> {
+        self.inner.device_profile(profile)
+    }
+    fn drop_coalesced(&mut self, class: u64, rule: u64, dropped: Dropped) -> Result<(), SinkError> {
+        self.inner.drop_coalesced(class, rule, dropped)
+    }
+    fn condition(&mut self, code: &str, detail: &str) -> Result<(), SinkError> {
+        self.inner.condition(code, detail)
+    }
+    fn completion(&mut self, op: u64, result: &[u8]) -> Result<(), SinkError> {
+        self.inner.completion(op, result)
+    }
+    fn snapshot(&mut self, manifest: &[u8]) -> Result<(), SinkError> {
+        self.inner.snapshot(manifest)
+    }
+    fn terminal(
+        &mut self,
+        kind: u64,
+        outcome: Option<u64>,
+        trap: Option<(String, String, String, String)>,
+    ) -> Result<(), SinkError> {
+        self.inner.terminal(kind, outcome, trap)
+    }
+}
+
+/// **Matrix case 10: an altered recorded publish refuses as decision divergence.** One byte of
+/// one recorded decision payload flipped at journaling time — everything else authentic, every
+/// head validly attested, every segment hash-true — and the deterministic replay's own decision
+/// gate is what catches the forgery: the replayed publish hash cannot match the recorded one.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_altered_recorded_publish_refuses_as_decision_divergence() {
+    let rig = rig();
+    let root = tempdir();
+    let (heads, segments) = certified_single_chain(&rig, &root, |sink| {
+        Box::new(TamperFirstPublish {
+            inner: sink,
+            tampered: false,
+        })
+    })
+    .await;
+    let err = certify_lineage(single_chain_certify_spec(&rig, heads), segments)
+        .await
+        .expect_err("a forged decision record must refuse");
+    match err {
+        ReconstructError::Sandbox(detail) => assert!(
+            detail.contains("diverges"),
+            "the refusal names the decision divergence: {detail}"
+        ),
+        other => panic!("expected the decision-gate refusal, got: {other}"),
     }
 }

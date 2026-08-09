@@ -536,6 +536,174 @@ fn verifier_plan_from_journal_records() {
     assert_eq!(plan.expected.len(), 1); // publish
 }
 
+// ----- head↔segment identity binding (the shared archive-reader verifier) -----
+
+mod binding {
+    use super::*;
+    use daemon_vhc_observe::journal::binding::{verify_head_binding, HeadClaim};
+    use daemon_vhc_observe::journal::ScanResult;
+
+    /// A real sealed segment (through the writer): 3 records, ordinal 4, a non-genesis prev.
+    fn sealed_scan() -> ScanResult {
+        let dir = super::tempdir();
+        let path = dir.join("segment-00000004.dvhcjrn");
+        let header = SegmentHeader {
+            id: ident(),
+            segment: 4,
+            prev_blake3: [0xAB; 32],
+        };
+        let mut w = SegmentWriter::create(&path, &header).unwrap();
+        for ord in 0..3u64 {
+            w.append(&Record::new(ord, Body::Clock(ClockRec { now: 1000 + ord })))
+                .unwrap();
+        }
+        w.seal().unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        scan_bytes(&bytes).unwrap()
+    }
+
+    fn claim() -> HeadClaim<'static> {
+        HeadClaim {
+            run_id: h(1),
+            epoch: 4,
+            role: "trainer",
+            module: h(2),
+            chain_instance: Some(42),
+            segment: 4,
+            prev_hash: Hash([0xAB; 32]),
+            records: 3,
+        }
+    }
+
+    #[test]
+    fn a_matching_head_binds() {
+        verify_head_binding(&sealed_scan(), &claim()).expect("binds");
+    }
+
+    /// The adoption shape (defect 16): a claim form without the chain scope (the harness
+    /// `ChainHead`, whose `instance` is the ATTESTING span) skips the instance comparison but
+    /// still binds everything else.
+    #[test]
+    fn a_scopeless_claim_skips_the_chain_scope_check() {
+        let mut c = claim();
+        c.chain_instance = None;
+        verify_head_binding(&sealed_scan(), &c).expect("binds without the chain scope");
+    }
+
+    /// Every claimed field is load-bearing: mutate each one and the binding must refuse,
+    /// naming the disagreement.
+    #[test]
+    fn every_identity_field_is_load_bearing() {
+        let scan = sealed_scan();
+        let cases: Vec<(&str, HeadClaim<'static>)> = vec![
+            ("run_id", {
+                let mut c = claim();
+                c.run_id = h(0xEE);
+                c
+            }),
+            ("epoch", {
+                let mut c = claim();
+                c.epoch = 9;
+                c
+            }),
+            ("role", {
+                let mut c = claim();
+                c.role = "coordinator";
+                c
+            }),
+            ("module", {
+                let mut c = claim();
+                c.module = h(0xEE);
+                c
+            }),
+            ("chain scope", {
+                let mut c = claim();
+                c.chain_instance = Some(43);
+                c
+            }),
+            ("ordinal", {
+                let mut c = claim();
+                c.segment = 5;
+                c
+            }),
+            ("prev link", {
+                let mut c = claim();
+                c.prev_hash = h(0xCD);
+                c
+            }),
+            ("record count", {
+                let mut c = claim();
+                c.records = 4;
+                c
+            }),
+        ];
+        for (field, c) in cases {
+            let err = verify_head_binding(&scan, &c)
+                .expect_err(&format!("a mutated {field} must refuse"));
+            assert!(
+                err.0.contains("!=") || err.0.contains("attests"),
+                "{field}: the refusal names the disagreement, got {err}"
+            );
+        }
+    }
+
+    /// An unsealed segment (no clean roll) never binds — archive material is sealed only.
+    #[test]
+    fn an_unsealed_segment_refuses() {
+        let dir = super::tempdir();
+        let path = dir.join("segment-00000004.dvhcjrn");
+        let header = SegmentHeader {
+            id: ident(),
+            segment: 4,
+            prev_blake3: [0xAB; 32],
+        };
+        let mut w = SegmentWriter::create(&path, &header).unwrap();
+        w.append(&Record::new(0, Body::Clock(ClockRec { now: 1 })))
+            .unwrap();
+        w.commit().unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let scan = scan_bytes(&bytes).unwrap();
+        let err = verify_head_binding(&scan, &claim()).expect_err("unsealed refuses");
+        assert!(err.0.contains("sealed"), "got {err}");
+    }
+
+    /// A seal whose declared count disagrees with the records the scan actually recovered
+    /// refuses even when the head repeats the same wrong number — the segment is internally
+    /// inconsistent, and the head's count would otherwise vacuously "match".
+    #[test]
+    fn a_lying_seal_count_refuses() {
+        let dir = super::tempdir();
+        let path = dir.join("segment-00000004.dvhcjrn");
+        let header = SegmentHeader {
+            id: ident(),
+            segment: 4,
+            prev_blake3: [0xAB; 32],
+        };
+        // Hand-build the seal with a wrong count but a CORRECT self-excluding hash, so the
+        // scan accepts it and only the binding catches the lie.
+        let mut w = SegmentWriter::create(&path, &header).unwrap();
+        w.append(&Record::new(0, Body::Clock(ClockRec { now: 1 })))
+            .unwrap();
+        let pre_seal = w.file_blake3();
+        let seal = Record::new(
+            1,
+            Body::Seal(SealRec {
+                segment_blake3: Hash(pre_seal),
+                records: 2, // lies: only 1 record precedes the seal
+            }),
+        );
+        w.append_framed(&SegmentWriter::encode(&seal).unwrap())
+            .unwrap();
+        w.commit().unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let scan = scan_bytes(&bytes).unwrap();
+        let mut c = claim();
+        c.records = 2; // the head repeats the lie
+        let err = verify_head_binding(&scan, &c).expect_err("internal inconsistency refuses");
+        assert!(err.0.contains("recovered"), "got {err}");
+    }
+}
+
 // ----- a tiny tempdir helper (no external dev-dep) -----
 
 fn tempdir() -> std::path::PathBuf {

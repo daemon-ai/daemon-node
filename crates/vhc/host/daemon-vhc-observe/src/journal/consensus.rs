@@ -435,12 +435,27 @@ fn walk_verified_chain(
             segment,
             detail: e.to_string(),
         })?;
-        if !scan.sealed {
-            return Err(ConsensusReplayError::BadSegment {
-                segment,
-                detail: "archived segment is not sealed".into(),
-            });
-        }
+        // The full head↔segment identity binding (shared verifier). The harness `ChainHead`
+        // carries no chain scope (its `instance` is the attesting span, which an adopted
+        // abandoned-tail head legitimately advances past the segment header's frozen
+        // identity — defect 16), so the chain-scope comparison is skipped here.
+        daemon_vhc_journal::verify_head_binding(
+            &scan,
+            &daemon_vhc_journal::HeadClaim {
+                run_id: head.run_id,
+                epoch: head.epoch,
+                role: &head.role,
+                module: head.module,
+                chain_instance: None,
+                segment: head.segment,
+                prev_hash: head.prev_hash,
+                records: head.records,
+            },
+        )
+        .map_err(|e| ConsensusReplayError::BadSegment {
+            segment,
+            detail: e.to_string(),
+        })?;
         for record in scan.records {
             if !matches!(record.body, Body::Seal(_)) {
                 records.push(record);

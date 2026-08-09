@@ -51,24 +51,26 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
 
+use daemon_vhc_net::{ContentStore, FsContentStore};
 use daemon_vhc_observe::journal::archive::{ChainHead, RecordArchive};
-use daemon_vhc_observe::journal::verifier::{
-    run_replay, ExpectedDecision, GuestUnderReplay, PayloadSource, ReplayOutcome, ReplayPlan,
-    ReplayStep,
-};
+use daemon_vhc_observe::journal::Record;
 use daemon_vhc_observe::{
-    coordinator_lineage, envelope_trusted_bases, extract_wire_capture, records_are_wire_form,
-    recover_chain_from_verified_heads, replay_consensus_from_verified_archive, verify_chains,
-    verify_committed_payloads, AuthorityConfig, Body, ConsensusReplayError, RecoveredChain,
-    ReplayError, ReplicationPolicy, RetentionPolicy,
+    coordinator_lineage, envelope_trusted_bases, records_are_wire_form,
+    replay_consensus_from_verified_archive, semantic_fold, verify_chains,
+    verify_committed_payloads, AuthorityConfig, ConsensusReplayError, ReplayError,
+    ReplicationPolicy, RetentionPolicy, SemanticFoldError,
 };
 use daemon_vhc_proto::archive::ArchiveHeadRecord;
 use daemon_vhc_proto::genesis::GenesisEnvelope;
-use daemon_vhc_proto::{blake3_hash, from_canonical_slice, Hash};
+use daemon_vhc_proto::{blake3_hash, from_canonical_slice, to_canonical_vec, Hash, VerifiedChain};
+use daemon_vhc_session::reconstruct::{
+    certify_lineage, ClosureClass, LineageReplayReport, ReconstructError, ReconstructSpec,
+};
 use daemon_vhc_session::replay_sandbox::SandboxedCoordinator;
 
 /// The parsed `vhc-replay` inputs.
@@ -83,18 +85,68 @@ pub struct Args {
 struct ConsensusVerdict {
     /// Whether the archive re-verified fully (records re-derived + every digest recomputed).
     agree: bool,
+    /// Coordinator chains in the certified lineage (1 = the degenerate single-chain shape).
+    chains: u64,
+    /// Incarnation spans the lineage replay drove.
+    spans: u64,
+    /// Reason-2 seams whose anchor + kind-3 bindings verified.
+    seams: u64,
+    /// How the lineage closed: `terminal(<outcome>)` (the recorded terminal was reproduced —
+    /// a COMPLETE record of a finished run) or `prefix` (a verified sealed prefix). `None` on
+    /// the harness lane (no closure question — the harness archive is its own whole story).
+    closure: Option<String>,
+    /// Per-span replay facts (wire lane only).
+    span_facts: Vec<SpanVerdict>,
+    /// Per-seam validation facts (wire lane only).
+    seam_facts: Vec<SeamVerdict>,
     /// Sealed segments walked (chain-verified, content-re-hashed) on a green run.
     segments_verified: u64,
     /// Records recovered across them on a green run.
     records_recovered: u64,
-    /// `RoundRecord`s re-derived byte-identically on a green run.
+    /// UNIQUE `RoundRecord`s verified (identical replay-forward duplicates deduplicate).
     rounds_verified: u64,
+    /// Identical duplicate `RoundRecord`s collapsed by the semantic fold.
+    round_duplicates_deduped: u64,
     /// Committed `(peer, hash)` payload entries re-verified on a green run.
     payload_entries_verified: u64,
+    /// `RoundRecord` set commitments recomputed from payloads alone.
+    set_commitments_verified: u64,
+    /// The failing stage's taxonomy class on a red run (`verify`, `segment`, `transport`,
+    /// `replay`, `seam-anchor`, `kind-3`, `equivocation`, `continuity`, `digest-conflict`,
+    /// `payload`).
+    failure_stage: Option<String>,
     /// The first round at which re-derivation / digest re-verification diverged (red runs only).
     first_divergence_round: Option<u64>,
-    /// The typed reason on a red run.
+    /// The typed reason on a red run (carries the first-failing chain/span/round coordinates).
     detail: Option<String>,
+}
+
+/// One incarnation span's replay facts.
+#[derive(Debug, Serialize)]
+struct SpanVerdict {
+    /// The span's index in the lineage replay.
+    index: usize,
+    /// The incarnation id the span's tag-0 header carries.
+    instance: u64,
+    /// The tag-13 instantiation reason (0 initial, 1 trap-restart, 2 upgrade-activation).
+    reason: u64,
+    /// Records in the span.
+    records: usize,
+    /// Recorded publishes the decision gate verified.
+    publishes: usize,
+    /// How the span's replay ended.
+    end: String,
+}
+
+/// One reason-2 seam's validation facts.
+#[derive(Debug, Serialize)]
+struct SeamVerdict {
+    /// The SUCCESSOR span's index.
+    span: usize,
+    /// The anchoring tag-10 manifest byte length (== the predecessor export's manifest).
+    anchor_manifest_len: usize,
+    /// Recorded kind-3 restore read-backs verified against their staged identities.
+    kind3_checked: usize,
 }
 
 /// One round's per-peer digest-agreement facts.
@@ -216,42 +268,26 @@ fn verify_archive(args: &Args) -> Result<ReplayVerdict> {
         .context("envelope names no coordinator role")?;
     let lineage =
         coordinator_lineage(&chains, &coordinator_role).context("order coordinator lineage")?;
-    // Cross-chain (restart-succession) replay lands with coordinator reconstruction; a single
-    // uninterrupted chain is the C1/C1.5 shape this oracle certifies today.
-    let [chain] = lineage.as_slice() else {
-        bail!(
-            "coordinator lineage spans {} chains (restart succession); cross-chain replay is \
-             not yet certified — replay each chain against its own span",
-            lineage.len()
-        );
-    };
-    let heads: Vec<ChainHead> = chain
-        .heads
-        .iter()
-        .map(|record| ChainHead {
-            run_id: record.body.run_id,
-            epoch: record.body.epoch,
-            role: record.body.role.clone(),
-            instance: record.body.instance,
-            module: record.body.module,
-            segment: record.body.segment,
-            segment_hash: record.body.segment_hash,
-            prev_hash: record.body.prev_hash,
-            records: record.body.records,
-        })
-        .collect();
 
-    // -- the record archive: publish every sealed segment (content-addressed, re-hashed) --------
-    let mut archive = RecordArchive::new(
-        authority,
-        ReplicationPolicy { factor: 1 },
-        RetentionPolicy::default(),
-    );
-    for (_stem, path) in read_hex_stem_dir(&dir.join("segments"), ".seg")? {
-        let bytes = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
-        archive
-            .publish_segment(bytes)
-            .map_err(|e| anyhow::anyhow!("publish segment {}: {e}", path.display()))?;
+    // -- the lineage's records, straight from the archive dir (hash-verified here; the kernel
+    //    re-runs the FULL head↔segment binding through its own recover step) — the journal-form
+    //    detector and the semantic fold both read these.
+    let mut lineage_records: Vec<Record> = Vec::new();
+    for chain in &lineage {
+        for head in &chain.heads {
+            let path = dir
+                .join("segments")
+                .join(format!("{}.seg", head.body.segment_hash.to_hex()));
+            let bytes = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+            anyhow::ensure!(
+                blake3_hash(&bytes) == head.body.segment_hash,
+                "segment {} does not hash-match its attested head",
+                path.display()
+            );
+            let scan = daemon_vhc_observe::scan_bytes(&bytes)
+                .map_err(|e| anyhow::anyhow!("scan segment {}: {e}", head.body.segment))?;
+            lineage_records.extend(scan.records);
+        }
     }
 
     // -- the content-addressed payload objects ---------------------------------------------------
@@ -267,34 +303,86 @@ fn verify_archive(args: &Args) -> Result<ReplayVerdict> {
         payloads.insert(hash, bytes);
     }
 
-    // -- oracle mode: consensus re-verification, through the journal form the chain carries ------
+    // -- oracle mode: consensus re-verification, through the journal form the lineage carries ----
     //
+    // PRODUCTION archives journal the §12.1 wire forms and the FULL delivered-event stream, and
+    // certify through the lineage-certification kernel (single- AND multi-chain: the session's
+    // state-carrying seam replay + decision gate, the observe semantic fold, payload closure).
     // HARNESS-form archives (SDK types journaled directly, event-driven clock) re-derive through
-    // the frames-only sandboxed consensus oracle. PRODUCTION archives journal the §12.1 wire
-    // forms and the FULL delivered-event stream (wall-clock timer ticks + completion order are
-    // recorded nondeterministic inputs), so they re-verify through the §8.7 worker input-replay
-    // engine: the pinned module is re-driven from the recorded events with `payload_get` answered
-    // from the archive's content-addressed payload set, every recorded publish must reproduce
-    // bit-exactly, and every committed digest must recompute from the payloads alone.
-    let consensus = match recover_chain_from_verified_heads(&archive, &heads) {
-        Ok(chain) if records_are_wire_form(&chain.records) => {
-            wire_consensus_verdict(&coord_wasm, &chain, &payloads)
+    // the frames-only sandboxed consensus oracle, unchanged.
+    let consensus = if records_are_wire_form(&lineage_records) {
+        wire_lineage_verdict(
+            dir,
+            run_id,
+            &trusted,
+            &coordinator_role,
+            &envelope,
+            &coord_wasm,
+            &lineage,
+            &lineage_records,
+            &payloads,
+        )
+    } else {
+        // The harness archive is single-chain by construction (no restart succession rides the
+        // SDK harness journals).
+        let [chain] = lineage.as_slice() else {
+            bail!(
+                "harness-form archive spans {} chains — not a shape the harness oracle replays",
+                lineage.len()
+            );
+        };
+        let heads: Vec<ChainHead> = chain
+            .heads
+            .iter()
+            .map(|record| ChainHead {
+                run_id: record.body.run_id,
+                epoch: record.body.epoch,
+                role: record.body.role.clone(),
+                instance: record.body.instance,
+                module: record.body.module,
+                segment: record.body.segment,
+                segment_hash: record.body.segment_hash,
+                prev_hash: record.body.prev_hash,
+                records: record.body.records,
+            })
+            .collect();
+        // The record archive: publish every sealed segment (content-addressed, re-hashed).
+        let mut archive = RecordArchive::new(
+            authority,
+            ReplicationPolicy { factor: 1 },
+            RetentionPolicy::default(),
+        );
+        for (_stem, path) in read_hex_stem_dir(&dir.join("segments"), ".seg")? {
+            let bytes = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+            archive
+                .publish_segment(bytes)
+                .map_err(|e| anyhow::anyhow!("publish segment {}: {e}", path.display()))?;
         }
-        Ok(_) => {
-            match replay_consensus_from_verified_archive(&sandbox, &archive, &heads, &payloads) {
-                Ok(report) => ConsensusVerdict {
-                    agree: true,
-                    segments_verified: report.segments_verified,
-                    records_recovered: report.records_recovered,
-                    rounds_verified: report.replay.rounds_verified,
-                    payload_entries_verified: report.payload_entries_verified,
-                    first_divergence_round: None,
-                    detail: None,
-                },
-                Err(e) => red_verdict(divergence_round(&e), e.to_string()),
-            }
+        match replay_consensus_from_verified_archive(&sandbox, &archive, &heads, &payloads) {
+            Ok(report) => ConsensusVerdict {
+                agree: true,
+                chains: 1,
+                spans: 0,
+                seams: 0,
+                closure: None,
+                span_facts: Vec::new(),
+                seam_facts: Vec::new(),
+                segments_verified: report.segments_verified,
+                records_recovered: report.records_recovered,
+                rounds_verified: report.replay.rounds_verified,
+                round_duplicates_deduped: 0,
+                payload_entries_verified: report.payload_entries_verified,
+                set_commitments_verified: report.set_commitments_verified,
+                failure_stage: None,
+                first_divergence_round: None,
+                detail: None,
+            },
+            Err(e) => red_verdict(CertifyFailure {
+                stage: "harness",
+                round: divergence_round(&e),
+                detail: e.to_string(),
+            }),
         }
-        Err(e) => red_verdict(divergence_round(&e), e.to_string()),
     };
 
     // -- oracle mode: per-peer digest agreement (the G-2 transcript) -----------------------------
@@ -320,217 +408,228 @@ fn divergence_round(e: &ConsensusReplayError) -> Option<u64> {
     }
 }
 
+/// A typed certification failure: the taxonomy class, the first-failing round where one is
+/// knowable, and the full detail (which carries chain/span/ordinal coordinates).
+struct CertifyFailure {
+    stage: &'static str,
+    round: Option<u64>,
+    detail: String,
+}
+
+impl From<ReconstructError> for CertifyFailure {
+    fn from(e: ReconstructError) -> Self {
+        let stage = match &e {
+            ReconstructError::Verify(_) => "verify",
+            ReconstructError::Segment { .. } => "segment",
+            ReconstructError::Transport { .. } => "transport",
+            ReconstructError::Sandbox(_) => "replay",
+            ReconstructError::SeamAnchor { .. } => "seam-anchor",
+            ReconstructError::Kind3 { .. } => "kind-3",
+        };
+        Self {
+            stage,
+            round: None,
+            detail: e.to_string(),
+        }
+    }
+}
+
+impl From<SemanticFoldError> for CertifyFailure {
+    fn from(e: SemanticFoldError) -> Self {
+        let (stage, round) = match &e {
+            SemanticFoldError::Equivocation { round } => ("equivocation", Some(*round)),
+            SemanticFoldError::Continuity { .. } => ("continuity", None),
+            SemanticFoldError::DigestConflict { round, .. } => ("digest-conflict", Some(*round)),
+            SemanticFoldError::Codec(_) => ("codec", None),
+        };
+        Self {
+            stage,
+            round,
+            detail: e.to_string(),
+        }
+    }
+}
+
 /// A red consensus verdict carrying its typed reason.
-fn red_verdict(first_divergence_round: Option<u64>, detail: String) -> ConsensusVerdict {
+fn red_verdict(f: CertifyFailure) -> ConsensusVerdict {
     ConsensusVerdict {
         agree: false,
+        chains: 0,
+        spans: 0,
+        seams: 0,
+        closure: None,
+        span_facts: Vec::new(),
+        seam_facts: Vec::new(),
         segments_verified: 0,
         records_recovered: 0,
         rounds_verified: 0,
+        round_duplicates_deduped: 0,
         payload_entries_verified: 0,
-        first_divergence_round,
-        detail: Some(detail),
+        set_commitments_verified: 0,
+        failure_stage: Some(f.stage.to_string()),
+        first_divergence_round: f.round,
+        detail: Some(f.detail),
     }
 }
 
-/// The PRODUCTION-archive consensus verdict: §8.7 input replay of the coordinator chain
-/// (bit-exact decision reproduction) + digest-from-payloads re-verification of every published
-/// `RoundRecord`.
-fn wire_consensus_verdict(
+/// The PRODUCTION-archive consensus verdict, through the lineage-certification kernel: the
+/// session's state-carrying seam replay + per-span decision gate ([`certify_lineage`]), the
+/// observe semantic fold (equivocation / continuity / digest conflicts), and payload closure
+/// over the deduplicated round records.
+#[allow(clippy::too_many_arguments)] // the archive's verified parts, threaded once
+fn wire_lineage_verdict(
+    dir: &Path,
+    run_id: Hash,
+    trusted: &[daemon_vhc_proto::PeerId],
+    coordinator_role: &str,
+    envelope: &GenesisEnvelope,
     coord_wasm: &[u8],
-    chain: &RecoveredChain,
+    lineage: &[&VerifiedChain],
+    lineage_records: &[Record],
     payloads: &BTreeMap<Hash, Vec<u8>>,
 ) -> ConsensusVerdict {
-    match wire_input_replay(coord_wasm, chain, payloads) {
-        Ok((rounds_verified, payload_entries_verified)) => ConsensusVerdict {
-            agree: true,
-            segments_verified: chain.segments_verified,
-            records_recovered: chain.records.len() as u64,
-            rounds_verified,
-            payload_entries_verified,
-            first_divergence_round: None,
-            detail: None,
-        },
-        Err(e) => red_verdict(None, e.to_string()),
+    match wire_lineage_certify(
+        dir,
+        run_id,
+        trusted,
+        coordinator_role,
+        envelope,
+        coord_wasm,
+        lineage,
+        lineage_records,
+        payloads,
+    ) {
+        Ok(v) => v,
+        Err(f) => red_verdict(f),
     }
 }
 
-/// Re-drive the archived coordinator journal through the §8.7 input-replay engine and re-verify
-/// the committed digests from the payloads. Returns `(round records verified, payload entries
-/// verified)`.
-fn wire_input_replay(
+#[allow(clippy::too_many_arguments)] // the archive's verified parts, threaded once
+fn wire_lineage_certify(
+    dir: &Path,
+    run_id: Hash,
+    trusted: &[daemon_vhc_proto::PeerId],
+    coordinator_role: &str,
+    envelope: &GenesisEnvelope,
     coord_wasm: &[u8],
-    chain: &RecoveredChain,
+    lineage: &[&VerifiedChain],
+    lineage_records: &[Record],
     payloads: &BTreeMap<Hash, Vec<u8>>,
-) -> Result<(u64, u64)> {
-    use daemon_vhc_host::run::{replay, ReplayEnd, ReplayScript, RunIdentity};
-    use daemon_vhc_host::{EngineConfig, Worker};
+) -> Result<ConsensusVerdict, CertifyFailure> {
+    let replay_fail = |detail: String| CertifyFailure {
+        stage: "replay",
+        round: None,
+        detail,
+    };
 
-    let capture = extract_wire_capture(&chain.records);
-    let header = capture
-        .header
-        .as_ref()
-        .context("production journal carries no tag-0 run header")?;
-    anyhow::ensure!(
-        header.module.0 == *blake3::hash(coord_wasm).as_bytes(),
-        "the journal's recorded module {} is not the genesis-pinned coordinator",
-        header.module.to_hex()
-    );
+    // -- 1. the schema-free kernel replay (session): spans, seams, decisions, closure ------------
+    let heads: Vec<ArchiveHeadRecord> = lineage
+        .iter()
+        .flat_map(|c| c.heads.iter().cloned())
+        .collect();
+    let segments_total = heads.len() as u64;
+    let incarnation = lineage.iter().map(|c| c.chain_instance).max().unwrap_or(0) + 1;
+    let role_entry = &envelope.roles[coordinator_role];
+    let config = to_canonical_vec(&role_entry.config)
+        .map_err(|e| replay_fail(format!("role config: {e}")))?;
+    let engine = daemon_vhc_host::Worker::new(daemon_vhc_host::EngineConfig::default())
+        .map_err(|e| replay_fail(format!("engine: {e}")))?;
+    let linked = daemon_vhc_host::linked_worlds(&engine, coord_wasm)
+        .map_err(|e| replay_fail(format!("linked worlds: {e}")))?;
+    let grants =
+        daemon_vhc_proto::GrantsDoc::author(&linked, &role_entry.grants).to_canonical_bytes();
 
-    // -- the replay script: the recorded nondeterministic inputs, split by answering mechanism --
-    let mut script = ReplayScript::default();
-    for record in &chain.records {
-        match &record.body {
-            Body::Event(e) => script.events.push_back((e.at, e.frame.clone())),
-            Body::ReadBack(r) => {
-                anyhow::ensure!(
-                    r.sidecar.is_none(),
-                    "record {}: sidecar-referenced read-back values are not supported by the \
-                     archive replay (no sidecar key material rides a product archive)",
-                    record.ord
-                );
-                let value = r.value.clone().unwrap_or_default();
-                if r.kind >= 128 {
-                    // The retired bridge's reserved journal kinds: never re-fed.
-                } else if r.kind == u64::from(daemon_vhc_abi::READBACK_KIND_STREAM_BYTES) {
-                    script.stream_bytes.push_back((r.src, value));
-                } else if r.kind == u64::from(daemon_vhc_abi::READBACK_KIND_TENSOR_EXPORT) {
-                    script.tensor_exports.push_back((r.src, value));
-                } else if r.kind == u64::from(daemon_vhc_abi::READBACK_KIND_STATE_SEAL) {
-                    script.state_seals.push_back((r.src, value));
-                } else {
-                    script.readbacks.push_back((r.src, r.kind, value));
-                }
-            }
-            Body::Clock(c) => script.clocks.push_back(c.now),
-            Body::TimerArm(t) => script.timer_arms.push_back((t.id, t.delay)),
-            Body::TimerCancel(t) => script.timer_cancels.push_back((t.id, t.status)),
-            Body::DeviceProfile(d) => script.device_profiles.push_back(d.profile.clone()),
-            _ => {}
+    // Stage the segments into a throwaway FLAT content store (the kernel fetches attested
+    // segments content-addressed; the archive names them `<hex>.seg`).
+    let staged = std::env::temp_dir().join(format!("vhc-replay-certify-{}", std::process::id()));
+    std::fs::create_dir_all(&staged)
+        .map_err(|e| replay_fail(format!("create staging dir: {e}")))?;
+    let stage_result = (|| -> Result<LineageReplayReport, CertifyFailure> {
+        for (stem, path) in read_hex_stem_dir(&dir.join("segments"), ".seg")
+            .map_err(|e| replay_fail(format!("segments dir: {e}")))?
+        {
+            std::fs::copy(&path, staged.join(stem))
+                .map_err(|e| replay_fail(format!("stage {}: {e}", path.display())))?;
         }
-    }
-    script.identity = Some(RunIdentity {
-        run_id: header.run_id.0,
-        epoch: header.epoch,
-        role: header.role.clone(),
-        instance: header.instance,
-        module: header.module.0,
-    });
-    // The §8.7 content-addressed re-fetch table: `payload_get` completions materialize their
-    // buffers from the archive's payload objects.
-    script.payloads = payloads.iter().map(|(h, b)| (h.0, b.clone())).collect();
-    // The archive carries the SEALED prefix only (never a live unsealed tail), so the recorded
-    // stream legitimately ends before the guest does — a prefix replay, not a divergence.
-    script.stop_at_exhaustion = true;
+        let store: Arc<dyn ContentStore> = Arc::new(
+            FsContentStore::open(&staged).map_err(|e| replay_fail(format!("open store: {e}")))?,
+        );
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| replay_fail(format!("tokio runtime: {e}")))?;
+        rt.block_on(certify_lineage(
+            ReconstructSpec {
+                heads,
+                run_id,
+                trusted: trusted.to_vec(),
+                role: coordinator_role.to_string(),
+                run_label: run_id.to_hex(),
+                journal_root: None,
+                module: coord_wasm.to_vec(),
+                config,
+                grants,
+                incarnation,
+                restore: None,
+                sidecar_key: None,
+                deadline_ms: 120_000,
+            },
+            store,
+        ))
+        .map_err(CertifyFailure::from)
+    })();
+    let _ = std::fs::remove_dir_all(&staged);
+    let report = stage_result?;
 
-    // -- re-drive the module; the journal's own publishes are the oracle -------------------------
-    let worker =
-        Worker::new(EngineConfig::default()).map_err(|e| anyhow::anyhow!("engine: {e}"))?;
-    let replayed = replay(&worker, coord_wasm, &header.config, &header.grants, script)
-        .map_err(|e| anyhow::anyhow!("input replay: {e}"))?;
-    match &replayed.end {
-        // A recorded outcome (the run terminated inside the archived prefix) or the clean end of
-        // a prefix replay (the archive stops at its last sealed segment) both close the drive;
-        // everything else is a real finding.
-        ReplayEnd::Outcome(_) | ReplayEnd::ScriptExhausted => {}
-        other => bail!("the replayed coordinator did not reach a recorded outcome: {other:?}"),
-    }
-    let plan = ReplayPlan::from_records(&chain.records);
-    let mut guest = ReplayedDecisions::new(&replayed, &plan);
-    match run_replay(&plan, &mut guest, &NoSidecars) {
-        ReplayOutcome::Pass { .. } => {}
-        other => bail!("input replay decision verdict: {other:?}"),
-    }
+    // -- 2. the semantic fold (observe): equivocation, continuity, digest conflicts --------------
+    let fold = semantic_fold(lineage_records).map_err(CertifyFailure::from)?;
 
-    // -- digests from payloads alone: every committed entry + every set commitment ---------------
-    let rounds = capture.round_records();
-    let (payload_entries_verified, _) = verify_committed_payloads(rounds.iter().copied(), payloads)
-        .map_err(|e| anyhow::anyhow!("digest re-verification: {e}"))?;
-    Ok((rounds.len() as u64, payload_entries_verified))
-}
+    // -- 3. payload closure over the deduplicated round records ----------------------------------
+    let (payload_entries_verified, set_commitments_verified) =
+        verify_committed_payloads(fold.records.iter(), payloads).map_err(|e| CertifyFailure {
+            stage: "payload",
+            round: divergence_round(&e),
+            detail: e.to_string(),
+        })?;
 
-/// The §8.7 `GuestUnderReplay` seam over the host replay's slice-attributed decisions: the run
-/// already happened synchronously (`replay` — a replay can never block, every input is in the
-/// journal), so delivery here walks the per-slice groups in recorded order. Ordinals are clerical
-/// (journal bookkeeping the replay cannot know); decisions carry the recorded ord so equality
-/// judges the substance: channel, seq, payload hash.
-struct ReplayedDecisions {
-    per_event: Vec<Vec<(u64, u64, [u8; 32])>>, // (channel, seq, payload_hash) per slice
-    next_event: usize,
-    expected_ords: Vec<u64>,
-    next_ord: usize,
-}
-
-impl ReplayedDecisions {
-    fn new(run: &daemon_vhc_host::run::ReplayedRun, plan: &ReplayPlan) -> Self {
-        let mut per_event = vec![Vec::new(); run.events_delivered];
-        for d in &run.decisions {
-            per_event[d.event_index.min(run.events_delivered.saturating_sub(1))].push((
-                d.channel,
-                d.seq,
-                d.payload_hash,
-            ));
-        }
-        let expected_ords = plan
-            .expected
+    Ok(ConsensusVerdict {
+        agree: true,
+        chains: lineage.len() as u64,
+        spans: report.spans.len() as u64,
+        seams: report.seams.len() as u64,
+        closure: Some(match report.closure {
+            ClosureClass::Terminal { outcome } => format!("terminal({outcome})"),
+            ClosureClass::Prefix => "prefix".to_string(),
+        }),
+        span_facts: report
+            .spans
             .iter()
-            .map(|e| match e {
-                ExpectedDecision::Publish { ord, .. } => *ord,
-                _ => 0, // non_exhaustive: future decision kinds carry their own ords
+            .map(|s| SpanVerdict {
+                index: s.index,
+                instance: s.instance,
+                reason: s.reason,
+                records: s.records,
+                publishes: s.publishes,
+                end: s.end.clone(),
             })
-            .collect();
-        Self {
-            per_event,
-            next_event: 0,
-            expected_ords,
-            next_ord: 0,
-        }
-    }
-}
-
-impl GuestUnderReplay for ReplayedDecisions {
-    fn deliver_event(&mut self, _ord: u64, _at: u64, _frame: &[u8]) -> Vec<ExpectedDecision> {
-        let group = self
-            .per_event
-            .get(self.next_event)
-            .cloned()
-            .unwrap_or_default();
-        self.next_event += 1;
-        group
-            .into_iter()
-            .map(|(channel, seq, hash)| {
-                let ord = self
-                    .expected_ords
-                    .get(self.next_ord)
-                    .copied()
-                    .unwrap_or_default();
-                self.next_ord += 1;
-                ExpectedDecision::Publish {
-                    ord,
-                    channel,
-                    seq,
-                    hash: Hash(hash),
-                }
+            .collect(),
+        seam_facts: report
+            .seams
+            .iter()
+            .map(|s| SeamVerdict {
+                span: s.span,
+                anchor_manifest_len: s.anchor_manifest_len,
+                kind3_checked: s.kind3_checked,
             })
-            .collect()
-    }
-
-    fn supply_import(&mut self, _step: &ReplayStep) {
-        // Inputs were consumed by the synchronous host replay from the same journal.
-    }
-}
-
-/// Product archives carry no sidecar key material; an oversize read-back would have been refused
-/// while building the script, so a sidecar fetch here would itself be a finding.
-struct NoSidecars;
-impl PayloadSource for NoSidecars {
-    fn fetch(
-        &self,
-        _sref: &daemon_vhc_observe::journal::record::SidecarRef,
-        _ord: u64,
-    ) -> Option<Vec<u8>> {
-        None
-    }
+            .collect(),
+        segments_verified: segments_total,
+        records_recovered: lineage_records.len() as u64,
+        rounds_verified: fold.records.len() as u64,
+        round_duplicates_deduped: fold.duplicates_deduped,
+        payload_entries_verified,
+        set_commitments_verified,
+        failure_stage: None,
+        first_divergence_round: None,
+        detail: None,
+    })
 }
 
 /// Fold the per-peer transcripts into per-round agreement facts + the first divergence round.
@@ -615,6 +714,21 @@ fn render_text(v: &ReplayVerdict) -> String {
     );
     if v.consensus.agree {
         let _ = writeln!(s, "  verdict            : AGREE");
+        if let Some(closure) = &v.consensus.closure {
+            let _ = writeln!(s, "  closure            : {closure}");
+            let _ = writeln!(
+                s,
+                "  lineage            : {} chains, {} spans, {} seams",
+                v.consensus.chains, v.consensus.spans, v.consensus.seams
+            );
+            for seam in &v.consensus.seam_facts {
+                let _ = writeln!(
+                    s,
+                    "    seam -> span {:<3} anchor manifest {} B, kind-3 checked {}",
+                    seam.span, seam.anchor_manifest_len, seam.kind3_checked
+                );
+            }
+        }
         let _ = writeln!(
             s,
             "  segments verified  : {}",
@@ -625,14 +739,26 @@ fn render_text(v: &ReplayVerdict) -> String {
             "  records recovered  : {}",
             v.consensus.records_recovered
         );
-        let _ = writeln!(s, "  rounds re-derived  : {}", v.consensus.rounds_verified);
+        let _ = writeln!(
+            s,
+            "  rounds verified    : {} unique ({} duplicate replay-forward publishes deduped)",
+            v.consensus.rounds_verified, v.consensus.round_duplicates_deduped
+        );
         let _ = writeln!(
             s,
             "  payload entries    : {}",
             v.consensus.payload_entries_verified
         );
+        let _ = writeln!(
+            s,
+            "  set commitments    : {}",
+            v.consensus.set_commitments_verified
+        );
     } else {
         let _ = writeln!(s, "  verdict            : DISAGREE");
+        if let Some(stage) = &v.consensus.failure_stage {
+            let _ = writeln!(s, "  failing stage      : {stage}");
+        }
         if let Some(r) = v.consensus.first_divergence_round {
             let _ = writeln!(s, "  first divergence   : round {r}");
         }

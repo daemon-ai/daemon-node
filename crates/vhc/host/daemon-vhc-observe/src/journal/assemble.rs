@@ -115,6 +115,15 @@ pub enum AssembleError {
     /// A record body failed to decode while enumerating payloads/digests.
     #[error("record decode: {0}")]
     Codec(String),
+    /// One peer published two DIFFERENT state digests for one round — never silently
+    /// last-writer-wins (equivocating evidence must refuse, not overwrite).
+    #[error("peer {peer} round {round}: conflicting state digests", peer = .peer.to_hex())]
+    DigestConflict {
+        /// The conflicting peer.
+        peer: PeerId,
+        /// The conflicted round.
+        round: u64,
+    },
     /// Filesystem failure writing the layout.
     #[error("io: {0}")]
     Io(String),
@@ -210,14 +219,16 @@ pub fn assemble_archive(
                     detail: e.to_string(),
                 })
                 .and_then(|scan| {
-                    if scan.sealed {
-                        Ok(())
-                    } else {
-                        Err(AssembleError::BadSegment {
-                            hash: head.body.segment_hash,
-                            detail: "archived segment is not sealed".into(),
-                        })
-                    }
+                    // The full head↔segment identity binding (shared verifier): sealed unit,
+                    // frozen execution identity, ordinal, prev link, seal count.
+                    daemon_vhc_journal::verify_head_binding(
+                        &scan,
+                        &daemon_vhc_journal::HeadClaim::from_archive_head(&head.body),
+                    )
+                    .map_err(|e| AssembleError::BadSegment {
+                        hash: head.body.segment_hash,
+                        detail: e.to_string(),
+                    })
                 })?;
             write_atomic(
                 &out.join("segments")
@@ -234,6 +245,14 @@ pub fn assemble_archive(
         for head in &chain.heads {
             let bytes = fetch_verified(fetch, &head.body.segment_hash)?;
             let scan = scan_bytes(&bytes).map_err(|e| AssembleError::BadSegment {
+                hash: head.body.segment_hash,
+                detail: e.to_string(),
+            })?;
+            daemon_vhc_journal::verify_head_binding(
+                &scan,
+                &daemon_vhc_journal::HeadClaim::from_archive_head(&head.body),
+            )
+            .map_err(|e| AssembleError::BadSegment {
                 hash: head.body.segment_hash,
                 detail: e.to_string(),
             })?;
@@ -261,10 +280,7 @@ pub fn assemble_archive(
         }
         for frame in &capture.frames {
             if let VhcMessage::Digest(digest) = &frame.message {
-                by_peer
-                    .entry(frame.sender)
-                    .or_default()
-                    .insert(digest.round, digest.digest.0);
+                insert_peer_digest(&mut by_peer, frame.sender, digest.round, digest.digest.0)?;
             }
         }
     } else {
@@ -280,10 +296,7 @@ pub fn assemble_archive(
         for input in &capture.inputs {
             if let Input::Message(sm) = input {
                 if let VhcMessage::Digest(digest) = &sm.payload {
-                    by_peer
-                        .entry(sm.signer)
-                        .or_default()
-                        .insert(digest.round, digest.digest.0);
+                    insert_peer_digest(&mut by_peer, sm.signer, digest.round, digest.digest.0)?;
                 }
             }
         }
@@ -319,6 +332,27 @@ pub fn assemble_archive(
         peer_transcripts,
         coordinator_lineage: lineage.iter().map(|c| c.chain_instance).collect(),
     })
+}
+
+/// Record one peer's per-round digest: an identical duplicate collapses (replay-forward
+/// re-publishes are legal), a DIFFERENT value for the same `(peer, round)` is the typed
+/// [`AssembleError::DigestConflict`] — never a silent overwrite.
+fn insert_peer_digest(
+    by_peer: &mut BTreeMap<PeerId, BTreeMap<u64, [u8; 16]>>,
+    peer: PeerId,
+    round: u64,
+    digest: [u8; 16],
+) -> Result<(), AssembleError> {
+    match by_peer.entry(peer).or_default().entry(round) {
+        std::collections::btree_map::Entry::Vacant(v) => {
+            v.insert(digest);
+            Ok(())
+        }
+        std::collections::btree_map::Entry::Occupied(o) if *o.get() == digest => Ok(()),
+        std::collections::btree_map::Entry::Occupied(_) => {
+            Err(AssembleError::DigestConflict { peer, round })
+        }
+    }
 }
 
 /// Fetch + re-hash content-addressed bytes (the store is untrusted).

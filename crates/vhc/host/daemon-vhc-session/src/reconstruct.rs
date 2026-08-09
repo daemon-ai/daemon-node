@@ -94,6 +94,100 @@ pub enum ReconstructError {
     /// The sandbox replay itself failed (engine/driver/guest-level).
     #[error("sandbox replay: {0}")]
     Sandbox(String),
+    /// CERTIFICATION ONLY (never the live lane): a reason-2 seam's anchoring tag-10 is absent
+    /// or disagrees with the predecessor replay's exported capture manifest — the successor
+    /// chain did not anchor on the state the lineage actually reproduces.
+    #[error("span {span} seam anchor: {detail}")]
+    SeamAnchor {
+        /// The successor span's index in the lineage replay.
+        span: usize,
+        /// What failed.
+        detail: String,
+    },
+    /// CERTIFICATION ONLY (never the live lane): a recorded kind-3 restore read-back does not
+    /// equal the inline capture section staged at that identity in manifest order — the
+    /// recorded migration re-fed bytes that are not the predecessor's exported state.
+    #[error("span {span} kind-3 binding: {detail}")]
+    Kind3 {
+        /// The migrating span's index in the lineage replay.
+        span: usize,
+        /// What failed.
+        detail: String,
+    },
+}
+
+/// The final-span end policy of a lineage replay.
+///
+/// * [`EndPolicy::Reconstruct`] — the live crash-recovery lane (existing semantics, unchanged):
+///   the final span MUST reach the §10.2 quiesce export; its capture becomes the successor's
+///   migration input.
+/// * [`EndPolicy::Certify`] — the offline certification lane: the final span may additionally
+///   end at its RECORDED terminal outcome (a completed run replays to completion — there is no
+///   state to export past a terminal), and the seam/kind-3 binding checks run at every
+///   reason-2 span. No live behavior rides this policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EndPolicy {
+    /// Live crash recovery: quiesce export required (existing semantics).
+    Reconstruct,
+    /// Offline certification: recorded terminal accepted; seam checks enforced.
+    Certify,
+}
+
+/// How a certified lineage replay closed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClosureClass {
+    /// The recorded terminal outcome was reproduced by the replayed guest — the archive is a
+    /// COMPLETE record of a finished run, not merely a verified prefix.
+    Terminal {
+        /// The reproduced outcome code (0 = success).
+        outcome: u64,
+    },
+    /// A verified sealed prefix: the replay folded and re-derived everything recorded, and the
+    /// state exported through the §10.2 quiesce path (the existing G-5 semantics).
+    Prefix,
+}
+
+/// Per-span replay facts (certification evidence; also useful operator telemetry).
+#[derive(Clone, Debug)]
+pub struct SpanFact {
+    /// The span's index in the lineage replay.
+    pub index: usize,
+    /// The incarnation id the span's tag-0 header carries.
+    pub instance: u64,
+    /// The tag-13 instantiation reason (0 initial, 1 trap-restart, 2 upgrade-activation).
+    pub reason: u64,
+    /// Records in the span.
+    pub records: usize,
+    /// Recorded tag-4 publishes the decision gate verified.
+    pub publishes: usize,
+    /// How the span's replay ended (debug form of [`ReplayEnd`]).
+    pub end: String,
+}
+
+/// Per-seam validation facts (one per reason-2 span under [`EndPolicy::Certify`]).
+#[derive(Clone, Debug)]
+pub struct SeamFact {
+    /// The SUCCESSOR span's index.
+    pub span: usize,
+    /// The anchoring tag-10 manifest byte length (== the predecessor export's manifest).
+    pub anchor_manifest_len: usize,
+    /// Recorded kind-3 restore read-backs verified against their staged identities.
+    pub kind3_checked: usize,
+}
+
+/// The product of a lineage replay: the closure class, per-span and per-seam facts, and the
+/// final span's exported capture when one exists (a terminal closure has none — there is no
+/// state past a completed run).
+#[derive(Debug)]
+pub struct LineageReplayReport {
+    /// How the lineage closed.
+    pub closure: ClosureClass,
+    /// Per-span facts, in replay order.
+    pub spans: Vec<SpanFact>,
+    /// Per-seam facts (populated under [`EndPolicy::Certify`] only).
+    pub seams: Vec<SeamFact>,
+    /// The final span's §10.2 export (`Some` on the quiesce path, `None` past a terminal).
+    pub capture: Option<SnapshotCapture>,
 }
 
 /// Everything the reconstruction executor needs — resolved by the join path, verified here.
@@ -147,6 +241,36 @@ pub async fn reconstruct_coordinator(
     spec: ReconstructSpec,
     segments: Arc<dyn ContentStore>,
 ) -> Result<SnapshotCapture, ReconstructError> {
+    let report = replay_verified_lineage(spec, segments, EndPolicy::Reconstruct).await?;
+    report.capture.ok_or_else(|| {
+        ReconstructError::Sandbox(
+            "the reconstruction instance staged no snapshot (§10.2 export missing)".into(),
+        )
+    })
+}
+
+/// The certification kernel's session half: the same verified-lineage replay as
+/// [`reconstruct_coordinator`] under [`EndPolicy::Certify`] — the final span may end at its
+/// recorded terminal outcome, every reason-2 seam's anchoring tag-10 and kind-3 restore
+/// read-backs are bound to the predecessor replay's export, and the full per-span/per-seam
+/// fact report is returned. Schema-free: round-vocabulary (equivocation/continuity/digest)
+/// certification is the observe crate's fold, orchestrated above this.
+///
+/// # Errors
+/// A typed [`ReconstructError`]; certification is RED on any of them.
+pub async fn certify_lineage(
+    spec: ReconstructSpec,
+    segments: Arc<dyn ContentStore>,
+) -> Result<LineageReplayReport, ReconstructError> {
+    replay_verified_lineage(spec, segments, EndPolicy::Certify).await
+}
+
+/// Verify heads → recover the record stream → replay it span by span under `policy`.
+async fn replay_verified_lineage(
+    spec: ReconstructSpec,
+    segments: Arc<dyn ContentStore>,
+    policy: EndPolicy,
+) -> Result<LineageReplayReport, ReconstructError> {
     // -- 1. re-verify the carried heads against genesis trust (carriage, not trust) --------------
     let chains = verify_chains(&spec.run_id, &spec.trusted, spec.heads.clone())?;
     let lineage = coordinator_lineage(&chains, &spec.role)?;
@@ -159,11 +283,12 @@ pub async fn reconstruct_coordinator(
         role = spec.role,
         chains = lineage.len(),
         records = records.len(),
+        policy = ?policy,
         "coordinator reconstruction: replaying the recovered record stream through the sandbox"
     );
     // -- 3+4. full-record input replay + decision gate (blocking: synchronous wasm drive) --------
     let restore = spec.restore.clone();
-    tokio::task::spawn_blocking(move || replay_capture(&spec, restore, records))
+    tokio::task::spawn_blocking(move || replay_lineage(&spec, restore, records, policy))
         .await
         .map_err(|e| ReconstructError::Sandbox(format!("replay task: {e}")))?
 }
@@ -245,13 +370,17 @@ async fn recover_records(
                 segment: head.body.segment,
                 detail: format!("scan: {e}"),
             })?;
-            if Hash(scan.header.prev_blake3) != head.body.prev_hash {
-                return Err(ReconstructError::Segment {
-                    chain_instance: chain.chain_instance,
-                    segment: head.body.segment,
-                    detail: "segment header's prev link disagrees with the attested head".into(),
-                });
-            }
+            // The full head↔segment identity binding (shared verifier): sealed unit, frozen
+            // execution identity, ordinal, prev link, seal count — not just the prev link.
+            daemon_vhc_journal::verify_head_binding(
+                &scan,
+                &daemon_vhc_journal::HeadClaim::from_archive_head(&head.body),
+            )
+            .map_err(|e| ReconstructError::Segment {
+                chain_instance: chain.chain_instance,
+                segment: head.body.segment,
+                detail: e.to_string(),
+            })?;
             last_complete = Some(scan.complete_file_blake3);
             chain_records.extend(scan.records);
         }
@@ -588,15 +717,20 @@ fn verify_decisions(
 
 /// Re-drive the recovered record stream through the §8.7 input-replay engine, span by span,
 /// gate each span's decisions against its recorded publishes, and export the final state via
-/// the guest's own §10.2 snapshot path (driven by the synthetic exhaustion Quiesce).
+/// the guest's own §10.2 snapshot path (driven by the synthetic exhaustion Quiesce). Under
+/// [`EndPolicy::Certify`] the final span may instead end at its RECORDED terminal outcome
+/// (closure class [`ClosureClass::Terminal`]), and every reason-2 seam is bound: anchoring
+/// tag-10 == the predecessor replay's exported manifest, each kind-3 read-back == the inline
+/// section staged at that identity in manifest order.
 ///
 /// Synchronous (a replay can never block — every input it may wait for is in the script) —
 /// called from `spawn_blocking`.
-fn replay_capture(
+fn replay_lineage(
     spec: &ReconstructSpec,
     restore: Option<SnapshotCapture>,
     records: Vec<Record>,
-) -> Result<SnapshotCapture, ReconstructError> {
+    policy: EndPolicy,
+) -> Result<LineageReplayReport, ReconstructError> {
     let sandbox = |e: String| ReconstructError::Sandbox(e);
 
     let module_hash = *blake3::hash(&spec.module).as_bytes();
@@ -619,6 +753,9 @@ fn replay_capture(
     // capture (a lineage that begins mid-history). Anything else boots fresh from genesis.
     let mut carried: Option<SnapshotCapture> = restore;
     let mut exported: Option<SnapshotCapture> = None;
+    let mut closure = ClosureClass::Prefix;
+    let mut span_facts: Vec<SpanFact> = Vec::with_capacity(total);
+    let mut seam_facts: Vec<SeamFact> = Vec::new();
 
     for (i, span) in spans.into_iter().enumerate() {
         // The header is the journal's own claim of what ran — cross-check it against the
@@ -650,6 +787,24 @@ fn replay_capture(
         } else {
             sections_by_hash(None)
         };
+        // The certification seam binding (CERTIFY ONLY — the live lane's behavior is
+        // unchanged): the successor span must have journaled the predecessor's exported
+        // manifest as its anchoring tag-10, and every recorded kind-3 restore read-back must
+        // equal the inline section staged at that identity in manifest order.
+        if policy == EndPolicy::Certify && span.reason == 2 {
+            seam_facts.push(verify_seam(i, &span.records, carried.as_ref())?);
+        }
+        let is_final = i + 1 == total;
+        // The recorded terminal of the FINAL span (a tag-16 kind-0 outcome): under Certify a
+        // completed run's replay legitimately ends exactly there — the terminal-closure class.
+        let recorded_terminal = if is_final && policy == EndPolicy::Certify {
+            span.records.iter().rev().find_map(|r| match &r.body {
+                Body::Terminal(t) if t.kind == 0 => t.outcome,
+                _ => None,
+            })
+        } else {
+            None
+        };
         let mut script = build_script(&span.records, &section_values)?;
         // A TRAILING recorded stop delivery (`EV_TAG_STOP`) is the host's end-of-feed marker —
         // a graceful stop that was journaled before the process exited — not a consensus
@@ -658,10 +813,17 @@ fn replay_capture(
         // (§10.2). Drop it; the state to rebuild IS the state at the stop point. (A stop with
         // records after it — a same-incarnation node-restart resume — replays through the
         // live LOCAL recovery path, never through this executor.)
-        if script
-            .events
-            .back()
-            .is_some_and(|(_, frame)| is_stop_event(frame))
+        //
+        // EXCEPT the one case where the stop IS the story's ending: certifying the final span
+        // of a COMPLETED run (a recorded tag-16 kind-0 terminal). There the replay must ride
+        // the stop into `da_run`'s own return and reproduce the recorded outcome — nothing
+        // needs exporting past a terminal.
+        let certify_terminal = recorded_terminal.is_some();
+        if !certify_terminal
+            && script
+                .events
+                .back()
+                .is_some_and(|(_, frame)| is_stop_event(frame))
         {
             script.events.pop_back();
         }
@@ -706,10 +868,17 @@ fn replay_capture(
 
         verify_decisions(i, &span.records, &replayed)?;
 
-        let is_final = i + 1 == total;
         match &replayed.end {
             ReplayEnd::Outcome(code)
                 if u64::from(*code) == u64::from(daemon_vhc_abi::OUTCOME_QUIESCE_READY) => {}
+            // Certification of a COMPLETED run: the final span reproduced its recorded
+            // terminal outcome — there is no state to export past a terminal, and requiring
+            // the synthetic quiesce would refuse exactly the archives worth certifying.
+            ReplayEnd::Outcome(code) if is_final && recorded_terminal == Some(u64::from(*code)) => {
+                closure = ClosureClass::Terminal {
+                    outcome: u64::from(*code),
+                };
+            }
             // A mid-lineage span may end exactly as the recording did (a trap that caused the
             // reason-1 restart, a recorded terminal outcome) — the successor span rebuilds
             // from scratch, as the live restart did.
@@ -722,14 +891,134 @@ fn replay_capture(
             }
         }
 
+        span_facts.push(SpanFact {
+            index: i,
+            instance: span.header.instance,
+            reason: span.reason,
+            records: span.records.len(),
+            publishes: span
+                .records
+                .iter()
+                .filter(|r| matches!(r.body, Body::Publish(_)))
+                .count(),
+            end: format!("{:?}", replayed.end),
+        });
         carried = replayed.capture.clone();
         if is_final {
             exported = replayed.capture;
         }
     }
 
-    exported.ok_or_else(|| {
-        sandbox("the reconstruction instance staged no snapshot (§10.2 export missing)".into())
+    if policy == EndPolicy::Reconstruct && exported.is_none() {
+        return Err(sandbox(
+            "the reconstruction instance staged no snapshot (§10.2 export missing)".into(),
+        ));
+    }
+    Ok(LineageReplayReport {
+        closure,
+        spans: span_facts,
+        seams: seam_facts,
+        capture: exported,
+    })
+}
+
+/// The reason-2 seam binding ([`EndPolicy::Certify`] only): the successor's anchoring tag-10
+/// (journaled BEFORE its first delivered event — `lifecycle.rs` writes `mig.capture.manifest`
+/// verbatim on `anchor: true`) must equal the predecessor replay's exported manifest, and each
+/// recorded kind-3 restore read-back must equal the inline capture section staged at that
+/// identity — the driver's staging counter starts at 1 and the migration stages FIRST, so the
+/// k-th inline section (manifest order, 0-based) is staged at id `1 + k`. Not merely
+/// any-section-with-the-same-hash: identity binding, in manifest order. (By-ref sections never
+/// travel through kind-3; a sidecar-referenced value binds through its recorded plaintext
+/// content address.)
+fn verify_seam(
+    span_index: usize,
+    records: &[Record],
+    carried: Option<&SnapshotCapture>,
+) -> Result<SeamFact, ReconstructError> {
+    let capture = carried.ok_or_else(|| ReconstructError::SeamAnchor {
+        span: span_index,
+        detail: "upgrade-activation span with no predecessor capture (the lineage does not \
+                 anchor)"
+            .into(),
+    })?;
+    let anchor = records
+        .iter()
+        .take_while(|r| !matches!(r.body, Body::Event(_)))
+        .find_map(|r| match &r.body {
+            Body::Snapshot(s) => Some(&s.manifest),
+            _ => None,
+        })
+        .ok_or_else(|| ReconstructError::SeamAnchor {
+            span: span_index,
+            detail: "the reason-2 span journals no anchoring tag-10 before its first \
+                     delivered event"
+                .into(),
+        })?;
+    if *anchor != capture.manifest {
+        return Err(ReconstructError::SeamAnchor {
+            span: span_index,
+            detail: format!(
+                "the anchoring tag-10 manifest ({} B, blake3 {}) is not the predecessor \
+                 replay's exported manifest ({} B, blake3 {})",
+                anchor.len(),
+                Hash(*blake3::hash(anchor).as_bytes()).to_hex(),
+                capture.manifest.len(),
+                Hash(*blake3::hash(&capture.manifest).as_bytes()).to_hex(),
+            ),
+        });
+    }
+
+    // Inline sections in manifest order → staged identities 1..=n.
+    let expected: std::collections::BTreeMap<u64, &Vec<u8>> = capture
+        .sections
+        .iter()
+        .filter_map(|s| match s {
+            daemon_vhc_proto::det_state::CkptDocSection::Inline(_, bytes) => Some(bytes),
+            daemon_vhc_proto::det_state::CkptDocSection::ByRef(..) => None,
+        })
+        .enumerate()
+        .map(|(k, bytes)| (1 + k as u64, bytes))
+        .collect();
+    let mut checked = 0usize;
+    for record in records {
+        let Body::ReadBack(r) = &record.body else {
+            continue;
+        };
+        if r.kind != u64::from(daemon_vhc_abi::READBACK_KIND_STATE_SECTION) {
+            continue;
+        }
+        let kind3 = |detail: String| ReconstructError::Kind3 {
+            span: span_index,
+            detail,
+        };
+        let expected_bytes = expected.get(&r.src).copied().ok_or_else(|| {
+            kind3(format!(
+                "record {}: a kind-3 read-back at staging id {} — no inline section is \
+                 staged at that identity ({} inline sections)",
+                record.ord,
+                r.src,
+                expected.len()
+            ))
+        })?;
+        let bound = match (&r.value, &r.sidecar) {
+            (Some(value), _) => value == expected_bytes,
+            (None, Some(sref)) => sref.hash.as_bytes() == blake3::hash(expected_bytes).as_bytes(),
+            (None, None) => expected_bytes.is_empty(),
+        };
+        if !bound {
+            return Err(kind3(format!(
+                "record {}: the recorded kind-3 value at staging id {} is not the inline \
+                 section staged at that identity in manifest order",
+                record.ord, r.src
+            )));
+        }
+        checked += 1;
+    }
+    Ok(SeamFact {
+        span: span_index,
+        anchor_manifest_len: capture.manifest.len(),
+        kind3_checked: checked,
     })
 }
 
@@ -826,13 +1115,15 @@ pub async fn extract_catch_up_frames(
                 segment: head.body.segment,
                 detail: format!("scan: {e}"),
             })?;
-            if Hash(scan.header.prev_blake3) != head.body.prev_hash {
-                return Err(ReconstructError::Segment {
-                    chain_instance: chain.chain_instance,
-                    segment: head.body.segment,
-                    detail: "segment header's prev link disagrees with the attested head".into(),
-                });
-            }
+            daemon_vhc_journal::verify_head_binding(
+                &scan,
+                &daemon_vhc_journal::HeadClaim::from_archive_head(&head.body),
+            )
+            .map_err(|e| ReconstructError::Segment {
+                chain_instance: chain.chain_instance,
+                segment: head.body.segment,
+                detail: e.to_string(),
+            })?;
             for record in &scan.records {
                 let Body::Publish(p) = &record.body else {
                     continue;
@@ -1221,6 +1512,143 @@ mod catch_up_tests {
         assert!(
             matches!(err, ReconstructError::Segment { segment: 0, .. }),
             "typed segment refusal, got {err:?}"
+        );
+    }
+}
+
+/// The seam gate's unit matrix (certification kernel, session half): a reason-2 successor span
+/// must anchor on EXACTLY the state its predecessor's replay exports — the tag-10 manifest
+/// byte-identical, every recorded kind-3 read-back bound to the inline section staged at that
+/// identity in manifest order. Each check is exercised in isolation over synthesized records;
+/// the product path (`daemon-vhc-testkit/tests/reconstruct_product.rs`) drives the same gate
+/// over real lineages.
+#[cfg(test)]
+mod seam_tests {
+    use super::*;
+    use daemon_vhc_journal::record::{EventRec, ReadBackRec, SnapshotRec};
+    use daemon_vhc_proto::det_state::CkptDocSection;
+
+    const KIND3: u64 = daemon_vhc_abi::READBACK_KIND_STATE_SECTION as u64;
+
+    /// The predecessor replay's export: a manifest plus two inline sections (staging ids 1, 2).
+    fn capture() -> SnapshotCapture {
+        SnapshotCapture {
+            manifest: b"manifest/predecessor-export".to_vec(),
+            sections: vec![
+                CkptDocSection::Inline("optimizer".into(), b"section/one".to_vec()),
+                CkptDocSection::Inline("weights".into(), b"section/two".to_vec()),
+            ],
+        }
+    }
+
+    fn snapshot(ord: u64, manifest: &[u8]) -> Record {
+        Record::new(
+            ord,
+            Body::Snapshot(SnapshotRec {
+                manifest: manifest.to_vec(),
+            }),
+        )
+    }
+
+    fn kind3(ord: u64, src: u64, value: &[u8]) -> Record {
+        Record::new(
+            ord,
+            Body::ReadBack(ReadBackRec {
+                src,
+                kind: KIND3,
+                status: 0,
+                value: Some(value.to_vec()),
+                sidecar: None,
+            }),
+        )
+    }
+
+    fn event(ord: u64) -> Record {
+        Record::new(
+            ord,
+            Body::Event(EventRec {
+                at: 0,
+                frame: vec![],
+            }),
+        )
+    }
+
+    /// GREEN: the anchoring tag-10 matches the export and every kind-3 binds in manifest order.
+    #[test]
+    fn a_matching_anchor_and_bound_kind3s_pass_with_the_facts_counted() {
+        let cap = capture();
+        let records = vec![
+            snapshot(0, &cap.manifest),
+            kind3(1, 1, b"section/one"),
+            kind3(2, 2, b"section/two"),
+            event(3),
+        ];
+        let fact = verify_seam(1, &records, Some(&cap)).expect("the seam binds");
+        assert_eq!(fact.span, 1);
+        assert_eq!(fact.anchor_manifest_len, cap.manifest.len());
+        assert_eq!(fact.kind3_checked, 2, "both restore read-backs verified");
+    }
+
+    /// Case 7 of the certification matrix: the successor's anchoring tag-10 is NOT the
+    /// predecessor replay's exported manifest — the lineage does not anchor, RED.
+    #[test]
+    fn a_diverging_anchor_manifest_refuses_as_seam_anchor() {
+        let records = vec![snapshot(0, b"manifest/someone-elses-state"), event(1)];
+        let err = verify_seam(1, &records, Some(&capture())).expect_err("a foreign anchor is RED");
+        match err {
+            ReconstructError::SeamAnchor { span: 1, detail } => {
+                assert!(
+                    detail.contains("manifest"),
+                    "names the disagreement: {detail}"
+                );
+            }
+            other => panic!("expected a seam-anchor refusal, got: {other}"),
+        }
+    }
+
+    /// A reason-2 span that journals NO tag-10 before its first delivered event never anchors.
+    #[test]
+    fn a_missing_anchor_refuses_as_seam_anchor() {
+        let cap = capture();
+        // The tag-10 AFTER the first event is a mid-run snapshot, not the §10.3 anchor.
+        let records = vec![event(0), snapshot(1, &cap.manifest)];
+        let err = verify_seam(1, &records, Some(&cap)).expect_err("an unanchored seam is RED");
+        assert!(matches!(err, ReconstructError::SeamAnchor { span: 1, .. }));
+    }
+
+    /// A seam with no predecessor capture at all (the lineage's first span claims reason 2).
+    #[test]
+    fn a_seam_without_a_predecessor_capture_refuses() {
+        let err = verify_seam(0, &[event(0)], None).expect_err("nothing to anchor on is RED");
+        assert!(matches!(err, ReconstructError::SeamAnchor { span: 0, .. }));
+    }
+
+    /// A recorded kind-3 whose value is not the section staged at that identity is a typed
+    /// kind-3 refusal — the successor restored state the predecessor did not export.
+    #[test]
+    fn a_kind3_value_diverging_from_the_staged_section_refuses_typed() {
+        let cap = capture();
+        let records = vec![
+            snapshot(0, &cap.manifest),
+            kind3(1, 1, b"section/NOT-one"),
+            event(2),
+        ];
+        let err = verify_seam(1, &records, Some(&cap)).expect_err("a diverging kind-3 is RED");
+        assert!(
+            matches!(err, ReconstructError::Kind3 { span: 1, .. }),
+            "got: {err}"
+        );
+    }
+
+    /// A kind-3 at a staging identity nothing was staged at (src past the inline sections).
+    #[test]
+    fn a_kind3_at_an_unstaged_identity_refuses_typed() {
+        let cap = capture();
+        let records = vec![snapshot(0, &cap.manifest), kind3(1, 9, b"x"), event(2)];
+        let err = verify_seam(1, &records, Some(&cap)).expect_err("an unstaged identity is RED");
+        assert!(
+            matches!(err, ReconstructError::Kind3 { span: 1, .. }),
+            "got: {err}"
         );
     }
 }
