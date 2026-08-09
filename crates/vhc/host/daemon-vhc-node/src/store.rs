@@ -532,6 +532,21 @@ impl VhcStore {
         Ok(())
     }
 
+    /// Advance the run row's `last_round` monotonically from a `RoundOutcome` — the round head
+    /// the operator surface (`vhc detail`) reads. `RunPhase` also writes the row
+    /// ([`VhcStore::set_phase`]) but phases change only at lifecycle edges, so a run that goes
+    /// "running" at round 0 and then trains for hours would otherwise read `round=0` forever
+    /// (the c15 telemetry defect). `MAX()` keeps a late re-delivered outcome from regressing
+    /// the head.
+    pub fn advance_round(&self, run_id: &str, round: u64) -> Result<(), StoreError> {
+        self.lock().execute(
+            "UPDATE vhc_runs SET last_round = MAX(last_round, ?2), updated_ms = ?3
+             WHERE run_id = ?1",
+            params![run_id, round as i64, now_ms()],
+        )?;
+        Ok(())
+    }
+
     /// Record a run's D0 execution identity (decisions D1): the transition-chain `epoch`, the
     /// envelope-level `role`, and the never-reused durable u64 `instance` incarnation. Idempotent.
     pub fn set_execution_identity(

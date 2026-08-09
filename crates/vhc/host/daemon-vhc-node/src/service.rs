@@ -1851,7 +1851,10 @@ impl VhcService {
             } => self
                 .store
                 .bump_contribution(&run_id, 0, 0, *up_bytes, *down_bytes, 0, 0)?,
-            protocol::Event::RoundOutcome { stalled, .. } => {
+            protocol::Event::RoundOutcome { round, stalled, .. } => {
+                // The durable round head: `RunPhase` writes the row only at lifecycle edges,
+                // so without this `vhc detail` reads round=0 for the whole run (c15 defect).
+                self.store.advance_round(&run_id, *round)?;
                 self.store
                     .bump_contribution(&run_id, u64::from(!*stalled), 0, 0, 0, 0, 0)?
             }

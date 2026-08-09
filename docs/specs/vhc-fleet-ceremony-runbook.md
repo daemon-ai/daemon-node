@@ -281,17 +281,36 @@ Runs BOTH oracle modes over an on-disk archive and emits a per-round, per-peer v
 cargo run -p xtask -- vhc-replay --archive <dir> --run <run-id> [--json]
 ```
 
-- **Consensus re-derivation (sandboxed).** The pinned coordinator module is driven inside the real
-  host sandbox — consensus never runs natively — over the archived driving inputs recovered from the
-  sealed record segments; every archived round record must re-derive byte-identically, and every
-  committed digest must recompute from the content-addressed payloads alone.
+- **Consensus re-derivation (sandboxed, cross-chain certified).** The pinned coordinator module is
+  driven inside the real host sandbox — consensus never runs natively — over the archived driving
+  inputs recovered from the sealed record segments; every archived round record must re-derive
+  byte-identically, and every committed digest must recompute from the content-addressed payloads
+  alone. A lineage spanning MULTIPLE chains (restart succession) routes through the certification
+  kernel: every signed head is bound to its segment bytes (sealed + every identity field + the
+  seal's pre-seal record count), every reason-2 seam is bound (the successor's anchoring tag-10
+  manifest must equal the predecessor replay's exported capture; every recorded kind-3 restore
+  read-back must equal the section staged at that identity, by value or sidecar hash), and the
+  lineage-global semantic fold refuses equivocation (two different `RoundRecord`s for one round),
+  continuity breaks (the deduplicated committed rounds must be dense from 0 — identical
+  replay-forward re-publishes deduplicate and count once), and conflicting per-peer digests.
 - **Per-peer digest agreement.** Each peer's recorded per-round det-state digest is compared across
   peers; a round where any peer's digest differs from the round quorum is a disagreement, and the
   earliest such round is the first divergence.
 
 The verdict is GREEN iff the consensus oracle agrees AND (when peer transcripts are present) every
-per-round digest agrees across every reporting peer; otherwise RED, carrying the first divergence
-round.
+per-round digest agrees across every reporting peer; otherwise RED, carrying the failing stage and
+the first divergence round. GREEN additionally reports the **closure class**:
+
+- **`terminal(<outcome>)`** — the final span's replay rode the recorded stop into the guest's own
+  `da_run` return and reproduced the recorded tag-9 kind-0 outcome: the archive is a COMPLETE
+  record of a finished run.
+- **`prefix`** — a verified sealed prefix (an archive is a sealed prefix by construction; a
+  still-running, killed, or terminal-head-less lineage certifies here). Every recorded decision is
+  still verified; only COMPLETENESS is not claimed.
+
+Consumers assert on the class: the C2 evidence gate (§6.2) requires `terminal` on the completed
+run's archive; a `prefix` there means the terminal segment's head is missing and must be
+explained before any completeness claim.
 
 #### Archive directory layout contract
 
@@ -351,9 +370,12 @@ run → per-seal publisher → untrusted stores → assembly → GREEN `vhc-repl
 assembled layout under `DVHC_KEEP_ARCHIVE=<dir>` for a manual CLI smoke).
 
 A coordinator lineage that spans MULTIPLE chains (restart succession) assembles fine — every
-chain's heads and segments land in the layout — but `vhc-replay` refuses it typed for now:
-cross-chain replay lands with sandboxed coordinator reconstruction (the join-transaction rebuild),
-which owns the seam semantics.
+chain's heads and segments land in the layout — and `vhc-replay` certifies it through the
+session certification kernel (`certify_lineage`: the same executor the join-transaction rebuild
+runs, under the `Certify` end policy), so a drill run carries the replay claim itself. The
+single chain is the degenerate lineage through the same path; harness-form archives are
+unchanged. Pinned by the `reconstruct_product` certification matrix and the fold/binding/seam
+unit gates.
 
 A succession may also cross **base identities** (the seat moved boxes): the publisher's
 succession-link resolution considers a predecessor chain published under a DIFFERENT
@@ -449,6 +471,17 @@ Resource discipline throughout: one local build at a time, jobs capped at ≤ np
    instant.
 5. **Provenance:** each deployed binary's `blake3` + the candidate commit recorded per box. Disk
    check: ≥ 40 GiB free per trainer.
+6. **Featured build check (CHECKED, per worker binary):** the worker MUST be built with its
+   platform lane's features (`--features vhc-net,wgpu-spirv` on the build host / Windows DX12
+   lane / Mac Metal lane) — a featureless worker builds fine and then refuses
+   `BackendUnavailable` at join. Evidence: the build command line recorded beside the binary
+   hash, AND backend availability verified ON-BOX (`daemon-cli vhc hardware` names the expected
+   backend) — the stale-image lesson: never trust the build host's view of a shipped binary.
+7. **Profile re-provision check (CHECKED, after EVERY worker rebuild):** a rebuild changes the
+   sealed backend revision, which invalidates every dev profile — run `vhc-provision-dev-profile`
+   and re-run the fit probe on each box whose worker changed, BEFORE any join. Evidence: the
+   fresh probe verdict (GREEN, key digest recorded). Skipping this refuses
+   `EstimateNotComposable` at join (typed, correct — but a preflight failure, not a run finding).
 
 ### 4.4 Keystores + the trust set
 
@@ -552,7 +585,19 @@ advertise_ips = ["<box WAN/LAN ip>"]
 
 [vhc.default_policy]
 mode = "always"
+
+[vhc.owner_budget]
+disk_mb = 245760   # CEREMONY-SPECIFIC: 3x the 60 GiB seat reservation + slack (see below)
 ```
+
+**The 240 GiB owner budget is ceremony-specific configuration, not a production sizing rule.**
+REPLACE-mode re-admission (tuple drift after any rebuild) reserves the incoming seat's FULL
+fresh claim before the superseded seat releases, so a box holding two standing 60 GiB seats
+needs one extra transient reservation's headroom or arbitration refuses and burns the retry
+budget into `FailedTerminal` (observed live, c15m). The long-term fix is transactional
+replacement accounting — charge only the DELTA while retaining the incumbent's fencing, never
+release-before-reserve (releasing first would un-fence the incumbent while the replacement can
+still fail) — recorded as future work; until it lands, ceremony boxes carry the 3× budget.
 
 The coordinator allowlist on every box pins the dev registry base (the node refuses any other
 coordinator endpoint). The build host's config additionally volunteers for the coordinator role (the
@@ -739,8 +784,13 @@ the R2 record-set objects. Assemble the replay archive per the §3.4 layout cont
 `cargo run -p xtask -- vhc-replay --archive <dir> --run <run-id> --json` over the §3.4 archive on the
 build host: both oracle modes (input replay + sandboxed consensus re-derivation against the pinned
 coordinator module), every round re-derived byte-identically, verdict machine-readable into the
-ledger. On a G-2 abort, the same command is the localization tool: it replays each peer's journal to
-the divergence round and diffs the fold inputs.
+ledger. **The completed run's archive must certify GREEN with closure class `terminal`** (§3.4):
+the recorded outcome reproduced by the replay itself, not merely a verified prefix — a `prefix`
+verdict on a completed run means the terminal segment's head never published and is a finding to
+adjudicate, not a pass. Drill-produced multi-chain lineages certify through the same command (the
+cross-chain kernel; seams bound, rounds globally continuous and non-equivocating). On a G-2 abort,
+the same command is the localization tool: it replays each peer's journal to the divergence round
+and diffs the fold inputs.
 
 ### 6.3 The results ledger
 

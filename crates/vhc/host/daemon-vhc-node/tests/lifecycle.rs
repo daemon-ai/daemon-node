@@ -266,6 +266,37 @@ async fn duplicate_terminal_is_idempotent() {
     );
 }
 
+/// `vhc detail` reads the durable row's `last_round`; phases change only at lifecycle edges,
+/// so the row must advance from each `RoundOutcome` (the c15 round=0 telemetry defect) and a
+/// late re-delivered earlier outcome must never regress the head.
+#[tokio::test]
+async fn round_outcomes_advance_the_durable_round_head() {
+    let worker = StreamingWorker::new();
+    let svc = service_over(VhcStore::open_in_memory().unwrap(), worker.clone(), 5);
+    svc.vhc_join("run-r".into(), policy(), "op".into())
+        .await
+        .unwrap();
+    observe_ready(&svc, "run-r");
+    let generation = svc.store().get_run("run-r").unwrap().unwrap().instance;
+    let outcome = |round| protocol::Event::RoundOutcome {
+        round,
+        committed: 2,
+        ingested: 2,
+        stalled: false,
+        digest: [7; 16],
+        generation,
+    };
+    let head = |svc: &VhcService| svc.store().get_run("run-r").unwrap().unwrap().last_round;
+
+    assert_eq!(head(&svc), 0, "the readiness RunPhase snapshot");
+    svc.handle_worker_event(&outcome(3)).unwrap();
+    assert_eq!(head(&svc), 3, "the outcome advances the durable head");
+    svc.handle_worker_event(&outcome(1)).unwrap();
+    assert_eq!(head(&svc), 3, "a late earlier outcome never regresses it");
+    svc.handle_worker_event(&outcome(4)).unwrap();
+    assert_eq!(head(&svc), 4);
+}
+
 /// Events stamped with a stale generation are discarded whole: they fold no contribution,
 /// transition no state, and can never terminate the CURRENT instance.
 #[tokio::test]

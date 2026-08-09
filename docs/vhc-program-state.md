@@ -99,6 +99,98 @@ None of these blocks C0 or C1.
 
 ## 7. Current state (rewrite this section at every boundary)
 
+**Two boundaries, kept distinct.** (1) **c15m EXECUTED at `068873f2`** — the two-box
+recovery-first workstream is closed on that commit: defects 15–22 found live and fixed with
+regressions, the drill run completed 12/12 after a coordinator hard-kill, and the product
+archive pull verified end to end. (2) The **cross-chain certification commits are the
+SUBSEQUENT candidate boundary the C2 freeze takes**: `f1e43a2e` (certification kernel +
+15-case gate), `46df0409` (wasmtime 46.0.2 security patch; the c15m verdict re-ran
+byte-identical), plus the `vhc detail` round-telemetry fix (this boundary's commit). Nothing
+after `068873f2` has run in a live ceremony; everything after it is offline-verifier,
+telemetry, and docs surface.
+
+- **Cross-chain replay certification (2026-08-09, `f1e43a2e`)** — the architecture claim
+  "every coordinator decision is offline re-verifiable by anyone from the archive" is now
+  executable across restart succession, no new trust authority, no wire change:
+  - `daemon-vhc-journal::binding` — the head↔segment binding verifier (sealed + internally
+    consistent + every signed identity field agrees, seal pre-seal count == head count),
+    adopted at all three readers (session recovery, observe assembly, chain walker).
+  - `daemon-vhc-session::reconstruct` — `EndPolicy::Certify` + `ClosureClass`: a completed
+    run's replay rides its recorded stop into the guest's own return and must reproduce the
+    recorded tag-9 kind-0 outcome (**`terminal` closure**) or remains an honest **verified
+    `prefix`**; every reason-2 seam is bound (anchoring tag-10 == the predecessor replay's
+    exported manifest; each kind-3 read-back == the section staged at that identity, by
+    value or sidecar hash); typed SeamAnchor/Kind3 refusals.
+  - `daemon-vhc-observe::journal::certify` — the lineage semantic fold: identical
+    replay-forward duplicates deduplicate and count once; different `RoundRecord`s for one
+    round = equivocation; deduplicated rounds dense from 0; conflicting per-peer digests
+    refuse typed (the assembler's silent last-write-wins is gone).
+  - `xtask vhc-replay` routes wire-form archives — single- and multi-chain — through the
+    kernel; the verdict carries closure class, chain/span/seam facts, dedup counts, and the
+    failing stage on RED. 15-case test gate green (fold + binding + seam units, product
+    matrix over real lineages incl. a tampered-publish decision-divergence refusal).
+  - **c15m is CERTIFIED**: GREEN over `archive-c15m-final` — 11 chains, 10 seams bound,
+    121,570 records, 12 unique rounds (39,029 replay-forward duplicates deduplicated, zero
+    equivocation), payload + set-commitment closure, per-peer digest agreement. Closure
+    class **`prefix`, why recorded**: the terminal head never published — `RunTerminated`
+    reaped the worker before the archive publisher drained on every COMPLETED run (fixed in
+    `f1e43a2e`: drain precedes the event) — and c15m's journals were swept post-pull. The
+    live completion (`Outcome(0)`, cross-box digest agreement) remains a live claim.
+    Archive-borne completeness claims start with C2, whose evidence gate requires
+    `terminal`. Verdict: `$C15/replay-verdict-c15m-certified.json` (sha256 `067a45c5…`);
+    adjudication upgraded in `$C15/VERDICT.md`.
+- **The c15 series (2026-08-06..09, closed at `068873f2`)**: four runs on one freeze
+  (tiny-llama `640983cf…` lineage) — c15j/k/l clean 12-round runs (GREEN single-chain
+  replay; c15l 19 segments / 11,689 records), c15m the DRILL run (coordinator + workers
+  SIGKILL at round 3 → product reconstruction from the verified archive lineage → staged
+  archive catch-up → live checkpoint → completion 12/12, final digest cross-box identical).
+  Defects 15–22 fixed live with regressions (abandoned-tail adoption, supersession
+  terminals, within-horizon catch-up, seat-replacement race, fence-inclusive extraction,
+  guest-quiescence-paced delivery, back-pressure vs gap aging). Round-0 quorum digest
+  bit-identical across all four runs. Full adjudication: `$C15/VERDICT.md`; forensic
+  narrative: the handoff doc's dated 2026-08-08/09 sections.
+- **`vhc detail` round telemetry fixed (this boundary)**: the durable run row's
+  `last_round` now advances monotonically from every `RoundOutcome` (`VhcStore::
+  advance_round`); previously only lifecycle-edge `RunPhase` snapshots wrote it, so a
+  training run read `round=0` on the operator surface for its whole life. Regression:
+  `lifecycle.rs::round_outcomes_advance_the_durable_round_head`.
+- The pre-c15 hardening waves (One-Lifecycle/Two-Identities, checkpoint durability seam,
+  typed storage taxonomy + disk custodian [AR-9], deaf-path relay-first DO + heartbeat +
+  deafness verdict, incremental authenticated archive publication [AR-1..6], product
+  replay assembly, sandboxed coordinator reconstruction [AR-7/8], wire v45 disk surface)
+  are all landed, field-proven across c1 run-j/k and the c15 series, and recorded in the
+  ABI/runbook sections named in git history (`7cf37625`..`6d8c0713`); this file no longer
+  chronicles them individually.
+- Doctrine, provisioning, probes, and geometry are unchanged and load-bearing: `[RC-15]`
+  fit-verdict authority; PC-12 provisioning (`DAEMON_VHC_PROFILE_DIR`, dev authorities
+  doubly-opt-in, integration evidence only); ceremony geometry `CEREMONY_SEQ_LEN = 512`;
+  all three seats hold GREEN fit verdicts on their native lanes (bit-identical measured
+  peak 43,319,296 B; Strix/Vulkan-SPIR-V, 5090/native DX12, M4/native Metal MSL). A worker
+  rebuild changes the backend revision — re-provision the profile and re-run the fit probe
+  (now a checked runbook preflight item, not a note), or the join refuses
+  `EstimateNotComposable` (typed, correct).
+- **Standing non-claims (explicit; each is deliberate and recorded, not an oversight):**
+  1. R2 payload retention is authored (`payload_retention_rounds`) but NOT enforced by any
+     production deletion; payload availability is verified, never assumed.
+  2. Durable-watermark backpressure is absent (needed with payload GC + elastic
+     membership).
+  3. Stalled-record ordering in LIVE ring-replay bursts (defect 21's module-side half) is
+     deferred: host-paced catch-up is the product mechanism; the module fix changes the
+     module hash and waits for the compatibility-class work.
+  4. No general archive backfill and no in-session exact-frame loss repair.
+  5. Standby coordinator failover (§5.3) is uncertified; recovery is reconstruction.
+  6. Certification completeness is relative to the SUPPLIED heads snapshot: a withheld
+     fork is out of scope (fork evidence within the snapshot refuses typed).
+  7. c15m's archive certifies as a verified sealed prefix (terminal head unpublished,
+     unrecoverable post-sweep — see above); completeness claims start with C2.
+- C0: green and pinned. C1: green on hardware. C1.5 recovery-first: **closed at
+  `068873f2`** (c15 series). Remaining rungs: Windows 5090 full node → three-seat smoke →
+  freeze → C2 → closure (plan `cross-chain_certification_and_c2_closure_82651370`).
+- Program archive: frozen and locked read-only 2026-07-27.
+
+<details>
+<summary>Pre-c15 boundary chronicle (retired 2026-08-09; retained for provenance)</summary>
+
 - Integration trunk: `vhc-integration` at `6d8c0713` (Phase 6 boundary), clean. The One-Lifecycle/Two-Identities
   wave is fully landed and field-proven:
   - **One join transaction** (restart, retry, CLI join, fault recovery share one driver):
@@ -349,7 +441,8 @@ None of these blocks C0 or C1.
   lineage; teaching the offline oracle the seam semantics is follow-on work).
 - C0: green and pinned. C1: **green on hardware** (this boundary). Freeze/C2: the only
   rung left — needs the Windows 5090 seat joined in and the pre-C2 workstream scoped.
-- Program archive: frozen and locked read-only 2026-07-27.
+
+</details>
 
 ## 8. Fleet roster and next actions
 
@@ -363,29 +456,30 @@ a session then declared reachable boxes unreachable — access facts live here, 
 | Windows 5090 | `ssh usergpu356@37.230.134.194` (cmd.exe; build via sealed Nix cross-build, never on-box) | RTX 5090 32 GiB, Server 2022 | trainer | wgpu/DX12 |
 | M1 mini | `ssh m1@51.159.120.241` | Apple M1, 8 GiB | iroh relay only | — |
 
-All four answer ssh (verified 2026-08-04). Next actions (in order):
+All four answer ssh (verified 2026-08-04). Next actions (in order; the active plan is
+`cross-chain_certification_and_c2_closure_82651370`):
 
 1. ~~Fit probes at the reduced geometry~~ DONE — all three seats GREEN, native lanes (§7).
 2. ~~Run C1 on two boxes~~ DONE — run-j complete + zero mismatch, run-k churn drills
-   passed (§7).
-3. Pre-C2 workstream (plan `production-ready_ceremony_completion_47713b86`, strictly
-   sequential): ~~Phase 1 cadence contract + typed storage taxonomy~~ DONE (§7).
-   ~~Phase 2 deaf-path instrumentation + root cause~~ DONE (§7: relay-first DO, server
-   Binary heartbeat, client deafness verdict, plane_health surface, live churn
-   regression).    ~~Phase 3 incremental authenticated archive publication~~ DONE (§7:
-   proto archive contract, seal-hook publisher, head stores, cloud archive slots,
-   ABI §8.8). ~~Phase 4 GREEN replay assembly~~ DONE (§7: `assemble_archive` +
-   `vhc-archive-pull` + product `vhc-replay`, end-to-end gate GREEN). ~~Phase 5
-   sandboxed coordinator reconstruction~~ DONE (§7: node-verified head lineage +
-   worker sandbox replay + rewired `CheckpointStale`, [AR-7]/[AR-8]). ~~Phase 6 disk
-   custody~~ DONE (§7: custodian + custody ledger + anchored prune [AR-9] +
-   reconciliation + wire-v45 disk surface, gate GREEN, `6d8c0713`). Next: Phase 7,
-   the targeted C1.5 two-box run (re-provision profiles + re-run fit probes first —
-   the worker rebuild changed the sealed backend revision); plus the registry
-   Byzantine posture owner decision (§6).
-4. Bring the Windows 5090 seat into a three-box run (its worker lane builds with
-   `vhc-net,wgpu-spirv`; native DX12 verdict is already green).
-5. Freeze; memoized preflight; run C2; evidence closure; human-signed master merge.
+   passed.
+3. ~~Pre-C2 hardening (plan `production-ready_ceremony_completion_47713b86`, Phases 1–6)~~
+   DONE — chronicled in §7's provenance fold; boundary `6d8c0713`.
+4. ~~C1.5 recovery-first workstream (plan `recovery-first_phase_7_gates_f1d60cb7`)~~
+   DONE — the c15 series, defects 15–22 closed, drill run completed + pulled; boundary
+   `068873f2` (§7).
+5. ~~Cross-chain replay certification~~ DONE — kernel + 15-case gate + c15m certified
+   (`prefix`, why recorded); commits `f1e43a2e` + `46df0409` (§7).
+6. Windows 5090 full node: sealed cross-builds at the final candidate commit (features +
+   hashes verified on-box), node config + keystore + trust set, DX12 profile + fit probe
+   at the final worker revision, single-peer smoke, timer recalibration from the slowest
+   platform.
+7. Three-seat smoke (Strix coordinator+trainer, M4 trainer, Windows DX12 trainer):
+   three-way byte-identical digests before committing to ceremony geometry; hygiene +
+   park.
+8. Freeze (human ratifies `authoring-report.txt` before seeding — runbook §4.7 gate);
+   memoized preflight; run C2 (G-2 transcript, G-3 drills, G-4 restore, completion,
+   archive pull, GREEN `terminal`-closure replay); evidence closure; human-signed master
+   merge.
 
 ## 9. Agent contract
 

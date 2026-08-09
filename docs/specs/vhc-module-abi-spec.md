@@ -1999,6 +1999,32 @@ verdict (runbook §3.4) and coordinator reconstruction both consume them remotel
   (re-creating from genesis would fork the archived history). The unsealed tail is never prune
   material — it is the successor's reconstruction input ([AR-8]).
 
+- **[AR-10] Offline cross-chain certification.** The archived-architecture §4.4 claim — *every
+  coordinator decision is offline re-verifiable by anyone from the archive* — is executable
+  across restart succession, where "its journal" means the complete authenticated lineage. A
+  verifier holding only the genesis trust set and the §8.8 archive MUST be able to establish,
+  with no live system and no key material: **(a) binding** — every signed head binds to its
+  segment bytes (sealed and internally consistent; run/epoch/role/module/chain-scope/ordinal/
+  prev-link agree; the head's record count equals the seal's declared pre-seal count); **(b)
+  lineage** — chains fold densely and splice into exactly one founding succession by
+  content-addressed predecessor links (a withheld link is a typed refusal BEFORE replay); **(c)
+  decision equivalence** — the full record stream replays span by span through the sandbox
+  ([AR-8] semantics) and every recorded publish is re-derived byte-identically; **(d) seam
+  binding** — at every upgrade-activation span the anchoring snapshot record equals the
+  predecessor replay's exported capture manifest, and every recorded state-section read-back
+  equals the section staged at that identity (inline by value, sidecar by hash), in manifest
+  order; **(e) semantic closure** — across the WHOLE lineage the committed round records are
+  non-equivocating (identical replay-forward duplicates deduplicate; two different records for
+  one round refuse) and dense from round 0, per-peer digests are conflict-free, and every
+  committed payload re-hashes; **(f) closure class** — the verdict states whether the final
+  span's replay reproduced the recorded terminal outcome (**terminal**: a complete record of a
+  finished run) or verified a sealed prefix (**prefix**: every decision verified, completeness
+  not claimed). Every refusal is typed to distinguish archive corruption from deterministic
+  module divergence. Certification is relative to the SUPPLIED head snapshot: fork evidence
+  within it refuses; a wholly withheld fork is out of scope (recorded non-claim). Verifier
+  entry: `xtask vhc-replay`; kernel: `daemon-vhc-session::reconstruct::certify_lineage` +
+  the observe-side semantic fold.
+
 Wire shapes: `ArchiveHeadBody`/`ArchiveHeadRecord`/`ArchiveHeadDecision` in `daemon-vhc-proto`
 (domain `daemon-vhc/archive-head/1.0.0`); transport `PUT {base}/runs/:id/archive/head`,
 `GET {base}/runs/:id/archive/heads` (canonical CBOR; 200 accepted/already-stored, 409 typed
