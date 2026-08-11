@@ -558,6 +558,11 @@ pub struct VhcService {
     /// `retry.min_uptime_ms` (which resets the count); exhaustion parks the respawn lane
     /// loudly instead of silently cycling a dead seat forever.
     co_cycles: Mutex<BTreeMap<String, (u32, i64)>>,
+    /// REL-8(d), reliability spec §10: the run ids whose storage-pressure episode is currently
+    /// announced (a `storage_pressure` warning voiced once when a run scope crosses the
+    /// threshold of its quota, cleared when it drops back) — pressure is announced before it
+    /// kills, so quota deaths stop being surprises.
+    storage_pressured: Mutex<std::collections::BTreeSet<String>>,
     worker_factory: Option<WorkerFactory>,
     /// The identity keystore directory (D-P8 credential + per-run cert authorship); `None`
     /// disables node-side authorship (tests / headless).
@@ -636,6 +641,7 @@ impl VhcService {
             bring_up: Mutex::new(std::collections::BTreeSet::new()),
             co_retry: Mutex::new(BTreeMap::new()),
             co_cycles: Mutex::new(BTreeMap::new()),
+            storage_pressured: Mutex::new(std::collections::BTreeSet::new()),
             worker_factory: parts.worker_factory,
             identity_dir: parts.identity_dir,
             run_dir: parts.run_dir,
@@ -1083,6 +1089,31 @@ impl VhcService {
             }
             match self.reconverge(&run).await {
                 Ok(()) => reconverged += 1,
+                // REL-8(b), reliability spec §10: a re-assess refusal on the free-disk/ram
+                // lane floor is an ENVIRONMENT condition, not a failed attempt — it joins the
+                // storage-gate lane (park → reclaim → re-check → resume) exactly like
+                // `FailedStorage` does, instead of burning retry budget. A floor breach that
+                // survives reclamation still escalates loudly: the gated redispatch above
+                // refuses each pass and says why. Non-disk refusals keep the budgeted lane.
+                Err(e) if e.to_string().contains("below lane floor: ram/disk") => {
+                    self.store.set_storage_gated(&run.run_id, true)?;
+                    let due_at = now_ms() + retry.max_backoff_ms as i64;
+                    let _ = self.store.defer_retry(&run.run_id, due_at);
+                    let mut emitted = Vec::new();
+                    let _ = self.emit(
+                        VhcEvent::Warning {
+                            run_id: run.run_id.clone(),
+                            class: "storage_gate".to_string(),
+                            detail: format!(
+                                "reconverge re-assess refused on the ram/disk lane floor — \
+                                 parked storage-gated (retry budget untouched; reclaim runs \
+                                 before the gate re-check): {e}"
+                            ),
+                        },
+                        &mut emitted,
+                    );
+                    self.emit_changed(Some(run.run_id.clone()));
+                }
                 Err(e) => {
                     // A failed reconvergence attempt consumes budget like any recoverable
                     // failure: escalate on exhaustion, else reschedule with backoff. Loud
@@ -1195,6 +1226,50 @@ impl VhcService {
                 }
             }
         }
+        // REL-8(d) (reliability spec §10): pressure is announced before it kills. A run scope
+        // crossing the announce threshold of its per-run quota voices ONE `storage_pressure`
+        // warning (the episode clears silently when usage drops back, re-arming the announce)
+        // — so the two C2 quota-death surfaces (journal-sink `HostStorageExhausted` mid-run,
+        // lane-floor refusals against stacked dead incarnations) stop being surprises.
+        if self.config.storage.run_quota_mb > 0 {
+            if let Some(root) = &self.run_dir {
+                if let Ok(custodian) = daemon_vhc_custody::DiskCustodian::for_root(
+                    root,
+                    custody_config(&self.config.storage),
+                ) {
+                    let usage = custodian.usage();
+                    let scope_used: BTreeMap<&str, u64> =
+                        usage.scopes.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+                    for run in self.store.list_runs()? {
+                        let scope = blake3::hash(run.run_id.as_bytes()).to_hex().to_string();
+                        let used = scope_used.get(scope.as_str()).copied().unwrap_or(0);
+                        let pressured =
+                            Self::run_scope_pressured_at(used, self.config.storage.run_quota_mb);
+                        let mut announced = self.storage_pressured.lock().unwrap();
+                        if pressured && !announced.contains(&run.run_id) {
+                            announced.insert(run.run_id.clone());
+                            drop(announced);
+                            let mut emitted = Vec::new();
+                            let _ = self.emit(
+                                VhcEvent::Warning {
+                                    run_id: run.run_id.clone(),
+                                    class: "storage_pressure".to_string(),
+                                    detail: format!(
+                                        "run scope at {} of its {} MiB quota — reclaim or \
+                                         completion must land before the quota refuses writes",
+                                        format_args!("{} MiB", used / (1024 * 1024)),
+                                        self.config.storage.run_quota_mb
+                                    ),
+                                },
+                                &mut emitted,
+                            );
+                        } else if !pressured {
+                            announced.remove(&run.run_id);
+                        }
+                    }
+                }
+            }
+        }
         // REL-5 stall observer (reliability spec §6): a joined, alive run whose committed
         // progress has aged past its per-run threshold is announced ONCE (`run_stalled`);
         // `run_progress_resumed` closes the episode from the event pump. Detection only —
@@ -1261,6 +1336,13 @@ impl VhcService {
             }
         }
         Ok(reconverged)
+    }
+
+    /// REL-8(d): whether a run scope's usage has crossed the announce threshold (80%) of the
+    /// per-run quota — the point where reclaim/completion still has margin to land before the
+    /// quota starts refusing writes.
+    fn run_scope_pressured_at(used_bytes: u64, run_quota_mb: u64) -> bool {
+        run_quota_mb > 0 && used_bytes >= run_quota_mb.saturating_mul(1024 * 1024) / 5 * 4
     }
 
     /// The storage gate with RECLAIM-BEFORE-REFUSE: a held gate first runs the manifest-driven
@@ -1360,6 +1442,14 @@ impl VhcService {
 
     /// One attempt of the [`reconverge`](Self::reconverge) transaction body.
     async fn reconverge_attempt(&self, run: &PersistedRun) -> Result<(), VhcError> {
+        // REL-8(a), reliability spec §10: run the existing orphan reclamation BEFORE the fresh
+        // child's assess. Every reconverge recycles an incarnation, and the superseded
+        // predecessors' spills are exactly the bytes the re-assess's disk probe is about to
+        // judge — C2 accumulated ~59.8 GiB of dead recoverable state this way until the lane
+        // floor refused and the budget burned out against a full disk. Same judgment as the
+        // startup/gate-open passes: proven-superseded incarnations only, the newest is never
+        // reclaimed, the payload/archive evidence planes are never touched.
+        self.reconcile_run_state_dirs();
         let worker = self.instance_worker();
         let id = RoleInstanceId {
             run_id: run
@@ -6423,6 +6513,142 @@ mod storage_gate_tests {
         assert_eq!(row.run_state, RunState::FailedRetryable);
         assert!(!row.storage_gated);
         assert_eq!(row.retry_count, 1, "the ordinary path consumes budget");
+    }
+
+    /// A worker whose join refuses on the admission funnel's free-disk/ram lane floor — the
+    /// REL-8(b) reconverge shape (the re-assess probing a disk filled by dead incarnations).
+    struct FloorRefusingWorker;
+
+    #[async_trait]
+    impl WorkerControl for FloorRefusingWorker {
+        async fn probe(&self) -> Result<Hardware, VhcError> {
+            Ok(Hardware::default())
+        }
+        async fn assess(
+            &self,
+            _envelope: Vec<u8>,
+            _role: Option<String>,
+        ) -> Result<Eligibility, VhcError> {
+            Ok(Eligibility::default())
+        }
+        async fn join(
+            &self,
+            _run_id: String,
+            _coordinator: String,
+            _credentials: Vec<u8>,
+            _policy: JoinPolicy,
+            _admitted_tuple: Option<protocol::AdmittedTuple>,
+        ) -> Result<(), VhcError> {
+            Err(VhcError::Internal(
+                "assess refused: below lane floor: ram/disk".into(),
+            ))
+        }
+        async fn leave(&self, _run_id: String, _mode: LeaveMode) -> Result<(), VhcError> {
+            Ok(())
+        }
+        async fn throttle(
+            &self,
+            _vram_cap_mb: Option<u32>,
+            _duty_cycle_pct: Option<u8>,
+            _paused: bool,
+        ) -> Result<(), VhcError> {
+            Ok(())
+        }
+    }
+
+    /// REL-8(b): a reconverge refusal on the ram/disk lane floor parks the run STORAGE-GATED
+    /// (reclaim → re-check → resume) without burning retry budget — the C2 mechanism where a
+    /// disk full of dead incarnations converted a recoverable environment condition into
+    /// terminal escalation. Non-floor refusals keep the budgeted lane (pinned elsewhere).
+    #[tokio::test]
+    async fn a_lane_floor_reconverge_refusal_parks_storage_gated_without_burning_budget() {
+        let mut svc = coordinator_trainer_service(OwnerBudget::unbounded());
+        svc.worker_factory = Some(Arc::new(|| {
+            Arc::new(FloorRefusingWorker) as Arc<dyn WorkerControl>
+        }));
+        // A claim-bearing intent (derive_charge needs a memory figure) with no live instance:
+        // the run awaits retry (the terminal already released it).
+        let mut headroom = BTreeMap::new();
+        headroom.insert("claim_device_bytes".to_string(), 1_000_000i64);
+        headroom.insert("admitted_host_bytes".to_string(), 1_000_000i64);
+        svc.store
+            .put_join_intent(
+                "run-floor",
+                "https://coord.local/vhc",
+                &VhcPolicy {
+                    mode: VhcPolicyMode::Idle,
+                    vram_cap_mb: 8_000,
+                    duty_cycle_pct: 90,
+                    schedule: None,
+                },
+                None,
+                &VhcEligibility {
+                    eligible: true,
+                    reasons: Vec::new(),
+                    headroom,
+                },
+            )
+            .expect("seed the joined intent");
+        svc.store
+            .begin_release("run-floor", RunState::FailedRetryable, Some("worker died"))
+            .expect("release");
+        svc.store.commit_release("run-floor").expect("commit");
+        svc.store
+            .defer_retry("run-floor", now_ms() - 1_000)
+            .expect("the retry is due");
+
+        svc.reconcile_tick().await.expect("tick");
+
+        let row = svc.store.get_run("run-floor").expect("read").expect("row");
+        assert!(row.storage_gated, "the floor refusal joins the gate lane");
+        assert_eq!(row.retry_count, 0, "the retry budget is untouched");
+        let warned = svc
+            .store
+            .recent_events("run-floor", 32)
+            .expect("events")
+            .into_iter()
+            .any(|e| {
+                matches!(
+                    e,
+                    VhcEvent::Warning { class, detail, .. }
+                        if class == "storage_gate" && detail.contains("lane floor")
+                )
+            });
+        assert!(warned, "the parking is voiced with the floor reason");
+    }
+
+    /// REL-8(d): a run scope crossing 80% of its per-run quota voices ONE `storage_pressure`
+    /// warning (announced before the quota kills), and an announced episode never re-voices.
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)] // test fixture seeds raw bytes under a temp scope
+    async fn storage_pressure_is_announced_once_when_a_run_scope_nears_its_quota() {
+        let mut svc = coordinator_trainer_service(OwnerBudget::unbounded());
+        let root = tempfile::tempdir().expect("tempdir");
+        // The run scope directory (keyed by the run id's blake3 hex) sits at 90% of a 1 MiB
+        // per-run quota before the custodian's seeding walk.
+        let scope = blake3::hash("run-press".as_bytes()).to_hex().to_string();
+        std::fs::create_dir_all(root.path().join(&scope)).expect("scope dir");
+        std::fs::write(
+            root.path().join(&scope).join("state.bin"),
+            vec![0u8; 943_718],
+        )
+        .expect("scope bytes");
+        svc.run_dir = Some(root.path().to_path_buf());
+        svc.config.storage.run_quota_mb = 1;
+        seed_joined_run(&svc, "run-press", 2);
+        svc.store.mark_running("run-press").expect("running");
+
+        svc.reconcile_tick().await.expect("tick");
+        svc.reconcile_tick().await.expect("tick");
+
+        let pressure_events = svc
+            .store
+            .recent_events("run-press", 32)
+            .expect("events")
+            .into_iter()
+            .filter(|e| matches!(e, VhcEvent::Warning { class, .. } if class == "storage_pressure"))
+            .count();
+        assert_eq!(pressure_events, 1, "announced once, never re-voiced");
     }
 
     /// REL-7(d): the co-trainer respawn lane is CYCLE-bounded — a flap-die-respawn loop whose

@@ -312,6 +312,17 @@ enum Cmd {
         /// Stop after this many completed rounds.
         #[arg(long = "stop-rounds", default_value_t = 1_000_000)]
         stop_rounds: u64,
+        /// The per-box run storage budget in MiB (the fleet's provisioned `run_quota_mb`).
+        /// With `--per-round-growth-mb`, authoring validates
+        /// `budget >= stop_rounds x growth + restore headroom` (REL-8(c), reliability spec
+        /// §10/RQ-9) — refusing to author a run whose committed length cannot fit its quota.
+        /// Omitting both skips the gate with a warning.
+        #[arg(long = "storage-budget-mb")]
+        storage_budget_mb: Option<u64>,
+        /// The observed per-round journal+payload growth in MiB, from banked preflight
+        /// evidence (the fit-probe / smoke transcript the runbook already requires).
+        #[arg(long = "per-round-growth-mb")]
+        per_round_growth_mb: Option<u64>,
         /// The output directory for the four ceremony artifacts.
         #[arg(long)]
         out: PathBuf,
@@ -562,6 +573,8 @@ fn main() -> anyhow::Result<()> {
             witness_s,
             cooldown_s,
             stop_rounds,
+            storage_budget_mb,
+            per_round_growth_mb,
             out,
         } => ceremony::run(ceremony::Args {
             run_label,
@@ -584,6 +597,8 @@ fn main() -> anyhow::Result<()> {
             witness_s,
             cooldown_s,
             stop_rounds,
+            storage_budget_mb,
+            per_round_growth_mb,
             out,
         }),
         Cmd::VhcArchivePull {

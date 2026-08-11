@@ -78,7 +78,51 @@ pub struct Args {
     pub witness_s: u64,
     pub cooldown_s: u64,
     pub stop_rounds: u64,
+    /// The per-box run storage budget in MiB (REL-8(c); `None` skips the gate with a warning).
+    pub storage_budget_mb: Option<u64>,
+    /// The banked per-round journal+payload growth figure in MiB (REL-8(c)/RQ-9).
+    pub per_round_growth_mb: Option<u64>,
     pub out: PathBuf,
+}
+
+/// REL-8(c), reliability spec §10 (the §4.7 cadence↔retention precedent applied to disk): a
+/// run whose committed length cannot fit its per-box storage budget is an authoring error, not
+/// a round-40 discovery at the lane floor. Requires
+/// `budget >= stop_rounds x per-round growth + restore headroom`, where the headroom is one
+/// checkpoint-restore materialization approximated as 25% of the committed-growth term (its
+/// exact derivation and safety margin are RQ-9 — conservative until banked evidence freezes
+/// it). `None` for either input skips the gate loudly; a budget of 0 (unbounded quota) is a
+/// warning: the effective bound is then the disk, discovered at the lane floor.
+pub(crate) fn validate_storage_budget(
+    storage_budget_mb: Option<u64>,
+    per_round_growth_mb: Option<u64>,
+    stop_rounds: u64,
+) -> Result<()> {
+    let (Some(budget), Some(growth)) = (storage_budget_mb, per_round_growth_mb) else {
+        eprintln!(
+            "warning: authoring storage gate SKIPPED (pass --storage-budget-mb and \
+             --per-round-growth-mb from banked preflight evidence to validate the run's \
+             committed length against its per-box quota — reliability spec §10, RQ-9)"
+        );
+        return Ok(());
+    };
+    if budget == 0 {
+        eprintln!(
+            "warning: --storage-budget-mb 0 (unbounded quota) — the effective bound is the \
+             disk itself, discovered at the lane floor instead of at authoring"
+        );
+        return Ok(());
+    }
+    let committed = stop_rounds.saturating_mul(growth);
+    let required = committed.saturating_add(committed / 4);
+    anyhow::ensure!(
+        budget >= required,
+        "storage budget {budget} MiB cannot fit the authored run: stop_rounds {stop_rounds} x \
+         {growth} MiB/round = {committed} MiB committed growth + 25% restore headroom = \
+         {required} MiB required — raise the per-box quota, shorten the run, or bank a smaller \
+         growth figure (reliability spec §10, REL-8(c))"
+    );
+    Ok(())
 }
 
 /// Parse 32 lowercase/uppercase hex bytes into a fixed array.
@@ -167,6 +211,12 @@ pub fn run(args: Args) -> Result<()> {
     );
 
     let corpus_artifacts = corpus_artifact_pins(&manifest, corpus_manifest_hash);
+
+    validate_storage_budget(
+        args.storage_budget_mb,
+        args.per_round_growth_mb,
+        args.stop_rounds,
+    )?;
 
     let timers = CeremonyRunTimers {
         warmup_s: args.warmup_s,
@@ -531,6 +581,21 @@ mod tests {
         ceremony_genesis, CeremonyGenesisSpec, CeremonyRunTimers, CEREMONY_SEQ_LEN,
     };
     use daemon_vhc_testkit::live_genesis::fixture_authored_execution;
+
+    /// REL-8(c): the authoring storage gate refuses a run whose committed length cannot fit
+    /// its per-box quota; unbounded/unstated inputs skip loudly rather than fail.
+    #[test]
+    fn the_authoring_storage_gate_bounds_the_run_length_to_the_quota() {
+        // 100 rounds x 500 MiB = 50_000 MiB committed + 25% headroom = 62_500 MiB required.
+        assert!(validate_storage_budget(Some(62_500), Some(500), 100).is_ok());
+        let err = validate_storage_budget(Some(62_499), Some(500), 100)
+            .expect_err("a budget below committed growth + headroom refuses to author");
+        assert!(err.to_string().contains("62500 MiB required"), "{err}");
+        // Skipping inputs and the unbounded quota are warnings, never refusals.
+        assert!(validate_storage_budget(None, None, 100).is_ok());
+        assert!(validate_storage_budget(Some(0), Some(500), 100).is_ok());
+        assert!(validate_storage_budget(Some(1), None, 100).is_ok());
+    }
 
     /// The fixture tokenizer artifact's bytes (its blake3 is the manifest's tokenizer identity).
     const FIXTURE_TOKENIZER: &[u8] = b"tokenizer-fixture";

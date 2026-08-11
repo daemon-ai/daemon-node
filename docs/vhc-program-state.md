@@ -341,6 +341,11 @@ telemetry, and docs surface.
     disk custodian) — the gated wait consumes NO retry budget and never escalates.
     The run-k ENOSPC → `BadModule` → `FailedTerminal` misattribution is retired, with
     regressions at every layer (sink classification, trap classes, node gate + budget).
+    **Storage non-claim (post-C2, REL-8 landed):** the reconverge path now reclaims
+    superseded incarnations before re-assess and routes disk-floor refusals to the
+    storage-gate lane, and authoring validates the storage budget against run length —
+    but nothing yet *sources* the per-round growth figure from banked evidence (RQ-9
+    residual), and payload-plane retention remains an authored claim, not enforced GC.
   - Docs moved with the change: ABI §7.6 trap table, §12.6 [RS-2] class table,
     §12.10 [RL-4] storage-gated exception, §12.14 [SF-6] cadence wiring note;
     runbook §4.7 cadence check. Housekeeping rules encoded in §9 of this file.

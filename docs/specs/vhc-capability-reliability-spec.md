@@ -4,7 +4,8 @@
 node liveness), post-C2 workstream.
 **Status:** design specification, **implementation in progress** — clauses flip individually
 to **LANDED** with a date as their rungs land (currently: §3 REL-2, §3.1 REL-2a, §4 REL-3,
-§5 REL-4, §6 REL-5, §6.1 REL-5a, §9 REL-7 a/b/d); everything else remains specification.
+§5 REL-4, §6 REL-5, §6.1 REL-5a, §9 REL-7 a/b/d, §10 REL-8); everything else remains
+specification.
 Revision 2 (2026-08-10) incorporates an external design review: the object-store 403 taxonomy
 (§3), the ABI-minor assignment (§7), the demotion of trap attribution to a bounded heuristic
 (§5), and the qualified evidence claims (§3, §8). Revision 3 (same day, second review round)
@@ -47,7 +48,12 @@ verified by the testkit assembly regression (network-unplugged resume + tamper-a
 Revision 11 (2026-08-11, Rung 5 landed) flips §9 (REL-7 a/b/d: gap-hold visibility on
 `plane_health`, the runbook transport-posture preflight item, and the co-trainer cycle
 budget closing the 461-cycle unbounded-respawn defect) to LANDED; RQ-5's packet-loss residual
-and RQ-6's lane-separation half deliberately stay open.
+and RQ-6's lane-separation half deliberately stay open. Revision 12 (2026-08-11, Rung 6
+landed) flips §10 (REL-8: reclaim before every re-admission, the disk-floor refusal joining
+the storage-gate lane instead of the budget lane, the authoring storage gate, and the
+`storage_pressure` pre-kill warning) to LANDED on the unit-test-only discipline; RQ-9 is
+narrowed to its defaults-freeze residual (the per-round growth figure still comes from the
+operator, not from banked preflight evidence automatically).
 **Fence:** no change specified here may land while a ceremony that pins the node binaries is in
 flight (C2, run `f35bfa80…`, closed GREEN 2026-08-11 — no ceremony in flight as of Revision 6;
 the fence re-arms with the next authored run). §7 (guest contract) additionally changes the
@@ -745,6 +751,20 @@ windows rather than assume either story.
 
 ## 10. [REL-8] Storage lifecycle at the recovery seam
 
+**Status: LANDED (2026-08-11, Rung 6).** All four clauses are implemented and unit-test
+verified — no ceremony time consumed. (a) `reconverge_attempt` now runs the existing
+run-scoped `reconcile_run_state_dirs` judgment before the fresh child's assess. (b) A
+reconverge re-assess refusal carrying the free-disk lane-floor reason parks the run
+`storage_gated` with a voiced `storage_gate` warning and an untouched retry budget; non-disk
+assess refusals keep the budgeted lane (pinned by a node unit test against a floor-refusing
+worker). (c) `xtask ceremony author` grew `--storage-budget-mb`/`--per-round-growth-mb` and
+refuses an authored budget below `stop_rounds × growth + 25% restore headroom`; an unbounded
+budget over a bounded reservation warns (pinned by an xtask unit test). Deviation: the
+per-round growth figure is operator-supplied, not read from banked preflight evidence — that
+automation is RQ-9's residual. (d) The reconcile tick reads the custodian's per-scope usage
+and voices ONE `storage_pressure` warning per episode when a run scope crosses 80% of its
+quota, clearing when usage recedes (pinned by a node unit test).
+
 **Motivating evidence (C2 — as many manual interventions as the guest-panic class; now
 journal-proven, §2.1: three `HostStorageExhausted` trap terminals carrying the quota figure
 and one carrying the free-space floor refusal are in the product archive itself).** All
@@ -965,6 +985,6 @@ artifacts, and the verdict-producing `vhc-replay`.
 | RQ-6 | **Decided half IMPLEMENTED (§9d LANDED):** the co-trainer cycle budget ships — `max_retries` cycles, `min_uptime`-reset, loud park on exhaustion. OPEN half: whether transport-class faults then deserve a distinct (longer/slower) lane than guest faults | operational evidence with REL-5 announcing exhaustion |
 | RQ-7 | Ranged single-object GET resume for large payloads (mid-body resets on ~52 MB objects observed; presigned-URL Range semantics unverified; whole-object retry currently cheap enough) | revisit on evidence of retry thrashing; empirical Range probe first |
 | RQ-8 | REL-9's reaction trigger: is external run-head progress the only safe condition, or does a bounded exception exist for the whole-run-wedged 8b shape (zombie seat holder is this box)? | decided with the §7 decay-while-waiting fix in view, which removes most of that class at the source |
-| RQ-9 | The authoring storage gate's per-round growth figure: source (fit-probe vs smoke transcript), safety margin, and how restore/catch-up headroom is charged | banked preflight evidence from C2 + the three-seat smoke |
+| RQ-9 | **Structurally resolved (§10 LANDED):** the gate ships — `budget ≥ stop_rounds × growth + 25% restore headroom`, unbounded-budget warning. RESIDUAL: the growth figure is operator-supplied; sourcing it from banked preflight evidence (fit-probe vs smoke transcript) and freezing the 25% headroom margin remain open | banked preflight evidence from C2 + the three-seat smoke |
 | RQ-10 | First-class grant classes/planes in the ABI grants document (vs hash enumeration + evidence-based extension) | C3 ABI-minor scoping; REL-10's host-side extension is sufficient until then |
 | RQ-11 | The det-state eviction/retention contradiction (§2.1): the store evicted a chunk a still-retained sealed fold references (`state_store.rs:688-705`), and the guest saw `HASH_MISMATCH` for a fault that mismatched nothing. Two halves: the retention-window defect (why did eviction run ahead of the sealed-fold reference?) and the dishonest code (REL-3's mapper direction) | retention-window audit of `state_store` eviction against the sealed-fold retention contract; code honesty lands with REL-3 |

@@ -245,6 +245,15 @@ synthetic-clock values, so an untuned authoring is byte-identical to before; onl
 the run id. Genesis-rule violations (profile-chunk divisibility, state-chunk validity, checkpoint
 cadence vs retention) refuse at authoring.
 
+**Storage gate (REL-8(c), reliability spec §10).** Pass `--storage-budget-mb` (the per-run quota
+the fleet will run with, `[vhc.storage] run_quota_mb`) and `--per-round-growth-mb` (observed
+journal+payload growth per round from banked preflight evidence — the fit-probe or smoke
+transcript). Authoring refuses when the budget cannot cover
+`stop_rounds × growth + 25% restore headroom` — C2 filled its 60 GiB scopes mid-run precisely
+because nothing validated this at authoring time. An unbounded budget (0 or omitted) over a
+bounded seat reservation is a warning: the effective bound is then the disk, discovered at the
+lane floor.
+
 Outputs into `--out`:
 
 - `envelope.cbor` — the canonical `SignedEnvelope` **wire form** (`{ bytes, signature, signer }`)
