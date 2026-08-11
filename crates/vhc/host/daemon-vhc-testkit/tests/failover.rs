@@ -425,7 +425,9 @@ fn standby_resumes_from_archive_plus_journal_tail_byte_identically() {
                 segment: ord,
                 segment_hash: addr,
                 prev_hash: prev,
-                records: scan.records.len() as u64,
+                // The seal record is scanned but not counted — the head attests the seal's own
+                // declared count (binding.rs: `seal.records` excludes the seal frame itself).
+                records: scan.records.len() as u64 - 1,
             },
         )
         .expect("attest head");

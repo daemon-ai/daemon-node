@@ -276,7 +276,9 @@ fn drive_and_archive(
                 segment: ord,
                 segment_hash: addr,
                 prev_hash: prev,
-                records: scan.records.len() as u64,
+                // The seal record is scanned but not counted — the head attests the seal's own
+                // declared count (binding.rs: `seal.records` excludes the seal frame itself).
+                records: scan.records.len() as u64 - 1,
             },
         )
         .expect("attest");
@@ -716,4 +718,211 @@ fn threshold_keys_quorum_refusals_end_to_end() {
     let head_y = AttestedHead::attest(&[m2.clone(), m3.clone()], divergent).unwrap();
     let evidence = detect_fork(&[head_x, head_y], &authority).expect("threshold fork evidence");
     assert!(matches!(evidence, ForkEvidence::DivergentHead { .. }));
+}
+
+// -- lane 5: decay-while-waiting through the blob (the C2 floor-breach wedge, reliability §7) ------
+
+/// The C2 floor-breach membership wedge, healed by the production `coordinator_quorum.wasm`
+/// blob itself (the native repair is pinned in `decay_while_waiting.rs`; this lane proves the
+/// SAME tick ships in the sandboxed module the fleet actually runs). Scripted entirely on the
+/// deterministic event-count clock with tiny authored deadlines:
+///
+/// 1. a, b, c train round 0; b and c go silent and drop by ROUND accounting at k_absences = 2
+///    (round 1's record carries the drops); the floor breach (1 < 3) parks the run
+///    `Cooldown → WaitingForMembers`.
+/// 2. d joins during the wait and never speaks again — the zombie seat that, pre-repair, NO
+///    mechanism could reclaim: absence accounting lived only in round finalization and the
+///    waiting phase has no rounds. The wait stretches past the round-scaled decay window
+///    (k × (train + witness) = 10 ticks) while a keeps heartbeating; d decays WITHOUT a round
+///    (a keeps its seat — liveness re-stamps).
+/// 3. e and f join through the ordinary path, the floor gathers (a+e+f), warmup exits on
+///    readiness, and **round 2 opens and closes with exactly the healed roster** — the
+///    observable that discriminates the repair: pre-repair, zombie d stays "healthy", warmup
+///    can never gather full readiness, and no round ever opens again.
+#[test]
+fn floor_breach_zombie_decays_while_waiting_and_the_healed_roster_trains() {
+    let wasm = coordinator_quorum_wasm();
+    let custody = SigningKey::from_bytes(blake3::hash(b"decay/custody").as_bytes());
+    let authority = single_key(peer_id(&custody));
+    let run_id = Hash(*blake3::hash(b"decay/run").as_bytes());
+    let key = |label: &str| SigningKey::from_bytes(blake3::hash(label.as_bytes()).as_bytes());
+    let (a, b, c, d, e, f) = (
+        key("decay/a"),
+        key("decay/b"),
+        key("decay/c"),
+        key("decay/d"),
+        key("decay/e"),
+        key("decay/f"),
+    );
+
+    // Tiny authored deadlines (NOT the harness's effectively-infinite event_clock defaults):
+    // train 3 + witness 2 → decay window k(2) × 5 = 10 ticks; cooldown 2 so the breach can
+    // reach WaitingForMembers on the event-count clock.
+    let mut cfg = run_config("decay", 3, 3, 2);
+    cfg.round_witness_s = 2;
+    cfg.cooldown_s = 2;
+    let initial = CoordinatorState::new(cfg, Seed([0x33; 32]), 0);
+    let spec = spec_for(&wasm, &initial, authority, run_id);
+    let key_seed = *blake3::hash(b"decay/frame-key").as_bytes();
+
+    let join = |k: &SigningKey| ScriptMsg {
+        key: k.clone(),
+        msg: VhcMessage::Join(Join {
+            run_id: "decay".into(),
+            iroh_id: IrohId([0x44; 32]),
+            class: ThroughputClass::C1,
+            capabilities: CapabilitySet::new(),
+            envelope_hash: None,
+        }),
+    };
+    let ready = |k: &SigningKey, round: u64| ScriptMsg {
+        key: k.clone(),
+        msg: VhcMessage::Heartbeat(Heartbeat {
+            round,
+            ready: Some(true),
+        }),
+    };
+    let filler = |k: &SigningKey, round: u64| ScriptMsg {
+        key: k.clone(),
+        msg: VhcMessage::Heartbeat(Heartbeat { round, ready: None }),
+    };
+
+    let mut payloads = BTreeMap::new();
+    let mut script = Vec::new();
+    // Prologue: a, b, c join + ready → round 0 opens on the readiness fast path.
+    for k in [&a, &b, &c] {
+        script.push(join(k));
+    }
+    for k in [&a, &b, &c] {
+        script.push(ready(k, 0));
+    }
+    // Rounds 0 and 1: only a commits (b and c are silent); each round closes at the
+    // event-count train deadline and finalizes off the evidenced committed set.
+    for round in 0..2u64 {
+        let bytes = format!("update/decay/a/{round}").into_bytes();
+        let hash = blake3_hash(&bytes);
+        payloads.insert(hash, bytes.clone());
+        script.push(ScriptMsg {
+            key: a.clone(),
+            msg: VhcMessage::Commitment(Commitment {
+                round,
+                payload: hash,
+                size: bytes.len() as u64,
+                locators: Vec::new(),
+            }),
+        });
+        script.push(ScriptMsg {
+            key: a.clone(),
+            msg: VhcMessage::StorageReceipt(StorageReceipt {
+                round,
+                verified: vec![RecordEntry {
+                    peer: peer_id(&a),
+                    hash,
+                    size: bytes.len() as u64,
+                }],
+            }),
+        });
+        for _ in 0..4 {
+            script.push(filler(&a, round));
+        }
+    }
+    // The breach cools down (2 ticks) into WaitingForMembers.
+    for _ in 0..4 {
+        script.push(filler(&a, 1));
+    }
+    // d joins during the wait, then NEVER speaks again — the zombie seat.
+    script.push(join(&d));
+    // The wait stretches past the decay window (10 ticks from d's join) on a's heartbeats:
+    // a re-stamps its own liveness every filler, d decays without a round.
+    for _ in 0..14 {
+        script.push(filler(&a, 1));
+    }
+    // The freed floor gathers through the ordinary Join path and warms up on readiness.
+    script.push(join(&e));
+    script.push(join(&f));
+    for k in [&a, &e, &f] {
+        script.push(ready(k, 2));
+    }
+    // Round 2 trains on the HEALED roster: all three commit, one receipt evidences the set —
+    // the all-committed + all-evidenced fast paths finalize with no fillers.
+    let mut entries = Vec::new();
+    for (i, k) in [&a, &e, &f].into_iter().enumerate() {
+        let bytes = format!("update/decay/healed-{i}/2").into_bytes();
+        let hash = blake3_hash(&bytes);
+        payloads.insert(hash, bytes.clone());
+        entries.push(RecordEntry {
+            peer: peer_id(k),
+            hash,
+            size: bytes.len() as u64,
+        });
+        script.push(ScriptMsg {
+            key: (*k).clone(),
+            msg: VhcMessage::Commitment(Commitment {
+                round: 2,
+                payload: hash,
+                size: bytes.len() as u64,
+                locators: Vec::new(),
+            }),
+        });
+    }
+    script.push(ScriptMsg {
+        key: a.clone(),
+        msg: VhcMessage::StorageReceipt(StorageReceipt {
+            round: 2,
+            verified: entries,
+        }),
+    });
+
+    // The blob IS the oracle. Nine records drain deterministically: the two breach rounds, the
+    // catch-up REPLAY-FORWARD (each join during the wait re-publishes records 0 and 1 for the
+    // rejoiner — d, e, f × 2), and the healed round 2. The wedged shape never publishes a
+    // round-2 record at all (zombie d blocks warmup readiness forever).
+    let (_, _, decisions) = drive_and_archive(&wasm, &spec, key_seed, &custody, &script, 9);
+    let records: Vec<_> = decisions
+        .iter()
+        .filter_map(|m| match m {
+            VhcMessage::RoundRecord(rr) => Some(rr),
+            _ => None,
+        })
+        .collect();
+    // Round 0: a's evidence made the record (every re-publish is byte-identical in substance).
+    for rr in records.iter().filter(|rr| rr.round == 0) {
+        let entries = rr.inline.clone().unwrap_or_default();
+        assert_eq!(entries.len(), 1, "round 0 carries only a's entry");
+        assert_eq!(entries[0].peer, peer_id(&a));
+    }
+    // Round 1 closes EMPTY by the deadline (a's commit landed late under the tightened window —
+    // irrelevant to the subject) and drops the silent trainers at k_absences = 2.
+    let r1 = records
+        .iter()
+        .find(|rr| rr.round == 1)
+        .expect("round 1 record");
+    assert!(r1.inline.clone().unwrap_or_default().is_empty());
+    let mut dropped = r1.drops.clone();
+    dropped.sort();
+    let mut expected = vec![peer_id(&b), peer_id(&c)];
+    expected.sort();
+    assert_eq!(
+        dropped, expected,
+        "round accounting drops the dead trainers"
+    );
+    // Round 2 — the discriminator: it exists at all (zombie d decayed while waiting; otherwise
+    // warmup never gathers readiness), and it closes with exactly the healed roster.
+    let r2: Vec<_> = records.iter().filter(|rr| rr.round == 2).collect();
+    assert_eq!(r2.len(), 1, "one healed round record");
+    let mut healed: Vec<PeerId> = r2[0]
+        .inline
+        .clone()
+        .unwrap_or_default()
+        .iter()
+        .map(|e| e.peer)
+        .collect();
+    healed.sort();
+    let mut expected_roster = vec![peer_id(&a), peer_id(&e), peer_id(&f)];
+    expected_roster.sort();
+    assert_eq!(
+        healed, expected_roster,
+        "round 2 trains a + e + f, zombie-free"
+    );
+    assert!(r2[0].drops.is_empty(), "the healed round drops nobody");
 }

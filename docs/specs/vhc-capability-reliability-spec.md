@@ -91,6 +91,13 @@ under churn. RQ-11's root-cause half is accordingly narrowed to the out-of-store
 Revision 18 (2026-08-11) lands the REL-6 whole-run drill previously deferred to a ceremony:
 the genesis harness's permanent payload-plane fault drives the production minor-6 module to
 its own typed `ENV_STARVED` run-end (§7 amendment) — ~30 s, testkit-only.
+Revision 19 (2026-08-11) lands the decay-while-waiting drill through the production
+`coordinator_quorum.wasm` blob (§7 amendment): the adversarial-authority floor-breach lane
+proves a silent zombie decays during `WaitingForMembers` and healing joins retrain — the
+consensus-tick pins now hold end-to-end through the sandboxed module. Beside it, a testkit
+attestation repair: two harnesses attested `scan.records.len()` INCLUDING the tag-17 seal,
+tripping the c15 head↔seal binding equality in three certification lanes — heads now attest
+the seal's own declared count, matching the production publisher's non-seal filter.
 **Fence:** no change specified here may land while a ceremony that pins the node binaries is in
 flight (C2, run `f35bfa80…`, closed GREEN 2026-08-11 — no ceremony in flight as of Revision 6;
 the fence re-arms with the next authored run). §7 (guest contract) additionally changes the
@@ -629,6 +636,19 @@ completes `Failed(NET_UNREACHABLE)`), and the pinned case
 its OWN typed `RunEnd::Outcome(ENV_STARVED)` — no Stop delivered, no trap, the C2 line-2814
 class converted end-to-end — with the journal §8.7-replaying bit-for-bit through the failed
 completions to the same typed end. Only the live G-3 shapes still ride the next ceremony.*
+
+*Revision 19 amendment: decay-while-waiting is now ALSO pinned through the production
+`coordinator_quorum.wasm` blob, not just the native consensus tick. The adversarial-authority
+floor-breach lane
+(`adversarial_authority.rs::floor_breach_zombie_decays_while_waiting_and_the_healed_roster_trains`,
+~7 s) authors tiny real deadlines (the harness's usual effectively-infinite `event_clock`
+windows are deliberately NOT used), trains one round on `{a, b, c}`, breaches the floor when
+`b` and `c` fall silent (absence-dropped at `k_absences`), parks the blob in
+`WaitingForMembers` with the wedge shape RQ-8 deferred — a still-seated zombie (`a`, silent
+past `member_timeout_s`) holding a roster seat — and proves the blob decays it WHILE WAITING
+(no rounds finalizing), freeing the seat for healing joins (`d`, `e`, `f`) that retrain to a
+genuine committed round. Replay-forward on joins re-publishes earlier records; the lane
+asserts on the genuine per-round records and the zombie's absence from the healed roster.*
 
 This rung is an **ABI minor revision** (module-side only; no node↔app WireVersion change).
 Outcome codes 4–15 are reserved "assigned only by a future minor of this document"
