@@ -78,6 +78,16 @@ abstract delivery seam (`retry_held_with` — deadline verdict, silent within-de
 back-pressure clock re-arm, backfill drain), and the gossip layer's loss boundary pinned on
 a real two-endpoint iroh mesh (deaf-window recovery = exactly the rebroadcast ring; eviction
 = permanent loss). Seconds-scale, no ceremony time; RQ-5's live-evidence residual unchanged.
+Revision 17 (2026-08-11, RQ-11 closed to a residual) lands the custody-hole honesty fix and
+the retention audit: `read_range` now returns the typed `RangeReadError` (out-of-bounds /
+`ChunkMissing` / `Custody` / IO), and the [SF-R1] self-sealed fetch maps only a genuine
+re-hash failure to `HASH_MISMATCH` — the evicted-chunk availability hole (the C2 shape) and
+IO/range refusals are `StoreRefused`-class (`range_err_code`, unit-pinned exactly). The
+retention-window audit (full read-back of every still-sealed fold after sibling evictions,
+trailing checkpoint repins, pin/unpin sweeps, spilled backing, shared-prefix chunks) found
+**no hole**: the in-store eviction/refcount window upholds the sealed-fold retention contract
+under churn. RQ-11's root-cause half is accordingly narrowed to the out-of-store suspects
+(external spill-directory interference / cross-instance carriage), recorded in §16.
 **Fence:** no change specified here may land while a ceremony that pins the node binaries is in
 flight (C2, run `f35bfa80…`, closed GREEN 2026-08-11 — no ceremony in flight as of Revision 6;
 the fence re-arms with the next authored run). §7 (guest contract) additionally changes the
@@ -221,7 +231,10 @@ What this corrects, clause by clause:
   spill-file-missing arms), surfacing to the guest as `HASH_MISMATCH` with an eviction detail.
   Two defects in one: the eviction/retention window contradicts the sealed-fold retention
   contract, and the code is dishonest (nothing mismatched — REL-3's mapper direction covers
-  the coding half).
+  the coding half). *Resolved to a residual at Revision 17:* the code half is fixed (typed
+  `RangeReadError`; only genuine re-hash failure is `HASH_MISMATCH`), and the retention
+  window audited clean under churn — the hole's origin moves to out-of-store suspects (see
+  RQ-11 in §16).
 
 ## 3. [REL-2] GET-side absorption at the store (the reliability foundation)
 
@@ -407,7 +420,12 @@ against ABI §7.5:
 
 The two HOST-side semantic refusals in the range arm (covering-span decompose failure,
 span-fit refusal) deliberately stay explicit `StoreRefused` outside the mapper: no network was
-involved. Exhausted-5xx lineage resolved to `NetUnreachable`, not `Timeout` — a 5xx/reset is
+involved. The [SF-R1] **self-sealed** fetch (host-local, no `VhcNetError` in the path) gained
+its own typed assignment at Revision 17 (RQ-11): `read_range`'s `RangeReadError` maps
+`Custody` (genuine re-hash failure) → `HashMismatch` and everything else — the evicted-chunk
+availability hole, IO, out-of-bounds — → `StoreRefused` (`linker/data.rs::range_err_code`,
+unit-pinned), closing the last arm that collapsed an availability fault into the integrity
+code. Exhausted-5xx lineage resolved to `NetUnreachable`, not `Timeout` — a 5xx/reset is
 the far end refusing transiently, not a deadline elapsing. Unit tests pin the full assignment
 exactly (`the_shared_net_mapper_assigns_the_abi_completion_codes_exactly`) so a drift
 re-collapsing the vocabulary fails the suite.
@@ -1078,4 +1096,4 @@ artifacts, and the verdict-producing `vhc-replay`.
 | RQ-8 | **Decided conservatively (§11 LANDED):** external run-head progress is the ONLY reaction condition taken — a never-committed session is never recycled, and the whole-run-wedged 8b shape (zombie seat holder is this box) is deliberately left to the operator today. REMAINING: whether a bounded exception is worth taking at all — narrower now that §7's decay-while-waiting is LANDED (Revision 15), which removes most of that wedge class at the source (in the NEXT module revision; the frozen C2 module keeps the wedge) | operational evidence from the first ceremony running the minor-6 module |
 | RQ-9 | **Structurally resolved (§10 LANDED):** the gate ships — `budget ≥ stop_rounds × growth + 25% restore headroom`, unbounded-budget warning. RESIDUAL: the growth figure is operator-supplied; sourcing it from banked preflight evidence (fit-probe vs smoke transcript) and freezing the 25% headroom margin remain open | banked preflight evidence from C2 + the three-seat smoke |
 | RQ-10 | First-class grant classes/planes in the ABI grants document (vs hash enumeration + evidence-based extension) | C3 ABI-minor scoping; REL-10's host-side extension (§12 LANDED) is sufficient until then |
-| RQ-11 | The det-state eviction/retention contradiction (§2.1): the store evicted a chunk a still-retained sealed fold references (`state_store.rs:688-705`), and the guest saw `HASH_MISMATCH` for a fault that mismatched nothing. Two halves: the retention-window defect (why did eviction run ahead of the sealed-fold reference?) and the dishonest code (REL-3's mapper direction) | retention-window audit of `state_store` eviction against the sealed-fold retention contract; code honesty lands with REL-3 |
+| RQ-11 | **Closed to a residual (2026-08-11).** The dishonest-code half is FIXED: `read_range` returns the typed `RangeReadError`, and the [SF-R1] fetch maps only genuine re-hash failure to `HASH_MISMATCH` — the evicted-chunk hole and IO/range refusals are `StoreRefused`-class (`range_err_code` + the C2-shape unit test: still-sealed fold, deleted spill object). The retention-window half is AUDITED CLEAN: full read-back of every still-sealed fold after sibling evictions, trailing checkpoint repins, pin/unpin sweeps, spilled backing, and shared-prefix chunks found no hole — in-store eviction/refcount upholds the sealed-fold retention contract. **Residual:** the C2 hole therefore came from OUTSIDE the store's own eviction logic — candidates: external interference with the spill directory (disk-pressure cleanup, operator action), or a cross-instance carriage path (`inject_sealed_family`/restart) not exercised by the churn audit. Needs the next incident's spill-directory listing beside the journal to pin | banked; revisit if the class recurs post-honesty-fix (the typed `StoreRefused` + eviction detail now names it directly) |

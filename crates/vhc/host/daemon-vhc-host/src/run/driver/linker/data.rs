@@ -382,13 +382,25 @@ fn service_self_sealed_fetch(
                 detail: Some("buffer quota exhausted (deny new buffers)".into()),
             }),
         },
-        Err(detail) => CompletionResult::Err(CompError {
-            code: daemon_vhc_abi::COMP_ERR_HASH_MISMATCH,
-            detail: Some(detail),
+        Err(err) => CompletionResult::Err(CompError {
+            code: range_err_code(&err),
+            detail: Some(err.to_string()),
         }),
     };
     st.enqueue_completion(op, &result).map_err(Trap::from)?;
     Ok(op)
+}
+
+/// The [SF-R1] completion code for a failed self-sealed range read — keyed off the TYPED
+/// failure class (reliability spec RQ-11): only a genuine re-hash failure is `HASH_MISMATCH`;
+/// an availability hole under a still-sealed fold (an evicted/missing chunk — the C2 shape)
+/// and IO/range refusals are `STORE_REFUSED`. C2 decoded a guest receiving `HASH_MISMATCH`
+/// for a fault that mismatched nothing; the frozen module read it as a deterministic terminal.
+fn range_err_code(err: &crate::run::state_store::RangeReadError) -> u64 {
+    match err {
+        crate::run::state_store::RangeReadError::Custody => daemon_vhc_abi::COMP_ERR_HASH_MISMATCH,
+        _ => daemon_vhc_abi::COMP_ERR_STORE_REFUSED,
+    }
 }
 
 /// Service a `data.fetch` of an **externally-registered det-state fold** ([SF-R2]): bounds +
@@ -504,4 +516,36 @@ fn immediate_fetch_refusal(
     });
     st.enqueue_completion(op, &result).map_err(Trap::from)?;
     Ok(op)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::range_err_code;
+    use crate::run::state_store::RangeReadError;
+
+    /// RQ-11: the completion-code assignment for failed self-sealed reads, pinned exactly.
+    /// A custody hole (`ChunkMissing` — the C2 evicted-chunk shape) must NEVER surface as
+    /// `HASH_MISMATCH`; only a genuine re-hash failure carries the integrity code.
+    #[test]
+    fn only_a_genuine_rehash_failure_is_hash_mismatch() {
+        assert_eq!(
+            range_err_code(&RangeReadError::Custody),
+            daemon_vhc_abi::COMP_ERR_HASH_MISMATCH
+        );
+        for availability in [
+            RangeReadError::ChunkMissing,
+            RangeReadError::Io("read failed".into()),
+            RangeReadError::OutOfBounds {
+                off: 0,
+                end: 9,
+                byte_len: 8,
+            },
+        ] {
+            assert_eq!(
+                range_err_code(&availability),
+                daemon_vhc_abi::COMP_ERR_STORE_REFUSED,
+                "{availability} must be the availability class"
+            );
+        }
+    }
 }

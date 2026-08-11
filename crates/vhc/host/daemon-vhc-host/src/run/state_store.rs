@@ -102,6 +102,48 @@ impl std::fmt::Display for SealedReadError {
     }
 }
 
+/// Why a sealed fold's **range read** failed ([`StateStore::read_range`]) — typed so the
+/// data@2 completion mapper can distinguish an AVAILABILITY hole (a chunk the still-sealed
+/// fold references is gone — `StoreRefused`-class, the environment/custody seam) from a
+/// genuine INTEGRITY fault (bytes that no longer re-hash — `HashMismatch`-class). C2 decoded
+/// exactly this confusion (reliability spec RQ-11): an evicted-chunk hole surfaced to the
+/// guest as `HASH_MISMATCH` although nothing had mismatched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RangeReadError {
+    /// The requested `[off, end)` exceeds the sealed family's byte length.
+    OutOfBounds {
+        /// Requested range start.
+        off: u64,
+        /// Requested range end (exclusive).
+        end: u64,
+        /// The sealed family's byte length.
+        byte_len: u64,
+    },
+    /// The fold is still sealed but a constituent chunk is not in custody — an evicted index
+    /// entry or a missing spilled object. An availability hole (the RQ-11 shape), never an
+    /// integrity fault: nothing mismatched, the bytes are simply gone.
+    ChunkMissing,
+    /// Chunk bytes no longer re-hash to their content address — a genuine custody/integrity
+    /// violation (impossible unless memory/disk corrupted — surfaced loudly, never silently).
+    Custody,
+    /// A spilled chunk's backing read failed with an IO error.
+    Io(String),
+}
+
+impl std::fmt::Display for RangeReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OutOfBounds { off, end, byte_len } => write!(
+                f,
+                "range [{off}, {end}) out of bounds (sealed family is {byte_len} bytes)"
+            ),
+            Self::ChunkMissing => write!(f, "sealed fold references an evicted chunk"),
+            Self::Custody => write!(f, "custody violation: chunk bytes do not re-hash"),
+            Self::Io(e) => write!(f, "state chunk spill read failed: {e}"),
+        }
+    }
+}
+
 /// A typed state-store refusal — the linker maps each onto its trap
 /// (`crate::trap::TrapCode`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -665,20 +707,23 @@ impl StateStore {
 
     /// Assemble the byte range `[off, end)` of a sealed fold from its content-addressed chunks,
     /// re-hashing each contributing chunk (custody cross-check). `None` when the fold is
-    /// unknown; `Err` describes an out-of-bounds range or a custody violation (impossible
-    /// unless memory corrupted — surfaced loudly, never silently).
+    /// unknown; the `Err` is TYPED ([`RangeReadError`]) so callers distinguish an availability
+    /// hole (an evicted/missing chunk under a still-sealed fold — the RQ-11 shape) from a
+    /// genuine integrity fault (bytes that no longer re-hash) — the completion-code mapping
+    /// depends on that distinction.
     pub fn read_range(
         &self,
         fold: &[u8; 32],
         off: u64,
         end: u64,
-    ) -> Option<Result<Vec<u8>, String>> {
+    ) -> Option<Result<Vec<u8>, RangeReadError>> {
         let sealed = self.sealed.get(fold)?;
         if off > sealed.byte_len || end > sealed.byte_len || off > end {
-            return Some(Err(format!(
-                "range [{off}, {end}) out of bounds (sealed family is {} bytes)",
-                sealed.byte_len
-            )));
+            return Some(Err(RangeReadError::OutOfBounds {
+                off,
+                end,
+                byte_len: sealed.byte_len,
+            }));
         }
         let mut out = Vec::with_capacity((end - off) as usize);
         let mut cursor = 0u64;
@@ -693,22 +738,16 @@ impl StateStore {
                 break;
             }
             let Some(entry) = self.chunks.get(hash) else {
-                return Some(Err("sealed fold references an evicted chunk".into()));
+                return Some(Err(RangeReadError::ChunkMissing));
             };
             // Custody-verified read (resident or disk-spilled). A missing spilled object and a
             // re-hash mismatch are BOTH loud, typed errors here — the disk backing does not
             // weaken the custody cross-check (the bytes moving to disk changes only latency).
             let bytes = match self.read_chunk(hash, entry) {
                 Ok(b) => b,
-                Err(SpillReadError::Missing) => {
-                    return Some(Err("sealed fold references an evicted chunk".into()))
-                }
-                Err(SpillReadError::Custody) => {
-                    return Some(Err("custody violation: chunk bytes do not re-hash".into()))
-                }
-                Err(SpillReadError::Io(e)) => {
-                    return Some(Err(format!("state chunk spill read failed: {e}")))
-                }
+                Err(SpillReadError::Missing) => return Some(Err(RangeReadError::ChunkMissing)),
+                Err(SpillReadError::Custody) => return Some(Err(RangeReadError::Custody)),
+                Err(SpillReadError::Io(e)) => return Some(Err(RangeReadError::Io(e))),
             };
             let lo = off.saturating_sub(chunk_start) as usize;
             let hi = (end.min(chunk_end) - chunk_start) as usize;
@@ -1080,6 +1119,37 @@ mod tests {
         s.seal(id).unwrap();
     }
 
+    /// The RQ-11 retention audit: after any eviction/pin churn, EVERY still-sealed fold must
+    /// serve its FULL byte range — sibling evictions must never punch a hole under a live fold
+    /// (the C2 "sealed fold references an evicted chunk" shape). Reads the whole range AND a
+    /// shared-prefix-crossing sub-range of each survivor.
+    fn audit_full_readback(s: &StateStore, live: &[([u8; 32], Vec<u8>)], ctx: &str) {
+        for (fold, expect) in live {
+            assert!(s.sealed(fold).is_some(), "{ctx}: fold should be sealed");
+            let all = s
+                .read_range(fold, 0, expect.len() as u64)
+                .unwrap_or_else(|| panic!("{ctx}: still-sealed fold unknown to read_range"))
+                .unwrap_or_else(|e| panic!("{ctx}: hole under a live fold: {e}"));
+            assert_eq!(&all, expect, "{ctx}: full range");
+            // The boundary-crossing slice exercises the shared prefix chunk + distinct tail.
+            let cross = s.read_range(fold, 6, 10).unwrap().unwrap();
+            assert_eq!(
+                &cross,
+                &expect[6..10],
+                "{ctx}: shared-prefix crossing slice"
+            );
+        }
+    }
+
+    fn seal_round(s: &mut StateStore, r: u8) -> ([u8; 32], Vec<u8>) {
+        let id = s.open("master", 12).unwrap();
+        s.emit(id, b"SHAREDCK", 0).unwrap();
+        s.emit(id, &[r; 4], 0).unwrap();
+        let mut bytes = b"SHAREDCK".to_vec();
+        bytes.extend_from_slice(&[r; 4]);
+        (s.seal(id).unwrap(), bytes)
+    }
+
     #[test]
     fn retention_evicts_oldest_unpinned_and_dedups_shared_chunks() {
         let mut s = StateStore::new(StateStoreConfig {
@@ -1087,14 +1157,9 @@ mod tests {
             retain_roots: 2,
             ..StateStoreConfig::default()
         });
-        let mut folds = Vec::new();
         // Three rounds of "master": round r = [shared 8-byte chunk][round-distinct tail].
-        for r in 0..3u8 {
-            let id = s.open("master", 12).unwrap();
-            s.emit(id, b"SHAREDCK", 0).unwrap();
-            s.emit(id, &[r; 4], 0).unwrap();
-            folds.push(s.seal(id).unwrap());
-        }
+        let rounds: Vec<_> = (0..3u8).map(|r| seal_round(&mut s, r)).collect();
+        let folds: Vec<_> = rounds.iter().map(|(f, _)| *f).collect();
         // retain_roots = 2: round 0's fold evicted, rounds 1/2 retained.
         assert!(s.sealed(&folds[0]).is_none(), "oldest evicted");
         assert!(s.sealed(&folds[1]).is_some() && s.sealed(&folds[2]).is_some());
@@ -1104,22 +1169,88 @@ mod tests {
         assert_eq!(s.stats().chunk_objects, 3);
         // An evicted fold no longer serves ranges.
         assert!(s.read_range(&folds[0], 0, 4).is_none());
+        // RQ-11 audit: round 0's eviction released the SHARED chunk's ref — the survivors
+        // holding it must still read back whole.
+        audit_full_readback(&s, &rounds[1..], "after round-0 eviction");
 
         // Pinned folds are exempt AND do not count against `state_retain_roots` (design §8.2:
         // retained roots PLUS checkpoint-pinned): pin round 1, then seal rounds 3 and 4 — the
         // unpinned population {2, 3} fits after round 3; round 4 evicts round 2 (oldest
         // unpinned) while the pinned round 1 survives everything.
         s.pin(folds[1]);
-        let mut extra = Vec::new();
-        for r in [9u8, 10] {
-            let id = s.open("master", 12).unwrap();
-            s.emit(id, b"SHAREDCK", 0).unwrap();
-            s.emit(id, &[r; 4], 0).unwrap();
-            extra.push(s.seal(id).unwrap());
-        }
+        let extra: Vec<_> = [9u8, 10].map(|r| seal_round(&mut s, r)).into();
         assert!(s.sealed(&folds[1]).is_some(), "pinned fold survives");
         assert!(s.sealed(&folds[2]).is_none(), "oldest unpinned evicted");
-        assert!(s.sealed(&extra[0]).is_some() && s.sealed(&extra[1]).is_some());
+        assert!(s.sealed(&extra[0].0).is_some() && s.sealed(&extra[1].0).is_some());
+        // RQ-11 audit again after the pin-churn eviction wave.
+        let live: Vec<_> = std::iter::once(rounds[1].clone())
+            .chain(extra.iter().cloned())
+            .collect();
+        audit_full_readback(&s, &live, "after pin churn");
+    }
+
+    #[test]
+    #[allow(clippy::disallowed_methods)] // test-only temp-dir cleanup
+    fn spilled_retention_churn_never_punches_holes_under_live_folds() {
+        // The RQ-11 retention audit under the DISK backing C2 actually ran with: sibling
+        // evictions delete disk objects (`release_chunk` → `spill.remove`), so a refcount
+        // fault would surface here as a missing spilled object under a still-sealed fold.
+        // Churn: seal waves sharing a prefix chunk, checkpoint repins moving across waves,
+        // plain pin/unpin cycles — after every step, every still-sealed fold reads back whole.
+        let root = spill_root("retention-churn");
+        let spill = SpillStore::open(&root).unwrap();
+        let mut s = StateStore::new_with_spill(
+            StateStoreConfig {
+                chunk_size: 8,
+                retain_roots: 2,
+                ..StateStoreConfig::default()
+            },
+            Some(spill),
+        );
+        let mut live: Vec<([u8; 32], Vec<u8>)> = Vec::new();
+        for r in 0..8u8 {
+            live.push(seal_round(&mut s, r));
+            // Checkpoint pinning trails one round behind the freshest seal (the live-checkpoint
+            // pattern): repin to {r-2, r-1} — superseded pins re-enter ordinary retention at
+            // the NEXT seal of their family.
+            let pins: Vec<[u8; 32]> = live.iter().rev().skip(1).take(2).map(|(f, _)| *f).collect();
+            s.repin_checkpoint(&pins);
+            // The store is the authority on survivors (eviction runs at seals, under the pin
+            // state each seal observed); the AUDIT is the invariant — every fold the store
+            // still calls sealed serves its full range, and every evicted identity is wholly
+            // gone (never a half-alive fold serving holes).
+            let (survivors, gone): (Vec<_>, Vec<_>) = live
+                .iter()
+                .cloned()
+                .partition(|(f, _)| s.sealed(f).is_some());
+            audit_full_readback(&s, &survivors, &format!("wave {r}"));
+            for (f, _) in &gone {
+                assert!(
+                    s.read_range(f, 0, 12).is_none(),
+                    "wave {r}: evicted identity"
+                );
+            }
+            live = survivors;
+        }
+        assert!(
+            live.len() < 8,
+            "churn evicted something (audit not vacuous)"
+        );
+        // Drop every checkpoint pin, then one more seal wave sweeps the previously pinned
+        // folds through ordinary retention — the survivors must STILL read back whole.
+        s.repin_checkpoint(&[]);
+        live.push(seal_round(&mut s, 200));
+        let survivors: Vec<_> = live
+            .iter()
+            .filter(|(f, _)| s.sealed(f).is_some())
+            .cloned()
+            .collect();
+        assert!(survivors.len() < live.len(), "the unpin sweep evicted");
+        audit_full_readback(&s, &survivors, "after unpin sweep");
+        // The disk-object population equals the chunk index (no orphaned deletes, no leaks):
+        // survivors share one prefix chunk + one distinct tail each.
+        assert_eq!(object_count(&root), s.stats().chunk_objects);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1284,7 +1415,38 @@ mod tests {
         let hash = daemon_vhc_proto::Hash(*blake3::hash(b"AAAAAAAA").as_bytes());
         std::fs::write(root.join(hash.to_hex()), b"TAMPERED!").unwrap();
         let err = s.read_range(&fold, 0, 8).unwrap().unwrap_err();
-        assert!(err.contains("custody violation"), "got: {err}");
+        assert_eq!(err, RangeReadError::Custody, "got: {err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[allow(clippy::disallowed_methods)] // test-only removal of a spilled object
+    fn a_custody_hole_under_a_still_sealed_fold_is_a_typed_miss_not_a_mismatch() {
+        // The RQ-11 / C2 shape: the fold is STILL SEALED but a constituent chunk's backing
+        // is gone (here: the spilled object deleted out from under it — operationally,
+        // whatever lets custody run ahead of the sealed-fold retention contract). The refusal
+        // must be the AVAILABILITY class (`ChunkMissing` → `StoreRefused` at the data@2
+        // mapper), never `Custody`/`HASH_MISMATCH` — nothing mismatched, the bytes are gone.
+        // C2's frozen guest received the dishonest mismatch and treated it as a
+        // deterministic terminal.
+        let root = spill_root("hole");
+        let spill = SpillStore::open(&root).unwrap();
+        let mut s = StateStore::new_with_spill(cfg(8), Some(spill));
+        let id = s.open("master", 8).unwrap();
+        s.emit(id, b"AAAAAAAA", 0).unwrap();
+        let fold = s.seal(id).unwrap();
+        let hash = daemon_vhc_proto::Hash(*blake3::hash(b"AAAAAAAA").as_bytes());
+        std::fs::remove_file(root.join(hash.to_hex())).unwrap();
+
+        assert!(s.sealed(&fold).is_some(), "the fold is still sealed");
+        let err = s.read_range(&fold, 0, 8).unwrap().unwrap_err();
+        assert_eq!(err, RangeReadError::ChunkMissing, "got: {err}");
+        assert_eq!(err.to_string(), "sealed fold references an evicted chunk");
+        // The publication enumeration sees the same hole as its own typed class.
+        assert!(matches!(
+            s.sealed_chunks(&fold),
+            Err(SealedReadError::ChunkUnreadable(h, _)) if h == hash
+        ));
         let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -51,7 +51,7 @@ pub use replay::{
 };
 pub use state_spill::{SpillReadError, SpillStore};
 pub use state_store::{
-    CarriedFamily, SealedFold, StateStore, StateStoreConfig, StateStoreError, StateStoreStats,
-    STATE_STREAM_ID_TOP_BIT,
+    CarriedFamily, RangeReadError, SealedFold, StateStore, StateStoreConfig, StateStoreError,
+    StateStoreStats, STATE_STREAM_ID_TOP_BIT,
 };
 pub use streams::StreamTable;
