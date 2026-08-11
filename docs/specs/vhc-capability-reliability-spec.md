@@ -2,7 +2,9 @@
 
 **Subsystem:** VHC — the environment/consensus boundary (capability providers, trap taxonomy,
 node liveness), post-C2 workstream.
-**Status:** design specification, **pre-implementation**. Nothing in this document is landed.
+**Status:** design specification, **implementation in progress** — clauses flip individually
+to **LANDED** with a date as their rungs land (currently: §3 REL-2, §4 REL-3); everything else
+remains specification.
 Revision 2 (2026-08-10) incorporates an external design review: the object-store 403 taxonomy
 (§3), the ABI-minor assignment (§7), the demotion of trap attribution to a bounded heuristic
 (§5), and the qualified evidence claims (§3, §8). Revision 3 (same day, second review round)
@@ -27,7 +29,10 @@ settled. Revision 6 (2026-08-11, **Rung 0 executed**) records the decoded C2 arc
 archived completion codes were NOT uniformly `STORE_REFUSED`, a sixth panic-feeding class
 (evicted det-state chunk under a sealed fold, RQ-11) surfaced, and the co-located-trainer
 respawn lane's unbounded flap cycle (461 attempt-0 cycles at flat 1 s pace) is pinned to its
-counter-reset-on-spawn-success (RQ-6).
+counter-reset-on-spawn-success (RQ-6). Revision 7 (2026-08-11, Rungs 1a+1b landed) flips §3
+(REL-2: GET-side absorption, the 403/expiry taxonomy, presign freshness) and §4 (REL-3: the
+shared `comp_error_code` mapper; RQ-2 resolved inline) to LANDED, both verified by unit tests
+only — no ceremony time consumed.
 **Fence:** no change specified here may land while a ceremony that pins the node binaries is in
 flight (C2, run `f35bfa80…`, closed GREEN 2026-08-11 — no ceremony in flight as of Revision 6;
 the fence re-arms with the next authored run). §7 (guest contract) additionally changes the
@@ -320,29 +325,43 @@ single-stream contexts); and no presign-expiry shape appears anywhere in C2's re
 expiry-403 lane is precautionary correctness (the RQ-1 probe still gates landing) rather than
 the incident's explanation.
 
-## 4. [REL-3] One shared network-fault mapper (honest completion codes)
+## 4. [REL-3] One shared network-fault mapper (honest completion codes) — LANDED (2026-08-11)
 
-**Today.** Seven session op arms collapse every environmental error to
-`COMP_ERR_STORE_REFUSED = 3`: `PayloadPut` (`role_session.rs:2104`), `PayloadGet` (`:2119`),
-`ArtifactFetch` (`:2135`), det-state chunk reads (`:2165`), det-state covering span (`:2178`),
-artifact range open (`:2202`), artifact range fetch (`:2212`) — erasing exactly the
-distinction the store produces. The ABI already has vocabulary: `COMP_ERR_NET_UNREACHABLE = 1`,
-`COMP_ERR_TIMEOUT = 2`, `COMP_ERR_STORE_REFUSED = 3`, `COMP_ERR_HASH_MISMATCH = 4`
-(`daemon-vhc-abi/src/lib.rs:1458-1466`).
+**Before.** Seven session op arms collapsed every environmental error to
+`COMP_ERR_STORE_REFUSED = 3`: `PayloadPut`, `PayloadGet`, `ArtifactFetch`, det-state chunk
+reads, det-state covering span, artifact range open, artifact range fetch — erasing exactly
+the distinction the store produces. The ABI already had vocabulary:
+`COMP_ERR_NET_UNREACHABLE = 1`, `COMP_ERR_TIMEOUT = 2`, `COMP_ERR_STORE_REFUSED = 3`,
+`COMP_ERR_HASH_MISMATCH = 4` (`daemon-vhc-abi/src/lib.rs:1458-1466`).
 
-**Specified.** One shared `VhcNetError → (COMP_ERR code, detail)` mapper used by ALL
-environment-class op arms — not per-arm mapping, which is how the classification drifted to
-uniform `STORE_REFUSED` in the first place. Direction (truthful classes): transient
-network-shaped exhaustion → timeout/unreachable lane; miss and semantic store refusal →
-`STORE_REFUSED`; hash mismatch → `HASH_MISMATCH`. The **exact** assignment (e.g. whether an
-exhausted 5xx lineage is `TIMEOUT` or `NET_UNREACHABLE`) is validated against the ABI §6.4
-completion-code semantics before landing, not prescribed here — **RQ-2**.
+**Landed.** One shared mapper, `comp_error_code(&VhcNetError) -> u64`
+(`role_session.rs`, beside `service_op`), reached by every environment-class arm through the
+single failure constructor `net_op_failure(op_label, &err)` (op-labelled detail + host-side
+`warn!` voicing) — not per-arm mapping, which is how the classification drifted to uniform
+`STORE_REFUSED` in the first place. **RQ-2 resolved** — the exact assignment, validated
+against ABI §7.5:
 
-Consequences: the journaled tag-14 completion carries the true fault class (§5's attribution
-input and §8's audit evidence), and the C3 guest (§7) can react to the named class. This
-changes completion **values**, which are journaled and replayed — deterministic-safe (the
-journal records what the guest saw) but it must land before a ceremony freeze, never inside
-one.
+| `VhcNetError` | `COMP_ERR` | Rationale |
+|---|---|---|
+| `Transient { Timeout }` | `Timeout` (2) | the per-request deadline elapsed |
+| `Transient { Connect / Reset / ServerFault / Other }` | `NetUnreachable` (1) | network / far end momentarily unavailable — environmental |
+| `HashMismatch` | `HashMismatch` (4) | tamper/corruption reject path |
+| `PayloadMiss` | `StoreRefused` (3) | authoritative absence / lifecycle — the §6.4 stall ladder's input |
+| `Transport`, authoritative `PresignExpired` (post-REL-2 lane), `Fetch`, URL/scheme rejects | `StoreRefused` (3) | semantic refusals retrying cannot change |
+
+The two HOST-side semantic refusals in the range arm (covering-span decompose failure,
+span-fit refusal) deliberately stay explicit `StoreRefused` outside the mapper: no network was
+involved. Exhausted-5xx lineage resolved to `NetUnreachable`, not `Timeout` — a 5xx/reset is
+the far end refusing transiently, not a deadline elapsing. Unit tests pin the full assignment
+exactly (`the_shared_net_mapper_assigns_the_abi_completion_codes_exactly`) so a drift
+re-collapsing the vocabulary fails the suite.
+
+Consequences (now in force): the journaled tag-14 completion carries the true fault class
+(§5's attribution input and §8's audit evidence), and the C3 guest (§7) can react to the named
+class. This changes completion **values**, which are journaled and replayed —
+deterministic-safe (the journal records what the guest saw) and landed outside any ceremony
+freeze. Note the C2-frozen tiny-llama predates honest codes: archives sealed before this
+change still read uniform `STORE_REFUSED` (the §2.1 decode discipline stands for them).
 
 ## 5. [REL-4] Environmental trap attribution — a bounded compatibility heuristic
 
@@ -858,7 +877,7 @@ artifacts, and the verdict-producing `vhc-replay`.
 | RQ | Question | Resolved by |
 |---|---|---|
 | RQ-1 | **Narrowed (§3 landed):** the freshness mechanism is decided and landed (cache invalidation via `presign_fresh`); the conservative S3-vocabulary recognizer is landed. REMAINING: which error bodies R2 actually returns for an aged presigned GET (and whether expiry is enforced at admission or mid-transfer) — an unrecognized shape currently degrades to the loud semantic-403 lane. *Rung 0 (§2.1): no expiry shape anywhere in C2's record — precautionary, not the incident class* | aged-URL probe at the next ceremony's preflight (a URL must age past its server-set TTL — not a short offline test) |
-| RQ-2 | Exact `VhcNetError` → `COMP_ERR_*` assignment (e.g. exhausted-5xx lineage: `TIMEOUT` vs `NET_UNREACHABLE`) | ABI §6.4 semantics review during REL-3 |
+| RQ-2 | **Resolved (§4 landed):** the exact assignment is pinned in §4's table and by unit test — `Transient{Timeout}`→`Timeout`; every other transient (connect/reset/5xx/other)→`NetUnreachable` (a 5xx/reset is the far end refusing transiently, not a deadline elapsing); `HashMismatch`→`HashMismatch`; miss + every semantic refusal (incl. authoritative post-REL-2 `PresignExpired`)→`StoreRefused` | landed with REL-3 (validated against ABI §7.5) |
 | RQ-3 | Whether §5's minimum constraints are the right final attribution rule, or trap-site metadata / guest-declared conformance / explicit probabilism is needed | operational evidence from the first runs with REL-4 active; revisited at C3 certification |
 | RQ-4 | The REL-5 progress definition: committed-only vs multi-watermark, and threshold behavior across long checkpoint publications | validation against a live checkpoint-heavy run before defaults freeze |
 | RQ-5 | **Partially resolved (§2.1/§9c):** the non-heal mechanism was the unbounded co-trainer respawn cycle, pinned. RESIDUAL: the underlying iroh-vs-WS packet loss behind the standing gap (endpoint logs were not preserved) | §9(a) gap-hold visibility + preserved endpoint logs on the next ceremony |

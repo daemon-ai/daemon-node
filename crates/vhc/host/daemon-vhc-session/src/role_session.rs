@@ -2014,6 +2014,49 @@ async fn relay_egress(
     Ok(())
 }
 
+/// REL-3 (reliability spec §4): the ONE shared `VhcNetError` → ABI §7.5 `comp-error` code mapper.
+/// Every environment-op arm in [`service_op`] completes through this function, so the fault class
+/// the guest observes is decided in exactly one place — before this mapper, every arm collapsed
+/// every failure to `StoreRefused`, which is how the C2 archive lost the transport/semantic
+/// distinction (Rung 0, spec §2.1). The RQ-2 assignment, validated against ABI §7.5:
+///
+/// - `Transient { Timeout }` → `Timeout` (2): the per-request deadline elapsed.
+/// - `Transient { Connect | Reset | ServerFault | Other }` → `NetUnreachable` (1): the network or
+///   the far end is momentarily unavailable — environmental, honest about retry-worthiness.
+/// - `HashMismatch` → `HashMismatch` (4): the tamper/corruption reject path.
+/// - `PayloadMiss` → `StoreRefused` (3): the store authoritatively does not serve the object
+///   (absence / lifecycle expiry) — the §6.4 stall ladder's input, never a transport fault.
+/// - Everything else → `StoreRefused` (3): semantic refusals (`Transport`, an AUTHORITATIVE
+///   `PresignExpired` that already survived the REL-2 re-presign lane, `Fetch`, URL/scheme
+///   rejects) — retrying cannot change them.
+fn comp_error_code(e: &daemon_vhc_net::VhcNetError) -> u64 {
+    use daemon_vhc_net::{TransportFaultKind, VhcNetError};
+    match e {
+        VhcNetError::Transient { kind, .. } => match kind {
+            TransportFaultKind::Timeout => daemon_vhc_abi::COMP_ERR_TIMEOUT,
+            TransportFaultKind::Connect
+            | TransportFaultKind::Reset
+            | TransportFaultKind::ServerFault
+            | TransportFaultKind::Other => daemon_vhc_abi::COMP_ERR_NET_UNREACHABLE,
+        },
+        VhcNetError::HashMismatch { .. } => daemon_vhc_abi::COMP_ERR_HASH_MISMATCH,
+        _ => daemon_vhc_abi::COMP_ERR_STORE_REFUSED,
+    }
+}
+
+/// The typed refusal every environment-op arm completes with: the shared REL-3 code mapping plus
+/// an op-labelled detail. Voiced HOST-SIDE too — the failure detail otherwise rides only the
+/// completion into the guest, and a fail-loud guest surfaces just its panic site, leaving the
+/// environmental cause unrecoverable from the node log.
+fn net_op_failure(op_label: &str, e: &daemon_vhc_net::VhcNetError) -> OpOutcome {
+    let code = comp_error_code(e);
+    tracing::warn!(error = %e, op_label, code, "environment op failed; typed completion to guest");
+    OpOutcome::Failed {
+        code,
+        detail: format!("{op_label}: {e}"),
+    }
+}
+
 /// Service one capability op against the providers. The PUMP owns every trust step (hash
 /// verification, range slicing, handle minting) — the provider only moves bytes.
 async fn service_op(
@@ -2095,16 +2138,7 @@ async fn service_op(
                 }
                 OpOutcome::PutDone
             }
-            Err(e) => {
-                // Voiced HOST-SIDE too: the failure detail otherwise rides only the completion
-                // into the guest, and a fail-loud guest surfaces just its panic site — the
-                // transport cause would be unrecoverable from the node log.
-                tracing::warn!(error = %e, "payload put failed; failing the module op");
-                OpOutcome::Failed {
-                    code: daemon_vhc_abi::COMP_ERR_STORE_REFUSED,
-                    detail: format!("payload put: {e}"),
-                }
-            }
+            Err(e) => net_op_failure("payload put", &e),
         },
         OpRequest::PayloadGet { hash } => {
             match providers
@@ -2113,13 +2147,7 @@ async fn service_op(
                 .await
             {
                 Ok(bytes) => OpOutcome::GetDone { bytes },
-                Err(e) => {
-                    tracing::warn!(error = %e, "payload get failed; failing the module op");
-                    OpOutcome::Failed {
-                        code: daemon_vhc_abi::COMP_ERR_STORE_REFUSED,
-                        detail: format!("payload get: {e}"),
-                    }
-                }
+                Err(e) => net_op_failure("payload get", &e),
             }
         }
         OpRequest::ArtifactFetch { hash, .. } => {
@@ -2131,10 +2159,7 @@ async fn service_op(
                 .await
             {
                 Ok(artifact) => OpOutcome::FetchDone { artifact },
-                Err(e) => OpOutcome::Failed {
-                    code: daemon_vhc_abi::COMP_ERR_STORE_REFUSED,
-                    detail: format!("artifact fetch: {e}"),
-                },
+                Err(e) => net_op_failure("artifact fetch", &e),
             }
         }
         OpRequest::ArtifactRange {
@@ -2161,19 +2186,18 @@ async fn service_op(
                             match providers.artifacts.get_content(chunk_hash).await {
                                 Ok(chunk) => bytes.extend_from_slice(&chunk),
                                 Err(e) => {
-                                    failure = Some(OpOutcome::Failed {
-                                        code: daemon_vhc_abi::COMP_ERR_STORE_REFUSED,
-                                        detail: format!(
-                                            "det-state chunk {} fetch: {e}",
-                                            chunk_hash.to_hex()
-                                        ),
-                                    });
+                                    failure = Some(net_op_failure(
+                                        &format!("det-state chunk {} fetch", chunk_hash.to_hex()),
+                                        &e,
+                                    ));
                                     break;
                                 }
                             }
                         }
                         failure.unwrap_or(OpOutcome::RangeDone { bytes })
                     }
+                    // A span the chunk map cannot decompose is a HOST-SIDE semantic refusal —
+                    // deliberately not the REL-3 net mapper: no network was involved.
                     Err(e) => OpOutcome::Failed {
                         code: daemon_vhc_abi::COMP_ERR_STORE_REFUSED,
                         detail: format!("det-state covering span: {e}"),
@@ -2198,6 +2222,8 @@ async fn service_op(
                                 bytes: artifact[lo..hi].to_vec(),
                             }
                         } else {
+                            // A span that does not fit the stored object is a HOST-SIDE semantic
+                            // refusal — deliberately not the REL-3 net mapper.
                             OpOutcome::Failed {
                                 code: daemon_vhc_abi::COMP_ERR_STORE_REFUSED,
                                 detail: format!(
@@ -2208,10 +2234,7 @@ async fn service_op(
                             }
                         }
                     }
-                    Err(e) => OpOutcome::Failed {
-                        code: daemon_vhc_abi::COMP_ERR_STORE_REFUSED,
-                        detail: format!("artifact range fetch: {e}"),
-                    },
+                    Err(e) => net_op_failure("artifact range fetch", &e),
                 }
             }
         }
@@ -2785,6 +2808,71 @@ mod tests {
 
     fn trap(code: TrapCode) -> Trap {
         Trap::new(code, "publish", None, "test")
+    }
+
+    /// REL-3: the shared mapper's RQ-2 assignment, pinned exactly (spec §4 / ABI §7.5). A drift
+    /// here silently re-collapses the archive's fault vocabulary — the Rung 0 defect.
+    #[test]
+    fn the_shared_net_mapper_assigns_the_abi_completion_codes_exactly() {
+        use daemon_vhc_net::{TransportFaultKind as K, VhcNetError as E};
+        let transient = |kind| E::Transient {
+            kind,
+            detail: "t".into(),
+        };
+        // The per-request deadline elapsing is the ONLY Timeout.
+        assert_eq!(
+            comp_error_code(&transient(K::Timeout)),
+            daemon_vhc_abi::COMP_ERR_TIMEOUT
+        );
+        // Every other transient transport fault is an unreachable environment.
+        for kind in [K::Connect, K::Reset, K::ServerFault, K::Other] {
+            assert_eq!(
+                comp_error_code(&transient(kind)),
+                daemon_vhc_abi::COMP_ERR_NET_UNREACHABLE
+            );
+        }
+        // The tamper/corruption reject keeps its own code.
+        assert_eq!(
+            comp_error_code(&E::HashMismatch {
+                expected: "aa".into(),
+                actual: "bb".into(),
+            }),
+            daemon_vhc_abi::COMP_ERR_HASH_MISMATCH
+        );
+        // Authoritative store answers — absence, semantic refusal, an expiry that survived the
+        // REL-2 re-presign lane — are StoreRefused: retrying cannot change them.
+        for semantic in [
+            E::PayloadMiss("absent".into()),
+            E::Transport("403 semantic".into()),
+            E::PresignExpired("second expiry".into()),
+            E::Fetch("resolver".into()),
+        ] {
+            assert_eq!(
+                comp_error_code(&semantic),
+                daemon_vhc_abi::COMP_ERR_STORE_REFUSED,
+                "{semantic:?}"
+            );
+        }
+    }
+
+    /// REL-3: the arm-facing constructor labels the op in the detail and carries the mapped code.
+    #[test]
+    fn the_net_op_failure_carries_the_label_and_the_mapped_code() {
+        let out = net_op_failure(
+            "payload get",
+            &daemon_vhc_net::VhcNetError::Transient {
+                kind: daemon_vhc_net::TransportFaultKind::Reset,
+                detail: "connection reset by peer".into(),
+            },
+        );
+        match out {
+            OpOutcome::Failed { code, detail } => {
+                assert_eq!(code, daemon_vhc_abi::COMP_ERR_NET_UNREACHABLE);
+                assert!(detail.starts_with("payload get: "), "{detail}");
+                assert!(detail.contains("connection reset"), "{detail}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
     }
 
     #[test]
