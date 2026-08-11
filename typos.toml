@@ -11,7 +11,11 @@ extend-exclude = [
   "research/**",
   # Vendored, locally-patched crate copies pulled in via [patch.crates-io] (upstream source, only
   # a targeted fix is ours) - honored on explicit staged paths via the hook's `--force-exclude`.
+  # Both forms: the anchored one for walks rooted here, the `**/`-prefixed one for the
+  # superproject's submodule-bump gate, whose walk keeps paths cwd-relative (`daemon-node/vendor/…`)
+  # so the anchored pattern never matches.
   "vendor/**",
+  "**/vendor/**",
   "**/target/**",
   "**/build*/**",
   "**/result-*/**",
