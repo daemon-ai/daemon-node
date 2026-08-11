@@ -369,6 +369,15 @@ verifying core is `daemon_vhc_observe::assemble_archive` — the same function t
 run → per-seal publisher → untrusted stores → assembly → GREEN `vhc-replay` (that test keeps its
 assembled layout under `DVHC_KEEP_ARCHIVE=<dir>` for a manual CLI smoke).
 
+**The assembly is resumable (REL-2a, reliability spec §3.1).** An interrupted or failed pull
+is re-run with the same `--out`: every content object already verified on disk (its bytes
+re-hash to the requested address) is reused instead of re-downloaded, and the report separates
+`fetched` from `reused (resumed)` counts per class — a resumed assembly is visible, never
+silently claimed as fresh. A torn or tampered local file fails the same blake3 gate a fresh
+fetch gets and is re-fetched and atomically repaired. Transient egress faults
+(connect/timeout/reset/5xx) are absorbed per object by the store's bounded retry rather than
+aborting the pass; a genuine 404 still refuses immediately.
+
 A coordinator lineage that spans MULTIPLE chains (restart succession) assembles fine — every
 chain's heads and segments land in the layout — and `vhc-replay` certifies it through the
 session certification kernel (`certify_lineage`: the same executor the join-transaction rebuild

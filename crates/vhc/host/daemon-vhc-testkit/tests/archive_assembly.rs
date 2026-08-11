@@ -348,7 +348,7 @@ fn product_archive_assembles_and_replays_green() {
     let report = assemble_archive(&out, &wire, published.clone(), &mut fetch)
         .expect("assembly verifies + writes the layout from the signed wire form");
     let inner_out = tempdir();
-    let inner_report = assemble_archive(&inner_out, frozen.bytes(), published, &mut fetch)
+    let inner_report = assemble_archive(&inner_out, frozen.bytes(), published.clone(), &mut fetch)
         .expect("assembly verifies + writes the layout from the bare inner bytes");
     assert_eq!(inner_report.run_id, report.run_id);
     assert_eq!(inner_report.chains_verified, report.chains_verified);
@@ -369,6 +369,78 @@ fn product_archive_assembles_and_replays_green() {
     assert_eq!(
         report.peer_transcripts, 2,
         "both workers' digest transcripts"
+    );
+    assert_eq!(
+        (
+            report.segments_reused,
+            report.payloads_reused,
+            report.module_reused
+        ),
+        (0, 0, false),
+        "a first pass over an empty layout reuses nothing"
+    );
+
+    // -- resume (REL-2a): a second pass over the same layout touches the network for NOTHING ------
+    // Every content object already sits verified on disk, so an assembly with the network
+    // unplugged must still succeed — and report the reuse instead of claiming fresh fetches.
+    let mut no_network = |hash: &Hash| -> Result<Vec<u8>, String> {
+        Err(format!(
+            "network fetch of {} during a fully-resumable pass",
+            hash.to_hex()
+        ))
+    };
+    let resumed = assemble_archive(&out, &wire, published.clone(), &mut no_network)
+        .expect("a complete layout resumes with zero network fetches");
+    assert_eq!(
+        (resumed.segments_written, resumed.payloads_written),
+        (0, 0),
+        "nothing re-fetched on resume"
+    );
+    assert_eq!(resumed.segments_reused, report.segments_written);
+    assert_eq!(resumed.payloads_reused, report.payloads_written);
+    assert!(resumed.module_reused);
+    assert_eq!(resumed.run_id, report.run_id);
+    assert_eq!(resumed.peer_transcripts, report.peer_transcripts);
+
+    // A torn/tampered local file fails the same blake3 gate a fresh fetch gets and falls
+    // through to the network: corrupt exactly one payload, resume, and exactly that object is
+    // re-fetched while everything else is reused.
+    let corrupt_hash = *script
+        .payloads
+        .keys()
+        .next()
+        .expect("the run committed payloads");
+    std::fs::write(
+        out.join("payloads")
+            .join(format!("{}.bin", corrupt_hash.to_hex())),
+        b"torn",
+    )
+    .expect("corrupt one payload");
+    let refetched = std::cell::Cell::new(0u64);
+    let mut counting = |hash: &Hash| -> Result<Vec<u8>, String> {
+        refetched.set(refetched.get() + 1);
+        rt.block_on(content_store.get_content(hash))
+            .map_err(|e| e.to_string())
+    };
+    let repaired = assemble_archive(&out, &wire, published.clone(), &mut counting)
+        .expect("a tampered object is re-fetched, the rest reused");
+    assert_eq!(
+        refetched.get(),
+        1,
+        "only the corrupted object hit the network"
+    );
+    assert_eq!(repaired.payloads_written, 1);
+    assert_eq!(repaired.payloads_reused, report.payloads_written - 1);
+    assert_eq!(
+        daemon_vhc_proto::blake3_hash(
+            &std::fs::read(
+                out.join("payloads")
+                    .join(format!("{}.bin", corrupt_hash.to_hex()))
+            )
+            .expect("repaired payload")
+        ),
+        corrupt_hash,
+        "the corrupted file was atomically repaired"
     );
 
     // -- and re-verifies the run through the consensus oracle from the layout alone --------------

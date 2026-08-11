@@ -28,6 +28,14 @@
 //! `heads.cbor` carries the FULL verified head-record set (every role's chains, canonical CBOR
 //! `Vec<ArchiveHeadRecord>`): the replay reader re-groups and selects the coordinator lineage
 //! itself, and trainer chains ride along as replay/evidence inputs.
+//!
+//! **Resume (REL-2a, reliability spec §3.1):** every content object is looked up local-first —
+//! a destination file whose bytes re-hash to the requested address IS the verified object, so
+//! an interrupted assembly resumes from whatever it already verified instead of re-downloading
+//! a 30–50 minute pass. Reused objects are counted separately in [`AssembleReport`]
+//! (`segments_reused` / `payloads_reused` / `module_reused`), and resume never skips judgment:
+//! head authorization, chain re-folds, head↔segment binding, and digest-conflict refusal run
+//! on every pass over existing and fetched bytes alike.
 
 // Sanctioned raw-fs home (the journal-substrate pattern): the assembler writes an
 // operator-chosen replay-archive directory with fsync + rename atomicity; oracle tooling, never
@@ -72,8 +80,14 @@ pub struct AssembleReport {
     pub heads_written: u64,
     /// Segment objects fetched, re-hashed, and written.
     pub segments_written: u64,
+    /// Segment objects satisfied by an existing verified file (a resumed assembly; REL-2a).
+    pub segments_reused: u64,
     /// Payload objects fetched, re-hashed, and written.
     pub payloads_written: u64,
+    /// Payload objects satisfied by an existing verified file (a resumed assembly; REL-2a).
+    pub payloads_reused: u64,
+    /// Whether the pinned coordinator module was satisfied by an existing verified file.
+    pub module_reused: bool,
     /// Per-peer digest transcripts written.
     pub peer_transcripts: u64,
     /// The coordinator lineage's chains, founding first (their `chain_instance`s).
@@ -197,8 +211,11 @@ pub fn assemble_archive(
     std::fs::create_dir_all(out.join("peers"))?;
     write_atomic(&out.join("envelope.cbor"), envelope_bytes)?;
 
-    let coord_wasm = fetch_verified(fetch, &coord_artifact)?;
-    write_atomic(&out.join("coordinator.wasm"), &coord_wasm)?;
+    let module_path = out.join("coordinator.wasm");
+    let (coord_wasm, module_reused) = fetch_verified_at(fetch, &coord_artifact, &module_path)?;
+    if !module_reused {
+        write_atomic(&module_path, &coord_wasm)?;
+    }
 
     let all_heads: Vec<ArchiveHeadRecord> = chains
         .iter()
@@ -210,9 +227,13 @@ pub fn assemble_archive(
 
     // -- fetch + re-hash every sealed segment of every chain -------------------------------------
     let mut segments_written = 0u64;
+    let mut segments_reused = 0u64;
     for chain in &chains {
         for head in &chain.heads {
-            let bytes = fetch_verified(fetch, &head.body.segment_hash)?;
+            let seg_path = out
+                .join("segments")
+                .join(format!("{}.seg", head.body.segment_hash.to_hex()));
+            let (bytes, reused) = fetch_verified_at(fetch, &head.body.segment_hash, &seg_path)?;
             scan_bytes(&bytes)
                 .map_err(|e| AssembleError::BadSegment {
                     hash: head.body.segment_hash,
@@ -230,12 +251,12 @@ pub fn assemble_archive(
                         detail: e.to_string(),
                     })
                 })?;
-            write_atomic(
-                &out.join("segments")
-                    .join(format!("{}.seg", head.body.segment_hash.to_hex())),
-                &bytes,
-            )?;
-            segments_written += 1;
+            if reused {
+                segments_reused += 1;
+            } else {
+                write_atomic(&seg_path, &bytes)?;
+                segments_written += 1;
+            }
         }
     }
 
@@ -243,7 +264,14 @@ pub fn assemble_archive(
     let mut lineage_records: Vec<Record> = Vec::new();
     for chain in &lineage {
         for head in &chain.heads {
-            let bytes = fetch_verified(fetch, &head.body.segment_hash)?;
+            // The lineage is a subset of the chains swept above, so this read is always
+            // satisfied by the file that sweep just wrote — the historical in-pass
+            // double-fetch is absorbed by the same local-first step (not counted as reuse:
+            // it is an in-pass cache hit, not a resumed prior pass).
+            let seg_path = out
+                .join("segments")
+                .join(format!("{}.seg", head.body.segment_hash.to_hex()));
+            let (bytes, _) = fetch_verified_at(fetch, &head.body.segment_hash, &seg_path)?;
             let scan = scan_bytes(&bytes).map_err(|e| AssembleError::BadSegment {
                 hash: head.body.segment_hash,
                 detail: e.to_string(),
@@ -302,13 +330,16 @@ pub fn assemble_archive(
         }
     }
     let mut payloads_written = 0u64;
+    let mut payloads_reused = 0u64;
     for hash in &payload_hashes {
-        let bytes = fetch_verified(fetch, hash)?;
-        write_atomic(
-            &out.join("payloads").join(format!("{}.bin", hash.to_hex())),
-            &bytes,
-        )?;
-        payloads_written += 1;
+        let payload_path = out.join("payloads").join(format!("{}.bin", hash.to_hex()));
+        let (bytes, reused) = fetch_verified_at(fetch, hash, &payload_path)?;
+        if reused {
+            payloads_reused += 1;
+        } else {
+            write_atomic(&payload_path, &bytes)?;
+            payloads_written += 1;
+        }
     }
     let mut peer_transcripts = 0u64;
     for (peer, rounds) in &by_peer {
@@ -328,7 +359,10 @@ pub fn assemble_archive(
         chains_verified: chains.len() as u64,
         heads_written: all_heads.len() as u64,
         segments_written,
+        segments_reused,
         payloads_written,
+        payloads_reused,
+        module_reused,
         peer_transcripts,
         coordinator_lineage: lineage.iter().map(|c| c.chain_instance).collect(),
     })
@@ -355,8 +389,23 @@ fn insert_peer_digest(
     }
 }
 
-/// Fetch + re-hash content-addressed bytes (the store is untrusted).
-fn fetch_verified(fetch: &mut ContentFetch<'_>, hash: &Hash) -> Result<Vec<u8>, AssembleError> {
+/// Obtain verified content-addressed bytes, local-first (REL-2a resume, reliability spec §3.1):
+/// if the destination file already exists and its bytes re-hash to the requested address, it IS
+/// the verified object (`write_atomic`'s temp+fsync+rename means a final-named file cannot be
+/// torn) — judged by exactly the `blake3` gate a fresh fetch gets, so the trust posture is
+/// unchanged. Absence or mismatch falls through to the network. Returns `(bytes, reused)`;
+/// resume never skips judgment (head binding, segment scan, digest folds all still run), only
+/// bytes.
+fn fetch_verified_at(
+    fetch: &mut ContentFetch<'_>,
+    hash: &Hash,
+    dest: &Path,
+) -> Result<(Vec<u8>, bool), AssembleError> {
+    if let Ok(bytes) = std::fs::read(dest) {
+        if blake3_hash(&bytes) == *hash {
+            return Ok((bytes, true));
+        }
+    }
     let bytes = fetch(hash).map_err(|detail| AssembleError::Fetch {
         hash: *hash,
         detail,
@@ -364,7 +413,7 @@ fn fetch_verified(fetch: &mut ContentFetch<'_>, hash: &Hash) -> Result<Vec<u8>, 
     if blake3_hash(&bytes) != *hash {
         return Err(AssembleError::ContentMismatch { hash: *hash });
     }
-    Ok(bytes)
+    Ok((bytes, false))
 }
 
 /// Write bytes via a same-directory temp + rename (a torn assembly never masquerades complete).

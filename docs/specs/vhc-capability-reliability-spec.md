@@ -3,8 +3,8 @@
 **Subsystem:** VHC — the environment/consensus boundary (capability providers, trap taxonomy,
 node liveness), post-C2 workstream.
 **Status:** design specification, **implementation in progress** — clauses flip individually
-to **LANDED** with a date as their rungs land (currently: §3 REL-2, §4 REL-3, §5 REL-4,
-§6 REL-5, §6.1 REL-5a); everything else remains specification.
+to **LANDED** with a date as their rungs land (currently: §3 REL-2, §3.1 REL-2a, §4 REL-3,
+§5 REL-4, §6 REL-5, §6.1 REL-5a); everything else remains specification.
 Revision 2 (2026-08-10) incorporates an external design review: the object-store 403 taxonomy
 (§3), the ABI-minor assignment (§7), the demotion of trap attribution to a bounded heuristic
 (§5), and the qualified evidence claims (§3, §8). Revision 3 (same day, second review round)
@@ -40,7 +40,10 @@ stateful `run_stalled`/`run_progress_resumed` pair) and §6.1 (REL-5a: honest se
 strings) to LANDED, records one deviation (the per-run threshold adapts to the *observed*
 inter-commit gap over a 10-minute floor, because the authored round wall is not visible
 host-side), and narrows RQ-4 to its residual (freezing the defaults against a live
-checkpoint-heavy run).
+checkpoint-heavy run). Revision 10 (2026-08-11, Rung 1c landed) flips §3.1 (REL-2a: resume
+moved into the assembler with `*_reused` reporting; the module-fallback GET joins the retry
+contract; the C2 field patch superseded and its redundant outer retry removed) to LANDED,
+verified by the testkit assembly regression (network-unplugged resume + tamper-and-repair).
 **Fence:** no change specified here may land while a ceremony that pins the node binaries is in
 flight (C2, run `f35bfa80…`, closed GREEN 2026-08-11 — no ceremony in flight as of Revision 6;
 the fence re-arms with the next authored run). §7 (guest contract) additionally changes the
@@ -264,18 +267,29 @@ passes to single transients (one connect-timeout, three mid-body resets on disti
 payloads) against an egress path producing roughly one transient per 15–40 minutes — the REL-2
 gap demonstrated in the offline tooling (C2 ledger, "Closure work").
 
-**Status: field-patched mid-closure (the interim half of this rung is LANDED as an
-uncommitted working-tree patch); the durable half remains specified.** After the fourth
-failure the frozen-tool posture was superseded: `xtask/src/archive_pull.rs` (base
-`b43901ff6b3f`, diff `sha256 c46c75a3…4ff9`, +39/−5 — full provenance in the C2 ledger)
-gained (1) per-object bounded retry on typed `Transient` faults (5 attempts, 2 s doubling;
-semantic errors fail immediately) and (2) closure-level resume: a local content-addressed
-file whose bytes re-hash to the requested address satisfies the fetch, absence/mismatch falls
-through to the network. Verification posture is byte-identical — the assembler re-hashes and
-atomically rewrites everything the closure returns — and the patch incidentally absorbs the
-in-pass lineage double-fetch (the second sweep hits the files the first sweep wrote). The
-certification verdict tool (`vhc-replay`) stays the frozen commit; the C2 VERDICT names the
-patched pull tool by commit + diff hash.
+**Status: LANDED (2026-08-11) — the durable version below, superseding the C2 field patch.**
+Resume moved into the assembler itself: `fetch_verified_at` looks up every content object
+local-first (destination file exists + re-hashes to the address ⇒ it IS the verified object),
+counted separately in `AssembleReport` (`segments_reused`, `payloads_reused`,
+`module_reused`) so a resumed assembly is visible in the report, not claimed as fetched. The
+in-pass lineage double-fetch is absorbed by the same step (an in-pass cache hit, deliberately
+NOT counted as reuse). All structural verification still runs every pass. The pull tool's
+field-patch outer retry loop was REMOVED as redundant — the production
+`R2Store::get_content` carries REL-2's bounded transient retry since Rung 1a, and stacking
+the two would have made 20 silent attempts; the module-fallback bare GET gained its own
+equivalent bounded loop (4 attempts, 1 s doubling, transient shapes only via the shared
+egress classifier); and the fallback's error text now annotates rather than buries the
+content-leg fault. Verified by the testkit assembly regression: a complete layout resumes
+with the network unplugged (zero fetches, full reuse counts), and a tampered payload fails
+the blake3 gate, is the ONLY object re-fetched, and is atomically repaired.
+
+**Provenance (historical).** After the fourth failed closure pull the frozen-tool posture was
+superseded mid-C2: `xtask/src/archive_pull.rs` (base `b43901ff6b3f`, diff
+`sha256 c46c75a3…4ff9`, +39/−5 — full provenance in the C2 ledger) gained per-object bounded
+retry on typed `Transient` faults and closure-level resume. Verification posture was
+byte-identical. The certification verdict tool (`vhc-replay`) stayed the frozen commit; the
+C2 VERDICT names the patched pull tool by commit + diff hash. That working-tree patch is now
+superseded by the landed assembler-side version.
 
 **Today (verified).** `assemble_archive` fetches unconditionally — the coordinator module
 (`assemble.rs:200`), every sealed segment (`assemble.rs:215`), and every committed payload
@@ -296,7 +310,7 @@ re-*verification*, never re-*download*: every artifact in the layout is content-
 be torn — an existing file that re-hashes to its address IS the verified object, judged by the
 same `blake3` check a fresh fetch gets.
 
-**Specified (the durable version — supersedes the field patch when it lands).**
+**Specified (the durable version — landed as summarized above).**
 
 - Resume moves from the tool's closure into the assembler itself: `fetch_verified` gains the
   local-first step (if the destination file exists and re-hashes to the requested address,

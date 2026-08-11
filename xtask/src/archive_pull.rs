@@ -26,8 +26,9 @@ use anyhow::{Context, Result};
 use daemon_egress::{EgressClient, EgressConfig, Redirects};
 use daemon_vhc_net::transport::ContentStore;
 use daemon_vhc_net::{
-    ArchiveHeadStore, HttpArchiveHeadStore, HttpPresignClient, PresignClient, PresignOp,
-    PresignRequest, PublishedArtifact, R2Store, RegistryClient, RunId,
+    classify_egress, status_is_transient, ArchiveHeadStore, HttpArchiveHeadStore,
+    HttpPresignClient, PresignClient, PresignOp, PresignRequest, PublishedArtifact, R2Store,
+    RegistryClient, RunId, VhcNetError,
 };
 use daemon_vhc_observe::assemble_archive;
 use daemon_vhc_proto::Hash;
@@ -53,6 +54,12 @@ fn egress() -> Result<EgressClient> {
 /// One content-plane GET: the production `ContentStore` get (`payload/<hex>` — segments and
 /// committed payloads), with the run-artifact key (`modules/<hex>.wasm`) as the fallback for the
 /// genesis-pinned coordinator module. The assembler re-hashes every byte; this only moves them.
+///
+/// Reliability posture (REL-2a, reliability spec §3.1 — supersedes the C2 field patch): the
+/// content leg inherits the store's bounded transient retry (`R2Store::get_content`, REL-2);
+/// the module-fallback leg carries its own equivalent bounded loop below; and on a double
+/// failure the CONTENT leg's error is reported as primary with the fallback outcome as an
+/// annotation — the fallback's (expected) miss must never bury the real fault.
 async fn fetch_object(
     r2: &R2Store<HttpPresignClient>,
     presign: &HttpPresignClient,
@@ -65,20 +72,59 @@ async fn fetch_object(
         Err(e) => e.to_string(),
     };
     let path = PublishedArtifact::Module(*hash).object_path();
-    let req = PresignRequest::artifact(PresignOp::Get, &path);
-    let resp = presign
-        .presign(run, &req)
-        .await
-        .map_err(|e| format!("{first}; presign GET {path}: {e}"))?;
-    match egress.get(&resp.url, Redirects::None).await {
-        Ok(r) if r.status().is_success() => r
-            .bytes()
-            .await
-            .map(|b| b.to_vec())
-            .map_err(|e| format!("read {path}: {e}")),
-        Ok(r) => Err(format!("{first}; GET {path} returned {}", r.status())),
-        Err(e) => Err(format!("{first}; GET {path}: {e}")),
+    match fetch_module_fallback(presign, egress, run, &path).await {
+        Ok(bytes) => Ok(bytes),
+        Err(fallback) => Err(format!("{first} (module fallback {path}: {fallback})")),
     }
+}
+
+/// How many times the module-fallback GET is attempted before its fault becomes the caller's.
+const FALLBACK_ATTEMPTS: u32 = 4;
+
+/// The fallback leg of [`fetch_object`] under the same REL-2 retry contract as the store path:
+/// bounded attempts with doubling backoff on transient shapes (connect/timeout/reset via the
+/// egress classifier; 5xx/408/429 by status), immediate return on semantic refusals (a 404 here
+/// is the authoritative "not a module object" answer the caller folds into its report).
+async fn fetch_module_fallback(
+    presign: &HttpPresignClient,
+    egress: &EgressClient,
+    run: &RunId,
+    path: &str,
+) -> Result<Vec<u8>, String> {
+    let mut delay = std::time::Duration::from_secs(1);
+    let mut last = String::new();
+    for attempt in 1..=FALLBACK_ATTEMPTS {
+        let req = PresignRequest::artifact(PresignOp::Get, path);
+        let resp = presign
+            .presign(run, &req)
+            .await
+            .map_err(|e| format!("presign GET: {e}"))?;
+        let transient = match egress.get(&resp.url, Redirects::None).await {
+            Ok(r) if r.status().is_success() => {
+                return r
+                    .bytes()
+                    .await
+                    .map(|b| b.to_vec())
+                    .map_err(|e| format!("read body: {e}"));
+            }
+            Ok(r) if status_is_transient(r.status()) => format!("GET returned {}", r.status()),
+            Ok(r) => return Err(format!("GET returned {}", r.status())),
+            Err(e) => match classify_egress(&e, "module fallback GET") {
+                VhcNetError::Transient { detail, .. } => detail,
+                other => return Err(other.to_string()),
+            },
+        };
+        last = transient;
+        if attempt < FALLBACK_ATTEMPTS {
+            eprintln!(
+                "  transient on module fallback {path} (attempt {attempt}/{FALLBACK_ATTEMPTS}): \
+                 {last}; retrying in {delay:?}"
+            );
+            tokio::time::sleep(delay).await;
+            delay = delay.saturating_mul(2);
+        }
+    }
+    Err(format!("exhausted {FALLBACK_ATTEMPTS} attempts: {last}"))
 }
 
 /// The `vhc-archive-pull` entry point.
@@ -136,6 +182,9 @@ pub fn run(args: Args) -> Result<()> {
     let presign_client = presign(&args.base)?;
     let egress_client = egress()?;
     let mut fetch = |hash: &Hash| -> Result<Vec<u8>, String> {
+        // Resume lives in the assembler itself now (`fetch_verified_at`, REL-2a): a prior
+        // pull's verified content-addressed file satisfies the fetch before this closure is
+        // ever consulted. This closure only moves network bytes.
         rt.block_on(fetch_object(
             &r2,
             &presign_client,
@@ -154,8 +203,17 @@ pub fn run(args: Args) -> Result<()> {
     );
     println!("  chains verified    : {}", report.chains_verified);
     println!("  head records       : {}", report.heads_written);
-    println!("  sealed segments    : {}", report.segments_written);
-    println!("  payload objects    : {}", report.payloads_written);
+    println!(
+        "  sealed segments    : {} fetched, {} reused (resumed)",
+        report.segments_written, report.segments_reused
+    );
+    println!(
+        "  payload objects    : {} fetched, {} reused (resumed)",
+        report.payloads_written, report.payloads_reused
+    );
+    if report.module_reused {
+        println!("  coordinator.wasm   : reused (resumed)");
+    }
     println!("  peer transcripts   : {}", report.peer_transcripts);
     println!(
         "  coordinator lineage: {:?} (chain instances, founding first)",
