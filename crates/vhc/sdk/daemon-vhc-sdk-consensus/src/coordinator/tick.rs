@@ -99,7 +99,12 @@ fn drive_time(state: &mut CoordinatorState, out: &mut Vec<Output>) {
     let cfg = &state.config;
     match state.phase {
         Phase::WaitingForMembers => {
-            if state.healthy_count() >= cfg.min_peers {
+            // Membership decay must not freeze while waiting (reliability spec §7, the C2
+            // floor-breach wedge): absence accounting otherwise lives only inside
+            // `finalize_round`, so once the floor breaches there are no rounds, hence no decay,
+            // hence a dead member holds its seat forever and a rejoiner meets `RosterFull`.
+            decay_stale_members(state, out);
+            if state.healthy_count() >= state.config.min_peers {
                 enter_warmup(state, out);
             }
         }
@@ -167,6 +172,14 @@ fn dispatch_payload(
     version: VhcProtoVersion,
     payload: VhcMessage,
 ) {
+    // Liveness stamp: any authenticated frame proves the signer was alive at this logical time —
+    // the staleness input decay-while-waiting reads (a member never heard through a whole
+    // round-scaled absence window while the run WAITS is a zombie holding a seat). Deterministic:
+    // `now_s` is state, and the stamp is a pure function of (state, input).
+    let now = state.now_s;
+    if let Some(m) = state.member_mut(&signer) {
+        m.last_seen_s = now;
+    }
     match payload {
         VhcMessage::Join(j) => on_join(state, out, signer, version, j),
         VhcMessage::Commitment(c) => on_commitment(state, out, signer, c),
@@ -254,7 +267,9 @@ fn on_join(
         }
         Err(reason) => out.push(Output::Reject(Rejection::Admission(reason))),
         Ok(()) => {
-            let m = Member::joining(signer, j.iroh_id, j.class, state.epoch);
+            let mut m = Member::joining(signer, j.iroh_id, j.class, state.epoch);
+            // The join itself is the first liveness evidence (decay-while-waiting's input).
+            m.last_seen_s = state.now_s;
             // The epoch roster forms through the whole pre-round window (`WaitingForMembers` +
             // `Warmup`): a peer that joins before the first round opens is a live member. A join
             // that arrives once a round is ACTIVE is staged `pending` (the roster is frozen for the
@@ -593,6 +608,41 @@ fn open_round(state: &mut CoordinatorState, out: &mut Vec<Output>) {
         s.open = Some(ro.clone());
     }
     out.push(Output::publish(VhcMessage::RoundOpen(ro)));
+}
+
+/// Decay zombie roster entries WITHOUT a round (reliability spec §7, `WaitingForMembers` only):
+/// a healthy member not heard for the full round-scaled absence equivalent — the time
+/// `k_absences` rounds would have taken at their authored maximum
+/// (`k × (round_train_max_s + round_witness_s)`) — is dropped, freeing its seat for an announced
+/// rejoiner. Staleness is floored at the CURRENT phase's start, so entering the phase restarts
+/// every member's window (a restored/reconstructed roster is never mass-dropped on tick one) and
+/// a member must stay silent through the whole waiting window to decay.
+///
+/// Consensus safety: this only SHRINKS the healthy set — it never admits anyone the Join path
+/// would not, and a decayed member that is actually alive rejoins through the ordinary
+/// previously-`Dropped` lane (its node-side keeper recycles the silent session and re-announces).
+fn decay_stale_members(state: &mut CoordinatorState, out: &mut Vec<Output>) {
+    let k = state.config.k_absences;
+    if k == 0 {
+        return; // absence-dropping disabled by authored policy — waiting decay follows it
+    }
+    let round_span = state.config.round_train_max_s + state.config.round_witness_s;
+    let window = u64::from(k).saturating_mul(round_span);
+    if window == 0 {
+        return;
+    }
+    let (now, phase_start) = (state.now_s, state.phase_start_s);
+    let mut drops: Vec<PeerId> = Vec::new();
+    for m in state.roster.iter_mut().filter(|m| m.is_healthy()) {
+        let seen = m.last_seen_s.max(phase_start);
+        if now.saturating_sub(seen) >= window {
+            m.state = ClientState::Dropped;
+            drops.push(m.peer);
+        }
+    }
+    for p in drops {
+        out.push(Output::Note(Notice::Dropped(p)));
+    }
 }
 
 /// Freeze the round record from signed evidence, account absences/drops, and decide the next phase.

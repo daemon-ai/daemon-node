@@ -10,6 +10,7 @@
 //! (the `main!` exports are wasm32-only, exactly like the v1 `experiment!` macro).
 
 pub use daemon_vhc_abi::CERTIFICATION_MINOR_V2;
+pub use daemon_vhc_abi::{COMP_ERR_GRANT_EXHAUSTED, ENV_STARVED_MINOR_V2, OUTCOME_ENV_STARVED};
 pub use daemon_vhc_proto::execution_grant::ExecutionGrant;
 pub use daemon_vhc_proto::resource_plan::LogicalResourcePlan;
 

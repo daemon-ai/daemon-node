@@ -62,7 +62,17 @@ decay-while-waiting fix, which removes most of that class at the source). Revisi
 (2026-08-11, Rung 8 landed) flips §12 (REL-10: continuous evidence-based grant extension at
 the `PayloadPut` seam — the `da_migrate` precedent generalized; the `grants.cddl`
 artifacts-field drift repaired beside it) to LANDED on the unit-test-only discipline; RQ-10
-(first-class grant classes/planes) stays a C3 ABI-minor design item.
+(first-class grant classes/planes) stays a C3 ABI-minor design item. Revision 15
+(2026-08-11, Rung 4 landed) flips §7 (REL-6: ABI minor 6 assigning `OUTCOME_ENV_STARVED = 4`
+→ host `FailedRetryable`; reserved-code degrade-to-`Left` drift repaired in the same commit;
+tiny-llama's classified panic-site audit converting the environment-sensitive seams — 2814
+payload fetch, 1834 restore window, 1955 round-base window, init manifest/window, container
+put, moment export — to typed run-ends with `GRANT_EXHAUSTED` as bounded backpressure; the
+8b admitted-on-own-membership fix; decay-while-waiting in the coordinator SDK) to LANDED on
+the unit-test-only discipline (consensus-tick two-dead-trainer + window/liveness scenarios,
+ABI negotiation tests, session outcome-arm tests; whole-run testkit drills and the G-3 shapes
+belong to the next ceremony window, per the no-long-C2-tests constraint). Runbook §4.7
+headroom generalized to ≥ expected concurrent churn.
 **Fence:** no change specified here may land while a ceremony that pins the node binaries is in
 flight (C2, run `f35bfa80…`, closed GREEN 2026-08-11 — no ceremony in flight as of Revision 6;
 the fence re-arms with the next authored run). §7 (guest contract) additionally changes the
@@ -568,7 +578,21 @@ and the existing event surface; a dedicated run-head field on the detail struct 
 CDDL/WireVersion change and is NOT taken in this wave. `vhc detail` renders both axes
 side by side from what it already receives.
 
-## 7. [REL-6] Guest contract at the next module revision — an ABI minor
+## 7. [REL-6] Guest contract at the next module revision — an ABI minor — LANDED (2026-08-11, Rung 4)
+
+*Landed exactly as specified below, all six bullets: ABI minor 6 + `OUTCOME_ENV_STARVED = 4`
+(`daemon-vhc-abi`, spec §4.5 table + minor history in the same commit), the host
+`FailedRetryable` arm plus the degrade-to-`Left` drift repair for reserved codes 5–15
+(`role_session.rs`), the tiny-llama typed-run-end conversions with the classified panic-site
+audit and bounded `GRANT_EXHAUSTED` backpressure (guest module hash changes — next-genesis
+material, the frozen C2 artifact keeps non-claims 8a/8b), the 8b admitted-on-own-membership
+fix, decay-while-waiting in the coordinator SDK tick (`Member.last_seen_s`, serde-defaulted;
+staleness floored at phase start so restored rosters are never mass-dropped), and the runbook
+§4.7 headroom generalization. Verification is unit-scoped by the post-C2 constraint: the
+two-dead-trainer wedge and the window/liveness/reset scenarios are pinned at the
+consensus-tick level (`decay_while_waiting.rs`), minor negotiation at the driver-selection
+level, outcome arms at the session level. The whole-run testkit drills and the live G-3
+shapes ride the next ceremony.*
 
 This rung is an **ABI minor revision** (module-side only; no node↔app WireVersion change).
 Outcome codes 4–15 are reserved "assigned only by a future minor of this document"
@@ -1025,7 +1049,7 @@ artifacts, and the verdict-producing `vhc-replay`.
 | RQ-5 | **Partially resolved (§2.1/§9c):** the non-heal mechanism was the unbounded co-trainer respawn cycle, pinned. RESIDUAL: the underlying iroh-vs-WS packet loss behind the standing gap (endpoint logs were not preserved) | §9(a) gap-hold visibility + preserved endpoint logs on the next ceremony |
 | RQ-6 | **Decided half IMPLEMENTED (§9d LANDED):** the co-trainer cycle budget ships — `max_retries` cycles, `min_uptime`-reset, loud park on exhaustion. OPEN half: whether transport-class faults then deserve a distinct (longer/slower) lane than guest faults | operational evidence with REL-5 announcing exhaustion |
 | RQ-7 | Ranged single-object GET resume for large payloads (mid-body resets on ~52 MB objects observed; presigned-URL Range semantics unverified; whole-object retry currently cheap enough) | revisit on evidence of retry thrashing; empirical Range probe first |
-| RQ-8 | **Decided conservatively (§11 LANDED):** external run-head progress is the ONLY reaction condition taken — a never-committed session is never recycled, and the whole-run-wedged 8b shape (zombie seat holder is this box) is deliberately left to the operator today. REMAINING: whether a bounded exception is worth taking at all once the §7 decay-while-waiting fix lands | revisited with C3's decay-while-waiting fix, which removes most of that class at the source |
+| RQ-8 | **Decided conservatively (§11 LANDED):** external run-head progress is the ONLY reaction condition taken — a never-committed session is never recycled, and the whole-run-wedged 8b shape (zombie seat holder is this box) is deliberately left to the operator today. REMAINING: whether a bounded exception is worth taking at all — narrower now that §7's decay-while-waiting is LANDED (Revision 15), which removes most of that wedge class at the source (in the NEXT module revision; the frozen C2 module keeps the wedge) | operational evidence from the first ceremony running the minor-6 module |
 | RQ-9 | **Structurally resolved (§10 LANDED):** the gate ships — `budget ≥ stop_rounds × growth + 25% restore headroom`, unbounded-budget warning. RESIDUAL: the growth figure is operator-supplied; sourcing it from banked preflight evidence (fit-probe vs smoke transcript) and freezing the 25% headroom margin remain open | banked preflight evidence from C2 + the three-seat smoke |
 | RQ-10 | First-class grant classes/planes in the ABI grants document (vs hash enumeration + evidence-based extension) | C3 ABI-minor scoping; REL-10's host-side extension (§12 LANDED) is sufficient until then |
 | RQ-11 | The det-state eviction/retention contradiction (§2.1): the store evicted a chunk a still-retained sealed fold references (`state_store.rs:688-705`), and the guest saw `HASH_MISMATCH` for a fault that mismatched nothing. Two halves: the retention-window defect (why did eviction run ahead of the sealed-fold reference?) and the dishonest code (REL-3's mapper direction) | retention-window audit of `state_store` eviction against the sealed-fold retention contract; code honesty lands with REL-3 |

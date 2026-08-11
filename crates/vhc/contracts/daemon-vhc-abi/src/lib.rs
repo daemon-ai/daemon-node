@@ -91,7 +91,17 @@ pub const DA_ABI_MAJOR_V2: u32 = 2;
 /// import shape**: [`required_v2_minor`] sees imports, so the SDK MUST raise a module's declared
 /// minor whenever it arms pre-loop panic forwarding or emits the two new exports. Conformance
 /// asserts both couplings and the lower-minor legacy path.
-pub const DA_ABI_MINOR_V2: u32 = 5;
+///
+/// **Minor 6 assigns Outcome code 4** ([`OUTCOME_ENV_STARVED`], ABI §4.5): "the run cannot proceed
+/// because a required committed input is unavailable after host absorption" — the typed run-end a
+/// conforming guest returns where a frozen module used to panic at a failed environmental
+/// completion (the REL-6 guest contract, reliability spec §7). No symbol changes: like minor 5's
+/// behavioral floor, minor 6 versions what a conforming host UNDERSTANDS — a host below 6 that
+/// received code 4 anyway would journal it and degrade it to `Left` (§4.5's reserved-code
+/// reading), and §1.3 minor negotiation refuses a minor-6 module on such a host outright
+/// ([`AbiRefusalCode::AbiMinorTooNew`]), so the degraded reading is a defense in depth, not a
+/// lane.
+pub const DA_ABI_MINOR_V2: u32 = 6;
 
 /// The **certification minor**: the major-2 rung that jointly carries the observational-logging
 /// exemption, [`DA_RESOURCE_PLAN_EXPORT`] and [`DA_APPLY_EXECUTION_GRANT_EXPORT`].
@@ -104,11 +114,19 @@ pub const DA_ABI_MINOR_V2: u32 = 5;
 /// context rendering — and MUST continue to be admitted unchanged.
 pub const CERTIFICATION_MINOR_V2: u32 = 5;
 
+/// The **EnvStarved minor**: the major-2 rung that assigns Outcome code 4
+/// ([`OUTCOME_ENV_STARVED`], §4.5). A module that ends a starved run with code 4 MUST declare at
+/// least this minor — that is what lets an older host refuse it by name
+/// ([`AbiRefusalCode::AbiMinorTooNew`]) instead of misreading the outcome. No symbol change
+/// rides this rung.
+pub const ENV_STARVED_MINOR_V2: u32 = 6;
+
 /// The minor ladder only ever climbs: the host's implemented minor is at least every rung it has
 /// assigned. A compile error rather than a test failure, because a rung that went backwards would
 /// make the too-new refusal admit modules the host cannot serve.
 const _: () = assert!(DA_ABI_MINOR_V2 >= BUFFER_STAGE_MINOR_V2);
 const _: () = assert!(DA_ABI_MINOR_V2 >= CERTIFICATION_MINOR_V2);
+const _: () = assert!(DA_ABI_MINOR_V2 >= ENV_STARVED_MINOR_V2);
 
 /// The assessment export a certification-minor module provides in place of `da_claim`:
 /// `da_resource_plan(cfg_ptr, cfg_len, capability_grants_ptr, capability_grants_len) -> u64`,
@@ -1157,7 +1175,18 @@ pub const OUTCOME_QUIESCE_READY: u32 = 2;
 /// converges on the live edge). The node therefore classifies this outcome RETRYABLE, unlike other
 /// nonzero outcomes — a fresh instance with a fresh restore does NOT reach the same status.
 pub const OUTCOME_STALE_RESTORE: u32 = 3;
-/// Outcomes ≥ this are module-defined; journaled verbatim, treated by the host as `Left` (ABI §4.5).
+/// Outcome 4 (assigned by ABI minor 6, §4.5): the run cannot proceed because a **required
+/// committed input is unavailable after host absorption** — a record-listed committed payload, a
+/// restore/init window, or the run's own checkpoint publication failed its completion even after
+/// the host's transient-fault absorption (reliability spec §3) was exhausted. The typed run-end a
+/// conforming guest returns where a frozen module used to panic at the seam (REL-6). Exactly like
+/// [`OUTCOME_STALE_RESTORE`], this is NOT deterministic for the (module, plan, grant) tuple — the
+/// environment starved this incarnation — so the node classifies it RETRYABLE: a rejoin resolves
+/// a fresher restore pointer and retries against a recovered content plane.
+pub const OUTCOME_ENV_STARVED: u32 = 4;
+/// Outcomes ≥ this are module-defined; journaled verbatim and surfaced as the module's own typed
+/// TERMINAL refusal of admitted input — deterministic for the tuple, never retried (ABI §4.5, the
+/// minor-6 amendment recording deliberate behavior).
 pub const OUTCOME_MODULE_DEFINED_MIN: u32 = 16;
 
 // -- stop / quiesce reasons (ABI §4.2) ------------------------------------------------------------
@@ -1586,14 +1615,12 @@ mod tests {
         assert_eq!(host_minor_for(DA_ABI_MAJOR), None);
         // B1 bumped the major-2 minor to 1 with Completion delivery; C1 bumped it to 2 with
         // Fence delivery + the compute@2 shim; the det-state wave bumped it to 3 with the
-        // state store + the three state imports; the buffer-staging trio bumped it to 4; and the
+        // state store + the three state imports; the buffer-staging trio bumped it to 4; the
         // certification rung bumped it to 5 with the logging exemption and the two resource
-        // exports (all on the ratified coupled-to-the-working-driver path, ABI §1.4/§4.6).
-        // Minor 6 stays AbiMinorTooNew.
-        assert_eq!(
-            host_minor_for(DA_ABI_MAJOR_V2),
-            Some(CERTIFICATION_MINOR_V2)
-        );
+        // exports; and the REL-6 rung bumped it to 6 assigning Outcome 4 EnvStarved (all on the
+        // ratified coupled-to-the-working-driver path, ABI §1.4/§4.6). Minor 7 stays
+        // AbiMinorTooNew.
+        assert_eq!(host_minor_for(DA_ABI_MAJOR_V2), Some(ENV_STARVED_MINOR_V2));
         assert_eq!(host_minor_for(3), None);
     }
 
@@ -1807,7 +1834,11 @@ mod tests {
     #[test]
     fn the_certification_minor_adds_two_exports_without_removing_any() {
         assert_eq!(CERTIFICATION_MINOR_V2, BUFFER_STAGE_MINOR_V2 + 1);
-        assert_eq!(DA_ABI_MINOR_V2, CERTIFICATION_MINOR_V2);
+        // The EnvStarved rung (minor 6, Outcome 4) sits one above certification and is what the
+        // host implements; it adds NO export or symbol, so every shape assertion below is
+        // pinned at the certification minor unchanged.
+        assert_eq!(ENV_STARVED_MINOR_V2, CERTIFICATION_MINOR_V2 + 1);
+        assert_eq!(DA_ABI_MINOR_V2, ENV_STARVED_MINOR_V2);
 
         let legacy = v2_required_exports_for_minor(BUFFER_STAGE_MINOR_V2);
         assert_eq!(legacy, V2_REQUIRED_EXPORTS.to_vec());

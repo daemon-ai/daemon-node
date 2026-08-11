@@ -186,6 +186,42 @@ const OUTCOME_CORPUS_RANGE_INVALID: u32 = 33;
 const OUTCOME_ROUND_WINDOW_UNPLANNABLE: u32 = 34;
 const OUTCOME_COMMITTED_PAYLOAD_INVALID: u32 = 35;
 
+/// `da_run` outcome 4 (ABI §4.5, assigned by minor 6 — this module declares it): the run cannot
+/// proceed because a REQUIRED COMMITTED INPUT is unavailable after host absorption. The REL-6
+/// guest contract (reliability spec §7): a failed completion at an environment-sensitive seam —
+/// a record-listed committed payload, a restore/init window, the run's own checkpoint-container
+/// put — ends the run typed instead of panicking (the C2 `lib.rs:2814` class). The node
+/// classifies it RETRYABLE: a rejoin restores fresher against a recovered content plane.
+const OUTCOME_ENV_STARVED: u32 = daemon_vhc_sdk::OUTCOME_ENV_STARVED;
+
+/// Bounded backpressure absorption for a refused record-payload fetch (`GRANT_EXHAUSTED`, the
+/// C2 23:09Z class): the guest re-requests the one refused payload at most this many times —
+/// consumed handles are already released at every ingest seal, so a retry lands after quota
+/// returns — and only genuine exhaustion ends the run (`OUTCOME_ENV_STARVED`). The frozen
+/// module's blind ~500 ms refetch cycle (~70 refusals in ~40 s, then a panic) is what this
+/// bound replaces.
+const RECORD_FETCH_RETRIES_MAX: u32 = 4;
+
+// -- panic-site audit (REL-1 conformance, reliability spec §2/§7 — classified, not counted) ------
+//
+// The remaining `expect`/`assert!`/`panic!` sites in this module are DELIBERATE, in exactly two
+// classes:
+//
+// 1. **Deterministic-invariant assertions** — geometry/layout math (`ordinal fits usize`,
+//    "walk geometry", "the walk accepts…"), decodes of content the HOST already hash-verified
+//    against a committed address (manifest parses, f32-le images), registrations of genesis- or
+//    checkpoint-granted folds (`data_register_state_chunks == 0`), and own-state bookkeeping
+//    (`the in-flight open`, "op is an outstanding window read"). A failure is a module or
+//    contract defect, deterministic for the (module, plan, grant) tuple; failing loud IS the
+//    conforming behavior (a typed outcome would misclassify a defect as environment).
+//
+// 2. **Environment-sensitive completion seams** — every fallible completion whose failure means
+//    the environment starved this incarnation converts to a typed run-end, never a panic:
+//    the record-listed committed payload fetch (backpressure-bounded, `OUTCOME_ENV_STARVED`),
+//    the restore/init window and init-manifest fetches, the committed-container put, and the
+//    quiesce moment-export walk. These are the sites this audit converted; adding a NEW
+//    completion consumer puts it in this class by default.
+
 /// Per-step queue-depth-reset fences start here; round-final fences are `round + 1`.
 const STEP_FENCE_BASE: u64 = 1 << 32;
 
@@ -548,14 +584,14 @@ impl GuestModule for TinyLlama {
         ModuleDecl {
             name: "tiny-llama",
             version: env!("CARGO_PKG_VERSION"),
-            // The certification rung. The import shape alone would fix this at 4 (the
-            // incremental buffer-staging trio is the highest introducing minor this module
-            // imports), but this module also emits a Logical Resource Plan, consumes an
-            // Execution Grant before initialization, and forwards a panic from inside
-            // `da_init` — three behavioral dependencies on the host that the import shape cannot
-            // see. Declaring the rung is what makes a host that does not implement them refuse
-            // this module by name instead of trapping it at initialization.
-            abi_minor: daemon_vhc_sdk::CERTIFICATION_MINOR_V2,
+            // Minor 6 (the EnvStarved rung, ABI §4.5). The import shape alone would fix this at
+            // 4 (the incremental buffer-staging trio is the highest introducing minor this
+            // module imports), and the certification behaviors (Logical Resource Plan, Execution
+            // Grant, `da_init` panic forwarding) require 5 — but this module additionally ends a
+            // starved run with `OUTCOME_ENV_STARVED = 4` (the REL-6 guest contract), an outcome
+            // code ASSIGNED at minor 6. Declaring the rung is what makes an older host refuse
+            // this module by name (`AbiMinorTooNew`) instead of misreading outcome 4.
+            abi_minor: daemon_vhc_sdk::ENV_STARVED_MINOR_V2,
             channels: vec![0],
             // The config-independent fallback (a harness that hands no decodable config). The
             // honest, geometry-derived figures are `decl_for_config` below — this module's
@@ -811,6 +847,10 @@ struct PendingRecord {
     entries: Vec<RecordEntry>,
     /// fetch op → the entry's peer (the payload lands under `(round, peer)`).
     ops: BTreeMap<u64, PeerId>,
+    /// Backpressure re-requests consumed by this record's fetch set (bounded by
+    /// [`RECORD_FETCH_RETRIES_MAX`]; a `GRANT_EXHAUSTED` refusal is re-requested, anything past
+    /// the budget ends the run [`OUTCOME_ENV_STARVED`] — REL-6).
+    retries: u32,
 }
 
 /// The corpus geometry the live mode fetches against, derived from the verified manifest.
@@ -843,7 +883,14 @@ struct LiveState {
     roster: Vec<PeerId>,
     corpus: Option<LiveCorpus>,
     manifest_op: Option<u64>,
-    /// Whether a round has been observed (stops the periodic Join/Heartbeat re-announce).
+    /// Whether this peer's OWN MEMBERSHIP is proven — its entry committed in an inline
+    /// `RoundRecord` (non-claim 8b, reliability spec §7). A broadcast `RoundOpen` proves only
+    /// that SOME round opened (the coordinator floods it to every peer, member or not), so
+    /// flipping on it silenced an unadmitted rejoiner's re-announce while it still held no
+    /// seat — the C2 roster-vacancy wedge. Until this flips, the 500 ms Join/ready-Heartbeat
+    /// re-announce keeps running, so the peer can heal a later vacancy. Future non-inline
+    /// record-set encodings must extract equivalent membership evidence from the referenced
+    /// set; that obligation travels with any such encoding change.
     admitted: bool,
     /// The highest round this peer has PLANNED (fetches kicked off). The coordinator re-publishes
     /// the standing `RoundOpen` to every (re)joiner (§6.5 replay-forward) and the re-publish is a
@@ -1001,6 +1048,21 @@ impl LiveState {
             ready: Some(true),
         }));
     }
+}
+
+/// A FAILED completion's error code (`None` when the completion succeeded or carries no code):
+/// the typed `Err { code, .. }` the host's shared network-fault mapper assigned (REL-3) — the
+/// vocabulary the REL-6 seams branch on (`GRANT_EXHAUSTED` is backpressure; everything else
+/// already outlived the host's transient absorption).
+fn completion_err_code(ev: &daemon_vhc_sdk::Event) -> Option<u64> {
+    let ciborium::value::Value::Array(result) = ev.items.get(2)? else {
+        return None;
+    };
+    let code = result
+        .first()
+        .and_then(|v| v.as_integer())
+        .map(i128::from)?;
+    (code != 0).then(|| u64::try_from(code).unwrap_or(u64::MAX))
 }
 
 /// One completion's `Ok(BufferHandle)` (`None` on a failed op) — the handle KEPT, not read: the
@@ -1658,7 +1720,13 @@ fn drive_boot_completion(
 ) -> bool {
     if boot.manifest_op == Some(op) {
         boot.manifest_op = None;
-        let bytes = completion_bytes(ev).expect("the pinned init manifest fetches (fail loud)");
+        // REL-6: a failed init-manifest completion is environment (an initialization fetch) —
+        // latch the typed run-end. The parse below stays a deterministic-invariant panic: the
+        // host verified the bytes against the pinned address.
+        let Some(bytes) = completion_bytes(ev) else {
+            core.borrow_mut().refusal = Some(OUTCOME_ENV_STARVED);
+            return true;
+        };
         let manifest =
             DetStateManifest::from_canonical_bytes(&bytes).expect("the init manifest parses");
         let (numels, window_size) = {
@@ -1700,7 +1768,11 @@ fn drive_boot_completion(
     let Some(ordinal) = boot.window_ops.remove(&op) else {
         return false;
     };
-    let bytes = completion_bytes(ev).expect("an init master window fetches (fail loud)");
+    // REL-6: a failed init-window completion is environment — latch the typed run-end.
+    let Some(bytes) = completion_bytes(ev) else {
+        core.borrow_mut().refusal = Some(OUTCOME_ENV_STARVED);
+        return true;
+    };
     let vals = le_bytes_to_f32s(&bytes).expect("init window is an f32-le image");
     let window = boot.schedule[usize::try_from(ordinal).expect("ordinal fits usize")];
     let off = usize::try_from(window.param_off / 4).expect("offset fits usize");
@@ -1831,7 +1903,13 @@ fn drive_restore_completion(
     let Some((family, ordinal)) = restore.inflight.remove(&op) else {
         return false;
     };
-    let bytes = completion_bytes(ev).expect("a restore window fetches (fail loud)");
+    // REL-6: a failed restore-window completion is environment (the C2 1834 class) — latch the
+    // typed run-end; the node's retryable lane restores fresher. The DECODE below stays a
+    // deterministic-invariant panic: the host hash-verified these bytes against the fold.
+    let Some(bytes) = completion_bytes(ev) else {
+        core.borrow_mut().refusal = Some(OUTCOME_ENV_STARVED);
+        return true;
+    };
     let vals = le_bytes_to_f32s(&bytes).expect("restore window is an f32-le image");
     let window = restore.schedule[usize::try_from(ordinal).expect("ordinal fits usize")];
     let off = usize::try_from(window.param_off / 4).expect("offset fits usize");
@@ -1952,7 +2030,12 @@ fn drive_ingest_completion(
         Some(w) if w.ops.contains_key(&op) => {}
         _ => return IngestStep::NotMine,
     }
-    let bytes = completion_bytes(ev).expect("round-base window fetch completes (fail loud)");
+    // REL-6: a failed round-base window completion is environment (the C2 1955 class) — latch
+    // the typed run-end instead of panicking mid-walk.
+    let Some(bytes) = completion_bytes(ev) else {
+        core.borrow_mut().refusal = Some(OUTCOME_ENV_STARVED);
+        return IngestStep::Progressed;
+    };
 
     let sealed;
     {
@@ -2475,7 +2558,11 @@ fn run_module(mut cfg: GuestCfg, restored: Option<RestoredRefs>) -> u32 {
                             // coordinator opens rounds strictly after records, so a second
                             // in-flight open means this peer is already stalled and sits the
                             // round out (the ladder catches it up at the next record).
-                            l.admitted = true;
+                            //
+                            // Non-claim 8b: an open is NOT membership evidence — the flood
+                            // reaches non-members too — so admission does NOT flip here; the
+                            // re-announce keeps running until this peer's entry commits in a
+                            // record (below).
                             // A re-delivered standing open (the coordinator replays it to every
                             // (re)joiner, and the replay is a broadcast) at/below the planning
                             // watermark is a no-op: this peer already planned — and possibly
@@ -2515,6 +2602,15 @@ fn run_module(mut cfg: GuestCfg, restored: Option<RestoredRefs>) -> u32 {
                     }
                     VhcMessage::RoundRecord(rr) => {
                         let entries: Vec<RecordEntry> = rr.inline.clone().unwrap_or_default();
+                        // Non-claim 8b (reliability spec §7): this peer's OWN entry committed in
+                        // an inline record is the membership evidence that stops the re-announce
+                        // — checked before the watermark guard, because a replay-forwarded
+                        // at/below-watermark record proves membership just as well.
+                        if let Some(l) = live.as_mut() {
+                            if !l.admitted && entries.iter().any(|e| e.peer == l.peer) {
+                                l.admitted = true;
+                            }
+                        }
                         // Module-driven payload custody, in BOTH modes: fetch every record-listed
                         // committed payload from the content-addressed plane (self included —
                         // idempotent and uniform) into a host buffer, then run the barrier. The
@@ -2532,7 +2628,12 @@ fn run_module(mut cfg: GuestCfg, restored: Option<RestoredRefs>) -> u32 {
                                 ops.insert(op, e.peer);
                             }
                         }
-                        let pending = PendingRecord { rr, entries, ops };
+                        let pending = PendingRecord {
+                            rr,
+                            entries,
+                            ops,
+                            retries: 0,
+                        };
                         let pending_round = pending.rr.round;
                         if pending.ops.is_empty() {
                             dispatch_record(
@@ -2696,9 +2797,13 @@ fn run_module(mut cfg: GuestCfg, restored: Option<RestoredRefs>) -> u32 {
                 // The committed container is durable: voice the commitment the put's content
                 // address names.
                 if let Some((round, size)) = pending_commit.remove(&op) {
-                    let hash = Hash(
-                        completion_hash(&ev).expect("the committed container PUTs (fail loud)"),
-                    );
+                    // REL-6: a failed container put is environment — the run's own commitment
+                    // cannot become durable, so the incarnation ends typed and its successor
+                    // re-trains the round against a recovered plane.
+                    let Some(raw) = completion_hash(&ev) else {
+                        return OUTCOME_ENV_STARVED;
+                    };
+                    let hash = Hash(raw);
                     publish_tagged(3, round, &hash.0);
                     if live.is_some() {
                         publish_wire(&VhcMessage::Commitment(Commitment {
@@ -2810,8 +2915,32 @@ fn run_module(mut cfg: GuestCfg, restored: Option<RestoredRefs>) -> u32 {
                     .iter_mut()
                     .find_map(|(round, p)| p.ops.remove(&op).map(|peer| (*round, peer)));
                 if let Some((round, peer)) = record_round {
-                    let handle = completion_handle(&ev)
-                        .expect("a record-listed committed payload fetches (fail loud)");
+                    let Some(handle) = completion_handle(&ev) else {
+                        // REL-6 (reliability spec §7): a failed completion on a record-listed
+                        // committed payload is ENVIRONMENT, never a module defect — the frozen
+                        // module panicked here (the C2 2814 class). `GRANT_EXHAUSTED` is
+                        // backpressure: consumed handles return at every ingest seal, so a
+                        // BOUNDED re-request lands once quota frees. Anything else (or an
+                        // exhausted budget) already outlived the host's transient absorption
+                        // (REL-2) — the run ends TYPED and the node's retryable lane restores
+                        // a fresh incarnation against a recovered content plane.
+                        let p = pending_records.get_mut(&round).expect("the pending record");
+                        if completion_err_code(&ev)
+                            == Some(daemon_vhc_sdk::COMP_ERR_GRANT_EXHAUSTED)
+                            && p.retries < RECORD_FETCH_RETRIES_MAX
+                        {
+                            p.retries += 1;
+                            let e = p
+                                .entries
+                                .iter()
+                                .find(|e| e.peer == peer)
+                                .expect("the refused op maps to a record entry");
+                            let retry = daemon_vhc_sdk::payload_get(&e.hash.0);
+                            p.ops.insert(retry, peer);
+                            continue;
+                        }
+                        return OUTCOME_ENV_STARVED;
+                    };
                     payloads.map.insert((round, peer), HostStaged(handle));
                     let done = pending_records
                         .get(&round)
@@ -2834,7 +2963,11 @@ fn run_module(mut cfg: GuestCfg, restored: Option<RestoredRefs>) -> u32 {
                 match quiesce_step {
                     Some(MomentStep::Progressed) => continue,
                     Some(MomentStep::Failed) => {
-                        panic!("a moment window export failed (the drain fails loud, §10.2)")
+                        // REL-6: a failed moment-window export during the drain is an
+                        // environment-sensitive completion (device/storage seam) — the drain
+                        // ends typed instead of panicking; the node retries the quiesce on a
+                        // fresh incarnation.
+                        return OUTCOME_ENV_STARVED;
                     }
                     Some(MomentStep::Sealed) => {
                         let walk = quiesce.take().expect("quiesce present");

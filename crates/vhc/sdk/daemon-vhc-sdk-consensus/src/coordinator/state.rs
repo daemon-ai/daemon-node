@@ -91,6 +91,15 @@ pub struct Member {
     /// Whether the member has signalled model-readiness in the current `Warmup` (additive
     /// early-exit, §6.2/§6.5). Reset when a fresh `Warmup` begins; set by a ready [`Heartbeat`].
     pub warmup_ready: bool,
+    /// The logical clock (`state.now_s`) at which this member was last HEARD — any authenticated
+    /// frame it signed (join, commitment, heartbeat, …). The decay-while-waiting staleness input
+    /// (reliability spec §7): absence accounting otherwise lives only inside round finalization,
+    /// so a member that died during a floor breach held its seat forever (no rounds ⇒ no decay ⇒
+    /// the C2 membership wedge). Additive (`serde(default)`): pre-existing snapshots reload with
+    /// `0`, and the decay predicate floors staleness at the current phase's start, so a restored
+    /// roster is never mass-dropped on the first tick.
+    #[serde(default)]
+    pub last_seen_s: u64,
 }
 
 impl Member {
@@ -107,6 +116,7 @@ impl Member {
             last_seen_round: 0,
             last_straggle_round: None,
             warmup_ready: false,
+            last_seen_s: 0,
         }
     }
 

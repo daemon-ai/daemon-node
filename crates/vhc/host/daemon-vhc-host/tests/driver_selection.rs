@@ -224,6 +224,24 @@ fn minor0_declaration_without_minor1_imports_stays_admitted() {
 }
 
 #[test]
+fn minor6_declaration_is_admitted() {
+    // The REL-6 bump's positive selection pin (ABI §4.5 minor 6 — Outcome 4 EnvStarved): minor 6
+    // assigns an outcome code, no new symbol, so a module importing any existing surface and
+    // declaring 2.6 negotiates cleanly. Together with `v2_minor_above_host_is_minor_too_new`
+    // (2.7 refused) this is the §1.4 compatibility pair: an older host REFUSES the newer module
+    // at the front door rather than ever reading outcome 4 as a generic terminal.
+    const {
+        assert!(
+            daemon_vhc_abi::DA_ABI_MINOR_V2 >= 6,
+            "the EnvStarved assignment is implemented"
+        );
+    }
+    let wasm = build_module(&[("vhc@2", "next_event")], V2_EXPORTS, pack(2, 6));
+    let sel = select_driver(&worker(), &wasm, None).expect("a minor-6 module is admitted");
+    assert_eq!((sel.major, sel.minor), (2, 6));
+}
+
+#[test]
 fn v2_minor_above_host_is_minor_too_new() {
     // One above the host's implemented minor (derived, not hard-coded — the constant moves with
     // each phase's bump; C1's Phase-C bump took it to 2): AbiMinorTooNew continues to protect

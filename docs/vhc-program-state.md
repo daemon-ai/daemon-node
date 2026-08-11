@@ -252,10 +252,17 @@ telemetry, and docs surface.
      not on actual admission — an unadmitted rejoiner goes silent and cannot heal a later
      roster vacancy. Both mitigated by the C2 churn-headroom genesis (non-claim → recorded
      defect, three-seat smoke). Both recurred live during C2 (transient R2 egress fault →
-     guest trap → multi-hour `WaitingForMembers` stall, manual leave/rejoin recovery); the
-     post-C2 mitigation design is tracked in
-     [`specs/vhc-capability-reliability-spec.md`](specs/vhc-capability-reliability-spec.md)
-     (pre-implementation; nothing landed).
+     guest trap → multi-hour `WaitingForMembers` stall, manual leave/rejoin recovery).
+     **Narrowed (2026-08-11, REL-6 landed):** both are FIXED in source at ABI minor 6 —
+     (a) environment-sensitive completion failures end the run with the typed
+     `OUTCOME_ENV_STARVED = 4` (→ `FailedRetryable`), with `GRANT_EXHAUSTED` treated as
+     bounded backpressure; (b) `admitted` flips only on own-membership evidence in a
+     committed `RoundRecord`, and silent members decay DURING `WaitingForMembers`
+     (round-scaled staleness) so a breached floor self-heals on rejoin. The non-claim now
+     covers only the FROZEN C2 module artifact (its hash predates the fix); any genesis
+     authored from the current source carries the conformant module. Design + landing
+     record: [`specs/vhc-capability-reliability-spec.md`](specs/vhc-capability-reliability-spec.md)
+     §7 [REL-6].
 - C0: green and pinned. C1: green on hardware. C1.5 recovery-first: **closed at
   `068873f2`** (c15 series). Windows 5090 full node: **GREEN (above)**. Three-seat smoke:
   **GREEN (above)**. **C2: COMPLETE + CERTIFIED `terminal(0)` (above) — the ladder is

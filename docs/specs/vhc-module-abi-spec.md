@@ -88,6 +88,18 @@ architecture gate") is **out of scope for Phase A** except for the transitional 
 
 ### 0.5 Changelog
 
+- **Minor 6 — Outcome 4 `EnvStarved` assigned (2026-08-11, the REL-6 guest contract).** §4.5's
+  outcome table gains code 4: the typed run-end for a run starved of a required committed input
+  after host absorption (reliability spec §7), classified retryable by the node exactly like
+  `StaleRestore`. The reserved range narrows to 5–15. No symbol, export, or journal-schema
+  change — minor 6 versions what a conforming host understands, and §1.3 negotiation refuses a
+  minor-6 module on an older host (`AbiMinorTooNew`). §17.1's ladder reflects
+  `DA_ABI_MINOR_V2 = 6`; the certification surface (minor 5) is unchanged. Two degraded-reading
+  repairs land beside the assignment: the node now actually degrades unknown reserved codes
+  (5–15) to `Left` as §4.5 always specified (they previously surfaced as an invented terminal
+  failure), and the `≥16` row is amended to record the deliberate implementation (module-defined
+  codes are typed terminal refusals, never `Left` — no implementation ever read them otherwise).
+
 - **Imported as the canonical tracked ABI, and minor 5 added (2026-07-27).** This document moved into
   the repository as the single normative module ABI, per the ratified placement of normative amendment
   A5; the external copy in the program directory became a non-normative pointer in the same change.
@@ -1030,14 +1042,15 @@ Upgrade and throttle both use `Quiesce` first and forced interruption only on ex
 | 1 | `Left` | The module chose to leave the run (its own policy). |
 | 2 | `QuiesceReady` | Returned during a `Quiesce` drain; snapshot manifest published (§10.2). |
 | 3 | `StaleRestore` | The module refuses to fold a record history **gapped above its restored resync watermark** (rounds committed before this incarnation attached are never re-delivered on the ordered records channel; folding across them would fork the det trajectory). The node treats this outcome as **retryable**: the recovery is a rejoin restoring a fresher checkpoint, and live pointers advance every ingested round, so the retry converges on the live edge. |
-| 4–15 | reserved | assigned only by a future minor of this document. |
-| ≥16 | module-defined | journaled verbatim; treated by the host exactly as `Left`. |
+| 4 | `EnvStarved` | *(assigned by minor 6 — a module returning it MUST declare minor ≥ 6)* The run cannot proceed because a **required committed input is unavailable after host absorption**: a record-listed committed payload, a restore/init window, or the run's own checkpoint publication failed its completion even after the host's transient-fault absorption was exhausted (reliability spec §3/§7). The typed run-end a conforming guest returns where a frozen module used to panic at the seam. Like `StaleRestore`, the node treats this outcome as **retryable** — the environment starved this incarnation; a rejoin restores a fresher checkpoint against a recovered content plane. |
+| 5–15 | reserved | assigned only by a future minor of this document. |
+| ≥16 | module-defined | journaled verbatim; the node surfaces it as a module-defined **terminal** end — the code is the module's own typed refusal of admitted input, deterministic for the (module, plan, grant) tuple, so it is never retried. *(Amended at minor 6 to record deliberate behavior: the pre-6 text read "treated exactly as `Left`", which no implementation ever did.)* |
 
 (Resolution of OQ-5: the vocabulary stays small; module-specific exit information belongs in a
-published frame or the snapshot manifest, not in the Outcome. Unknown reserved codes 4–15 from a
+published frame or the snapshot manifest, not in the Outcome. Unknown reserved codes 5–15 from a
 future-minor module never reach an older host by §1.4; a host receiving one anyway treats it as
-`Left` and journals it — which is also the sound degraded reading of `StaleRestore` on a host
-older than its assignment.)
+`Left` and journals it — which is also the sound degraded reading of `StaleRestore` (or
+`EnvStarved`) on a host older than its assignment.)
 
 A guest that returns from `da_run` without having consumed a `Stop`/`Quiesce` (it fell out of its
 own loop) is treated as `Left` with a journaled warning. A trap during `da_run` is handled per §7.6
@@ -3824,7 +3837,7 @@ invalidate a certification candidate's pins three times over. They are not one s
 | Constant | Value | Meaning |
 |---|---|---|
 | `DA_ABI_MAJOR_V2` | `2` | the major this document fixes |
-| `DA_ABI_MINOR_V2` | `5` | the highest minor this host implements |
+| `DA_ABI_MINOR_V2` | `6` | the highest minor this host implements (minor 6 assigns Outcome 4 `EnvStarved`, §4.5 — no symbol changes) |
 | `CERTIFICATION_MINOR_V2` | `5` | the minor at which the surface below applies |
 | `LEGACY_CONTEXT_MAX_MINOR` | `4` | the highest minor that keeps the legacy surface |
 

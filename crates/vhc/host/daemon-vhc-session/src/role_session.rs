@@ -2607,6 +2607,30 @@ fn classify_natural_end(
                     .into(),
             }
         }
+        // `EnvStarved` (ABI §4.5 code 4, minor 6): a required committed input stayed unavailable
+        // after the host's transient absorption — the guest's typed run-end where a frozen module
+        // used to panic (REL-6, reliability spec §7). Environmental, not deterministic for the
+        // (module, plan, grant) tuple: a rejoin restores fresher and retries against a recovered
+        // content plane, so this rides the same retryable lane as StaleRestore.
+        Ok(RunEnd::Outcome(code)) if code == daemon_vhc_abi::OUTCOME_ENV_STARVED => {
+            TerminalOutcome::FailedRetryable {
+                reason: "environment starved: a required committed input stayed unavailable \
+                         after host absorption; rejoining against a recovered content plane"
+                    .into(),
+            }
+        }
+        // Reserved codes above this host's assignments (5–15 at minor 6) degrade to `Left`, per
+        // ABI §4.5's OQ-5 resolution — §1.3 minor negotiation keeps a future-minor module off
+        // this host, so reaching here means negotiation was bypassed; the sound degraded reading
+        // is "the module chose to end", journaled with the code, never an invented terminal
+        // failure. (This repairs the recorded spec/code drift: every unmatched nonzero outcome
+        // used to be FailedTerminal.)
+        Ok(RunEnd::Outcome(code)) if code < daemon_vhc_abi::OUTCOME_MODULE_DEFINED_MIN => {
+            eprintln!(
+                "reserved outcome {code} (above this host's ABI minor) degraded to Left (§4.5)"
+            );
+            TerminalOutcome::Left { checkpoint: None }
+        }
         Ok(RunEnd::Outcome(code)) => TerminalOutcome::FailedTerminal {
             reason: format!("module ended with outcome {code}"),
         },
@@ -3232,8 +3256,30 @@ mod tests {
             classify_natural_end(Ok(RunEnd::Outcome(0)), None),
             TerminalOutcome::Completed { outcome: 0 }
         );
+        // EnvStarved (ABI §4.5 code 4, minor 6): the REL-6 typed run-end rides the retryable
+        // lane — a rejoin restores fresher against a recovered content plane.
+        assert!(matches!(
+            classify_natural_end(
+                Ok(RunEnd::Outcome(daemon_vhc_abi::OUTCOME_ENV_STARVED)),
+                None
+            ),
+            TerminalOutcome::FailedRetryable { .. }
+        ));
+        // A reserved code above this host's assignments (5–15 at minor 6) degrades to Left, per
+        // §4.5's OQ-5 resolution — negotiation keeps such modules off this host; receiving one
+        // anyway must not invent a terminal failure (the repaired degrade-to-Left drift).
         assert!(matches!(
             classify_natural_end(Ok(RunEnd::Outcome(7)), None),
+            TerminalOutcome::Left { checkpoint: None }
+        ));
+        assert!(matches!(
+            classify_natural_end(Ok(RunEnd::Outcome(15)), None),
+            TerminalOutcome::Left { checkpoint: None }
+        ));
+        // Module-defined codes (≥ 16) keep the product's deliberate terminal reading — a typed
+        // module refusal is deterministic for the tuple, and retrying it re-derives the refusal.
+        assert!(matches!(
+            classify_natural_end(Ok(RunEnd::Outcome(32)), None),
             TerminalOutcome::FailedTerminal { .. }
         ));
         assert!(matches!(

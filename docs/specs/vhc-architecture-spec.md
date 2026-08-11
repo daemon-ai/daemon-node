@@ -24,9 +24,13 @@ derivation contract in full), drafted in parallel with this spec; `vhc-migration
 decompositions, and the swarm→vhc rename manifest;
 [`vhc-capability-reliability-spec.md`](vhc-capability-reliability-spec.md) — the post-C2
 capability-seam reliability workstream (transient absorption at the environment boundary,
-truthful failure naming, environmental trap attribution, node-level stall announcement;
-design specification, pre-implementation). Where this spec defers a detail to a companion,
-the deferral is explicit.
+truthful failure naming, environmental trap attribution, node-level stall announcement,
+guest typed run-ends; substantially LANDED as of 2026-08-11 — per-section status in that
+spec). Its guest-contract rung assigns ABI minor 6 (`EnvStarved`, ABI §4.5): the trap
+taxonomy itself is unchanged — environmental starvation leaves the trap lane entirely and
+becomes a typed outcome, so `guest trap ⇒ examine as module defect` sharpens into a
+conformance property rather than acquiring new trap codes. Where this spec defers a detail
+to a companion, the deferral is explicit.
 
 **The archived program architecture doc is a TARGET where it diverges.** The frozen
 `daemon-vhc-architecture.md` (archived under the program docs) reads as current in places where

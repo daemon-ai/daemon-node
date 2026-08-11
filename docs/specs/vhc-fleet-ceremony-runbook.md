@@ -563,15 +563,23 @@ keys:
    authority, `--min-peers 3 --max-peers 4`, `--ckpt-cadence 4 --payload-retention 64`,
    `--stop-rounds 48`, and timers from the smoke calibration (round-max ≈ 3× the slowest measured
    wall; warmup generous). Review `authoring-report.txt`; the human ratifies it before seeding.
-   **Churn headroom is MANDATORY (`max_peers = min_peers + 1`), not tuning.** With a FULL fixed
-   roster (min = max), a crashed trainer's roster entry stays healthy-but-absent for `k_absences`
-   rounds while its rejoined incarnation's every Join rejects `RosterFull`; the eventual drop then
-   breaches the membership floor into `WaitingForMembers` (no timeout) with nothing pending, and
-   the frozen guest's announce loop has already stopped on observing round traffic — a deadly
-   embrace that idles the run indefinitely (found live in the three-seat smoke, 2026-08-09; the
-   full mechanism is in that run's VERDICT). G-3's kill+rejoin drill re-creates exactly this
-   shape; the churn slot admits the new incarnation while the zombie decays. The authoring
-   cadence check already budgets one churn slot against retention.
+   **Churn headroom is MANDATORY (`max_peers ≥ min_peers + expected concurrent churn`), not
+   tuning.** With a FULL fixed roster (min = max), a crashed trainer's roster entry stays
+   healthy-but-absent for `k_absences` rounds while its rejoined incarnation's every Join rejects
+   `RosterFull`; the eventual drop then breaches the membership floor into `WaitingForMembers`
+   (no timeout) with nothing pending, and the frozen guest's announce loop has already stopped on
+   observing round traffic — a deadly embrace that idles the run indefinitely (found live in the
+   three-seat smoke, 2026-08-09; the full mechanism is in that run's VERDICT). G-3's kill+rejoin
+   drill re-creates exactly this shape; the churn slot admits the new incarnation while the
+   zombie decays. Size the headroom against the churn the fleet actually produces: C2 held TWO
+   simultaneously-dead trainer seats (Windows churned while the first zombie was still decaying),
+   which a single slot cannot absorb — one concurrent churn per unreliable host class is the
+   floor, so a three-seat fleet with one flaky host authors `3 / 4`, one with two flaky hosts
+   `3 / 5`. The authoring cadence check budgets the churn slots against retention. Coordinators
+   at the REL-6 revision also decay silent members DURING `WaitingForMembers` (reliability spec
+   §7 [REL-6], the decay-while-waiting repair), so a breached floor now self-heals when
+   replacements join — that is the backstop for headroom mis-sizing, not a license to author
+   min = max.
    **Cadence wiring check:** `--ckpt-cadence` must land in the trainer role's `live` config as
    `remote_ckpt_every` (ABI §12.14 [SF-6] wiring note) — a validated-but-unwired cadence silently
    runs the guest's serde default of 0 (upload at every boundary), so the G-4 gate would never

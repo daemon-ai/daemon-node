@@ -36,7 +36,8 @@ pub use migrate::{
 };
 pub use module::{
     derive_claim, manifest_bytes, trivial_resource_plan, ExecutionGrant, GuestModule,
-    LogicalResourcePlan, ModuleDecl, CERTIFICATION_MINOR_V2,
+    LogicalResourcePlan, ModuleDecl, CERTIFICATION_MINOR_V2, COMP_ERR_GRANT_EXHAUSTED,
+    ENV_STARVED_MINOR_V2, OUTCOME_ENV_STARVED,
 };
 
 /// Report a peer's per-round outcome — the post-ingest det digest plus the barrier's
