@@ -3,8 +3,8 @@
 **Subsystem:** VHC — the environment/consensus boundary (capability providers, trap taxonomy,
 node liveness), post-C2 workstream.
 **Status:** design specification, **implementation in progress** — clauses flip individually
-to **LANDED** with a date as their rungs land (currently: §3 REL-2, §4 REL-3); everything else
-remains specification.
+to **LANDED** with a date as their rungs land (currently: §3 REL-2, §4 REL-3, §5 REL-4,
+§6 REL-5, §6.1 REL-5a); everything else remains specification.
 Revision 2 (2026-08-10) incorporates an external design review: the object-store 403 taxonomy
 (§3), the ABI-minor assignment (§7), the demotion of trap attribution to a bounded heuristic
 (§5), and the qualified evidence claims (§3, §8). Revision 3 (same day, second review round)
@@ -34,7 +34,13 @@ counter-reset-on-spawn-success (RQ-6). Revision 7 (2026-08-11, Rungs 1a+1b lande
 shared `comp_error_code` mapper; RQ-2 resolved inline) to LANDED, both verified by unit tests
 only — no ceremony time consumed. Revision 8 (2026-08-11, Rung 2 landed) flips §5 (REL-4: the
 slice-context attribution heuristic) to LANDED on the same unit-test-only discipline; RQ-3
-(whether the constraints are the right final rule) deliberately stays open.
+(whether the constraints are the right final rule) deliberately stays open. Revision 9
+(2026-08-11, Rung 3 landed) flips §6 (REL-5: the stall observer, dual watermarks, the
+stateful `run_stalled`/`run_progress_resumed` pair) and §6.1 (REL-5a: honest session phase
+strings) to LANDED, records one deviation (the per-run threshold adapts to the *observed*
+inter-commit gap over a 10-minute floor, because the authored round wall is not visible
+host-side), and narrows RQ-4 to its residual (freezing the defaults against a live
+checkpoint-heavy run).
 **Fence:** no change specified here may land while a ceremony that pins the node binaries is in
 flight (C2, run `f35bfa80…`, closed GREEN 2026-08-11 — no ceremony in flight as of Revision 6;
 the fence re-arms with the next authored run). §7 (guest contract) additionally changes the
@@ -447,6 +453,23 @@ accretion that produced the c15 incarnation defects.
 
 ## 6. [REL-5] Node-level stall announcement
 
+**Status: LANDED (2026-08-11).** The stall observer rides `reconcile_tick` exactly as
+specified: per-run `ProgressTrack` carries **two watermarks** (committed progress from
+`RoundOutcome`, local activity from `RoundProgress`/`CheckpointPublished`) resolving RQ-4's
+structural half — the warning keys on committed progress, the detail reports both plus the
+run head (`last_round`) and both ages. The watermark initializes at session readiness (the
+run's own `RunPhase "running"`), so a run that never commits round 1 is detected.
+`run_stalled` is voiced once per episode; the next committed round closes it with
+`run_progress_resumed` — one stateful transition each way. **Deviation from the paragraph
+below, recorded:** the per-run threshold is NOT derived from authored round policy (the
+authored round wall is a guest/consensus-side value the node does not hold); it is
+**adaptive** — `max(10 min floor, 2× the largest observed inter-commit gap for this run)` —
+which self-calibrates to checkpoint-heavy rounds after one slow round has been observed.
+RQ-4's residual (whether the floor and multiplier are the right defaults, and first-round
+behavior before any gap has been observed) still wants a live checkpoint-heavy run before
+freezing. Unit-test verified (episode open/close, single-voicing, adaptive threshold
+stretch); no new event variant, warning class strings only, no wire change.
+
 **Today.** A parked run is silent: consensus `WaitingForMembers` is not mirrored host-side
 (`last_phase` stays `"running"` after attach; the phase enum lives guest-side,
 `coordinator/state.rs:30-34`), a dead session emits nothing, and fleet liveness in C2 depended
@@ -484,6 +507,15 @@ no-progress-while-joined-and-alive, not a guessed `WaitingForMembers`. Precedent
 they already poll (`vhc detail --watch/--json` → `recent_events`).
 
 ### 6.1 [REL-5a] Run-head progress vs session lifecycle — stop conflating them
+
+**Status: LANDED (2026-08-11).** The session now writes honest lifecycle values into the
+existing opaque phase string: `restoring` (a restore pointer is being resolved/rehydrated),
+`catching_up` (a staged catch-up backlog is folding), `running`, `draining` (graceful leave
+in progress). **Deviation, recorded:** the attached value stays `running`, not the
+`attached` this section originally sketched — `"running"` is the exact string the node's
+readiness promotion (Starting → Running) keys on, and it is now emitted only once restore
+and catch-up have genuinely completed, which makes the promotion *more* honest rather than
+renaming it. Display-only opaque string per the wire contract; no wire change.
 
 **Motivating evidence (C2).** Both multi-hour delayed operator responses trace to telemetry
 conflation: a restoring session reports `round=0` while the run head is at 40+;
@@ -891,7 +923,7 @@ artifacts, and the verdict-producing `vhc-replay`.
 | RQ-1 | **Narrowed (§3 landed):** the freshness mechanism is decided and landed (cache invalidation via `presign_fresh`); the conservative S3-vocabulary recognizer is landed. REMAINING: which error bodies R2 actually returns for an aged presigned GET (and whether expiry is enforced at admission or mid-transfer) — an unrecognized shape currently degrades to the loud semantic-403 lane. *Rung 0 (§2.1): no expiry shape anywhere in C2's record — precautionary, not the incident class* | aged-URL probe at the next ceremony's preflight (a URL must age past its server-set TTL — not a short offline test) |
 | RQ-2 | **Resolved (§4 landed):** the exact assignment is pinned in §4's table and by unit test — `Transient{Timeout}`→`Timeout`; every other transient (connect/reset/5xx/other)→`NetUnreachable` (a 5xx/reset is the far end refusing transiently, not a deadline elapsing); `HashMismatch`→`HashMismatch`; miss + every semantic refusal (incl. authoritative post-REL-2 `PresignExpired`)→`StoreRefused` | landed with REL-3 (validated against ABI §7.5) |
 | RQ-3 | Whether §5's minimum constraints are the right final attribution rule, or trap-site metadata / guest-declared conformance / explicit probabilism is needed | operational evidence from the first runs with REL-4 active; revisited at C3 certification |
-| RQ-4 | The REL-5 progress definition: committed-only vs multi-watermark, and threshold behavior across long checkpoint publications | validation against a live checkpoint-heavy run before defaults freeze |
+| RQ-4 | **Structurally resolved (§6 LANDED):** dual watermarks, warning keyed to committed progress, detail reports both; threshold adapts to the observed inter-commit gap (2×) over a 10-min floor. RESIDUAL: are the floor/multiplier the right defaults, and is first-round behavior (no observed gap yet) acceptable | validation against a live checkpoint-heavy run before defaults freeze |
 | RQ-5 | **Partially resolved (§2.1/§9c):** the non-heal mechanism was the unbounded co-trainer respawn cycle, pinned. RESIDUAL: the underlying iroh-vs-WS packet loss behind the standing gap (endpoint logs were not preserved) | §9(a) gap-hold visibility + preserved endpoint logs on the next ceremony |
 | RQ-6 | **Half decided (§2.1/§9d):** the co-trainer lane's missing cycle budget is a defect with a decided direction (primary-keeper discipline: cycle budget + `min_uptime`-style reset, loud escalation). OPEN half: whether transport-class faults then deserve a distinct (longer/slower) lane than guest faults | implementation of §9(d); operational evidence with REL-5 announcing exhaustion |
 | RQ-7 | Ranged single-object GET resume for large payloads (mid-body resets on ~52 MB objects observed; presigned-URL Range semantics unverified; whole-object retry currently cheap enough) | revisit on evidence of retry thrashing; empirical Range probe first |

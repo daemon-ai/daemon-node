@@ -609,6 +609,18 @@ async fn run_role(
              (register_state_chunks + chunk-keyed rehydration)"
         );
     }
+    // REL-5a honest lifecycle phase: a restoring session says so — checkpoint materialization +
+    // by-ref rehydration can take minutes, during which an undifferentiated "running"/round-0
+    // reading is exactly the telemetry conflation that delayed C2's operator responses.
+    if restoring {
+        let _ = events.send(Event::RunPhase {
+            run_id: run_label.to_string(),
+            phase: "restoring".into(),
+            epoch: identity.epoch,
+            round: 0,
+            generation: generation.load(Ordering::SeqCst),
+        });
+    }
     let run = match daemon_vhc_host::run::start_run_migrating(
         &worker, &module, run_cfg, journal, restore,
     ) {
@@ -668,9 +680,17 @@ async fn run_role(
         "role session running: control plane attached, certificate announced"
     );
 
+    // REL-5a: "running" is the READINESS announcement (the node's Starting → Running promotion
+    // keys on it), so a session with a staged catch-up backlog reports "catching_up" here and
+    // claims "running" only once the fold completes — folding can hold the session for minutes,
+    // and a box mid-fold is healthy-but-catching-up, not ready.
     let _ = events.send(Event::RunPhase {
         run_id: run_label.to_string(),
-        phase: "running".into(),
+        phase: if catch_up.is_empty() {
+            "running".into()
+        } else {
+            "catching_up".into()
+        },
         epoch: identity.epoch,
         round: 0,
         generation: generation.load(Ordering::SeqCst),
@@ -732,6 +752,15 @@ async fn run_role(
         .await
         {
             transport_fault = Some(reason);
+        } else {
+            // The fold completed: NOW the session is genuinely ready (REL-5a).
+            let _ = events.send(Event::RunPhase {
+                run_id: run_label.to_string(),
+                phase: "running".into(),
+                epoch: identity.epoch,
+                round: 0,
+                generation: generation.load(Ordering::SeqCst),
+            });
         }
     }
 
@@ -927,6 +956,18 @@ async fn run_role(
         pacer,
     )
     .await;
+
+    // REL-5a: a graceful leave is about to quiesce-drain (snapshot + leave checkpoint — minutes
+    // at ceremony scale); announce the phase so the box reads "draining", never a silent hang.
+    if matches!(leave_requested, Some(LeaveMode::Graceful)) {
+        let _ = events.send(Event::RunPhase {
+            run_id: run_label.to_string(),
+            phase: "draining".into(),
+            epoch: current.identity.epoch,
+            round: 0,
+            generation: gen_now,
+        });
+    }
 
     finish(
         current.run,

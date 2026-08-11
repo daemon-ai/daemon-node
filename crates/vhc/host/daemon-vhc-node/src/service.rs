@@ -412,6 +412,55 @@ struct IrohEndpointOwner {
 /// before a rejoin needs archive catch-up (defect 14's wedge was exactly this drift, unvoiced).
 const CHECKPOINT_LAG_WARN_ROUNDS: u64 = daemon_vhc_proto::RETAINED_RECORD_HORIZON_ROUNDS / 4 * 3;
 
+/// The REL-5 stall-warning floor (reliability spec §6): the minimum no-committed-progress age
+/// before a joined, alive run is announced `run_stalled`. The per-run threshold is
+/// `max(floor, 2 × the slowest inter-commit gap observed on THIS run)` — adaptive per run
+/// because round walls span seconds to many minutes across authored runs, and a healthy live
+/// checkpoint publication (measured 14–25 min, c15h) stretches one inter-round gap that the
+/// adaptive half then covers. Ten minutes absorbs the slow tail seen in C2 while still
+/// beating the multi-hour operator-response delays the warning exists to end (RQ-4: the
+/// derivation is validated against a checkpoint-heavy run before these defaults freeze; an
+/// AUTHORED round wall in the run document remains future vocabulary).
+const RUN_STALL_WARN_FLOOR_MS: i64 = 600_000;
+
+/// REL-5 run-progress track (reliability spec §6): the committed-progress watermark the stall
+/// warning keys on, the local-activity watermark its detail reports, and the observed-cadence
+/// input to the per-run threshold. Keyed by run id; created when the reconcile pass first sees
+/// the row joined + running (session readiness, within one tick), dropped when the row leaves
+/// that state.
+struct ProgressTrack {
+    /// When committed progress (a `RoundOutcome`) was last observed — initialized at track
+    /// creation so a run that never commits round 1 is detected.
+    committed_at_ms: i64,
+    /// The last committed round, `None` until the first `RoundOutcome`.
+    last_round: Option<u64>,
+    /// The slowest inter-commit gap observed on this run (ms) — the adaptive threshold input.
+    max_commit_gap_ms: i64,
+    /// When ANY local activity (`RoundProgress` / `CheckpointPublished`) was last observed —
+    /// reported in the warning detail to distinguish "alive but not committing" from "silent".
+    local_at_ms: i64,
+    /// Whether `run_stalled` has been voiced for the CURRENT episode — one stateful transition
+    /// each way, never a recurring alarm.
+    stalled: bool,
+}
+
+impl ProgressTrack {
+    fn fresh(now: i64) -> Self {
+        Self {
+            committed_at_ms: now,
+            last_round: None,
+            max_commit_gap_ms: 0,
+            local_at_ms: now,
+            stalled: false,
+        }
+    }
+
+    /// The per-run stall threshold (ms): the floor, stretched by observed cadence.
+    fn stall_threshold_ms(&self) -> i64 {
+        RUN_STALL_WARN_FLOOR_MS.max(self.max_commit_gap_ms.saturating_mul(2))
+    }
+}
+
 /// Durable-checkpoint lag alarm state for one role-instance generation (Gate B').
 #[derive(Default)]
 struct CkptLagTrack {
@@ -523,6 +572,10 @@ pub struct VhcService {
     /// Durable-checkpoint lag alarm state, `run id → generation → track` (Gate B'): fed by
     /// `CheckpointPublished` (the fence) and `RoundOutcome` (the head), cleared on leave/wipe.
     ckpt_lag: Mutex<BTreeMap<String, BTreeMap<u64, CkptLagTrack>>>,
+    /// REL-5 run-progress watermarks, `run id → track`: fed by `RoundOutcome` (committed) and
+    /// `RoundProgress`/`CheckpointPublished` (local activity); the reconcile tick's stall
+    /// observer reads them. Cleared on leave/wipe and when the row leaves joined + running.
+    progress: Mutex<BTreeMap<String, ProgressTrack>>,
     /// The coalescing vhc-feed revision stamped on each `VhcChanged` pointer.
     rev: AtomicU64,
     /// The pinned iroh bind port per run label (chosen once per node lifetime, so the published
@@ -582,6 +635,7 @@ impl VhcService {
             feed: parts.feed,
             current_run: Mutex::new(None),
             ckpt_lag: Mutex::new(BTreeMap::new()),
+            progress: Mutex::new(BTreeMap::new()),
             rev: AtomicU64::new(0),
             iroh_ports: Mutex::new(BTreeMap::new()),
             iroh_endpoint: Mutex::new(BTreeMap::new()),
@@ -1128,6 +1182,71 @@ impl VhcService {
                         ),
                     );
                 }
+            }
+        }
+        // REL-5 stall observer (reliability spec §6): a joined, alive run whose committed
+        // progress has aged past its per-run threshold is announced ONCE (`run_stalled`);
+        // `run_progress_resumed` closes the episode from the event pump. Detection only —
+        // recovery stays with the keeper (REL-9). Tracks are created here at the first tick
+        // that observes the row joined + running (session readiness, within one tick) and
+        // dropped when the row leaves that state, so a fresh incarnation restarts its watermark.
+        {
+            let now = now_ms();
+            let live: Vec<String> = self
+                .store
+                .list_runs()?
+                .into_iter()
+                .filter(|r| {
+                    r.desired_state == DesiredState::Joined && r.run_state == RunState::Running
+                })
+                .map(|r| r.run_id)
+                .collect();
+            let fire: Vec<(String, String)> = {
+                let mut progress = self.progress.lock().unwrap();
+                progress.retain(|id, _| live.contains(id));
+                let mut fire = Vec::new();
+                for run_id in &live {
+                    let t = progress
+                        .entry(run_id.clone())
+                        .or_insert_with(|| ProgressTrack::fresh(now));
+                    let age = now.saturating_sub(t.committed_at_ms);
+                    let threshold = t.stall_threshold_ms();
+                    if !t.stalled && age > threshold {
+                        t.stalled = true;
+                        let round = t
+                            .last_round
+                            .map_or("no round committed yet".to_string(), |r| {
+                                format!("last committed round {r}")
+                            });
+                        fire.push((
+                            run_id.clone(),
+                            format!(
+                                "no committed round for {}s ({round}; last local activity {}s \
+                                 ago; threshold {}s = max({}s floor, 2× the slowest observed \
+                                 inter-round gap)) — the session is alive and joined but the \
+                                 run head is not advancing",
+                                age / 1000,
+                                now.saturating_sub(t.local_at_ms) / 1000,
+                                threshold / 1000,
+                                RUN_STALL_WARN_FLOOR_MS / 1000,
+                            ),
+                        ));
+                    }
+                }
+                fire
+            };
+            for (run_id, detail) in fire {
+                tracing::warn!(run = run_id, "{detail}");
+                let mut emitted = Vec::new();
+                let _ = self.emit(
+                    VhcEvent::Warning {
+                        run_id: run_id.clone(),
+                        class: "run_stalled".to_string(),
+                        detail,
+                    },
+                    &mut emitted,
+                );
+                self.emit_changed(Some(run_id));
             }
         }
         Ok(reconverged)
@@ -1864,6 +1983,54 @@ impl VhcService {
             _ => {}
         }
 
+        let mut emitted = Vec::new();
+
+        // REL-5 progress watermarks (reliability spec §6): committed progress (`RoundOutcome`)
+        // advances the watermark the stall observer keys on and closes an announced stall; local
+        // activity (`RoundProgress` / `CheckpointPublished`) advances the watermark the warning
+        // detail reports. The inter-commit gap feeds the per-run adaptive threshold.
+        {
+            let resumed = {
+                let mut progress = self.progress.lock().unwrap();
+                match ev {
+                    protocol::Event::RoundOutcome { round, .. } => {
+                        progress.get_mut(&run_id).and_then(|t| {
+                            let now = now_ms();
+                            let gap = now.saturating_sub(t.committed_at_ms);
+                            t.max_commit_gap_ms = t.max_commit_gap_ms.max(gap);
+                            t.committed_at_ms = now;
+                            t.local_at_ms = now;
+                            t.last_round = Some(*round);
+                            std::mem::take(&mut t.stalled).then_some((*round, gap))
+                        })
+                    }
+                    protocol::Event::RoundProgress { .. }
+                    | protocol::Event::CheckpointPublished { .. } => {
+                        if let Some(t) = progress.get_mut(&run_id) {
+                            t.local_at_ms = now_ms();
+                        }
+                        None
+                    }
+                    _ => None,
+                }
+            };
+            if let Some((round, gap_ms)) = resumed {
+                let detail = format!(
+                    "committed progress resumed at round {round} after {}s without a commit",
+                    gap_ms / 1000
+                );
+                tracing::info!(run = run_id, "{detail}");
+                self.emit(
+                    VhcEvent::Warning {
+                        run_id: run_id.clone(),
+                        class: "run_progress_resumed".to_string(),
+                        detail,
+                    },
+                    &mut emitted,
+                )?;
+            }
+        }
+
         // Checkpoint-pointer publication (spec §9): the checkpoint DOCUMENT is already on
         // the payload plane (the session put it there); record the round → content-address
         // pointer at the registry under the run's `(role, kind)` slot so a late joiner restores
@@ -1947,7 +2114,6 @@ impl VhcService {
             }
         }
 
-        let mut emitted = Vec::new();
         // The durable-checkpoint lag alarm (Gate B'; defect 14's unvoiced drift): the FENCE a
         // rejoin would restore from is the freshest DURABLE checkpoint (`CheckpointPublished` —
         // doc + chunks on the content plane), and it trails the head by checkpoint assembly +
@@ -4110,6 +4276,7 @@ impl VhcApi for VhcService {
         // The run holds no role-instance here anymore: this node's iroh endpoint is unowned.
         self.forget_node_iroh_endpoint(&run_id);
         self.ckpt_lag.lock().unwrap().remove(&run_id);
+        self.progress.lock().unwrap().remove(&run_id);
         // A leaving coordinator surrenders its seat (fenced release; the floor persists).
         self.release_seat_for(&run_id).await;
         self.emit_changed(Some(run_id));
@@ -6039,6 +6206,104 @@ mod storage_gate_tests {
                 .iter()
                 .any(|e| matches!(e, VhcEvent::Warning { class, .. } if class == "checkpoint_lag")),
             "the lag warning is a persisted event"
+        );
+    }
+
+    /// REL-5 stall observer (reliability spec §6): a joined, alive run whose committed progress
+    /// ages past the per-run threshold is announced `run_stalled` exactly ONCE per episode, and
+    /// a committed round closes the episode with `run_progress_resumed` — one stateful
+    /// transition each way, never a recurring alarm.
+    #[tokio::test]
+    async fn a_stalled_run_is_announced_once_and_closed_by_committed_progress() {
+        let svc = coordinator_trainer_service(OwnerBudget::unbounded());
+        seed_joined_run(&svc, "run-stall", 4);
+        svc.store.mark_running("run-stall").expect("running");
+        let stall_count = |svc: &VhcService| {
+            svc.store
+                .recent_events("run-stall", 64)
+                .expect("events read")
+                .into_iter()
+                .filter(|e| matches!(e, VhcEvent::Warning { class, .. } if class == "run_stalled"))
+                .count()
+        };
+
+        // The first tick creates the watermark at readiness; a fresh run never warns.
+        svc.reconcile_tick().await.expect("tick");
+        assert_eq!(stall_count(&svc), 0, "a fresh watermark does not warn");
+
+        // Age the committed watermark past the floor: ONE warning, then silence.
+        {
+            let mut progress = svc.progress.lock().unwrap();
+            let t = progress
+                .get_mut("run-stall")
+                .expect("track created at readiness");
+            t.committed_at_ms -= RUN_STALL_WARN_FLOOR_MS + 60_000;
+        }
+        svc.reconcile_tick().await.expect("tick");
+        assert_eq!(stall_count(&svc), 1, "the stall is voiced");
+        svc.reconcile_tick().await.expect("tick");
+        assert_eq!(stall_count(&svc), 1, "an announced episode never re-voices");
+        let detail = svc
+            .store
+            .recent_events("run-stall", 64)
+            .expect("events read")
+            .into_iter()
+            .find_map(|e| match e {
+                VhcEvent::Warning { class, detail, .. } if class == "run_stalled" => Some(detail),
+                _ => None,
+            })
+            .expect("the stall detail persists");
+        assert!(
+            detail.contains("no committed round for") && detail.contains("threshold"),
+            "the detail carries the ages and the threshold derivation: {detail}"
+        );
+
+        // A committed round closes the episode LOUDLY (the resumed half of the pair)…
+        svc.handle_worker_event(&protocol::Event::RunPhase {
+            run_id: "run-stall".into(),
+            phase: "running".into(),
+            epoch: 0,
+            round: 0,
+            generation: 4,
+        })
+        .expect("phase attributes the run");
+        let outs = svc
+            .handle_worker_event(&protocol::Event::RoundOutcome {
+                round: 3,
+                committed: 2,
+                ingested: 2,
+                stalled: false,
+                digest: [0u8; 16],
+                generation: 4,
+            })
+            .expect("outcome handled");
+        assert!(
+            outs.iter().any(
+                |e| matches!(e, VhcEvent::Warning { class, .. } if class == "run_progress_resumed")
+            ),
+            "committed progress closes the episode"
+        );
+
+        // …and a NEW stall episode re-arms. The threshold is now adaptive: the aged gap above
+        // stretched max_commit_gap_ms, so the re-aging must clear 2× that observed gap.
+        {
+            let mut progress = svc.progress.lock().unwrap();
+            let t = progress.get_mut("run-stall").expect("track survives");
+            assert!(!t.stalled, "the resumed transition cleared the episode");
+            t.committed_at_ms -= t.stall_threshold_ms() + 60_000;
+        }
+        svc.reconcile_tick().await.expect("tick");
+        assert_eq!(stall_count(&svc), 2, "a new episode is voiced anew");
+
+        // A run that leaves joined+running drops its track (no warning for a parked row).
+        svc.store
+            .begin_release("run-stall", RunState::Left, None)
+            .expect("release");
+        svc.store.commit_release("run-stall").expect("commit");
+        svc.reconcile_tick().await.expect("tick");
+        assert!(
+            !svc.progress.lock().unwrap().contains_key("run-stall"),
+            "the track is dropped with the row's liveness"
         );
     }
 

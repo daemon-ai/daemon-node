@@ -671,6 +671,20 @@ frozen localizes the loss between the dual plane and the attach (look at `refuse
 Repeated `deaf_reconnects` without recovery is a registry finding — archive and adjudicate,
 never wait it out.
 
+**Stall announcement (reliability spec §6, REL-5).** A joined, alive run whose committed
+progress has aged past its per-run threshold (adaptive: 2× the largest observed inter-commit
+gap, 10-minute floor) voices a `run_stalled` warning in `detail`'s recent events — once per
+episode, closed by `run_progress_resumed` on the next committed round. The detail carries the
+last committed round and BOTH ages (committed vs. local activity): committed old + local
+fresh reads "the box is working but nothing is committing" (checkpoint publication, or the
+quorum is parked — check the other boxes); both old reads "this box itself is idle". A
+`run_stalled` that stands while other boxes advance is the §5.5-shape incident — do not wait
+it out. Session `phase` values are now honest lifecycle states (reliability spec §6.1):
+`restoring` and `catching_up` are healthy transits (watch them progress, minutes at ceremony
+scale), `running` means genuinely attached and live, `draining` is a graceful leave in
+flight — a box showing `restoring`/`catching_up` with a stale run head is catching up, not
+wedged.
+
 ### 5.5 Churn drills (G-3/G-4)
 
 - **Hard-kill drill at ~round 12** (first checkpoint exists at 8): on the Mac, `kill -9` the
