@@ -127,10 +127,20 @@ impl<P: PresignClient> R2Store<P> {
         self.presign.presign(&self.run, &req).await
     }
 
-    /// One attempt of a content-addressed put: presign (fresh each attempt) + presigned `PUT`.
-    async fn put_content_once(&self, hash: &ContentHash, bytes: &[u8]) -> Result<(), VhcNetError> {
+    /// One attempt of a content-addressed put: presign (`fresh` bypasses the presign cache — the
+    /// expiry-retry lane, which must never re-serve a rejected credential) + presigned `PUT`.
+    async fn put_content_once(
+        &self,
+        hash: &ContentHash,
+        bytes: &[u8],
+        fresh: bool,
+    ) -> Result<(), VhcNetError> {
         let req = PresignRequest::artifact(PresignOp::Put, content_rel(hash));
-        let resp = self.presign.presign(&self.run, &req).await?;
+        let resp = if fresh {
+            self.presign.presign_fresh(&self.run, &req).await?
+        } else {
+            self.presign.presign(&self.run, &req).await?
+        };
         let egress_resp = if resp.headers.is_empty() {
             self.egress
                 .put(&resp.url, bytes.to_vec(), Redirects::None)
@@ -147,6 +157,10 @@ impl<P: PresignClient> R2Store<P> {
                 .map_err(transport)?
         };
         let status = egress_resp.status();
+        if status == reqwest::StatusCode::FORBIDDEN {
+            let body = egress_resp.bytes().await.unwrap_or_default();
+            return Err(forbidden_error("PUT", &resp.url, &body));
+        }
         if !status.is_success() {
             return Err(status_error(
                 status,
@@ -179,15 +193,40 @@ impl<P: PresignClient> R2Store<P> {
             let bytes = egress_resp.bytes().await.map_err(read_body)?;
             return Ok(Some(bytes.to_vec()));
         }
-        // 404 (never stored / lifecycle-expired) and 403 (SignatureExpired at the object store) are
-        // the availability misses the stall ladder consumes — not hard faults.
-        if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::FORBIDDEN {
+        // 404 (never stored / lifecycle-expired) is the availability miss the stall ladder
+        // consumes — not a hard fault.
+        if status == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
+        }
+        // 403 is NOT a miss — the object may well exist (REL-2, reliability spec §3). A
+        // recognized credential-expiry body is the typed re-presign lane; any other 403 is an
+        // authoritative authorization refusal retrying cannot change.
+        if status == reqwest::StatusCode::FORBIDDEN {
+            let body = egress_resp.bytes().await.unwrap_or_default();
+            return Err(forbidden_error("GET", &resp.url, &body));
         }
         Err(status_error(
             status,
             format!("presigned GET {} returned {status}", resp.url),
         ))
+    }
+
+    /// One attempt of a content-addressed get: presign (`fresh` bypasses the presign cache — the
+    /// expiry-retry lane) + presigned `GET`; an absent object is the typed miss.
+    async fn get_content_once(
+        &self,
+        hash: &ContentHash,
+        fresh: bool,
+    ) -> Result<Vec<u8>, VhcNetError> {
+        let req = PresignRequest::artifact(PresignOp::Get, content_rel(hash));
+        let resp = if fresh {
+            self.presign.presign_fresh(&self.run, &req).await?
+        } else {
+            self.presign.presign(&self.run, &req).await?
+        };
+        self.get_object(&resp)
+            .await?
+            .ok_or_else(|| VhcNetError::PayloadMiss(hash.to_hex()))
     }
 }
 
@@ -270,9 +309,12 @@ impl<P: PresignClient> crate::transport::ContentStore for R2Store<P> {
         // dropped multi-hundred-MB upload would kill an otherwise healthy round. Bounded retries
         // with a fresh presign per attempt (the previous URL may have aged out during a slow
         // upload); a non-transient refusal (a 4xx status) still fails fast and loud.
+        let mut expiry_retried = false;
+        let mut fresh = false;
         let mut last: Option<VhcNetError> = None;
-        for attempt in 0..PUT_ATTEMPTS {
-            if attempt > 0 {
+        let mut attempt = 0;
+        while attempt < PUT_ATTEMPTS {
+            if attempt > 0 && !fresh {
                 let backoff = PUT_BACKOFF_BASE * 2u32.pow(attempt - 1);
                 tracing::warn!(
                     hash = %hash.to_hex(),
@@ -282,9 +324,22 @@ impl<P: PresignClient> crate::transport::ContentStore for R2Store<P> {
                 );
                 tokio::time::sleep(backoff).await;
             }
-            match self.put_content_once(&hash, bytes).await {
+            match self
+                .put_content_once(&hash, bytes, std::mem::take(&mut fresh))
+                .await
+            {
                 Ok(()) => return Ok(hash),
-                Err(e) if is_transient(&e) => last = Some(e),
+                // The object store rejected the credential as expired while the local cache may
+                // still consider it live: one immediate retry on a guaranteed-fresh presign,
+                // outside the transient budget. A second expiry is authoritative.
+                Err(VhcNetError::PresignExpired(_)) if !expiry_retried => {
+                    expiry_retried = true;
+                    fresh = true;
+                }
+                Err(e) if is_transient(&e) => {
+                    last = Some(e);
+                    attempt += 1;
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -292,19 +347,51 @@ impl<P: PresignClient> crate::transport::ContentStore for R2Store<P> {
     }
 
     async fn get_content(&self, hash: &ContentHash) -> Result<Vec<u8>, VhcNetError> {
-        let req = PresignRequest::artifact(PresignOp::Get, content_rel(hash));
-        let resp = self.presign.presign(&self.run, &req).await?;
-        let bytes = self
-            .get_object(&resp)
-            .await?
-            .ok_or_else(|| VhcNetError::PayloadMiss(hash.to_hex()))?;
-        // The requested address is not always the object's plain blake3: a chunk-addressed corpus
-        // shard is keyed by its domain-separated CHUNK FOLD, which never equals `blake3(bytes)`.
-        // The PUMP verifies every fetched object (plain hash for payloads/checkpoints/whole
-        // artifacts, covering-chunk hashes for chunk-addressed shards), so this seat serves the
-        // keyed bytes verbatim — a plain-hash gate here would wrongly reject every chunk-addressed
-        // range fetch (the store is untrusted by construction; the pump is the arbiter).
-        Ok(bytes)
+        // GET-side absorption (REL-2, reliability spec §3): a transient egress fault on a
+        // committed-payload read must not surface as a hard completion failure — the C2 evidence
+        // class is a single mid-body TCP reset, for which bounded whole-object retry is the
+        // right first knob (spec §2.1). A genuine miss (404) never retries: retention truth is
+        // the stall ladder's to consume, immediately.
+        let mut expiry_retried = false;
+        let mut fresh = false;
+        let mut attempt = 0;
+        loop {
+            match self
+                .get_content_once(hash, std::mem::take(&mut fresh))
+                .await
+            {
+                // Served verbatim: the requested address is not always the object's plain blake3
+                // (a chunk-addressed corpus shard is keyed by its domain-separated CHUNK FOLD),
+                // so verification is the PUMP's job — plain hash for payloads/checkpoints/whole
+                // artifacts, covering-chunk hashes for shards. A plain-hash gate here would
+                // wrongly reject every chunk-addressed range fetch (the store is untrusted by
+                // construction; the pump is the arbiter).
+                Ok(bytes) => return Ok(bytes),
+                // The expiry-retry lane: one immediate re-fetch on a guaranteed-fresh presign
+                // (cache bypassed — `cached()` could re-serve exactly the rejected URL), outside
+                // the transient budget. A second expiry is authoritative (a misconfigured
+                // coordinator), never a silent loop.
+                Err(VhcNetError::PresignExpired(_)) if !expiry_retried => {
+                    expiry_retried = true;
+                    fresh = true;
+                }
+                Err(e) if is_transient(&e) => {
+                    attempt += 1;
+                    if attempt >= GET_ATTEMPTS {
+                        return Err(e);
+                    }
+                    let backoff = GET_BACKOFF_BASE * 2u32.pow(attempt - 1);
+                    tracing::warn!(
+                        hash = %hash.to_hex(),
+                        attempt,
+                        error = %e,
+                        "content get failed transiently; retrying after {backoff:?}"
+                    );
+                    tokio::time::sleep(backoff).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 }
 
@@ -313,6 +400,44 @@ const PUT_ATTEMPTS: u32 = 4;
 
 /// The first retry backoff; doubles per attempt (2 s, 4 s, 8 s).
 const PUT_BACKOFF_BASE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How many times a content get is attempted before its transport fault becomes the caller's.
+const GET_ATTEMPTS: u32 = 4;
+
+/// The first GET retry backoff; doubles per attempt (1 s, 2 s, 4 s). Tuned from the C2 evidence
+/// (reliability spec §2.1): the observed fault class is a single mid-body reset with no
+/// saturation signature, so short flat-start pacing recovers it without stacking meaningful
+/// latency onto the blocked guest completion.
+const GET_BACKOFF_BASE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Whether an object-store `403` body carries a credential-expiry shape. Conservative on the
+/// S3-compatible error vocabulary an aged presigned URL produces (`Request has expired` under
+/// `AccessDenied`, `ExpiredToken`/`ExpiredRequest` codes); everything else stays an
+/// authoritative refusal. The exact bodies R2 returns — and whether it enforces expiry at
+/// request admission or mid-transfer — are RQ-1's empirical probe (reliability spec §16); C2's
+/// record contains no expiry-shaped fault, so this lane is precautionary correctness.
+fn body_is_expiry(body: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(body);
+    ["Request has expired", "ExpiredToken", "ExpiredRequest"]
+        .iter()
+        .any(|marker| text.contains(marker))
+}
+
+/// Type an object-store `403`: a recognized credential-expiry body is the typed
+/// [`VhcNetError::PresignExpired`] the re-presign lane consumes; anything else is an
+/// authoritative semantic refusal (never a miss — the object may well exist).
+fn forbidden_error(op: &str, url: &str, body: &[u8]) -> VhcNetError {
+    let snippet: String = String::from_utf8_lossy(body).chars().take(200).collect();
+    if body_is_expiry(body) {
+        VhcNetError::PresignExpired(format!(
+            "presigned {op} {url} rejected by the object store as expired: {snippet}"
+        ))
+    } else {
+        VhcNetError::Transport(format!(
+            "presigned {op} {url} returned 403 Forbidden: {snippet}"
+        ))
+    }
+}
 
 /// Whether a put fault is worth retrying in-attempt: exactly the TYPED transient lane
 /// (egress send faults, gateway 5xx — [`VhcNetError::Transient`]). A semantic
@@ -658,6 +783,247 @@ mod tests {
             ),
             "got {err:?}"
         );
+    }
+
+    // --- REL-2: GET-side absorption + the 403 taxonomy (reliability spec §3) ---------------------
+
+    /// A presign stub that mints a DISTINCT URL per mint (`/mint-<n>/...`) and counts mints —
+    /// makes the fresh-credential lane observable (a re-served cached URL would repeat `mint-0`).
+    struct CountingPresign {
+        base: String,
+        mints: std::sync::atomic::AtomicU32,
+    }
+
+    impl CountingPresign {
+        fn new(base: impl Into<String>) -> Self {
+            Self {
+                base: base.into(),
+                mints: std::sync::atomic::AtomicU32::new(0),
+            }
+        }
+
+        fn minted(&self) -> u32 {
+            self.mints.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl PresignClient for &CountingPresign {
+        async fn presign(
+            &self,
+            _run: &RunId,
+            req: &PresignRequest,
+        ) -> Result<PresignResponse, VhcNetError> {
+            let n = self.mints.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(PresignResponse {
+                url: format!(
+                    "{}/mint-{n}/{}",
+                    self.base,
+                    r2_object_key(&run(), req).unwrap()
+                ),
+                expires_at: u64::MAX,
+                headers: std::collections::BTreeMap::new(),
+            })
+        }
+    }
+
+    const EXPIRY_BODY: &str =
+        "<Error><Code>AccessDenied</Code><Message>Request has expired</Message></Error>";
+
+    /// REL-2: a transient server fault on a presigned GET is absorbed by bounded retry — the
+    /// C2 mid-body-reset class must not surface as a hard completion failure.
+    #[tokio::test]
+    async fn get_content_retries_a_transient_server_fault() {
+        use daemon_egress::{EgressClient, EgressConfig};
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(502))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"recovered".to_vec()))
+            .mount(&server)
+            .await;
+
+        let presign = CountingPresign::new(server.uri());
+        let store = R2Store::new(
+            &presign,
+            EgressClient::new(EgressConfig::default()).unwrap(),
+            run(),
+        );
+        let got = store
+            .get_content(&blake3_hash(b"whatever"))
+            .await
+            .expect("one 502 is absorbed");
+        assert_eq!(got, b"recovered");
+    }
+
+    /// REL-2: a genuine miss (404) NEVER retries — retention truth belongs to the stall ladder,
+    /// immediately. The mock's `expect(1)` verifies exactly one GET was issued.
+    #[tokio::test]
+    async fn get_content_miss_never_retries() {
+        use daemon_egress::{EgressClient, EgressConfig};
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let presign = CountingPresign::new(server.uri());
+        let store = R2Store::new(
+            &presign,
+            EgressClient::new(EgressConfig::default()).unwrap(),
+            run(),
+        );
+        let err = store
+            .get_content(&blake3_hash(b"whatever"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, VhcNetError::PayloadMiss(_)), "got {err:?}");
+        assert_eq!(presign.minted(), 1, "a miss must not re-presign");
+    }
+
+    /// REL-2: a recognized expiry-shaped 403 re-fetches ONCE on a guaranteed-fresh credential
+    /// (observable: the second GET rides a `mint-1` URL, so a re-served cached URL would fail).
+    #[tokio::test]
+    async fn get_content_expiry_403_refetches_on_fresh_presign() {
+        use daemon_egress::{EgressClient, EgressConfig};
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex("^/mint-0/"))
+            .respond_with(ResponseTemplate::new(403).set_body_string(EXPIRY_BODY))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex("^/mint-1/"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"fresh".to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let presign = CountingPresign::new(server.uri());
+        let store = R2Store::new(
+            &presign,
+            EgressClient::new(EgressConfig::default()).unwrap(),
+            run(),
+        );
+        let got = store
+            .get_content(&blake3_hash(b"whatever"))
+            .await
+            .expect("the fresh-credential re-fetch recovers");
+        assert_eq!(got, b"fresh");
+        assert_eq!(presign.minted(), 2, "exactly one fresh re-mint");
+    }
+
+    /// REL-2: a SECOND expiry-shaped 403 is authoritative — the lane never loops silently.
+    #[tokio::test]
+    async fn get_content_second_expiry_is_authoritative() {
+        use daemon_egress::{EgressClient, EgressConfig};
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(403).set_body_string(EXPIRY_BODY))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let presign = CountingPresign::new(server.uri());
+        let store = R2Store::new(
+            &presign,
+            EgressClient::new(EgressConfig::default()).unwrap(),
+            run(),
+        );
+        let err = store
+            .get_content(&blake3_hash(b"whatever"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, VhcNetError::PresignExpired(_)), "got {err:?}");
+        assert_eq!(
+            presign.minted(),
+            2,
+            "initial + one fresh re-mint, never more"
+        );
+    }
+
+    /// REL-2: a 403 WITHOUT an expiry shape is an authoritative semantic refusal — never a miss
+    /// (the object may well exist), never retried.
+    #[tokio::test]
+    async fn get_content_plain_403_is_semantic_not_miss() {
+        use daemon_egress::{EgressClient, EgressConfig};
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .set_body_string("<Error><Code>AccessDenied</Code></Error>"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let presign = CountingPresign::new(server.uri());
+        let store = R2Store::new(
+            &presign,
+            EgressClient::new(EgressConfig::default()).unwrap(),
+            run(),
+        );
+        let err = store
+            .get_content(&blake3_hash(b"whatever"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, VhcNetError::Transport(_)), "got {err:?}");
+    }
+
+    /// REL-2 (the PUT loop shares the caveat): an expiry-shaped 403 on a presigned PUT re-puts
+    /// ONCE on a guaranteed-fresh credential, outside the transient budget.
+    #[tokio::test]
+    async fn put_content_expiry_403_reputs_on_fresh_presign() {
+        use daemon_egress::{EgressClient, EgressConfig};
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path_regex("^/mint-0/"))
+            .respond_with(ResponseTemplate::new(403).set_body_string(EXPIRY_BODY))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path_regex("^/mint-1/"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let presign = CountingPresign::new(server.uri());
+        let store = R2Store::new(
+            &presign,
+            EgressClient::new(EgressConfig::default()).unwrap(),
+            run(),
+        );
+        let hash = store
+            .put_content(b"sealed-object")
+            .await
+            .expect("the fresh-credential re-put recovers");
+        assert_eq!(hash, blake3_hash(b"sealed-object"));
+        assert_eq!(presign.minted(), 2, "exactly one fresh re-mint");
     }
 
     /// NET-4: cross-store dyn fallback — an `R2Store` primary that misses falls through to an

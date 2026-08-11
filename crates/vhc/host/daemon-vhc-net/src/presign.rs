@@ -152,6 +152,20 @@ pub trait PresignClient: Send + Sync {
         run: &RunId,
         req: &PresignRequest,
     ) -> Result<PresignResponse, VhcNetError>;
+
+    /// Presign one object for `run`, guaranteeing a **freshly-minted** credential: any cached
+    /// URL for this request is invalidated first. The expiry-retry lane depends on this — the
+    /// object store can reject a URL the local cache still considers live (clock skew, the
+    /// store's own expiry evaluation), and re-entering plain [`PresignClient::presign`] would
+    /// re-serve exactly the rejected credential (REL-2, reliability spec §3). The default
+    /// forwards to `presign`, which is correct for every cacheless implementation.
+    async fn presign_fresh(
+        &self,
+        run: &RunId,
+        req: &PresignRequest,
+    ) -> Result<PresignResponse, VhcNetError> {
+        self.presign(run, req).await
+    }
 }
 
 /// The cache key: a run + the fully-qualified object request. `ObjectKind`/`PresignOp` are `Hash`.
@@ -334,6 +348,21 @@ impl PresignClient for HttpPresignClient {
                 .insert(cache_key, presigned.clone());
         }
         Ok(presigned)
+    }
+
+    async fn presign_fresh(
+        &self,
+        run: &RunId,
+        req: &PresignRequest,
+    ) -> Result<PresignResponse, VhcNetError> {
+        // Drop the cached credential first: the caller just had a URL rejected that `cached()`
+        // may still consider live (skew, the object store's own expiry reading), so a plain
+        // `presign` could re-serve exactly the rejected URL.
+        self.cache
+            .lock()
+            .expect("presign cache mutex")
+            .remove(&CacheKey::of(run, req));
+        self.presign(run, req).await
     }
 }
 
@@ -575,5 +604,40 @@ mod tests {
         let b = client.presign(&run, &req).await.unwrap();
         assert_eq!(a.url, b.url);
         // `server` drop verifies the `.expect(1)`.
+    }
+
+    /// REL-2 freshness guarantee: `presign_fresh` invalidates the cached credential and mints —
+    /// the expiry-retry lane must never be re-served the URL the object store just rejected.
+    /// Exactly two POSTs: the initial mint (then a cache hit proves the cache was live) and the
+    /// forced fresh mint.
+    #[tokio::test]
+    async fn presign_fresh_bypasses_a_live_cache_entry() {
+        use daemon_egress::{EgressClient, EgressConfig};
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let resp = PresignResponse {
+            url: format!("{}/obj/x", server.uri()),
+            expires_at: now_unix() + 900,
+            headers: BTreeMap::new(),
+        };
+        Mock::given(method("POST"))
+            .and(path_regex(r"/presign$"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::to_value(&resp).unwrap()),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let egress = EgressClient::new(EgressConfig::default()).unwrap();
+        let client = HttpPresignClient::new(egress, format!("{}/api/v1/vhc", server.uri()));
+        let run = RunId::new("run-c");
+        let req = PresignRequest::payload(PresignOp::Get, 1, "aabb");
+        client.presign(&run, &req).await.unwrap(); // mint 1, cached
+        client.presign(&run, &req).await.unwrap(); // cache hit — no POST
+                                                   // The forced-fresh call invalidates and mints again; `server` drop verifies `.expect(2)`.
+        client.presign_fresh(&run, &req).await.unwrap();
     }
 }
