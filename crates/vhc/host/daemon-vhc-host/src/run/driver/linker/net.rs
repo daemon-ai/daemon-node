@@ -13,6 +13,26 @@ use crate::run::driver::host::{build_signed_frame, read_guest, stash, Host};
 use crate::run::ops::OpRequest;
 use crate::trap::{Trap, TrapCode};
 
+/// REL-10 (reliability spec §12): the by-ref family folds a payload carries WHEN it is the
+/// host's §10.2 checkpoint-document shape — the committed run evidence that extends the
+/// admitted artifact set for the putting incarnation. Any other payload (including one that
+/// happens to be CBOR but not the doc shape) yields nothing.
+fn checkpoint_evidence_folds(bytes: &[u8]) -> Vec<[u8; 32]> {
+    daemon_vhc_proto::det_state::decode_checkpoint_doc(bytes)
+        .map(|(_, sections)| {
+            sections
+                .iter()
+                .filter_map(|s| match s {
+                    daemon_vhc_proto::det_state::CkptDocSection::ByRef(_, family) => {
+                        Some(family.fold.0)
+                    }
+                    daemon_vhc_proto::det_state::CkptDocSection::Inline(..) => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Link the `net@2` imports.
 #[allow(clippy::too_many_lines)]
 pub(super) fn link(linker: &mut Linker<Host>) -> Result<(), wasmtime::Error> {
@@ -33,8 +53,25 @@ pub(super) fn link(linker: &mut Linker<Host>) -> Result<(), wasmtime::Error> {
                 let op = st.ops.begin(request.clone()).map_err(|code| {
                     Trap::new(code, "payload_put", None, "max_outstanding grant (§2.3)")
                 })?;
+                // REL-10 (reliability spec §12): a put whose bytes carry the host's §10.2
+                // checkpoint-document shape is this run's own rotation minting COMMITTED run
+                // evidence — the document's by-ref family folds join the admitted artifact
+                // set (the `da_migrate` precedent, generalized to the continuous case), so a
+                // later re-fetch of a rotated fold (e.g. after the sealed store evicted the
+                // superseded generation) is served from the content plane instead of trapping
+                // GrantViolation. Deterministic guest output (the put CALL, not its service),
+                // so replay reproduces the same extension at the same point; a fetch of a
+                // hash with NO committed evidence still traps.
+                let OpRequest::PayloadPut { bytes: put_bytes } = &request else {
+                    unreachable!("constructed above")
+                };
+                let evidence_folds = checkpoint_evidence_folds(put_bytes);
                 st.op_requests.push((op, request));
                 st.note_egress();
+                drop(st);
+                for fold in evidence_folds {
+                    c.data_mut().granted_artifacts.insert(fold);
+                }
                 Ok(op)
             })(&mut c);
             stash(&mut c, r)
@@ -251,4 +288,51 @@ pub(super) fn link(linker: &mut Linker<Host>) -> Result<(), wasmtime::Error> {
     )?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::checkpoint_evidence_folds;
+    use daemon_vhc_proto::det_state::{
+        encode_checkpoint_doc, family_fold, CkptDocSection, FamilyRef,
+    };
+    use daemon_vhc_proto::Hash;
+
+    /// REL-10 (reliability spec §12): ONLY the host's checkpoint-document shape mints evidence
+    /// folds — its by-ref families, exactly; inline sections, arbitrary bytes, and non-doc CBOR
+    /// yield nothing (a fetch of a hash with no committed evidence keeps trapping).
+    #[test]
+    fn only_a_checkpoint_document_extends_the_evidence_granted_set() {
+        let chunk_hashes = vec![Hash([0x11; 32]), Hash([0x22; 32])];
+        let family = FamilyRef {
+            fold: family_fold(32, 64, &chunk_hashes),
+            byte_len: 64,
+            chunk_size: 32,
+            chunk_hashes,
+        };
+        let doc = encode_checkpoint_doc(
+            b"manifest",
+            &[
+                CkptDocSection::Inline("small".into(), vec![1, 2, 3]),
+                CkptDocSection::ByRef("master".into(), family.clone()),
+            ],
+        )
+        .expect("doc encodes");
+
+        assert_eq!(
+            checkpoint_evidence_folds(&doc),
+            vec![family.fold.0],
+            "the by-ref folds — and only those — are the committed evidence"
+        );
+        assert!(
+            checkpoint_evidence_folds(b"not a doc").is_empty(),
+            "arbitrary bytes mint nothing"
+        );
+        let cbor_not_doc =
+            daemon_vhc_proto::to_canonical_vec(&vec![1u64, 2, 3]).expect("cbor encodes");
+        assert!(
+            checkpoint_evidence_folds(&cbor_not_doc).is_empty(),
+            "CBOR that is not the doc shape mints nothing"
+        );
+    }
 }

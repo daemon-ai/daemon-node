@@ -58,7 +58,11 @@ landed) flips §11 (REL-9: the bounded stall-recycle riding the ordinary retryab
 the completion stand-down checking run-terminal evidence before any retry) to LANDED; RQ-8
 is decided conservatively — external run-head progress is the ONLY reaction condition taken,
 the whole-run-wedge exception is deliberately NOT implemented (revisit with C3's
-decay-while-waiting fix, which removes most of that class at the source).
+decay-while-waiting fix, which removes most of that class at the source). Revision 14
+(2026-08-11, Rung 8 landed) flips §12 (REL-10: continuous evidence-based grant extension at
+the `PayloadPut` seam — the `da_migrate` precedent generalized; the `grants.cddl`
+artifacts-field drift repaired beside it) to LANDED on the unit-test-only discipline; RQ-10
+(first-class grant classes/planes) stays a C3 ABI-minor design item.
 **Fence:** no change specified here may land while a ceremony that pins the node binaries is in
 flight (C2, run `f35bfa80…`, closed GREEN 2026-08-11 — no ceremony in flight as of Revision 6;
 the fence re-arms with the next authored run). §7 (guest contract) additionally changes the
@@ -894,6 +898,19 @@ budget, no consensus-side action.
 
 ## 12. [REL-10] Grant staleness under checkpoint rotation
 
+**Status: LANDED (2026-08-11, Rung 8).** The continuous case is closed at the one seam where
+committed run evidence is minted deterministically: a `net@2::payload_put` whose bytes carry
+the host's §10.2 checkpoint-document shape has its ByRef family folds inserted into the
+putting incarnation's `granted_artifacts` (`linker/net.rs`, `checkpoint_evidence_folds`) —
+the put CALL is guest output and journaled, so replay reproduces the identical extension at
+the identical point. Any other payload (including CBOR that is not the doc shape) mints
+nothing; a fetch of a hash with NO committed evidence still traps `GrantViolation`
+(deterministic defect lane, unchanged). The normative `grants.cddl` drift is repaired: the
+optional `artifacts` field the Rust `GrantsDoc` already carried is now in the schema,
+annotated that runtime evidence extension is host memory and never re-encoded into the
+document. Verified by unit tests (fold extraction: doc shape with mixed inline/by-ref
+sections, arbitrary bytes, non-doc CBOR; grammar: `grants-doc` with `artifacts` validates).
+
 **Motivating evidence (C2, a wholly new defect class — journal-proven, §2.1: the tag-9
 `GrantViolation` trap for artifact `ec95d3d6` is in the product archive, trainer-2 inst 22).**
 The guest trapped
@@ -1010,5 +1027,5 @@ artifacts, and the verdict-producing `vhc-replay`.
 | RQ-7 | Ranged single-object GET resume for large payloads (mid-body resets on ~52 MB objects observed; presigned-URL Range semantics unverified; whole-object retry currently cheap enough) | revisit on evidence of retry thrashing; empirical Range probe first |
 | RQ-8 | **Decided conservatively (§11 LANDED):** external run-head progress is the ONLY reaction condition taken — a never-committed session is never recycled, and the whole-run-wedged 8b shape (zombie seat holder is this box) is deliberately left to the operator today. REMAINING: whether a bounded exception is worth taking at all once the §7 decay-while-waiting fix lands | revisited with C3's decay-while-waiting fix, which removes most of that class at the source |
 | RQ-9 | **Structurally resolved (§10 LANDED):** the gate ships — `budget ≥ stop_rounds × growth + 25% restore headroom`, unbounded-budget warning. RESIDUAL: the growth figure is operator-supplied; sourcing it from banked preflight evidence (fit-probe vs smoke transcript) and freezing the 25% headroom margin remain open | banked preflight evidence from C2 + the three-seat smoke |
-| RQ-10 | First-class grant classes/planes in the ABI grants document (vs hash enumeration + evidence-based extension) | C3 ABI-minor scoping; REL-10's host-side extension is sufficient until then |
+| RQ-10 | First-class grant classes/planes in the ABI grants document (vs hash enumeration + evidence-based extension) | C3 ABI-minor scoping; REL-10's host-side extension (§12 LANDED) is sufficient until then |
 | RQ-11 | The det-state eviction/retention contradiction (§2.1): the store evicted a chunk a still-retained sealed fold references (`state_store.rs:688-705`), and the guest saw `HASH_MISMATCH` for a fault that mismatched nothing. Two halves: the retention-window defect (why did eviction run ahead of the sealed-fold reference?) and the dishonest code (REL-3's mapper direction) | retention-window audit of `state_store` eviction against the sealed-fold retention contract; code honesty lands with REL-3 |

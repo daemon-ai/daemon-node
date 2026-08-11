@@ -120,6 +120,7 @@ fn grants_doc_root_validates() {
         ("channels", Value::Array(vec![channel])),
         ("events", event_caps()),
         ("buffers", buffer_req()),
+        ("artifacts", Value::Array(vec![b(&H32)])),
         (
             "migration",
             map(vec![

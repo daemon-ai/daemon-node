@@ -37,6 +37,11 @@ grants-doc = {
   "channels":     [* channel-decl],   ; the ADMITTED channel table (§6.2)
   "events":       event-caps,         ; admitted advisory depths (≤ manifest request)
   "buffers":      buffer-req,          ; admitted quotas (≤ manifest request)
+  ? "artifacts":  [* hash32],         ; the admitted artifact set the role may data@2::fetch (§3.2)
+                                      ; — the ADMISSION-frozen enumeration; the host additionally
+                                      ; grants folds named by this run's committed checkpoint
+                                      ; documents at runtime (host memory, never re-encoded here —
+                                      ; reliability spec §12 [REL-10])
   ? "migration":  migration-grant,
 }
 
