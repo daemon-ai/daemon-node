@@ -21,8 +21,12 @@ reproduce it bit-for-bit (§1.4).
 ABI (interface groups, manifest schema, SDK slot crates, grant enforcement, the `plan@1`
 derivation contract in full), drafted in parallel with this spec; `vhc-migration.md`
 (forthcoming) — the current-code → v2 seam map, staged implementation waves, the complete litmus
-decompositions, and the swarm→vhc rename manifest. Where this spec defers a detail to a
-companion, the deferral is explicit.
+decompositions, and the swarm→vhc rename manifest;
+[`vhc-capability-reliability-spec.md`](vhc-capability-reliability-spec.md) — the post-C2
+capability-seam reliability workstream (transient absorption at the environment boundary,
+truthful failure naming, environmental trap attribution, node-level stall announcement;
+design specification, pre-implementation). Where this spec defers a detail to a companion,
+the deferral is explicit.
 
 **The archived program architecture doc is a TARGET where it diverges.** The frozen
 `daemon-vhc-architecture.md` (archived under the program docs) reads as current in places where

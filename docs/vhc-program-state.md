@@ -194,6 +194,26 @@ telemetry, and docs surface.
   `9ce5a0b4…`). **Consequence bound into Phase 5: the C2 genesis carries churn headroom
   (`max_peers = min_peers + 1`)** — G-3's trainer kill+rejoin drill re-creates exactly this
   deadlock on a full roster.
+- **C2 COMPLETE + CERTIFIED GREEN (2026-08-09 → 08-11, Phases 5–7 of the closure plan) — the
+  ceremony gate is CLOSED.** Run `f35bfa80…` (`c2-20260809`, genesis min 3 / max 4 churn
+  headroom, stop 48, cadence 4, node `851a2ef6`/worktree `b43901ff`): **all 48 rounds
+  committed, `terminal(0)` closure**, ~2.5 days wall including a planned multi-hour host
+  suspension and ~10 unplanned trainer incarnation cycles — none of which broke the digest
+  chain. The pulled 6.6 GB product archive certifies **GREEN under the frozen offline
+  verifier**: AGREE, closure `terminal(0)`, **4-instance coordinator lineage (3
+  reconstruction seams, every anchor + kind-3 bound)**, 1,282,416 records, 48 unique rounds
+  (785,318 replay-forward duplicates deduped), **23 peer keys, ALL rounds AGREE** — the
+  program's first fleet-scale terminal certification (G-2 continuous transcript, G-3
+  hard-kill + leave/rejoin drills through the churn slot, G-4 restores all banked). The run
+  doubled as the reliability workstream's motivating corpus: 8a/8b recurred on all three
+  boxes, plus new classes (recovery-seam disk-quota stacking, fresh-grant `GrantViolation`
+  staleness, unrecoverable inbound sequence gap, post-completion straggler stand-down, and
+  the archive-pull no-retry/no-resume gap — field-patched tool-side as REL-2a groundwork,
+  `xtask` +39/−5 on `b43901ff`, verification posture unchanged). Evidence:
+  `~/experiments/ceremony-artifacts/c2-20260809/` — `VERDICT.md` (sha256 `dcc0f98d…`),
+  `FREEZE.md`, `LEDGER.md`, verdict JSON `319cf8a7…`. All three boxes parked clean
+  (leave + wipe: Strix 21.0 / M4 42.0 / Windows 54.9 GB reclaimed; keystores + archive
+  planes + sealed binaries retained).
 - The pre-c15 hardening waves (One-Lifecycle/Two-Identities, checkpoint durability seam,
   typed storage taxonomy + disk custodian [AR-9], deaf-path relay-first DO + heartbeat +
   deafness verdict, incremental authenticated archive publication [AR-1..6], product
@@ -231,11 +251,17 @@ telemetry, and docs surface.
      announce loop stops on OBSERVING round traffic (`admitted` flips on any `RoundOpen`),
      not on actual admission — an unadmitted rejoiner goes silent and cannot heal a later
      roster vacancy. Both mitigated by the C2 churn-headroom genesis (non-claim → recorded
-     defect, three-seat smoke).
+     defect, three-seat smoke). Both recurred live during C2 (transient R2 egress fault →
+     guest trap → multi-hour `WaitingForMembers` stall, manual leave/rejoin recovery); the
+     post-C2 mitigation design is tracked in
+     [`specs/vhc-capability-reliability-spec.md`](specs/vhc-capability-reliability-spec.md)
+     (pre-implementation; nothing landed).
 - C0: green and pinned. C1: green on hardware. C1.5 recovery-first: **closed at
   `068873f2`** (c15 series). Windows 5090 full node: **GREEN (above)**. Three-seat smoke:
-  **GREEN (above)**. Remaining rungs: freeze → C2 → closure (plan
-  `cross-chain_certification_and_c2_closure_82651370`).
+  **GREEN (above)**. **C2: COMPLETE + CERTIFIED `terminal(0)` (above) — the ladder is
+  closed** (plan `cross-chain_certification_and_c2_closure_82651370`, all phases done).
+  Next workstream: capability-seam reliability
+  (`specs/vhc-capability-reliability-spec.md`, fence lifted by this closure).
 - Program archive: frozen and locked read-only 2026-07-27.
 
 <details>
@@ -527,11 +553,14 @@ All four answer ssh (verified 2026-08-04). Next actions (in order; the active pl
 7. ~~Three-seat smoke~~ DONE — `three-seat-smoke-a` COMPLETED 6/6, three-way byte-identical
    digests every round, multi-seam `terminal(0)` certification GREEN; the `RosterFull`
    crash-rejoin deadlock found + root-caused from the archive, boxes parked (§7).
-8. Freeze (human ratifies `authoring-report.txt` before seeding — runbook §4.7 gate); the
-   C2 genesis MUST carry churn headroom (`max_peers = min_peers + 1` — the three-seat
-   deadlock consequence) and the smoke-calibrated timers; memoized preflight; run C2 (G-2
-   transcript, G-3 drills, G-4 restore, completion, archive pull, GREEN `terminal`-closure
-   replay); evidence closure; human-signed master merge.
+8. ~~Freeze → C2 → closure~~ DONE — genesis `f35bfa80…` ratified + frozen (min 3 / max 4
+   churn headroom), 48/48 rounds, `terminal(0)`, archive pulled + certified GREEN by the
+   frozen verifier (23 peer keys, all rounds AGREE), evidence closed
+   (`~/experiments/ceremony-artifacts/c2-20260809/VERDICT.md`), all boxes parked (§7).
+   The human-signed master merge is the one remaining human act.
+9. Capability-seam reliability workstream (plan `capability-seam_reliability_workstream_
+   a62e90c2`, spec `specs/vhc-capability-reliability-spec.md`) — fence lifted by the C2
+   closure; its motivating corpus is C2's harvested defect ledger.
 
 ## 9. Agent contract
 
