@@ -312,6 +312,7 @@ pub fn start_run_migrating(
                     pending_readback_value: None,
                     in_run: false,
                     slice_ordinal: None,
+                    delivered_completion_failure: None,
                     slices_delivered: 0,
                     log_calls_this_phase: 0,
                     log_bytes_this_phase: 0,
@@ -707,6 +708,12 @@ pub(super) fn take_trap(store: &mut Store<Host>, e: wasmtime::Error) -> Trap {
             format!("{message} — {}", trap.detail)
         };
     }
+    // The failed completion the trapping slice consumed, if any (REL-4 attribution evidence).
+    // No context comparison is needed: the evidence lives on the ACTIVE slice and is cleared the
+    // moment the guest asks for the next event, so whatever is here at trap time belongs to the
+    // slice the trap occurred in — a between-slices or later-slice trap reads `None` by
+    // construction.
+    trap.env_completion = store.data().slice.delivered_completion_failure.clone();
     trap
 }
 

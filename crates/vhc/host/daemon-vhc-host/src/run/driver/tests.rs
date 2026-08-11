@@ -17,7 +17,7 @@ use daemon_vhc_proto::{peer_id, to_canonical_vec, SigningKey};
 use wasmtime::StoreLimitsBuilder;
 
 use crate::run::buffer::BufferTable;
-use crate::run::completion::{CompError, CompletionResult};
+use crate::run::completion::{CompError, CompletionResult, SuccessPayload};
 use crate::run::driver::BufferStreams;
 use crate::run::journal::{JournalSink, MemorySink, SinkEntry};
 use crate::run::ops::{OpRequest, OpTable};
@@ -595,6 +595,7 @@ fn signed_frame_carries_the_full_scope_tuple_and_verifies() {
             pending_readback_value: None,
             in_run: false,
             slice_ordinal: None,
+            delivered_completion_failure: None,
             slices_delivered: 0,
             log_calls_this_phase: 0,
             log_bytes_this_phase: 0,
@@ -671,6 +672,38 @@ fn signed_frame_carries_the_full_scope_tuple_and_verifies() {
     .expect("§12.1 signature verifies");
 }
 
+// -- REL-4: a failed completion queues its typed evidence; a success queues none ------------------
+
+/// The evidence the attribution heuristic consumes is populated at ENQUEUE, from the typed
+/// `CompletionResult` — delivery then only moves it onto the active slice, and never re-decodes
+/// the frozen frame.
+#[test]
+fn a_failed_completion_queues_its_typed_evidence_and_a_success_queues_none() {
+    let mut st = test_state(Box::new(MemorySink::new()));
+    st.enqueue_completion(
+        9,
+        &CompletionResult::Err(CompError {
+            code: daemon_vhc_abi::COMP_ERR_TIMEOUT,
+            detail: Some("the per-request deadline elapsed".into()),
+        }),
+    )
+    .unwrap();
+    st.enqueue_completion(10, &CompletionResult::Ok(SuccessPayload::Unit))
+        .unwrap();
+    let failed = st.queue.pop_front().expect("failed completion queued");
+    let env = failed
+        .completion_failure
+        .expect("typed evidence rides the failed completion");
+    assert_eq!(env.op, 9);
+    assert_eq!(env.code, daemon_vhc_abi::COMP_ERR_TIMEOUT);
+    assert_eq!(env.detail, "the per-request deadline elapsed");
+    let ok = st.queue.pop_front().expect("success completion queued");
+    assert!(
+        ok.completion_failure.is_none(),
+        "a success carries no failure evidence"
+    );
+}
+
 // -- the journalled terminal context is the real one, not a hard-coded literal --------------------
 
 /// A `SliceState` in the "nothing has happened yet" position, for the derivation table below.
@@ -688,6 +721,7 @@ fn quiescent_slice() -> SliceState {
         pending_readback_value: None,
         in_run: false,
         slice_ordinal: None,
+        delivered_completion_failure: None,
         slices_delivered: 0,
         log_calls_this_phase: 0,
         log_bytes_this_phase: 0,

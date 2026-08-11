@@ -43,6 +43,9 @@ pub(crate) struct QueuedEvent {
     /// Advisory gossip-class identity `(channel, arrival seq, sender)` — present iff this is a
     /// gossip frame (drop-oldest accounting + the tag-7 drop identity, §4.7).
     pub(crate) gossip_id: Option<(u32, u64, [u8; 32])>,
+    /// The typed failure this frame carries, iff it is a FAILED completion — retained on the
+    /// activated slice at delivery so a trap inside that slice carries its evidence (REL-4).
+    pub(crate) completion_failure: Option<crate::trap::EnvCompletion>,
 }
 
 pub(crate) struct ArmedTimer {
@@ -282,6 +285,16 @@ impl PumpState {
             result: result.clone(),
         })
         .map_err(|e| SinkError::protocol(e.to_string()))?;
+        // A FAILED completion rides its typed evidence alongside the frozen frame, so delivery
+        // can retain it on the activated slice (REL-4 attribution input) without re-decoding.
+        let completion_failure = match result {
+            CompletionResult::Err(e) => Some(crate::trap::EnvCompletion {
+                op,
+                code: e.code,
+                detail: e.detail.clone().unwrap_or_default(),
+            }),
+            CompletionResult::Ok(_) => None,
+        };
         self.queue.push_back(QueuedEvent {
             frame_bytes,
             tag: daemon_vhc_abi::EV_TAG_COMPLETION,
@@ -290,6 +303,7 @@ impl PumpState {
             timer_id: None,
             is_budget: false,
             gossip_id: None,
+            completion_failure,
         });
         Ok(())
     }
@@ -313,6 +327,7 @@ impl PumpState {
             timer_id: None,
             is_budget: false,
             gossip_id: None,
+            completion_failure: None,
         });
         Ok(())
     }
@@ -337,6 +352,7 @@ impl PumpState {
             timer_id: None,
             is_budget: false,
             gossip_id: None,
+            completion_failure: None,
         });
         Ok(())
     }
@@ -441,6 +457,7 @@ impl PumpHandle {
             timer_id: None,
             is_budget: false,
             gossip_id: None,
+            completion_failure: None,
         });
         drop(st);
         self.shared.wake.notify_all();
@@ -509,6 +526,7 @@ impl PumpHandle {
             timer_id: None,
             is_budget: false,
             gossip_id: Some((channel, seq, sender)),
+            completion_failure: None,
         });
         drop(st);
         self.shared.wake.notify_all();
@@ -565,6 +583,7 @@ impl PumpHandle {
             timer_id: None,
             is_budget: false,
             gossip_id: None,
+            completion_failure: None,
         });
         drop(st);
         self.shared.wake.notify_all();
@@ -616,6 +635,7 @@ impl PumpHandle {
             timer_id: None,
             is_budget: true,
             gossip_id: None,
+            completion_failure: None,
         });
         drop(st);
         self.shared.wake.notify_all();
@@ -756,6 +776,7 @@ impl PumpHandle {
             timer_id: None,
             is_budget: false,
             gossip_id: None,
+            completion_failure: None,
         });
         drop(st);
         self.shared.wake.notify_all();
@@ -1289,6 +1310,7 @@ pub(crate) fn fire_due_timers(st: &mut PumpState, now: u64) -> Result<(), Trap> 
             timer_id: Some(t.id),
             is_budget: false,
             gossip_id: None,
+            completion_failure: None,
         });
     }
     Ok(())

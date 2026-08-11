@@ -2598,6 +2598,34 @@ fn classify_trap(trap: &daemon_vhc_host::trap::Trap) -> TerminalOutcome {
         TrapCode::HostStorageFailed => TerminalOutcome::FailedTerminal {
             reason: format!("host storage fault (operator action required): {trap}"),
         },
+        // REL-4 (reliability spec §5): the bounded environmental-attribution HEURISTIC for frozen
+        // guests. A guest panic is retryable ONLY when the trapping slice itself consumed a failed
+        // completion (evidence attached at `take_trap` from the active slice — adjacency by
+        // construction, cleared on `next_event`) AND that failure was environment-class per the
+        // §4 mapper: TIMEOUT / NET_UNREACHABLE only. STORE_REFUSED, HASH_MISMATCH and
+        // GRANT_EXHAUSTED stay terminal by design — attributing those would paper over guest
+        // backpressure and host retention defects that have their own rungs. Temporal correlation,
+        // never causal proof: the reason says so, carries the evidence, and the retry budget
+        // bounds a mis-attribution (a genuinely divergent module re-traps and escalates).
+        TrapCode::GuestPanic => {
+            let env = trap.env_completion.as_ref().filter(|c| {
+                c.code == daemon_vhc_abi::COMP_ERR_TIMEOUT
+                    || c.code == daemon_vhc_abi::COMP_ERR_NET_UNREACHABLE
+            });
+            match env {
+                Some(c) => TerminalOutcome::FailedRetryable {
+                    reason: format!(
+                        "env-attributed trap (heuristic): op {} failed {} ({}); {trap}",
+                        c.op,
+                        daemon_vhc_abi::comp_err_slug(c.code).unwrap_or("?"),
+                        c.detail
+                    ),
+                },
+                None => TerminalOutcome::FailedTerminal {
+                    reason: format!("module trapped: {trap}"),
+                },
+            }
+        }
         _ => TerminalOutcome::FailedTerminal {
             reason: format!("module trapped: {trap}"),
         },
@@ -2808,6 +2836,60 @@ mod tests {
 
     fn trap(code: TrapCode) -> Trap {
         Trap::new(code, "publish", None, "test")
+    }
+
+    /// REL-4 (spec §5): the environmental-attribution heuristic's whitelist, pinned exactly. A
+    /// guest panic is retryable ONLY with slice-adjacent TIMEOUT/NET_UNREACHABLE evidence; every
+    /// other code — and no evidence at all — stays terminal.
+    #[test]
+    fn guest_panic_attribution_requires_adjacent_env_class_evidence() {
+        use daemon_vhc_host::trap::EnvCompletion;
+        let with_env = |code: u64| {
+            let mut t = trap(TrapCode::GuestPanic);
+            t.env_completion = Some(EnvCompletion {
+                op: 42,
+                code,
+                detail: "connection reset by peer".into(),
+            });
+            t
+        };
+        // The two environment classes attribute — labelled a heuristic, carrying the evidence.
+        for code in [
+            daemon_vhc_abi::COMP_ERR_TIMEOUT,
+            daemon_vhc_abi::COMP_ERR_NET_UNREACHABLE,
+        ] {
+            match classify_trap(&with_env(code)) {
+                TerminalOutcome::FailedRetryable { reason } => {
+                    assert!(
+                        reason.starts_with("env-attributed trap (heuristic): op 42 failed "),
+                        "{reason}"
+                    );
+                    assert!(reason.contains("connection reset by peer"), "{reason}");
+                }
+                other => panic!("expected retryable, got {other:?}"),
+            }
+        }
+        // Semantic / integrity / backpressure classes NEVER attribute (spec §5 calibration):
+        // GRANT_EXHAUSTED and HASH_MISMATCH panics have their own rungs; papering over them
+        // here would hide a guest backpressure defect and a host retention defect.
+        for code in [
+            daemon_vhc_abi::COMP_ERR_STORE_REFUSED,
+            daemon_vhc_abi::COMP_ERR_HASH_MISMATCH,
+            daemon_vhc_abi::COMP_ERR_GRANT_EXHAUSTED,
+        ] {
+            assert!(
+                matches!(
+                    classify_trap(&with_env(code)),
+                    TerminalOutcome::FailedTerminal { .. }
+                ),
+                "code {code} must stay terminal"
+            );
+        }
+        // No evidence (a between-slices or non-completion-slice panic) stays terminal.
+        assert!(matches!(
+            classify_trap(&trap(TrapCode::GuestPanic)),
+            TerminalOutcome::FailedTerminal { .. }
+        ));
     }
 
     /// REL-3: the shared mapper's RQ-2 assignment, pinned exactly (spec §4 / ABI §7.5). A drift

@@ -32,7 +32,9 @@ respawn lane's unbounded flap cycle (461 attempt-0 cycles at flat 1 s pace) is p
 counter-reset-on-spawn-success (RQ-6). Revision 7 (2026-08-11, Rungs 1a+1b landed) flips §3
 (REL-2: GET-side absorption, the 403/expiry taxonomy, presign freshness) and §4 (REL-3: the
 shared `comp_error_code` mapper; RQ-2 resolved inline) to LANDED, both verified by unit tests
-only — no ceremony time consumed.
+only — no ceremony time consumed. Revision 8 (2026-08-11, Rung 2 landed) flips §5 (REL-4: the
+slice-context attribution heuristic) to LANDED on the same unit-test-only discipline; RQ-3
+(whether the constraints are the right final rule) deliberately stays open.
 **Fence:** no change specified here may land while a ceremony that pins the node binaries is in
 flight (C2, run `f35bfa80…`, closed GREEN 2026-08-11 — no ceremony in flight as of Revision 6;
 the fence re-arms with the next authored run). §7 (guest contract) additionally changes the
@@ -363,7 +365,7 @@ deterministic-safe (the journal records what the guest saw) and landed outside a
 freeze. Note the C2-frozen tiny-llama predates honest codes: archives sealed before this
 change still read uniform `STORE_REFUSED` (the §2.1 decode discipline stands for them).
 
-## 5. [REL-4] Environmental trap attribution — a bounded compatibility heuristic
+## 5. [REL-4] Environmental trap attribution — a bounded compatibility heuristic — LANDED (2026-08-11)
 
 **What this is.** Temporal correlation, not causal proof: the trap carries no op identity, so
 "the guest trapped right after an environment-class failure" can never establish that the
@@ -402,6 +404,16 @@ metadata `(op, code, detail)`; trap classification reads it from the trap's capt
 Adjacency and clearing then fall out of the mechanism itself — a trap between slices
 (`slice_ordinal = None`) or in a later slice is unattributable by construction, rather than by
 a reconstructed delivery-ordinal comparison.
+
+**Landed exactly as specified above:** a failed completion's typed `(op, code, detail)` is
+captured at enqueue (`EnvCompletion`, `pump.rs enqueue_completion` — from the typed
+`CompletionResult`, never re-decoded from the frozen frame), moved onto the activated slice at
+delivery and cleared at the same seam that ends the slice (`vhc.rs next_event`), attached to
+the trap at the single trap-consumption point (`take_trap`), and consumed by the session's
+`classify_trap` GuestPanic arm under the whitelist below. The trap journal record is
+unchanged (the terminal record's fields are picked explicitly). Unit tests pin the whitelist
+(both env classes attribute; `STORE_REFUSED`/`HASH_MISMATCH`/`GRANT_EXHAUSTED` and
+evidence-free panics stay terminal) and the enqueue-side evidence capture.
 
 A `GuestPanic` trap classifies `FailedRetryable` only when ALL hold (normative regardless of
 mechanism):

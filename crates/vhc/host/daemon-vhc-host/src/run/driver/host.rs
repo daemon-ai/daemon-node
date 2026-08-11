@@ -55,6 +55,11 @@ pub(crate) struct SliceState {
     /// from "in slice n", and attributing a between-slices trap to the last slice that happened to
     /// run would point a reader at code that had already returned.
     pub(crate) slice_ordinal: Option<u64>,
+    /// The typed failure the ACTIVE slice's event carried, iff that event was a failed completion
+    /// (REL-4 attribution evidence). Set at delivery, cleared at the same seam as
+    /// [`Self::slice_ordinal`] — so, by construction, a trap between slices or in a later slice
+    /// cannot observe a stale failure.
+    pub(crate) delivered_completion_failure: Option<crate::trap::EnvCompletion>,
     /// How many event slices have been delivered. Zero means the first event has not arrived, which
     /// is what distinguishes "before the first slice" from "between slices".
     pub(crate) slices_delivered: u64,

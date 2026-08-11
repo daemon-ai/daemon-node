@@ -146,6 +146,23 @@ impl fmt::Display for TrapCode {
     }
 }
 
+/// The FAILED completion the trapping event slice consumed, when it consumed one — the evidence
+/// behind the REL-4 environmental-trap attribution heuristic (reliability spec §5).
+///
+/// Carried by construction, not reconstruction: the metadata lives on the active slice state
+/// (set at delivery, cleared when the guest asks for the next event), so a trap between slices or
+/// in a later slice cannot pick it up. Presence means exactly "the slice this trap occurred in was
+/// the one that delivered this failed completion" — temporal adjacency, **never causal proof**.
+#[derive(Debug, Clone)]
+pub struct EnvCompletion {
+    /// The op the completion answered.
+    pub op: u64,
+    /// The ABI §7.5 `comp-error` code (honest post-REL-3 classes).
+    pub code: u64,
+    /// The completion's human-readable detail (empty when it carried none).
+    pub detail: String,
+}
+
 /// A typed trap: the code plus the import, entry point, and a human detail (ABI §3.6).
 #[derive(Debug, Clone)]
 pub struct Trap {
@@ -160,6 +177,10 @@ pub struct Trap {
     pub entry_point: Option<&'static str>,
     /// A human-readable detail.
     pub detail: String,
+    /// The failed completion the trapping slice consumed, when it consumed one (REL-4 evidence;
+    /// see [`EnvCompletion`]). Attached at the single trap-consumption seam (`take_trap`), `None`
+    /// everywhere a trap is constructed.
+    pub env_completion: Option<EnvCompletion>,
 }
 
 impl Trap {
@@ -176,6 +197,7 @@ impl Trap {
             import,
             entry_point,
             detail: detail.into(),
+            env_completion: None,
         }
     }
 

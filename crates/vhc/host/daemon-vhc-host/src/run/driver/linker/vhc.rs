@@ -56,8 +56,10 @@ pub(super) fn link(linker: &mut Linker<Host>) -> Result<(), wasmtime::Error> {
                 c.data_mut().enter("next_event")?;
                 // Asking for the next event ends the slice that was active: from here until the
                 // next delivery the instance is genuinely between slices, and a trap in that window
-                // must not be attributed to the slice that already returned.
+                // must not be attributed to the slice that already returned. The slice's delivered
+                // completion evidence dies with it (REL-4 adjacency by construction).
                 c.data_mut().slice.slice_ordinal = None;
+                c.data_mut().slice.delivered_completion_failure = None;
                 // The bounded-guest-memory MEASUREMENT (the declared-budget evidence surface): wasm
                 // linear memory never shrinks, so its size at the one seam every event slice passes
                 // through is the run's high-water. Recorded here so a run's real footprint is a
@@ -102,7 +104,7 @@ pub(super) fn link(linker: &mut Linker<Host>) -> Result<(), wasmtime::Error> {
                 }
                 let shared = c.data().shared.clone();
                 // Park until an event is deliverable, firing due timers ourselves (§6.3).
-                let (frame, at) = {
+                let (mut frame, at) = {
                     let mut st = shared.state.lock().expect("pump lock");
                     loop {
                         // Rig delivery hold (D2 back-pressure prerequisite): freeze all delivery so
@@ -223,9 +225,11 @@ pub(super) fn link(linker: &mut Linker<Host>) -> Result<(), wasmtime::Error> {
                 d.slice.op_calls = 0;
                 d.slice.readback_bytes = 0;
                 // The slice becomes active here, and its ordinal is the delivery count — so a trap
-                // inside it names the slice it is actually in.
+                // inside it names the slice it is actually in. A failed completion's typed evidence
+                // rides onto the slice (REL-4): present only while THIS slice is the active one.
                 d.slice.slice_ordinal = Some(d.slice.slices_delivered);
                 d.slice.slices_delivered = d.slice.slices_delivered.saturating_add(1);
+                d.slice.delivered_completion_failure = frame.completion_failure.take();
                 if frame.tag == EV_TAG_STOP {
                     d.slice.stopped = true;
                 }
