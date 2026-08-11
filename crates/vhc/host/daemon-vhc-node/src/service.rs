@@ -418,9 +418,11 @@ const CHECKPOINT_LAG_WARN_ROUNDS: u64 = daemon_vhc_proto::RETAINED_RECORD_HORIZO
 /// because round walls span seconds to many minutes across authored runs, and a healthy live
 /// checkpoint publication (measured 14–25 min, c15h) stretches one inter-round gap that the
 /// adaptive half then covers. Ten minutes absorbs the slow tail seen in C2 while still
-/// beating the multi-hour operator-response delays the warning exists to end (RQ-4: the
-/// derivation is validated against a checkpoint-heavy run before these defaults freeze; an
-/// AUTHORED round wall in the run document remains future vocabulary).
+/// beating the multi-hour operator-response delays the warning exists to end (RQ-4
+/// RESOLVED: frozen against the banked C2 transcript — healthy cadence 5–8 min,
+/// checkpoint-follow rounds 13.6–20.9 min, and the replayed rule tripped only on genuine
+/// degradation plus one benign self-clearing first-checkpoint warning; an AUTHORED round
+/// wall in the run document remains future vocabulary).
 const RUN_STALL_WARN_FLOOR_MS: i64 = 600_000;
 
 /// REL-9(a) (reliability spec §11): the reaction multiplier — the keeper recycles a stalled
