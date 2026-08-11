@@ -549,6 +549,15 @@ pub struct VhcService {
     /// terminal silently halved the run's membership until the operator intervened (c15k:
     /// `OUTCOME_STALE_RESTORE` after coordinator reconstruction stalled the run for good).
     co_retry: Mutex<BTreeMap<String, (u32, i64)>>,
+    /// REL-7(d), reliability spec §9: the co-located trainer's CYCLE budget ledger,
+    /// `run id → (short-lived flap cycles, last spawn unix ms)`. `co_retry` above counts only
+    /// consecutive spawn REFUSALS (cleared on every successful spawn), so a flap-die-respawn
+    /// loop ran unbounded — C2 recorded 461 `attempt 0` cycles at flat 1 s pace. This ledger
+    /// survives successful spawns and adopts the primary keeper's discipline: a sibling
+    /// terminal counts against `retry.max_retries` unless the session survived
+    /// `retry.min_uptime_ms` (which resets the count); exhaustion parks the respawn lane
+    /// loudly instead of silently cycling a dead seat forever.
+    co_cycles: Mutex<BTreeMap<String, (u32, i64)>>,
     worker_factory: Option<WorkerFactory>,
     /// The identity keystore directory (D-P8 credential + per-run cert authorship); `None`
     /// disables node-side authorship (tests / headless).
@@ -626,6 +635,7 @@ impl VhcService {
             co_trainers: Mutex::new(BTreeMap::new()),
             bring_up: Mutex::new(std::collections::BTreeSet::new()),
             co_retry: Mutex::new(BTreeMap::new()),
+            co_cycles: Mutex::new(BTreeMap::new()),
             worker_factory: parts.worker_factory,
             identity_dir: parts.identity_dir,
             run_dir: parts.run_dir,
@@ -1143,6 +1153,7 @@ impl VhcService {
                 });
                 if torn_down {
                     self.co_retry.lock().unwrap().remove(&run_id);
+                    self.co_cycles.lock().unwrap().remove(&run_id);
                     continue;
                 }
                 let primary_live = self.instances.lock().unwrap().contains_key(&run_id);
@@ -1742,6 +1753,14 @@ impl VhcService {
                 worker,
             },
         );
+        // Stamp the spawn for the cycle-budget uptime judgment (REL-7(d)): a sibling that
+        // survives `min_uptime_ms` from here resets the flap-cycle count on its next terminal.
+        self.co_cycles
+            .lock()
+            .unwrap()
+            .entry(run_id.to_string())
+            .or_insert((0, 0))
+            .1 = now_ms();
         self.spawn_pump(Some((run_id.to_string(), generation)), rx);
         self.emit_changed(Some(run_id.to_string()));
     }
@@ -2275,6 +2294,44 @@ impl VhcService {
                     _ => (false, ""),
                 };
                 if respawn {
+                    // REL-7(d), reliability spec §9: the CYCLE budget — the `co_retry`
+                    // attempts counter below is cleared on every successful spawn (it counts
+                    // consecutive spawn refusals), so it never bounded a flap-die-respawn
+                    // loop (C2: 461 `attempt 0` cycles, ≥ 2.7 h of churn). The primary
+                    // keeper's discipline applies instead: this terminal counts a cycle
+                    // UNLESS the sibling survived `min_uptime_ms` (which resets the count);
+                    // an exhausted budget parks the lane LOUDLY — a dead network must
+                    // surface, never hide behind an eternally-cycling seat.
+                    let cycles = {
+                        let mut cyc = self.co_cycles.lock().unwrap();
+                        let entry = cyc.entry(run_id.to_string()).or_insert((0, 0));
+                        let uptime_ms = now_ms().saturating_sub(entry.1);
+                        if entry.1 > 0 && uptime_ms >= retry.min_uptime_ms as i64 {
+                            entry.0 = 0;
+                        }
+                        entry.0 = entry.0.saturating_add(1);
+                        entry.0
+                    };
+                    if cycles > retry.max_retries {
+                        self.co_retry.lock().unwrap().remove(run_id);
+                        let mut emitted = Vec::new();
+                        let _ = self.emit(
+                            VhcEvent::Warning {
+                                run_id: run_id.to_string(),
+                                class: "co_trainer".to_string(),
+                                detail: format!(
+                                    "co-located trainer cycle budget exhausted (after {} paced \
+                                     respawns, none surviving {} ms): {reason} — respawn lane \
+                                     parked; recovery escalates to the run-level lane (a \
+                                     primary reconvergence re-mints the sibling)",
+                                    cycles - 1,
+                                    retry.min_uptime_ms
+                                ),
+                            },
+                            &mut emitted,
+                        );
+                        return Ok(emitted);
+                    }
                     let (attempts, pace_ms) = {
                         let mut lane = self.co_retry.lock().unwrap();
                         let attempts = lane.get(run_id).map_or(0, |(n, _)| *n);
@@ -2297,14 +2354,18 @@ impl VhcService {
                             run_id: run_id.to_string(),
                             class: "co_trainer".to_string(),
                             detail: format!(
-                                "co-located trainer terminated (attempt {attempts}): {reason} — \
-                                 paced respawn in {pace_ms} ms"
+                                "co-located trainer terminated (attempt {attempts}, cycle \
+                                 {cycles}/{}): {reason} — paced respawn in {pace_ms} ms",
+                                retry.max_retries
                             ),
                         },
                         &mut emitted,
                     );
                     return Ok(emitted);
                 }
+                // A deliberate end (completed / left / failed_terminal) never respawns — and
+                // closes the cycle ledger with it.
+                self.co_cycles.lock().unwrap().remove(run_id);
                 return Ok(Vec::new());
             }
         }
@@ -6362,6 +6423,91 @@ mod storage_gate_tests {
         assert_eq!(row.run_state, RunState::FailedRetryable);
         assert!(!row.storage_gated);
         assert_eq!(row.retry_count, 1, "the ordinary path consumes budget");
+    }
+
+    /// REL-7(d): the co-trainer respawn lane is CYCLE-bounded — a flap-die-respawn loop whose
+    /// sibling never survives `min_uptime_ms` parks the lane loudly after `max_retries`
+    /// cycles (C2 recorded 461 unbounded `attempt 0` cycles), while a sibling that survived
+    /// its uptime threshold resets the count (the primary keeper's discipline).
+    #[test]
+    fn the_co_trainer_cycle_budget_parks_the_lane_after_sustained_flap() {
+        let svc = coordinator_trainer_service(OwnerBudget::unbounded());
+        seed_joined_run(&svc, "run-flap", 1);
+        svc.store.mark_running("run-flap").expect("running row");
+        let sibling_dies = |generation: u64, spawned_ms: i64| -> Vec<VhcEvent> {
+            svc.co_trainers.lock().unwrap().insert(
+                "run-flap".to_string(),
+                InstanceEntry {
+                    id: instance_id("trainer", generation),
+                    generation,
+                    worker: Arc::new(NoopWorker),
+                },
+            );
+            svc.co_cycles
+                .lock()
+                .unwrap()
+                .entry("run-flap".to_string())
+                .or_insert((0, 0))
+                .1 = spawned_ms;
+            svc.handle_run_terminated(
+                "run-flap",
+                generation,
+                &protocol::TerminalOutcome::FailedRetryable {
+                    reason: "inbound sequence gap unrecoverable".into(),
+                },
+            )
+            .expect("the sibling terminal is handled")
+        };
+        let max = svc.config.retry.max_retries;
+
+        // Short-lived cycles (spawned "just now") re-arm the paced lane up to the budget…
+        for cycle in 1..=max {
+            let outs = sibling_dies(u64::from(cycle), now_ms());
+            assert!(
+                outs.iter().any(|e| matches!(
+                    e,
+                    VhcEvent::Warning { class, detail, .. }
+                        if class == "co_trainer" && detail.contains("paced respawn")
+                )),
+                "cycle {cycle} re-arms the paced lane"
+            );
+            assert!(
+                svc.co_retry.lock().unwrap().contains_key("run-flap"),
+                "cycle {cycle} leaves the lane armed"
+            );
+        }
+
+        // …and the cycle past the budget parks the lane LOUDLY instead of cycling forever.
+        let outs = sibling_dies(u64::from(max) + 1, now_ms());
+        assert!(
+            outs.iter().any(|e| matches!(
+                e,
+                VhcEvent::Warning { class, detail, .. }
+                    if class == "co_trainer" && detail.contains("cycle budget exhausted")
+            )),
+            "exhaustion is voiced, never silent"
+        );
+        assert!(
+            !svc.co_retry.lock().unwrap().contains_key("run-flap"),
+            "the parked lane never re-arms itself"
+        );
+
+        // A sibling that SURVIVED its uptime threshold resets the count: the next terminal is
+        // cycle 1 again, not a continuation of the exhausted ledger.
+        let long_ago = now_ms() - i64::try_from(svc.config.retry.min_uptime_ms).unwrap() - 1_000;
+        let outs = sibling_dies(u64::from(max) + 2, long_ago);
+        assert!(
+            outs.iter().any(|e| matches!(
+                e,
+                VhcEvent::Warning { class, detail, .. }
+                    if class == "co_trainer" && detail.contains("cycle 1/")
+            )),
+            "a healthy uptime resets the cycle budget: {outs:?}"
+        );
+        assert!(
+            svc.co_retry.lock().unwrap().contains_key("run-flap"),
+            "the reset lane re-arms"
+        );
     }
 
     /// The gate's free-space check: disabled (`reserve_mb = 0`) and unprobeable (no identity

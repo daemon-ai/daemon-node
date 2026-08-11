@@ -714,6 +714,7 @@ async fn run_role(
     let mut transport_fault: Option<String> = None;
     // Deaf-path instrumentation: the attach-boundary counters + the slow reporting cadence.
     let mut health = InboundHealth::default();
+    let mut gap_hold = GapHold::default();
     let mut last_health_emit = std::time::Instant::now();
     let mut last_health_detail = String::new();
 
@@ -879,6 +880,7 @@ async fn run_role(
                                     .push(switch_signer);
                                 generation.store(identity.instance, Ordering::SeqCst);
                                 held.clear(); // held frames belong to the retired epoch's scope
+                                gap_hold = GapHold::default();
                                 let _ = events.send(Event::ModuleSwitched {
                                     run_id: run_label.to_string(),
                                     epoch: identity.epoch,
@@ -905,7 +907,9 @@ async fn run_role(
             _ = ticker.tick() => {
                 // Re-present held frames (a gap filled by a late frame, or back-pressure that
                 // drained); age out an unrecoverable gap.
-                if let Some(stale) = retry_held(&mut current.attach, &mut held, own_sender) {
+                if let Some(stale) =
+                    retry_held(&mut current.attach, &mut held, own_sender, &mut gap_hold)
+                {
                     transport_fault = Some(stale);
                     break 'session;
                 }
@@ -914,7 +918,7 @@ async fn run_role(
                 if last_health_emit.elapsed() >= PLANE_HEALTH_EVERY {
                     last_health_emit = std::time::Instant::now();
                     let transport = providers.plane_stats.as_ref().map(|f| f());
-                    let detail = plane_health_detail(transport.as_ref(), &health);
+                    let detail = plane_health_detail(transport.as_ref(), &health, &gap_hold);
                     if detail != last_health_detail {
                         last_health_detail = detail.clone();
                         let _ = events.send(Event::Warning {
@@ -940,7 +944,7 @@ async fn run_role(
         let transport = providers.plane_stats.as_ref().map(|f| f());
         let _ = events.send(Event::Warning {
             class: "plane_health".into(),
-            detail: plane_health_detail(transport.as_ref(), &health),
+            detail: plane_health_detail(transport.as_ref(), &health, &gap_hold),
         });
     }
 
@@ -1555,9 +1559,55 @@ struct InboundHealth {
     last_delivered_unix_ms: u64,
 }
 
-/// One `plane_health` event line: the transport counters (when the bound plane keeps them) and
-/// the session's attach-boundary counters, in chain order.
-fn plane_health_detail(transport: Option<&ControlPlaneStats>, inbound: &InboundHealth) -> String {
+/// The standing-gap snapshot the 50 ms re-present pass leaves behind for the `plane_health`
+/// line (REL-7(a), reliability spec §9): how many frames are held right now, how long the
+/// oldest GENUINE standing gap has stood (0 = none standing — back-pressure shadows re-arm
+/// their clocks and never count, the defect-22 lesson), and whose sequence is gapped. An
+/// impending [`GAP_DEADLINE`] verdict is thereby observable live on the surfaces operators
+/// already poll, instead of reconstructed from node-log scraping post-mortem.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct GapHold {
+    /// Frames held for re-presentation at this instant (gap + back-pressure alike).
+    held_now: u64,
+    /// Age in ms of the oldest gap standing WITHOUT back-pressure (0 = none standing).
+    oldest_standing_ms: u64,
+    /// The oldest standing gap's sender (envelope peek, first 8 bytes hex).
+    gapped_sender: Option<String>,
+}
+
+/// Compute the [`GapHold`] snapshot a re-present pass leaves: a pass that observed
+/// back-pressure reports no STANDING gap (its holds are — or may be — shadows of the
+/// undelivered front frame), while a pure-gap pass reports the front (oldest arrival) hold's
+/// age and sender.
+fn gap_snapshot(
+    still_held: &VecDeque<(std::time::Instant, Vec<u8>)>,
+    saw_backpressure: bool,
+) -> GapHold {
+    let held_now = still_held.len() as u64;
+    if saw_backpressure {
+        return GapHold {
+            held_now,
+            ..GapHold::default()
+        };
+    }
+    match still_held.front() {
+        Some((since, frame)) => GapHold {
+            held_now,
+            oldest_standing_ms: u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX),
+            gapped_sender: envelope_sender(frame)
+                .map(|s| s[..8].iter().map(|b| format!("{b:02x}")).collect()),
+        },
+        None => GapHold::default(),
+    }
+}
+
+/// One `plane_health` event line: the transport counters (when the bound plane keeps them),
+/// the session's attach-boundary counters, and the standing-gap hold state, in chain order.
+fn plane_health_detail(
+    transport: Option<&ControlPlaneStats>,
+    inbound: &InboundHealth,
+    gap: &GapHold,
+) -> String {
     let ws = match transport {
         Some(t) => format!(
             "ws[binary={} hb={} delivered={} dup={} deaf_reconnects={} last_binary_ms={}]",
@@ -1572,14 +1622,17 @@ fn plane_health_detail(transport: Option<&ControlPlaneStats>, inbound: &InboundH
     };
     format!(
         "{ws} session[forwarded={} delivered={} dup={} held={} refused={} records={} \
-         last_delivered_ms={}]",
+         last_delivered_ms={}] gap[held={} oldest_standing_ms={} sender={}]",
         inbound.forwarded,
         inbound.delivered,
         inbound.duplicate,
         inbound.held,
         inbound.refused,
         inbound.records,
-        inbound.last_delivered_unix_ms
+        inbound.last_delivered_unix_ms,
+        gap.held_now,
+        gap.oldest_standing_ms,
+        gap.gapped_sender.as_deref().unwrap_or("-"),
     )
 }
 
@@ -1813,6 +1866,7 @@ fn retry_held(
     attach: &mut Attach,
     held: &mut VecDeque<(std::time::Instant, Vec<u8>)>,
     own_sender: PeerId,
+    gap: &mut GapHold,
 ) -> Option<String> {
     let mut still_held: VecDeque<(std::time::Instant, Vec<u8>)> = VecDeque::new();
     let mut saw_backpressure = false;
@@ -1837,6 +1891,7 @@ fn retry_held(
             Err(_) => return Some("held frame delivery failed".into()),
         }
     }
+    *gap = gap_snapshot(&still_held, saw_backpressure);
     if saw_backpressure {
         // Spool-bound pass: the gaps are (or may be) shadows of the undelivered front frame.
         // Re-arm every clock; the deadline only measures gaps that stand on their own.
@@ -3019,15 +3074,66 @@ mod tests {
             records: 0,
             last_delivered_unix_ms: 0,
         };
-        let line = plane_health_detail(Some(&transport), &inbound);
+        let line = plane_health_detail(Some(&transport), &inbound, &GapHold::default());
         assert_eq!(
             line,
             "ws[binary=42 hb=7 delivered=0 dup=0 deaf_reconnects=1 \
              last_binary_ms=1700000000000] session[forwarded=0 delivered=0 dup=0 held=0 \
-             refused=0 records=0 last_delivered_ms=0]"
+             refused=0 records=0 last_delivered_ms=0] gap[held=0 oldest_standing_ms=0 sender=-]"
         );
         // A plane without counters (loopback / gossip-only) reports n/a, never omits the line.
-        assert!(plane_health_detail(None, &inbound).starts_with("ws[n/a] session["));
+        let no_transport = plane_health_detail(None, &inbound, &GapHold::default());
+        assert!(no_transport.starts_with("ws[n/a] session["));
+        // A standing gap rides the same line with its age and gapped sender (REL-7(a)): an
+        // impending GAP_DEADLINE verdict is observable live, not reconstructed from logs.
+        let standing = GapHold {
+            held_now: 3,
+            oldest_standing_ms: 12_500,
+            gapped_sender: Some("00112233aabbccdd".into()),
+        };
+        assert!(plane_health_detail(Some(&transport), &inbound, &standing)
+            .ends_with("gap[held=3 oldest_standing_ms=12500 sender=00112233aabbccdd]"));
+    }
+
+    #[test]
+    fn the_gap_snapshot_distinguishes_standing_gaps_from_backpressure_shadows() {
+        // A frame envelope with a recognizable sender (the same §12.1 shape envelope_sender
+        // peeks): Array[Map{"sender": Bytes}, ...].
+        let sender = [0xabu8; 32];
+        let mut frame = Vec::new();
+        ciborium::ser::into_writer(
+            &ciborium::value::Value::Array(vec![ciborium::value::Value::Map(vec![(
+                ciborium::value::Value::Text("sender".into()),
+                ciborium::value::Value::Bytes(sender.to_vec()),
+            )])]),
+            &mut frame,
+        )
+        .expect("encode frame");
+        let aged = std::time::Instant::now() - Duration::from_secs(15);
+        let held: VecDeque<(std::time::Instant, Vec<u8>)> =
+            vec![(aged, frame.clone()), (std::time::Instant::now(), frame)]
+                .into_iter()
+                .collect();
+
+        // A pure-gap pass reports the OLDEST hold's age and its sender.
+        let standing = gap_snapshot(&held, false);
+        assert_eq!(standing.held_now, 2);
+        assert!(
+            standing.oldest_standing_ms >= 15_000,
+            "oldest hold aged {}ms",
+            standing.oldest_standing_ms
+        );
+        assert_eq!(standing.gapped_sender.as_deref(), Some("abababababababab"));
+
+        // A pass that observed back-pressure reports NO standing gap (the holds are — or may
+        // be — shadows of the undelivered front frame; the defect-22 lesson), only the count.
+        let shadowed = gap_snapshot(&held, true);
+        assert_eq!(shadowed.held_now, 2);
+        assert_eq!(shadowed.oldest_standing_ms, 0);
+        assert_eq!(shadowed.gapped_sender, None);
+
+        // An empty pass reports the quiet default.
+        assert_eq!(gap_snapshot(&VecDeque::new(), false), GapHold::default());
     }
 
     #[test]

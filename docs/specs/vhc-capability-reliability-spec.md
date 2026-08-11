@@ -4,7 +4,7 @@
 node liveness), post-C2 workstream.
 **Status:** design specification, **implementation in progress** — clauses flip individually
 to **LANDED** with a date as their rungs land (currently: §3 REL-2, §3.1 REL-2a, §4 REL-3,
-§5 REL-4, §6 REL-5, §6.1 REL-5a); everything else remains specification.
+§5 REL-4, §6 REL-5, §6.1 REL-5a, §9 REL-7 a/b/d); everything else remains specification.
 Revision 2 (2026-08-10) incorporates an external design review: the object-store 403 taxonomy
 (§3), the ABI-minor assignment (§7), the demotion of trap attribution to a bounded heuristic
 (§5), and the qualified evidence claims (§3, §8). Revision 3 (same day, second review round)
@@ -44,6 +44,10 @@ checkpoint-heavy run). Revision 10 (2026-08-11, Rung 1c landed) flips §3.1 (REL
 moved into the assembler with `*_reused` reporting; the module-fallback GET joins the retry
 contract; the C2 field patch superseded and its redundant outer retry removed) to LANDED,
 verified by the testkit assembly regression (network-unplugged resume + tamper-and-repair).
+Revision 11 (2026-08-11, Rung 5 landed) flips §9 (REL-7 a/b/d: gap-hold visibility on
+`plane_health`, the runbook transport-posture preflight item, and the co-trainer cycle
+budget closing the 461-cycle unbounded-respawn defect) to LANDED; RQ-5's packet-loss residual
+and RQ-6's lane-separation half deliberately stay open.
 **Fence:** no change specified here may land while a ceremony that pins the node binaries is in
 flight (C2, run `f35bfa80…`, closed GREEN 2026-08-11 — no ceremony in flight as of Revision 6;
 the fence re-arms with the next authored run). §7 (guest contract) additionally changes the
@@ -645,6 +649,25 @@ has tag-14 + tag-9 but no tag-1.
 
 ## 9. [REL-7] Records-transport seam: gaps are typed-retryable BY DESIGN; make them visible, rare, and cheap to survive
 
+**Status: LANDED (2026-08-11) — clauses (a), (b), (d); (c)'s RQ-5 residual stays open by
+design.** (a) The `plane_health` line gained a `gap[held= oldest_standing_ms= sender=]`
+section computed by the 50 ms re-present pass: held-frame count, the age of the oldest gap
+standing WITHOUT back-pressure (shadow passes report 0 — the defect-22 discipline carries
+into the observability), and the gapped sender's peek — an impending `GAP_DEADLINE` verdict
+is now observable live and in the end-of-session post-mortem line. (b) The ceremony runbook's
+preflight (§4.2) gained the transport-posture item: multiple relay URLs per box (with the
+single-`relay_url` roster constraint documented explicitly rather than extended in this
+wave), `advertise_ips` direct addressing between mutually-reachable boxes, ledger entries for
+in-flight config changes, and endpoint/relay log preservation (RQ-5's prerequisite). (d) The
+co-trainer respawn lane is now CYCLE-bounded per the decided direction: a persistent per-run
+ledger counts each sibling terminal against `max_retries` unless the session survived
+`min_uptime_ms` (which resets it — the primary keeper's discipline); exhaustion parks the
+lane with a loud warning naming the run-level lane as the escalation path, never a silent
+infinite budget. `GAP_DEADLINE` is untouched. All three verified by unit tests (gap-snapshot
+standing-vs-shadow, plane-health format, sustained-flap park + healthy-uptime reset).
+RQ-6's open half (a distinct budget lane for transport-class vs guest faults) deliberately
+stays open pending operational evidence.
+
 **Motivating evidence (C2, 2026-08-11).** Windows trainer at round 46:
 `state=failed_retryable retries=1 reason=inbound sequence gap unrecoverable (no backfill
 within the deadline)`, concurrent with operator-observed iroh relay instability on Strix
@@ -939,7 +962,7 @@ artifacts, and the verdict-producing `vhc-replay`.
 | RQ-3 | Whether §5's minimum constraints are the right final attribution rule, or trap-site metadata / guest-declared conformance / explicit probabilism is needed | operational evidence from the first runs with REL-4 active; revisited at C3 certification |
 | RQ-4 | **Structurally resolved (§6 LANDED):** dual watermarks, warning keyed to committed progress, detail reports both; threshold adapts to the observed inter-commit gap (2×) over a 10-min floor. RESIDUAL: are the floor/multiplier the right defaults, and is first-round behavior (no observed gap yet) acceptable | validation against a live checkpoint-heavy run before defaults freeze |
 | RQ-5 | **Partially resolved (§2.1/§9c):** the non-heal mechanism was the unbounded co-trainer respawn cycle, pinned. RESIDUAL: the underlying iroh-vs-WS packet loss behind the standing gap (endpoint logs were not preserved) | §9(a) gap-hold visibility + preserved endpoint logs on the next ceremony |
-| RQ-6 | **Half decided (§2.1/§9d):** the co-trainer lane's missing cycle budget is a defect with a decided direction (primary-keeper discipline: cycle budget + `min_uptime`-style reset, loud escalation). OPEN half: whether transport-class faults then deserve a distinct (longer/slower) lane than guest faults | implementation of §9(d); operational evidence with REL-5 announcing exhaustion |
+| RQ-6 | **Decided half IMPLEMENTED (§9d LANDED):** the co-trainer cycle budget ships — `max_retries` cycles, `min_uptime`-reset, loud park on exhaustion. OPEN half: whether transport-class faults then deserve a distinct (longer/slower) lane than guest faults | operational evidence with REL-5 announcing exhaustion |
 | RQ-7 | Ranged single-object GET resume for large payloads (mid-body resets on ~52 MB objects observed; presigned-URL Range semantics unverified; whole-object retry currently cheap enough) | revisit on evidence of retry thrashing; empirical Range probe first |
 | RQ-8 | REL-9's reaction trigger: is external run-head progress the only safe condition, or does a bounded exception exist for the whole-run-wedged 8b shape (zombie seat holder is this box)? | decided with the §7 decay-while-waiting fix in view, which removes most of that class at the source |
 | RQ-9 | The authoring storage gate's per-round growth figure: source (fit-probe vs smoke transcript), safety margin, and how restore/catch-up headroom is charged | banked preflight evidence from C2 + the three-seat smoke |

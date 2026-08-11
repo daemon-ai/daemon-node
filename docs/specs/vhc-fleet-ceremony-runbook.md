@@ -464,6 +464,22 @@ Probe the relay's `generate_204`. If dead, launch it per `crates/vhc/host/daemon
 placement is not part of the gate — only the dual plane's existence is; any box (including the build
 host) can host it.
 
+**Transport posture (REL-7(b), reliability spec §9 — C2's round-46 standing gap was concurrent
+with operator-observed relay instability).** Per fleet box, before bring-up:
+
+- Pin **multiple** relay URLs in the node config where more than one relay is provisioned (the
+  endpoint accepts a relay set). Known constraint, documented rather than hidden: each roster
+  record advertises only the FIRST configured relay URL to peers as its dial-back relay — the
+  additional entries harden this box's own outbound connectivity, not what peers learn of it.
+- Provision `advertise_ips` direct addressing between fleet boxes wherever they are mutually
+  reachable (same LAN / tailnet), so the relay is NAT fallback rather than the hot path — a
+  wobbling relay then degrades redundancy instead of dropping frames.
+- Record the per-box relay list + advertised addresses in the ledger fleet table. Relay or
+  addressing changes DURING a run are node-local config (never frozen genesis): they take
+  effect on the next incarnation and each is a ledger entry.
+- Preserve relay + endpoint logs for the ceremony's duration (RQ-5's residual needs them: the
+  next standing-gap incident must pin which plane went quiet, which the C2 record could not).
+
 ### 4.3 Binaries + guests, per platform
 
 Resource discipline throughout: one local build at a time, jobs capped at ≤ nproc/2.
@@ -678,7 +694,12 @@ deafness — the client detects it via the server heartbeat's expected-progress 
 force-reconnects (counted in `deaf_reconnects`); `ws` advancing while `session[delivered]` is
 frozen localizes the loss between the dual plane and the attach (look at `refused`/`held`).
 Repeated `deaf_reconnects` without recovery is a registry finding — archive and adjudicate,
-never wait it out.
+never wait it out. The trailing `gap[held= oldest_standing_ms= sender=]` section (REL-7,
+reliability spec §9) is the standing-gap watch: `oldest_standing_ms` climbing toward the
+20 s gap deadline means BOTH planes are missing that sender's frames and a typed-retryable
+rejoin verdict is imminent — check the named sender's box and the relay before it fires.
+`held > 0` with `oldest_standing_ms=0` is back-pressure shadowing (a slow guest fold, not
+frame loss) and is healthy during catch-up drains.
 
 **Stall announcement (reliability spec §6, REL-5).** A joined, alive run whose committed
 progress has aged past its per-run threshold (adaptive: 2× the largest observed inter-commit
