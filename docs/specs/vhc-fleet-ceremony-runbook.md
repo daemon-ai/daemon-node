@@ -724,6 +724,18 @@ scale), `running` means genuinely attached and live, `draining` is a graceful le
 flight — a box showing `restoring`/`catching_up` with a stale run head is catching up, not
 wedged.
 
+**Keeper reaction (reliability spec §11, REL-9).** The node now ACTS on the two shapes C2
+resolved by hand. A `stall_recycle` warning means the keeper verified the run's archive head
+advanced past the stalled session's last committed round and recycled the session into the
+ordinary reconverge lane (what a manual `leave --immediate` + `join` did); the warning
+carries both rounds — no operator action needed unless the recycles themselves repeat, which
+is a retry-budget escalation and surfaces as such. A `completion_stand_down` warning means a
+retrying intent found signed evidence the run is over (verified head round reaching the
+authored stop) and parked itself `completed` — the C2 finished-run retry loop no longer
+needs a manual leave. A stalled run whose head is NOT advancing (a whole-run park, e.g. a
+floor breach) is deliberately never self-recycled: that remains an operator diagnosis
+(§5.5-shape).
+
 ### 5.5 Churn drills (G-3/G-4)
 
 - **Hard-kill drill at ~round 12** (first checkpoint exists at 8): on the Mac, `kill -9` the

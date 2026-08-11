@@ -423,6 +423,17 @@ const CHECKPOINT_LAG_WARN_ROUNDS: u64 = daemon_vhc_proto::RETAINED_RECORD_HORIZO
 /// AUTHORED round wall in the run document remains future vocabulary).
 const RUN_STALL_WARN_FLOOR_MS: i64 = 600_000;
 
+/// REL-9(a) (reliability spec §11): the reaction multiplier — the keeper recycles a stalled
+/// session only after the stall has persisted this many times the ANNOUNCE threshold (the
+/// reaction threshold is deliberately separate and larger: announcement is cheap, ending a
+/// live session is not), and only with external-progress evidence in hand.
+const RUN_STALL_RECYCLE_MULT: i64 = 3;
+
+/// REL-9(a): the minimum pace between external-progress evidence probes for one stalled run —
+/// each probe fetches + verifies the run's published archive heads, so the reaction path never
+/// turns the reconcile tick into a registry poll loop.
+const RUN_STALL_RECYCLE_PROBE_MS: i64 = 60_000;
+
 /// REL-5 run-progress track (reliability spec §6): the committed-progress watermark the stall
 /// warning keys on, the local-activity watermark its detail reports, and the observed-cadence
 /// input to the per-run threshold. Keyed by run id; created when the reconcile pass first sees
@@ -442,6 +453,9 @@ struct ProgressTrack {
     /// Whether `run_stalled` has been voiced for the CURRENT episode — one stateful transition
     /// each way, never a recurring alarm.
     stalled: bool,
+    /// REL-9(a): the earliest time the next external-progress evidence probe may run for this
+    /// stalled run (paced by [`RUN_STALL_RECYCLE_PROBE_MS`]); `0` = never probed.
+    recycle_probe_at_ms: i64,
 }
 
 impl ProgressTrack {
@@ -452,12 +466,38 @@ impl ProgressTrack {
             max_commit_gap_ms: 0,
             local_at_ms: now,
             stalled: false,
+            recycle_probe_at_ms: 0,
         }
     }
 
     /// The per-run stall threshold (ms): the floor, stretched by observed cadence.
     fn stall_threshold_ms(&self) -> i64 {
         RUN_STALL_WARN_FLOOR_MS.max(self.max_commit_gap_ms.saturating_mul(2))
+    }
+
+    /// REL-9(a) (reliability spec §11): the reaction trigger — `Some(last committed round)`
+    /// when the announced stall has persisted past the separate, larger reaction threshold
+    /// ([`RUN_STALL_RECYCLE_MULT`] × the announce threshold), the session HAS committed rounds
+    /// (a head "advancing past" a never-committed session is indistinguishable from
+    /// pre-restore history — the whole-run-wedge exception is RQ-8, deliberately not taken),
+    /// and the probe pace allows ([`RUN_STALL_RECYCLE_PROBE_MS`]). Arms the next probe window
+    /// when it fires.
+    fn recycle_candidate(&mut self, now: i64) -> Option<u64> {
+        let age = now.saturating_sub(self.committed_at_ms);
+        if !self.stalled
+            || age
+                <= self
+                    .stall_threshold_ms()
+                    .saturating_mul(RUN_STALL_RECYCLE_MULT)
+        {
+            return None;
+        }
+        let last_round = self.last_round?;
+        if now < self.recycle_probe_at_ms {
+            return None;
+        }
+        self.recycle_probe_at_ms = now + RUN_STALL_RECYCLE_PROBE_MS;
+        Some(last_round)
     }
 }
 
@@ -1060,6 +1100,39 @@ impl VhcService {
             if self.instances.lock().unwrap().contains_key(&run.run_id) {
                 continue;
             }
+            // REL-9(b) (reliability spec §11): completion stand-down — before any retry is
+            // spent, check run-terminal evidence; a completed run is not an error state to
+            // retry against (C2: a box kept `failed_retryable`-cycling against a finished
+            // run). The intent stands down to the deliberate-end lane (`Completed` never
+            // respawns); the evidence rides the journaled reason.
+            if let Some(evidence) = self.run_terminal_evidence(&run.run_id).await {
+                self.store
+                    .begin_release(&run.run_id, RunState::Completed, Some(&evidence))?;
+                self.store.commit_release(&run.run_id)?;
+                self.store.clear_retry(&run.run_id)?;
+                self.store
+                    .set_phase(&run.run_id, RunState::Completed.as_str(), run.last_round)?;
+                let mut emitted = Vec::new();
+                let _ = self.emit(
+                    VhcEvent::Warning {
+                        run_id: run.run_id.clone(),
+                        class: "completion_stand_down".to_string(),
+                        detail: format!("retry stood down: {evidence}"),
+                    },
+                    &mut emitted,
+                );
+                let _ = self.emit(
+                    VhcEvent::Phase {
+                        run_id: run.run_id.clone(),
+                        phase: RunState::Completed.as_str().to_string(),
+                        epoch: run.epoch,
+                        round: run.last_round,
+                    },
+                    &mut emitted,
+                );
+                self.emit_changed(Some(run.run_id.clone()));
+                continue;
+            }
             // The interim storage gate: a run whose last terminal was HostStorageExhausted is
             // redispatched only once the node-state filesystem clears the reserve floor. A held
             // gate defers WITHOUT consuming budget (the disk being full is not a failed attempt)
@@ -1287,6 +1360,7 @@ impl VhcService {
                 })
                 .map(|r| r.run_id)
                 .collect();
+            let mut recycle: Vec<(String, u64)> = Vec::new();
             let fire: Vec<(String, String)> = {
                 let mut progress = self.progress.lock().unwrap();
                 progress.retain(|id, _| live.contains(id));
@@ -1297,6 +1371,12 @@ impl VhcService {
                         .or_insert_with(|| ProgressTrack::fresh(now));
                     let age = now.saturating_sub(t.committed_at_ms);
                     let threshold = t.stall_threshold_ms();
+                    // REL-9(a) (reliability spec §11): the reaction — a stall that persisted
+                    // past the separate, larger reaction threshold becomes a paced
+                    // external-progress probe candidate ([`ProgressTrack::recycle_candidate`]).
+                    if let Some(last_round) = t.recycle_candidate(now) {
+                        recycle.push((run_id.clone(), last_round));
+                    }
                     if !t.stalled && age > threshold {
                         t.stalled = true;
                         let round = t
@@ -1332,6 +1412,37 @@ impl VhcService {
                     },
                     &mut emitted,
                 );
+                self.emit_changed(Some(run_id));
+            }
+            // REL-9(a): the evidence check + reaction, outside the track lock. The guard is
+            // the external-progress condition — the run's VERIFIED archive head advanced past
+            // this session's last committed round, so the run demonstrably progresses without
+            // us (a floor breach stalls EVERYONE's head; recycling a healthy-but-waiting
+            // session helps nothing and is refused here). The recycle rides the ordinary
+            // retryable terminal lane: existing budget, backoff, escalation.
+            for (run_id, last_round) in recycle {
+                let Some(head) = self.verified_run_head(&run_id).await else {
+                    continue;
+                };
+                if head <= last_round {
+                    continue;
+                }
+                let reason = format!(
+                    "stall_recycle: session made no progress while the run head advanced \
+                     (verified archive head round {head} > this session's last committed \
+                     round {last_round}) — recycling into the reconverge lane (REL-9)"
+                );
+                tracing::warn!(run = run_id, "{reason}");
+                let mut emitted = Vec::new();
+                let _ = self.emit(
+                    VhcEvent::Warning {
+                        run_id: run_id.clone(),
+                        class: "stall_recycle".to_string(),
+                        detail: reason.clone(),
+                    },
+                    &mut emitted,
+                );
+                self.recycle_stalled_session(&run_id, reason).await;
                 self.emit_changed(Some(run_id));
             }
         }
@@ -3924,6 +4035,66 @@ impl VhcService {
             lineage_heads,
         })
     }
+
+    /// REL-9 (reliability spec §11): the run's VERIFIED head — the latest committed-round
+    /// claim across the seat lineage's signed, certificate-chained archive heads
+    /// ([`Self::resolve_recovery`]'s freshness evidence, reused as the keeper's
+    /// external-progress evidence). `None` = no verifiable published history (or no discovery
+    /// seam), which the reaction paths treat as "no evidence": they never act on absence.
+    async fn verified_run_head(&self, run_id: &str) -> Option<u64> {
+        // The role argument only shapes the seat-role reconstruction directive, which this
+        // caller discards — the head claim itself is role-independent.
+        self.resolve_recovery(run_id, "").await.ok()?.verified_head
+    }
+
+    /// REL-9(b) (reliability spec §11): run-terminal evidence, `Some(description)` when the
+    /// run is provably over — the registry descriptor carries an authored total-round count
+    /// AND the verified archive-head round claim reaches it (`rounds_done >= stop` with the
+    /// head as the 0-based last committed ordinal). Descriptor metadata alone never proves
+    /// progress; the round claim is signed, certificate-chained evidence. `None` = no
+    /// evidence, never "not over".
+    async fn run_terminal_evidence(&self, run_id: &str) -> Option<String> {
+        let discovery = self.discovery.as_ref()?;
+        let rounds = discovery.run_rounds(run_id).await.ok().flatten()?;
+        if rounds == 0 {
+            return None;
+        }
+        let head = self.verified_run_head(run_id).await?;
+        (head >= rounds - 1).then(|| {
+            format!(
+                "run-terminal evidence: the verified archive head's committed round {head} \
+                 reaches the authored stop ({rounds} rounds) — the run is over"
+            )
+        })
+    }
+
+    /// REL-9(a) (reliability spec §11): recycle a stalled-but-alive session — the ONE action
+    /// the keeper already owns, applied by the node instead of an operator's
+    /// `leave --immediate` + `join`. The row settles FIRST through the ordinary retryable
+    /// terminal lane ([`Self::handle_run_terminated`]: durable release, budget + backoff,
+    /// escalation on exhaustion — no second recovery path, no new budget), so the child's own
+    /// late terminal events find a settled row and drop as duplicates; the child session is
+    /// then torn down best-effort.
+    async fn recycle_stalled_session(&self, run_id: &str, reason: String) {
+        let entry = {
+            let instances = self.instances.lock().unwrap();
+            instances
+                .get(run_id)
+                .map(|e| (e.generation, e.worker.clone()))
+        };
+        let Some((generation, worker)) = entry else {
+            return;
+        };
+        let _ = self.handle_run_terminated(
+            run_id,
+            generation,
+            &protocol::TerminalOutcome::FailedRetryable { reason },
+        );
+        let _ = worker.leave(run_id.to_string(), LeaveMode::Immediate).await;
+        if self.worker_factory.is_some() {
+            worker.shutdown().await;
+        }
+    }
 }
 
 /// What [`VhcService::resolve_recovery`] resolved from the run's published archive heads: the
@@ -6455,6 +6626,99 @@ mod storage_gate_tests {
         assert!(
             !svc.progress.lock().unwrap().contains_key("run-stall"),
             "the track is dropped with the row's liveness"
+        );
+    }
+
+    /// REL-9(a) trigger arithmetic (reliability spec §11): a stall becomes a recycle-probe
+    /// candidate only past the SEPARATE reaction threshold (3× the announce threshold), only
+    /// when the session has committed rounds (the RQ-8 whole-run-wedge exception is not
+    /// taken), and only at the probe pace — never a per-tick registry poll.
+    #[test]
+    fn the_recycle_trigger_requires_persistence_evidence_eligibility_and_pace() {
+        let now = 1_000_000_000_i64;
+        let mut t = ProgressTrack::fresh(now);
+        t.last_round = Some(7);
+
+        // Not yet announced: never a candidate, however old.
+        t.committed_at_ms = now - 100 * RUN_STALL_WARN_FLOOR_MS;
+        assert_eq!(t.recycle_candidate(now), None, "announce comes first");
+
+        // Announced but only past the ANNOUNCE threshold: the reaction waits.
+        t.stalled = true;
+        t.committed_at_ms = now - (RUN_STALL_WARN_FLOOR_MS + 1);
+        assert_eq!(
+            t.recycle_candidate(now),
+            None,
+            "the reaction threshold is larger"
+        );
+
+        // Past the reaction threshold with NO committed round: not eligible (RQ-8).
+        t.committed_at_ms = now - (RUN_STALL_RECYCLE_MULT * RUN_STALL_WARN_FLOOR_MS + 1);
+        t.last_round = None;
+        assert_eq!(
+            t.recycle_candidate(now),
+            None,
+            "a never-committed session is not recycled"
+        );
+
+        // Eligible: fires once, then the pace gates the next probe.
+        t.last_round = Some(7);
+        assert_eq!(
+            t.recycle_candidate(now),
+            Some(7),
+            "the candidate carries the watermark"
+        );
+        assert_eq!(t.recycle_candidate(now), None, "the probe pace holds");
+        assert_eq!(
+            t.recycle_candidate(now + RUN_STALL_RECYCLE_PROBE_MS),
+            Some(7),
+            "the next window probes again"
+        );
+    }
+
+    /// REL-9(a) reaction lane (reliability spec §11): recycling a stalled-but-alive session
+    /// rides the ORDINARY retryable terminal lane — the row settles `failed_retryable` with
+    /// the evidence-carrying reason journaled, the retry budget is consumed normally (no new
+    /// budget, escalation on exhaustion stays), the backoff is armed, and the instance is
+    /// released for the reconverge lane to re-mint.
+    #[tokio::test]
+    async fn a_recycled_stalled_session_rides_the_ordinary_retryable_lane() {
+        let svc = coordinator_trainer_service(OwnerBudget::unbounded());
+        seed_joined_run(&svc, "run-recycle", 6);
+        svc.store.mark_running("run-recycle").expect("running");
+
+        svc.recycle_stalled_session(
+            "run-recycle",
+            "stall_recycle: session made no progress while the run head advanced".into(),
+        )
+        .await;
+
+        let row = svc
+            .store
+            .get_run("run-recycle")
+            .expect("read")
+            .expect("row");
+        assert_eq!(
+            row.run_state,
+            RunState::FailedRetryable,
+            "typed retryable, never terminal"
+        );
+        assert_eq!(row.desired_state, DesiredState::Joined, "the intent stands");
+        assert_eq!(
+            row.retry_count, 1,
+            "the recycle consumes the existing budget"
+        );
+        assert!(row.next_retry_ms.is_some(), "the reconverge lane is armed");
+        assert!(
+            row.terminal_reason
+                .as_deref()
+                .is_some_and(|e| e.contains("stall_recycle")),
+            "the evidence-carrying reason is journaled: {:?}",
+            row.terminal_reason
+        );
+        assert!(
+            !svc.instances.lock().unwrap().contains_key("run-recycle"),
+            "the instance is released for the reconverge lane"
         );
     }
 

@@ -1172,3 +1172,143 @@ async fn checkpoint_restore_falls_back_to_a_sibling_only_without_an_own_doc() {
         .unwrap()
         .is_none());
 }
+
+/// REL-9(b)'s evidence surface: [`ArchiveHeadDiscovery`]'s genesis + signed-head shape, plus
+/// the registry descriptor's authored total-round count (`run_rounds`).
+struct TerminalEvidenceDiscovery {
+    envelope_wire: Vec<u8>,
+    heads: Vec<daemon_vhc_proto::ArchiveHeadRecord>,
+    rounds: Option<u64>,
+}
+
+#[async_trait]
+impl RunDiscovery for TerminalEvidenceDiscovery {
+    async fn list_runs(&self) -> Result<Vec<DiscoveredRun>, VhcError> {
+        Ok(Vec::new())
+    }
+    async fn get_run(&self, run_id: &str) -> Result<Option<DiscoveredRun>, VhcError> {
+        Ok(Some(DiscoveredRun {
+            run_id: run_id.to_string(),
+            coordinator: "https://coord.example/api/v1/vhc".into(),
+            envelope_hash: "deadbeef".into(),
+            proto_version: 3,
+        }))
+    }
+    async fn fetch_envelope(&self, _run_id: &str) -> Result<Vec<u8>, VhcError> {
+        Ok(self.envelope_wire.clone())
+    }
+    async fn fetch_archive_heads(
+        &self,
+        _run_id: &str,
+    ) -> Result<Vec<daemon_vhc_proto::ArchiveHeadRecord>, VhcError> {
+        Ok(self.heads.clone())
+    }
+    async fn run_rounds(&self, _run_id: &str) -> Result<Option<u64>, VhcError> {
+        Ok(self.rounds)
+    }
+}
+
+/// REL-9(b) (reliability spec §11): completion stand-down — a `failed_retryable` intent whose
+/// run is PROVABLY over (the registry descriptor's authored stop plus a verified archive-head
+/// round claim reaching it) stands down to the deliberate-end lane instead of retrying
+/// (C2: a box kept `failed_retryable`-cycling against a finished run). Evidence short of the
+/// stop never stands the run down.
+#[tokio::test]
+async fn a_finished_run_stands_down_instead_of_retrying() {
+    let base = daemon_vhc_proto::SigningKey::from_bytes(&[0xB6; 32]);
+    let (wire, run_id) = frozen_genesis_wire(&base);
+    let service_with_head = |claimed_round: Option<u64>, rounds: Option<u64>| {
+        let worker = FakeWorker::new();
+        let svc = VhcService::new(VhcServiceParts {
+            config: enabled_config(),
+            store: VhcStore::open_in_memory().unwrap(),
+            worker: worker.clone(),
+            feed: None,
+            discovery: Some(Arc::new(TerminalEvidenceDiscovery {
+                envelope_wire: wire.clone(),
+                heads: vec![coordinator_head(
+                    &base,
+                    run_id,
+                    daemon_vhc_proto::Hash([0xAB; 32]),
+                    claimed_round,
+                )],
+                rounds,
+            })),
+            budget: None,
+            worker_factory: None,
+            identity_dir: None,
+            run_dir: None,
+            seat_directory: None,
+        });
+        let store = svc.store();
+        store
+            .put_join_intent(
+                "run-done",
+                "coord",
+                &policy(),
+                None,
+                &VhcEligibility::default(),
+            )
+            .expect("intent seeds");
+        store
+            .begin_release(
+                "run-done",
+                daemon_vhc_node::RunState::FailedRetryable,
+                Some("worker died"),
+            )
+            .expect("release begins");
+        store.commit_release("run-done").expect("release commits");
+        store
+            .defer_retry("run-done", 0)
+            .expect("the retry is due immediately");
+        (svc, worker)
+    };
+
+    // The run is over (12 authored rounds; the verified head committed round 11): stand down.
+    let (svc, worker) = service_with_head(Some(11), Some(12));
+    svc.reconcile_tick().await.expect("tick");
+    let row = svc.store().get_run("run-done").expect("read").expect("row");
+    assert_eq!(
+        row.run_state,
+        daemon_vhc_node::RunState::Completed,
+        "a completed run is not an error state to retry against"
+    );
+    assert!(row.next_retry_ms.is_none(), "no retry is left armed");
+    assert!(
+        worker.calls().joins.is_empty(),
+        "the reconverge lane was never entered"
+    );
+    let stood_down = svc
+        .store()
+        .recent_events("run-done", 32)
+        .expect("events read")
+        .iter()
+        .any(|ev| {
+            matches!(
+                ev,
+                VhcEvent::Warning { class, detail, .. }
+                    if class == "completion_stand_down" && detail.contains("run-terminal evidence")
+            )
+        });
+    assert!(stood_down, "the stand-down is voiced with its evidence");
+
+    // Evidence SHORT of the stop (round 5 of 12): no stand-down — the retry lane proceeds.
+    let (svc, _worker) = service_with_head(Some(5), Some(12));
+    svc.reconcile_tick().await.expect("tick");
+    let row = svc.store().get_run("run-done").expect("read").expect("row");
+    assert_ne!(
+        row.run_state,
+        daemon_vhc_node::RunState::Completed,
+        "mid-run evidence never stands the intent down"
+    );
+
+    // No authored stop in the descriptor: no evidence, never "over".
+    let (svc, _worker) = service_with_head(Some(11), None);
+    svc.reconcile_tick().await.expect("tick");
+    let row = svc.store().get_run("run-done").expect("read").expect("row");
+    assert_ne!(
+        row.run_state,
+        daemon_vhc_node::RunState::Completed,
+        "a missing stop figure is absence of evidence, not completion"
+    );
+}

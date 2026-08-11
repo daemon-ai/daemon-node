@@ -131,6 +131,17 @@ pub trait RunDiscovery: Send + Sync {
         let _ = run_id;
         Ok(Vec::new())
     }
+
+    /// The registry descriptor's AUTHORED total-round count (`rounds`, the `stop_rounds` figure
+    /// registered at seed), `None` when the run is driven by another stop condition or the
+    /// registry does not know it. REL-9(b)'s completion stand-down compares this authored
+    /// figure against the VERIFIED archive-head round claim — descriptor metadata alone never
+    /// proves progress. Default `None` (no registry state), so fakes/offline nodes need not
+    /// implement it.
+    async fn run_rounds(&self, run_id: &str) -> Result<Option<u64>, VhcError> {
+        let _ = run_id;
+        Ok(None)
+    }
 }
 
 /// The role FAMILY a checkpoint pointer may FALL BACK across: authored per-seat roles
@@ -341,5 +352,14 @@ impl RunDiscovery for EgressRunDiscovery {
             .fetch_heads()
             .await
             .map_err(|e| VhcError::Discovery(e.to_string()))
+    }
+
+    async fn run_rounds(&self, run_id: &str) -> Result<Option<u64>, VhcError> {
+        let run = self
+            .registry
+            .get_run(run_id)
+            .await
+            .map_err(|e| VhcError::Discovery(e.to_string()))?;
+        Ok(run.and_then(|d| d.rounds))
     }
 }

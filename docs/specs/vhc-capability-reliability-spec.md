@@ -4,8 +4,8 @@
 node liveness), post-C2 workstream.
 **Status:** design specification, **implementation in progress** — clauses flip individually
 to **LANDED** with a date as their rungs land (currently: §3 REL-2, §3.1 REL-2a, §4 REL-3,
-§5 REL-4, §6 REL-5, §6.1 REL-5a, §9 REL-7 a/b/d, §10 REL-8); everything else remains
-specification.
+§5 REL-4, §6 REL-5, §6.1 REL-5a, §9 REL-7 a/b/d, §10 REL-8, §11 REL-9); everything else
+remains specification.
 Revision 2 (2026-08-10) incorporates an external design review: the object-store 403 taxonomy
 (§3), the ABI-minor assignment (§7), the demotion of trap attribution to a bounded heuristic
 (§5), and the qualified evidence claims (§3, §8). Revision 3 (same day, second review round)
@@ -53,7 +53,12 @@ landed) flips §10 (REL-8: reclaim before every re-admission, the disk-floor ref
 the storage-gate lane instead of the budget lane, the authoring storage gate, and the
 `storage_pressure` pre-kill warning) to LANDED on the unit-test-only discipline; RQ-9 is
 narrowed to its defaults-freeze residual (the per-round growth figure still comes from the
-operator, not from banked preflight evidence automatically).
+operator, not from banked preflight evidence automatically). Revision 13 (2026-08-11, Rung 7
+landed) flips §11 (REL-9: the bounded stall-recycle riding the ordinary retryable lane, and
+the completion stand-down checking run-terminal evidence before any retry) to LANDED; RQ-8
+is decided conservatively — external run-head progress is the ONLY reaction condition taken,
+the whole-run-wedge exception is deliberately NOT implemented (revisit with C3's
+decay-while-waiting fix, which removes most of that class at the source).
 **Fence:** no change specified here may land while a ceremony that pins the node binaries is in
 flight (C2, run `f35bfa80…`, closed GREEN 2026-08-11 — no ceremony in flight as of Revision 6;
 the fence re-arms with the next authored run). §7 (guest contract) additionally changes the
@@ -833,6 +838,25 @@ the quota (`HostStorageExhausted`).
 
 ## 11. [REL-9] Keeper reaction: recycle stalled-but-alive sessions, stand down completed runs
 
+**Status: LANDED (2026-08-11, Rung 7).** Both clauses are implemented and unit-test verified
+— no ceremony time consumed. (a) A stall announced by REL-5 that persists past a separate,
+larger reaction threshold (3× the announce threshold) becomes a PACED external-progress
+probe (one archive-head verification per minute at most, never a per-tick registry poll);
+when the run's VERIFIED head round claim has advanced past this session's last committed
+round, the keeper voices `stall_recycle` with the evidence in the reason and ends the
+session through the ordinary retryable terminal lane — existing budget, backoff, escalation,
+instance released for reconverge (pinned by trigger-arithmetic and lane unit tests). Only a
+session that HAS committed rounds is eligible — the RQ-8 whole-run-wedge exception is
+deliberately not taken. (b) Before any retry is spent, the reconcile pass checks
+run-terminal evidence — the registry descriptor's authored total-round count (the new
+`RunDiscovery::run_rounds` seam) against the verified archive-head round claim
+(`rounds_done ≥ stop`); a provably-over run stands down to the deliberate-end lane
+(`Completed`, retry cleared, `completion_stand_down` voiced with the evidence) instead of
+cycling (pinned by an integration test over a real frozen genesis + signed head, including
+the mid-run and no-stop-figure negatives). Descriptor metadata alone never proves progress —
+the round claim is signed, certificate-chained evidence; absence of evidence is never
+"over".
+
 **Motivating evidence (C2).** Roughly eight manual `leave --immediate` + `join` interventions,
 each performing exactly what the keeper's reconverge already does, triggered by a human
 watching a stalled watcher line. And after the run completed, Windows' last incarnation kept
@@ -984,7 +1008,7 @@ artifacts, and the verdict-producing `vhc-replay`.
 | RQ-5 | **Partially resolved (§2.1/§9c):** the non-heal mechanism was the unbounded co-trainer respawn cycle, pinned. RESIDUAL: the underlying iroh-vs-WS packet loss behind the standing gap (endpoint logs were not preserved) | §9(a) gap-hold visibility + preserved endpoint logs on the next ceremony |
 | RQ-6 | **Decided half IMPLEMENTED (§9d LANDED):** the co-trainer cycle budget ships — `max_retries` cycles, `min_uptime`-reset, loud park on exhaustion. OPEN half: whether transport-class faults then deserve a distinct (longer/slower) lane than guest faults | operational evidence with REL-5 announcing exhaustion |
 | RQ-7 | Ranged single-object GET resume for large payloads (mid-body resets on ~52 MB objects observed; presigned-URL Range semantics unverified; whole-object retry currently cheap enough) | revisit on evidence of retry thrashing; empirical Range probe first |
-| RQ-8 | REL-9's reaction trigger: is external run-head progress the only safe condition, or does a bounded exception exist for the whole-run-wedged 8b shape (zombie seat holder is this box)? | decided with the §7 decay-while-waiting fix in view, which removes most of that class at the source |
+| RQ-8 | **Decided conservatively (§11 LANDED):** external run-head progress is the ONLY reaction condition taken — a never-committed session is never recycled, and the whole-run-wedged 8b shape (zombie seat holder is this box) is deliberately left to the operator today. REMAINING: whether a bounded exception is worth taking at all once the §7 decay-while-waiting fix lands | revisited with C3's decay-while-waiting fix, which removes most of that class at the source |
 | RQ-9 | **Structurally resolved (§10 LANDED):** the gate ships — `budget ≥ stop_rounds × growth + 25% restore headroom`, unbounded-budget warning. RESIDUAL: the growth figure is operator-supplied; sourcing it from banked preflight evidence (fit-probe vs smoke transcript) and freezing the 25% headroom margin remain open | banked preflight evidence from C2 + the three-seat smoke |
 | RQ-10 | First-class grant classes/planes in the ABI grants document (vs hash enumeration + evidence-based extension) | C3 ABI-minor scoping; REL-10's host-side extension is sufficient until then |
 | RQ-11 | The det-state eviction/retention contradiction (§2.1): the store evicted a chunk a still-retained sealed fold references (`state_store.rs:688-705`), and the guest saw `HASH_MISMATCH` for a fault that mismatched nothing. Two halves: the retention-window defect (why did eviction run ahead of the sealed-fold reference?) and the dishonest code (REL-3's mapper direction) | retention-window audit of `state_store` eviction against the sealed-fold retention contract; code honesty lands with REL-3 |
