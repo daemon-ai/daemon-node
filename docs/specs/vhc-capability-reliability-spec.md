@@ -88,6 +88,9 @@ trailing checkpoint repins, pin/unpin sweeps, spilled backing, shared-prefix chu
 **no hole**: the in-store eviction/refcount window upholds the sealed-fold retention contract
 under churn. RQ-11's root-cause half is accordingly narrowed to the out-of-store suspects
 (external spill-directory interference / cross-instance carriage), recorded in §16.
+Revision 18 (2026-08-11) lands the REL-6 whole-run drill previously deferred to a ceremony:
+the genesis harness's permanent payload-plane fault drives the production minor-6 module to
+its own typed `ENV_STARVED` run-end (§7 amendment) — ~30 s, testkit-only.
 **Fence:** no change specified here may land while a ceremony that pins the node binaries is in
 flight (C2, run `f35bfa80…`, closed GREEN 2026-08-11 — no ceremony in flight as of Revision 6;
 the fence re-arms with the next authored run). §7 (guest contract) additionally changes the
@@ -616,6 +619,16 @@ two-dead-trainer wedge and the window/liveness/reset scenarios are pinned at the
 consensus-tick level (`decay_while_waiting.rs`), minor negotiation at the driver-selection
 level, outcome arms at the session level. The whole-run testkit drills and the live G-3
 shapes ride the next ceremony.*
+
+*Revision 18 amendment: the payload half of the whole-run drill turned out NOT to need a
+ceremony — the genesis harness's fault rig grew a permanent payload-plane fault
+(`FaultPlan.fail_payload_fetch`: every `payload_get` naming the poisoned committed set
+completes `Failed(NET_UNREACHABLE)`), and the pinned case
+(`adversarial.rs::permanently_unfetchable_payloads_end_the_run_env_starved_not_a_trap`,
+~30 s) drives the production minor-6 `tiny_llama.wasm` under the production coordinator to
+its OWN typed `RunEnd::Outcome(ENV_STARVED)` — no Stop delivered, no trap, the C2 line-2814
+class converted end-to-end — with the journal §8.7-replaying bit-for-bit through the failed
+completions to the same typed end. Only the live G-3 shapes still ride the next ceremony.*
 
 This rung is an **ABI minor revision** (module-side only; no node↔app WireVersion change).
 Outcome codes 4–15 are reserved "assigned only by a future minor of this document"

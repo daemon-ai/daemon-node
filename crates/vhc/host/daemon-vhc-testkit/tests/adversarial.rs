@@ -60,7 +60,7 @@ fn duplicate_round_record_is_ingested_once() {
             kind: FrameKind::Record,
             action: FaultAction::Duplicate,
         }],
-        delay_payload_staging: Vec::new(),
+        ..FaultPlan::default()
     };
     let faulted = genesis_whole_run(&coordinator, &worker, &spec).expect("faulted run");
 
@@ -99,8 +99,8 @@ fn delayed_committed_payloads_stall_then_catch_up() {
     // Faulted run: round 0's committed payloads reach worker 0 only at round 1's open.
     let mut spec = GenesisRunSpec::new(run_label, 1, 2);
     spec.faults = FaultPlan {
-        rules: Vec::new(),
         delay_payload_staging: vec![(0, 0)],
+        ..FaultPlan::default()
     };
     let faulted = genesis_whole_run(&coordinator, &worker, &spec).expect("faulted run");
 
@@ -150,4 +150,51 @@ fn delayed_committed_payloads_stall_then_catch_up() {
         w.digest, clean.workers[0].digest,
         "the straggle detour must change the path, not the state: identical det-lane end state"
     );
+}
+
+/// Pinned case 3 — the REL-6 whole-run drill (reliability spec §7): a record whose committed
+/// payloads are **permanently unfetchable** (every `payload_get` completes
+/// `Failed(NET_UNREACHABLE)`, past the host's transient absorption). The production minor-6
+/// `tiny_llama.wasm` must end the run TYPED — `RunEnd::Outcome(OUTCOME_ENV_STARVED)`, the
+/// guest's own protocol-vocabulary verdict — never the C2 line-2814 trap the frozen module
+/// produced for exactly this class. Session classification (`FailedRetryable`) and keeper
+/// respawn are pinned separately (`role_session.rs` units); this drill pins the guest half
+/// end-to-end under the real event-loop driver, with the journal §8.7-replaying through the
+/// failed completions to the same typed end.
+#[test]
+fn permanently_unfetchable_payloads_end_the_run_env_starved_not_a_trap() {
+    let coordinator = guest_wasm("coordinator_quorum");
+    let worker = guest_wasm("tiny_llama");
+
+    // One worker, one round: the record lands, its committed set never fetches.
+    let mut spec = GenesisRunSpec::new("genesis_run-adv-env-starved", 1, 1);
+    spec.faults = FaultPlan {
+        fail_payload_fetch: vec![(0, 0)],
+        ..FaultPlan::default()
+    };
+    let report = genesis_whole_run(&coordinator, &worker, &spec).expect("driven run");
+
+    let w = &report.workers[0];
+    // The guest's OWN typed run-end (the harness delivered no Stop): outcome 4, not a trap.
+    assert!(
+        matches!(
+            w.end,
+            daemon_vhc_host::run::RunEnd::Outcome(daemon_vhc_abi::OUTCOME_ENV_STARVED)
+        ),
+        "REL-6: the starved run must end RunEnd::Outcome(ENV_STARVED), got {:?}",
+        w.end
+    );
+    // The starved round never folded: theta + commitment voiced, no digest.
+    assert_eq!(
+        w.voices
+            .iter()
+            .map(|(t, r, _)| (*t, *r))
+            .collect::<Vec<_>>(),
+        vec![(2, 0), (3, 0)],
+        "trained + committed, then starved before the fold — no tag-4 voice"
+    );
+    // §8.7: the journal replays bit-for-bit THROUGH the failed completions to the same end.
+    assert!(w.replay_matched, "replay green through the starved end");
+    // The run as a whole is honestly non-green (a typed failure is not a clean completion).
+    assert!(!report.is_green());
 }

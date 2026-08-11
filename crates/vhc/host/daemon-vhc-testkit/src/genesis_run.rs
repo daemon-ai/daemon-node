@@ -148,6 +148,11 @@ pub struct FaultPlan {
     /// only at the NEXT round's open instead of before the record — the straggle trigger (module
     /// docs).
     pub delay_payload_staging: Vec<(usize, u64)>,
+    /// Payload-plane faults, permanent form (the REL-6 ENV_STARVED drill): `(worker, round)`
+    /// pairs whose record-listed committed payloads NEVER become fetchable — every `payload_get`
+    /// naming them completes `Failed(NET_UNREACHABLE)`, past any transient absorption. The
+    /// conformant guest ends the run typed (`OUTCOME_ENV_STARVED`), never a trap.
+    pub fail_payload_fetch: Vec<(usize, u64)>,
 }
 
 impl FaultPlan {
@@ -164,6 +169,12 @@ impl FaultPlan {
     #[must_use]
     pub fn payloads_delayed(&self, worker: usize, round: u64) -> bool {
         self.delay_payload_staging.contains(&(worker, round))
+    }
+
+    /// Whether `(worker, round)`'s committed payloads permanently fail to fetch.
+    #[must_use]
+    pub fn payloads_failed(&self, worker: usize, round: u64) -> bool {
+        self.fail_payload_fetch.contains(&(worker, round))
     }
 }
 
@@ -676,6 +687,10 @@ struct LiveWorker {
     /// Committed payloads withheld from [`Self::store`] past their record (the straggle trigger):
     /// round → the record-ordered bytes, published at the NEXT open (the catch-up input).
     held_payloads: BTreeMap<u64, Vec<Vec<u8>>>,
+    /// Content addresses that PERMANENTLY fail to fetch (the ENV_STARVED drill): a `payload_get`
+    /// naming one completes `Failed(NET_UNREACHABLE)` instead of holding — the environment past
+    /// the host's transient absorption, exactly what REL-6's typed run-end is for.
+    poisoned: std::collections::BTreeSet<[u8; 32]>,
     /// The worker's voice shape captured the instant before a withheld round became fetchable —
     /// the affirmative stall evidence (see [`GenesisWorkerReport::stalled_voices`]).
     stalled_voices: Option<Vec<(u64, u64)>>,
@@ -762,6 +777,22 @@ impl LiveWorker {
         }
         let mut still_pending = Vec::new();
         for (op, hash) in std::mem::take(&mut self.deferred_gets) {
+            if self.poisoned.contains(&hash) {
+                // The permanent payload-plane fault: the content plane cannot produce these
+                // bytes, and the host's transient absorption (REL-2) is already spent — the
+                // completion is the typed environment failure the REL-6 guest must convert
+                // into `OUTCOME_ENV_STARVED`, never a trap.
+                self.pump
+                    .complete_op(
+                        op,
+                        OpOutcome::Failed {
+                            code: daemon_vhc_abi::COMP_ERR_NET_UNREACHABLE,
+                            detail: "committed payload permanently unfetchable (drill)".into(),
+                        },
+                    )
+                    .map_err(|e| format!("failed-get completion: {e}"))?;
+                continue;
+            }
             match self.store.get(&hash) {
                 Some(bytes) => {
                     self.pump
@@ -784,6 +815,29 @@ impl LiveWorker {
     /// record names it).
     fn publish_committed(&mut self, payload: &[u8]) {
         self.store.insert(blake3_hash(payload).0, payload.to_vec());
+    }
+
+    /// Make a committed payload PERMANENTLY unfetchable on this worker's seat (the ENV_STARVED
+    /// drill): its content address completes `Failed(NET_UNREACHABLE)` at every `payload_get`.
+    fn poison_committed(&mut self, payload: &[u8]) {
+        self.poisoned.insert(blake3_hash(payload).0);
+    }
+
+    /// Service ops until the guest thread ends on its own (the ENV_STARVED drill's drive: the
+    /// failed completions land, the conformant guest returns its typed outcome — the harness
+    /// never delivers a `Stop`, so a clean end here is the guest's OWN run-end decision).
+    fn pump_until_run_end(&mut self, timeout: Duration) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            self.service_ops()?;
+            if self.run.as_ref().is_some_and(|r| r.is_finished()) {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err("timed out waiting for the guest's own run end".into());
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     /// Release every payload withheld past its record — the archive catching up — and let the
@@ -1026,6 +1080,7 @@ pub fn genesis_whole_run<'a>(
             store: BTreeMap::new(),
             deferred_gets: Vec::new(),
             held_payloads: BTreeMap::new(),
+            poisoned: std::collections::BTreeSet::new(),
             stalled_voices: None,
         });
     }
@@ -1178,7 +1233,14 @@ pub fn genesis_whole_run<'a>(
                                 .ok_or_else(|| "record entry for unknown peer".to_string())
                         })
                         .collect::<Result<_, String>>()?;
-                    if spec.faults.payloads_delayed(i, round) {
+                    if spec.faults.payloads_failed(i, round) {
+                        // The permanent payload-plane fault (REL-6 drill): the record's
+                        // committed set will NEVER be fetchable on this seat — every get
+                        // completes Failed(NET_UNREACHABLE) instead of holding.
+                        for p in &ordered {
+                            worker.poison_committed(p);
+                        }
+                    } else if spec.faults.payloads_delayed(i, round) {
                         // The straggle trigger: the record arrives, its payloads are not fetchable
                         // (published at the next open instead) — the guest's `payload_get`s stay
                         // outstanding, so the round cannot mint and voices nothing until the
@@ -1200,6 +1262,14 @@ pub fn genesis_whole_run<'a>(
                     )?;
                 }
                 for (i, w) in workers.iter_mut().enumerate() {
+                    if spec.faults.payloads_failed(i, round) {
+                        // The starved worker never folds this round: pump its failed
+                        // completions through and wait for the guest's OWN typed run-end
+                        // (the drill's subject — asserted from the report's `end`).
+                        w.pump_until_run_end(spec.timeout)
+                            .map_err(|e| format!("worker {i} starved run-end: {e}"))?;
+                        continue;
+                    }
                     if spec.faults.payloads_delayed(i, round)
                         || spec.faults.action(i, round, FrameKind::Record)
                             == Some(FaultAction::Drop)
@@ -1245,9 +1315,14 @@ pub fn genesis_whole_run<'a>(
     // Clean stop; §8.7 replay-verify each worker (bit-for-bit decisions).
     let mut reports = Vec::with_capacity(workers.len());
     for (i, mut w) in workers.into_iter().enumerate() {
-        w.pump
-            .stop(daemon_vhc_abi::STOP_REASON_RUN_COMPLETE)
-            .map_err(|e| format!("worker {i} stop: {e}"))?;
+        // A guest that already ended on its own (the ENV_STARVED drill's typed run-end) gets
+        // no Stop: enqueueing one after the terminal outcome would append to the journal past
+        // the run's own end.
+        if !w.run.as_ref().expect("run present").is_finished() {
+            w.pump
+                .stop(daemon_vhc_abi::STOP_REASON_RUN_COMPLETE)
+                .map_err(|e| format!("worker {i} stop: {e}"))?;
+        }
         let end = w
             .run
             .take()
@@ -1256,16 +1331,19 @@ pub fn genesis_whole_run<'a>(
             .map_err(|e| format!("worker {i} guest thread: {e}"))?;
         let voices = w.voices();
         // The guest's FINAL tag-4 det digest — its own det-lane voice (the round-agreement
-        // digest); the harness never re-derives state host-side.
-        let digest: [u8; 16] = voices
-            .iter()
-            .rev()
-            .find_map(|(t, _, bytes)| {
-                (*t == 4)
-                    .then(|| <[u8; 16]>::try_from(bytes.as_slice()).ok())
-                    .flatten()
-            })
-            .ok_or_else(|| format!("worker {i}: no tag-4 digest voice in the run"))?;
+        // digest); the harness never re-derives state host-side. A run that ended NON-clean
+        // (a typed refusal/starvation before any fold) legitimately has none — zeros stand in;
+        // `is_green` already refuses any non-`Outcome(0)` end.
+        let final_digest = voices.iter().rev().find_map(|(t, _, bytes)| {
+            (*t == 4)
+                .then(|| <[u8; 16]>::try_from(bytes.as_slice()).ok())
+                .flatten()
+        });
+        let digest: [u8; 16] = match final_digest {
+            Some(d) => d,
+            None if !matches!(end, RunEnd::Outcome(0)) => [0u8; 16],
+            None => return Err(format!("worker {i}: no tag-4 digest voice in the run")),
+        };
 
         let entries: Vec<SinkEntry> = w.sink.lock().expect("sink").entries.clone();
         let recorded: Vec<Decision> = entries
