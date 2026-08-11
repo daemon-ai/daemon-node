@@ -72,7 +72,12 @@ put, moment export — to typed run-ends with `GRANT_EXHAUSTED` as bounded backp
 the unit-test-only discipline (consensus-tick two-dead-trainer + window/liveness scenarios,
 ABI negotiation tests, session outcome-arm tests; whole-run testkit drills and the G-3 shapes
 belong to the next ceremony window, per the no-long-C2-tests constraint). Runbook §4.7
-headroom generalized to ≥ expected concurrent churn.
+headroom generalized to ≥ expected concurrent churn. Revision 16 (2026-08-11) adds the
+desync regression lattice to §9: the session's gap-aging ladder unit-pinned over a new
+abstract delivery seam (`retry_held_with` — deadline verdict, silent within-deadline hold,
+back-pressure clock re-arm, backfill drain), and the gossip layer's loss boundary pinned on
+a real two-endpoint iroh mesh (deaf-window recovery = exactly the rebroadcast ring; eviction
+= permanent loss). Seconds-scale, no ceremony time; RQ-5's live-evidence residual unchanged.
 **Fence:** no change specified here may land while a ceremony that pins the node binaries is in
 flight (C2, run `f35bfa80…`, closed GREEN 2026-08-11 — no ceremony in flight as of Revision 6;
 the fence re-arms with the next authored run). §7 (guest contract) additionally changes the
@@ -781,6 +786,27 @@ hours after gap faults, the evidence points at the **storage seam blocking the k
 reconverge's re-assess refused on the disk floor and burned the budget), not at gap
 misclassification — RQ-5's evidence pass must confirm this chain from the round-44/46
 windows rather than assume either story.
+
+**Desync regression lattice (2026-08-11, seconds-scale — no transport needed where the
+transport adds nothing).** The missing-message behavior is pinned at its two honest seams:
+(i) *the session's aging ladder* — `retry_held`'s core now runs over an abstract delivery
+seam (`retry_held_with`, `role_session.rs`), because the session cannot tell iroh loss from
+a relay flap from a WS drop: every desync converges to the same held-frame/gap-verdict
+ladder. Unit tests pin the four faces in milliseconds: a standing gap past `GAP_DEADLINE`
+returns the exact C2 verdict string; the same gap inside the deadline holds silently; a
+back-pressure pass re-arms even already-expired clocks (the defect-22 shadow guard at the
+ladder level); a late backfill drains the hold with no verdict however old it grew.
+(ii) *the gossip layer's loss boundary* — `deaf_window_loss_is_bounded_by_the_rebroadcast_ring`
+(`daemon-vhc-net/tests/iroh_gossip.rs`, real two-endpoint iroh mesh, ~1.3 s): a peer deaf
+through N publishes recovers on rejoin EXACTLY the delivery-assurance ring's retained
+messages via nonce-bumped re-floods, and everything evicted is permanently lost — iroh-gossip
+has no anti-entropy, which is the mechanical reason the aged-gap verdict must be a rejoin,
+not a wait. A relay-flap-specific drill was considered and deliberately not built: forcing
+relay-only paths on loopback needs iroh's unstable custom path-selector internals, upstream
+frames that facility as testing the relay protocol itself, and the deaf-window boundary
+already covers the product-visible consequence regardless of what made the peer deaf. RQ-5's
+live-evidence residual (preserved endpoint/relay logs on the next ceremony) is unchanged —
+these tests pin behavior under loss, not which plane lost.
 
 ## 10. [REL-8] Storage lifecycle at the recovery seam
 

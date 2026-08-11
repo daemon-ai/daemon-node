@@ -1868,6 +1868,19 @@ fn retry_held(
     own_sender: PeerId,
     gap: &mut GapHold,
 ) -> Option<String> {
+    retry_held_with(|frame| attach.deliver(frame), held, own_sender, gap)
+}
+
+/// [`retry_held`]'s aging ladder over an abstract delivery seam — the unit-testable core. The
+/// session cannot tell WHY a frame is missing (iroh loss past the rebroadcast ring, a relay
+/// flap, a WS drop): every desync converges to the same held-frame/gap-verdict shape here, so
+/// this seam is where missing-message behavior is pinned without a transport.
+fn retry_held_with(
+    mut deliver: impl FnMut(&[u8]) -> Result<InboundVerdict, daemon_vhc_host::run::SinkError>,
+    held: &mut VecDeque<(std::time::Instant, Vec<u8>)>,
+    own_sender: PeerId,
+    gap: &mut GapHold,
+) -> Option<String> {
     let mut still_held: VecDeque<(std::time::Instant, Vec<u8>)> = VecDeque::new();
     let mut saw_backpressure = false;
     let mut aged_out = false;
@@ -1875,7 +1888,7 @@ fn retry_held(
         if envelope_sender(&frame) == Some(own_sender.0) {
             continue;
         }
-        match attach.deliver(&frame) {
+        match deliver(&frame) {
             Ok(InboundVerdict::Backpressure { .. }) => {
                 saw_backpressure = true;
                 still_held.push_back((since, frame));
@@ -3158,6 +3171,173 @@ mod tests {
 
         // An empty pass reports the quiet default.
         assert_eq!(gap_snapshot(&VecDeque::new(), false), GapHold::default());
+    }
+
+    /// A §12.1-shaped frame envelope carrying only the `sender` field ([`envelope_sender`]'s
+    /// peek surface) — what the retry ladder needs from a held frame.
+    fn held_frame(sender: [u8; 32]) -> Vec<u8> {
+        let mut frame = Vec::new();
+        ciborium::ser::into_writer(
+            &ciborium::value::Value::Array(vec![ciborium::value::Value::Map(vec![(
+                ciborium::value::Value::Text("sender".into()),
+                ciborium::value::Value::Bytes(sender.to_vec()),
+            )])]),
+            &mut frame,
+        )
+        .expect("encode frame");
+        frame
+    }
+
+    fn own_key() -> PeerId {
+        peer_id(&SigningKey::from_bytes(&[0x51; 32]))
+    }
+
+    /// The C2 round-46 shape, pinned without a transport (the session cannot tell iroh loss
+    /// past the rebroadcast ring from any other loss — every desync converges to this ladder):
+    /// a genuinely missing frame leaves its successors gap-held; once the oldest hold outlives
+    /// [`GAP_DEADLINE`] on a pass with NO back-pressure, the session returns the typed
+    /// retryable verdict — recovery is the rejoin transaction, not an in-session repair.
+    #[test]
+    fn a_standing_gap_past_the_deadline_is_the_typed_retryable_verdict() {
+        let peer = [0xabu8; 32];
+        let aged = std::time::Instant::now() - GAP_DEADLINE - Duration::from_secs(1);
+        let mut held: VecDeque<_> = vec![(aged, held_frame(peer))].into_iter().collect();
+        let mut gap = GapHold::default();
+        let verdict = retry_held_with(
+            |_| {
+                Ok(InboundVerdict::Gap {
+                    sender: peer,
+                    channel: 0,
+                    expected: 5,
+                    got: 7,
+                })
+            },
+            &mut held,
+            own_key(),
+            &mut gap,
+        );
+        assert_eq!(
+            verdict.as_deref(),
+            Some("inbound sequence gap unrecoverable (no backfill within the deadline)")
+        );
+        // The same gap INSIDE the deadline keeps holding, silently — reorders resolve in ms.
+        let mut held: VecDeque<_> = vec![(std::time::Instant::now(), held_frame(peer))]
+            .into_iter()
+            .collect();
+        let verdict = retry_held_with(
+            |_| {
+                Ok(InboundVerdict::Gap {
+                    sender: peer,
+                    channel: 0,
+                    expected: 5,
+                    got: 7,
+                })
+            },
+            &mut held,
+            own_key(),
+            &mut gap,
+        );
+        assert_eq!(verdict, None);
+        assert_eq!(held.len(), 1, "the gapped frame stays held");
+        assert_eq!(gap.gapped_sender.as_deref(), Some("abababababababab"));
+    }
+
+    /// Backfill heals the hold: when the missing frame has arrived through the live inbound
+    /// path, the re-present pass delivers the held successor and the hold drains — no verdict,
+    /// however old the hold had grown while the gap stood.
+    #[test]
+    fn a_late_backfill_drains_the_hold_without_a_verdict() {
+        let peer = [0xabu8; 32];
+        let aged = std::time::Instant::now() - GAP_DEADLINE - Duration::from_secs(1);
+        let mut held: VecDeque<_> = vec![(aged, held_frame(peer))].into_iter().collect();
+        let mut gap = GapHold {
+            held_now: 1,
+            oldest_standing_ms: 21_000,
+            gapped_sender: Some("abababababababab".into()),
+        };
+        let verdict = retry_held_with(
+            |_| {
+                Ok(InboundVerdict::Deliver {
+                    channel: 0,
+                    seq: 7,
+                    sender: peer,
+                    payload: Vec::new(),
+                })
+            },
+            &mut held,
+            own_key(),
+            &mut gap,
+        );
+        assert_eq!(verdict, None);
+        assert!(held.is_empty(), "the delivered frame leaves the hold");
+        assert_eq!(gap, GapHold::default(), "the gap surface goes quiet");
+    }
+
+    /// The defect-22 guard at the ladder level: a pass that observed back-pressure re-arms
+    /// EVERY held clock — shadows of the undelivered front frame must never age into the
+    /// deadline verdict, even when their held timestamps are already past it.
+    #[test]
+    fn a_backpressure_pass_rearms_aged_clocks_instead_of_verdicting() {
+        let peer = [0xabu8; 32];
+        let aged = std::time::Instant::now() - GAP_DEADLINE - Duration::from_secs(1);
+        let mut held: VecDeque<_> = vec![
+            (aged, held_frame(peer)), // the spool-blocked front
+            (aged, held_frame(peer)), // its gap shadow, equally aged
+        ]
+        .into_iter()
+        .collect();
+        let mut gap = GapHold::default();
+        let mut first = true;
+        let verdict = retry_held_with(
+            |_| {
+                if std::mem::take(&mut first) {
+                    Ok(InboundVerdict::Backpressure {
+                        sender: peer,
+                        channel: 0,
+                        seq: 5,
+                    })
+                } else {
+                    Ok(InboundVerdict::Gap {
+                        sender: peer,
+                        channel: 0,
+                        expected: 5,
+                        got: 6,
+                    })
+                }
+            },
+            &mut held,
+            own_key(),
+            &mut gap,
+        );
+        assert_eq!(verdict, None, "shadows never age out");
+        assert_eq!(held.len(), 2);
+        for (since, _) in &held {
+            assert!(
+                since.elapsed() < Duration::from_secs(1),
+                "every clock re-armed to now"
+            );
+        }
+        assert_eq!(gap.gapped_sender, None, "no standing gap is reported");
+    }
+
+    /// Own-echo frames are dropped from the hold without touching the delivery seam (a node's
+    /// own publications fan back through gossip; re-presenting them would self-deliver).
+    #[test]
+    fn own_echo_frames_are_dropped_from_the_hold_undelivered() {
+        let own = own_key();
+        let aged = std::time::Instant::now() - GAP_DEADLINE - Duration::from_secs(1);
+        let mut held: VecDeque<_> = vec![(aged, held_frame(own.0))].into_iter().collect();
+        let mut gap = GapHold::default();
+        let verdict = retry_held_with(
+            |_| -> Result<InboundVerdict, daemon_vhc_host::run::SinkError> {
+                panic!("an own-echo frame must never reach the delivery seam")
+            },
+            &mut held,
+            own,
+            &mut gap,
+        );
+        assert_eq!(verdict, None);
+        assert!(held.is_empty());
     }
 
     #[test]

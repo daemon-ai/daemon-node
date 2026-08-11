@@ -196,6 +196,85 @@ async fn rebroadcast_refloods_without_duplicate_delivery() {
     );
 }
 
+/// The C2 desync shape, pinned at the gossip layer (reliability spec §9 [REL-7]): a deaf
+/// window's loss boundary is the delivery-assurance ring. iroh-gossip has NO anti-entropy for
+/// missed messages — a peer that was offline when a flood happened can only recover it from
+/// the origin's nonce-bumped re-flood ring. So a peer that reconnects (same key — the crashed
+/// seat's fresh incarnation) after missing publishes recovers EXACTLY the ring-retained
+/// messages, and everything evicted from the ring is PERMANENTLY lost at this layer, whatever
+/// made the peer deaf (relay flap, suspend, crash — indistinguishable from here). That
+/// permanence is why the session's aged-gap verdict is typed-RETRYABLE (rejoin + checkpoint
+/// restore + semantic catch-up), never an in-session wait for backfill that cannot come.
+#[tokio::test(flavor = "multi_thread")]
+async fn deaf_window_loss_is_bounded_by_the_rebroadcast_ring() {
+    let rebroadcast = RebroadcastConfig {
+        enabled: true,
+        interval: Duration::from_millis(150),
+        ring_capacity: 4,
+        ..RebroadcastConfig::default()
+    };
+    let nodes = build_mesh(2, rebroadcast.clone()).await;
+    let mut sub1 = nodes[1].subscribe();
+
+    // Baseline: the mesh delivers live.
+    let m0 = signed_heartbeat_bytes(&signing_key(1), 0);
+    nodes[0].publish(&m0).await.expect("publish m0");
+    assert_eq!(
+        recv_timeout(&mut sub1, DELIVER).await.as_deref(),
+        Some(&m0[..]),
+        "baseline delivery before the deaf window"
+    );
+
+    // Node 1 goes deaf; node 0 keeps publishing rounds 1..=6. With m0 that is 7 publishes
+    // through a ring of 4: rounds 3..=6 are retained, rounds 0..=2 are evicted.
+    nodes[1].shutdown().await;
+    let deaf_msgs: Vec<Vec<u8>> = (1..=6)
+        .map(|round| signed_heartbeat_bytes(&signing_key(1), round))
+        .collect();
+    for m in &deaf_msgs {
+        nodes[0]
+            .publish(m)
+            .await
+            .expect("publish during deaf window");
+    }
+
+    // The seat's fresh incarnation rejoins with the SAME key and dials the surviving node.
+    let rejoined = connect_node(2, rebroadcast).await;
+    let mut sub_rejoined = rejoined.subscribe();
+    let live = vec![nodes[0].clone(), rejoined.clone()];
+    wire_roster(&live).await;
+    wait_for_mesh(&live, 1).await;
+
+    // Recovery: exactly the ring-retained messages (rounds 3..=6) arrive via re-floods.
+    let expected: Vec<&[u8]> = deaf_msgs[2..].iter().map(Vec::as_slice).collect();
+    let mut recovered: Vec<Vec<u8>> = Vec::new();
+    let deadline = std::time::Instant::now() + DELIVER;
+    while recovered.len() < expected.len() && std::time::Instant::now() < deadline {
+        if let Some(msg) = recv_timeout(&mut sub_rejoined, Duration::from_millis(500)).await {
+            assert!(
+                expected.contains(&msg.as_slice()),
+                "an evicted (or unknown) message arrived after the deaf window — \
+                 the ring boundary is not what this suite pins"
+            );
+            recovered.push(msg);
+        }
+    }
+    assert_eq!(
+        recovered.len(),
+        expected.len(),
+        "every ring-retained message is recovered through the re-flood"
+    );
+    // Permanence: nothing else ever arrives — rounds 0..=2 are gone at this layer. (A bounded
+    // negative window; several re-flood intervals pass within it.)
+    assert!(
+        recv_timeout(&mut sub_rejoined, Duration::from_millis(700))
+            .await
+            .is_none(),
+        "evicted messages are permanently lost at the gossip layer — recovery is the \
+         session's rejoin lane, not transport backfill"
+    );
+}
+
 /// The pinned-frame anti-entropy regression (c15-20260806a class): a peer that was NOT in the
 /// mesh when a standing distribution record (a cert announcement) was first flooded — late topic
 /// join, or its other control plane deaf — still converges via the periodic pinned re-flood,
