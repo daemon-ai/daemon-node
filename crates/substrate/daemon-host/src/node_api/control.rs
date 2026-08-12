@@ -2059,6 +2059,14 @@ impl ControlApi for NodeApiImpl {
     }
 
     async fn agent_register(&self, mut entry: AgentEntry) -> Result<(), ApiError> {
+        // The catalog is keyed by name, so a blank one would persist an unaddressable row that
+        // `agent_remove` could never target. Validated here (the node is the enforcement point),
+        // not merely in the clients' registration forms.
+        if entry.name.trim().is_empty() {
+            return Err(ApiError::Other(
+                "agent register: name must not be empty".into(),
+            ));
+        }
         // A manual registration: force `source = Manual`, then verify/enrich it via the discovery
         // hook when wired (PATH check for every protocol; the ACP `initialize` handshake fills
         // version/caps for ACP entries only).

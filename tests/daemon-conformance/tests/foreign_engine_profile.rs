@@ -430,6 +430,46 @@ async fn acp_profile_validation_rejects_unknown_and_uninstalled_agents() {
     assert!(err.to_string().contains("no-such-agent"));
 }
 
+/// The catalog is keyed by name, so a blank one is rejected at `agent_register` rather than
+/// persisting a row that `agent_remove` could never address.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acp_register_rejects_a_blank_agent_name() {
+    let (node, _resolver_called, _handle) = assemble_acp_node();
+
+    for blank in ["", "   "] {
+        let err = node
+            .agent_register(AgentEntry {
+                name: blank.into(),
+                recipe: AgentRecipe {
+                    program: Some(env!("CARGO_BIN_EXE_mock_acp_agent").to_string()),
+                    args: Vec::new(),
+                    env: Vec::new(),
+                    endpoint: None,
+                },
+                source: AgentSource::Manual,
+                protocol: AgentProtocol::Acp,
+                installed: false,
+                version: None,
+                capabilities: Vec::new(),
+                verification: AgentVerification::NotInstalled,
+            })
+            .await
+            .expect_err("a blank agent name must fail agent_register");
+        assert!(
+            err.to_string().contains("name must not be empty"),
+            "the error says why the registration was refused: {err}"
+        );
+    }
+
+    assert!(
+        node.agent_catalog()
+            .await
+            .iter()
+            .all(|e| !e.name.trim().is_empty()),
+        "a refused registration must not reach the catalog"
+    );
+}
+
 /// Poll `session_get` until the resident foreign session's live `model_selector.current` reaches
 /// `expected` (the sidecar is refreshed asynchronously off the backend's push feed), then return it.
 async fn wait_for_selector_current(

@@ -1151,9 +1151,10 @@ pub trait ControlApi: Send + Sync {
 
     // -- Foreign-agent discovery + registry (catalog-style; the daemon probes its own PATH) --
 
-    /// Trigger a server-side foreign-agent discovery scan (PATH + well-known locations + the
-    /// curated known-agent recipe table + configured endpoints), confirming each ACP candidate via
-    /// the `initialize` handshake (stream-json entries are PATH-probed only). Operator-triggered
+    /// Trigger a server-side foreign-agent discovery scan: resolve each entry of the curated
+    /// known-agent recipe table on the daemon's `PATH`, confirming each installed ACP candidate via
+    /// the `initialize` handshake (stream-json entries are PATH-probed only). Agents outside the
+    /// curated table reach the catalog through `agent_register`, not this scan. Operator-triggered
     /// (spawns subprocesses), like `model_search`. Default: empty.
     async fn agent_discover(&self) -> Vec<AgentEntry> {
         Vec::new()
