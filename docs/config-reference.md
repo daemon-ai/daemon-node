@@ -12,6 +12,7 @@ Single-origin browser deployment: `web.addr` binds ONE plain-HTTP listener that 
 
 | TOML path | Environment variable | Type | Default |
 |-----------|----------------------|------|---------|
+| `agents.isolate_state` | `DAEMON_AGENTS__ISOLATE_STATE` | bool | `false` |
 | `api.auth_db` | `DAEMON_API__AUTH_DB` | optional | _(unset)_ |
 | `api.ingress_max_connections` | `DAEMON_API__INGRESS_MAX_CONNECTIONS` | number | `1024` |
 | `api.ingress_max_decoded_bytes` | `DAEMON_API__INGRESS_MAX_DECODED_BYTES` | optional | _(unset)_ |

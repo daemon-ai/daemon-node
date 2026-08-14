@@ -314,6 +314,8 @@ impl ControlApi for NodeApiImpl {
         // Phase 3: a resident foreign session's live `Model` selector (choices + current), so a
         // detail pane can render a foreign model picker without a side channel.
         let model_selector = self.live.model_selector(&session);
+        // A10: the agent's currently-advertised slash commands (live-only, full-replace).
+        let commands = self.live.session_commands(&session);
         Some(SessionDetail {
             info,
             overlay,
@@ -324,6 +326,7 @@ impl ControlApi for NodeApiImpl {
             engine,
             foreign_backend,
             model_selector,
+            commands,
         })
     }
 
@@ -2025,13 +2028,58 @@ impl ControlApi for NodeApiImpl {
     }
 
     async fn agent_discover(&self) -> Vec<AgentEntry> {
-        // Probe the curated direct-binary recipe table via the injected discovery hook (the binary
-        // owns the ACP runtime). Cache the results so `agent_catalog` surfaces them without
-        // re-probing, then return the merged catalog (discovery results + durable manual
-        // registrations).
+        // Wire v46 fast-discovery split. The presence pass (curated table x PATH, no subprocess
+        // spawns) lands in the cache and the reply IMMEDIATELY — the "are there installed
+        // agents?" truth a first-run wizard gates on must not wait for handshakes. The
+        // `initialize` verification sweep runs in the background; its landing updates the cache
+        // and emits `AgentsChanged`, so every subscribed client refetches the enriched catalog.
+        // A discoverer without a presence fast path (empty `presence()`) keeps the legacy
+        // synchronous full scan.
         if let Some(agents) = &self.agents {
-            let discovered = agents.discover().await;
-            *self.last_agents.write().unwrap() = discovered;
+            let mut presence = agents.presence();
+            if presence.is_empty() {
+                let discovered = agents.discover().await;
+                *self.last_agents.write().unwrap() = discovered;
+                self.emit_agents_changed();
+            } else {
+                {
+                    // Carry the previous sweep's handshake enrichment (version/capabilities) for
+                    // rows still installed, so a re-discover does not visibly "un-verify" agents
+                    // while the new sweep re-probes them.
+                    let last = self.last_agents.read().unwrap();
+                    for entry in presence.iter_mut() {
+                        if !entry.installed {
+                            continue;
+                        }
+                        if let Some(prev) = last
+                            .iter()
+                            .find(|p| p.name == entry.name && p.version.is_some())
+                        {
+                            entry.version = prev.version.clone();
+                            entry.capabilities = prev.capabilities.clone();
+                            entry.refresh_verification();
+                        }
+                    }
+                }
+                *self.last_agents.write().unwrap() = presence;
+                self.emit_agents_changed();
+                // One sweep at a time: a reconnect storm of discover calls must not stack
+                // subprocess sweeps — late callers ride the running sweep's `AgentsChanged`.
+                if !self
+                    .agents_scan_running
+                    .swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    let this = self.clone();
+                    let agents = agents.clone();
+                    tokio::spawn(async move {
+                        let discovered = agents.discover().await;
+                        *this.last_agents.write().unwrap() = discovered;
+                        this.agents_scan_running
+                            .store(false, std::sync::atomic::Ordering::SeqCst);
+                        this.emit_agents_changed();
+                    });
+                }
+            }
         }
         self.agent_catalog().await
     }
@@ -2055,7 +2103,14 @@ impl ControlApi for NodeApiImpl {
                 by_name.insert(entry.name.clone(), entry);
             }
         }
-        by_name.into_values().collect()
+        // Derive the auth verdict for every served row (wire v47) — the auth analogue of the
+        // verification re-derive above: ONE place folds descriptor + credential/marker presence
+        // into `entry.auth`, so no client (and no other node path) re-implements the rule.
+        let mut out: Vec<AgentEntry> = by_name.into_values().collect();
+        for entry in &mut out {
+            self.derive_agent_auth(entry);
+        }
+        out
     }
 
     async fn agent_register(&self, mut entry: AgentEntry) -> Result<(), ApiError> {
@@ -2067,13 +2122,37 @@ impl ControlApi for NodeApiImpl {
                 "agent register: name must not be empty".into(),
             ));
         }
+        // Agent names fan out into auth family ids (`agent/<name>`), credential refs
+        // (`agent/<name>/<var>`) and state-home path segments, so registration enforces a strict
+        // slug (wire v47) BEFORE a name can reach any of those surfaces. Pre-existing stored rows
+        // keep working for catalog/spawn; derivation excludes them until re-registered.
+        if !daemon_api::is_valid_agent_slug(&entry.name) {
+            return Err(ApiError::Other(format!(
+                "agent register: name `{}` is not a valid slug (lowercase letters, digits, \
+                 `.`/`_`/`-`; must start with a letter or digit; at most 64 chars; no `..`)",
+                entry.name
+            )));
+        }
+        // The supplied auth descriptor (wire v47) is INPUT and validated; the DERIVED verdict is
+        // never trusted from the caller — catalog assembly recomputes it (cleared here so a stale
+        // claim cannot even ride the persisted row).
+        if let Some(descriptor) = &entry.auth_descriptor {
+            validate_auth_descriptor(descriptor)?;
+        }
+        entry.auth = None;
         // A manual registration: force `source = Manual`, then verify/enrich it via the discovery
         // hook when wired (PATH check for every protocol; the ACP `initialize` handshake fills
         // version/caps for ACP entries only).
         entry.source = AgentSource::Manual;
         if let Some(agents) = &self.agents {
+            let supplied_descriptor = entry.auth_descriptor.clone();
             entry = agents.probe(entry).await;
             entry.source = AgentSource::Manual;
+            // The probe may derive a descriptor for ACP agents, but an EXPLICIT manual descriptor
+            // always wins (the operator's tested claim over a heuristic).
+            if supplied_descriptor.is_some() {
+                entry.auth_descriptor = supplied_descriptor;
+            }
         }
         // Re-derive the trust status from the (probed, if a hook is wired) installed/protocol/version
         // — never trust the caller-supplied value, and cover the no-hook path where `probe` did not
@@ -2085,7 +2164,10 @@ impl ControlApi for NodeApiImpl {
                 entry: to_cbor(&entry),
             })
             .await
-            .map_err(|e| ApiError::Other(format!("agent register: {e}")))
+            .map_err(|e| ApiError::Other(format!("agent register: {e}")))?;
+        // Wire v46: the catalog gained a row — point every subscribed client at a refetch.
+        self.emit_agents_changed();
+        Ok(())
     }
 
     async fn agent_remove(&self, name: String) -> Result<(), ApiError> {
@@ -2093,7 +2175,10 @@ impl ControlApi for NodeApiImpl {
         self.store
             .acp_remove(&name)
             .await
-            .map_err(|e| ApiError::Other(format!("agent remove: {e}")))
+            .map_err(|e| ApiError::Other(format!("agent remove: {e}")))?;
+        // Wire v46: the catalog lost a row — point every subscribed client at a refetch.
+        self.emit_agents_changed();
+        Ok(())
     }
 
     // -- Cron (I15): every op delegates to the shared `CronOps`; absent it, the trait defaults
@@ -2632,6 +2717,121 @@ impl ControlApi for NodeApiImpl {
 }
 
 impl NodeApiImpl {
+    /// Derive a catalog entry's auth verdict (wire v47) — the auth analogue of
+    /// `refresh_verification`, run at catalog assembly so every client renders the SAME verdict.
+    ///
+    /// Inputs: the entry's `auth_descriptor` (curated / probe-derived / manual), any
+    /// probe-advertised ACP methods stashed on `entry.auth`, and credential/marker presence in
+    /// the node's `CredentialStore`. "Authenticated" means credential CONFIGURED (present, or an
+    /// ACP success marker from a completed node-run flow) — not vendor-verified; the runtime
+    /// loop refines it. A non-slug name (a legacy stored row) is excluded from auth derivation
+    /// entirely — its name cannot safely become a family id / credential ref / path segment.
+    pub(crate) fn derive_agent_auth(&self, entry: &mut AgentEntry) {
+        use daemon_api::{AgentAuth, AgentAuthMethod, AgentAuthScheme, AgentAuthState};
+        if !daemon_api::is_valid_agent_slug(&entry.name) {
+            entry.auth = None;
+            return;
+        }
+        // The probe-advertised ACP methods (facts, kept); everything else on `entry.auth` is a
+        // placeholder this derivation replaces.
+        let advertised = entry.auth.take().map(|a| a.methods).unwrap_or_default();
+        let Some(descriptor) = entry.auth_descriptor.clone() else {
+            // No auth facts at all: the verdict is Unknown, expressed as an absent block (the
+            // wire default decodes to Unknown), so clients cannot mistake it for a claim.
+            return;
+        };
+        let family = format!("agent/{}", entry.name);
+        let credential_present = |cred_ref: &str| {
+            self.credentials
+                .as_ref()
+                .is_some_and(|store| store.get(cred_ref).is_some())
+        };
+        let (state, methods) = match &descriptor.scheme {
+            AgentAuthScheme::None => (AgentAuthState::NotRequired, Vec::new()),
+            AgentAuthScheme::ApiKeyEnv { var, label } => {
+                let configured = credential_present(&format!("{family}/{var}"));
+                let state = if configured {
+                    AgentAuthState::Authenticated
+                } else {
+                    AgentAuthState::Required
+                };
+                let methods = vec![AgentAuthMethod {
+                    id: "api-key".into(),
+                    label: label.clone(),
+                    kind: daemon_api::AuthFlowKind::UserToken,
+                    family: family.clone(),
+                }];
+                (state, methods)
+            }
+            // Research-gated vendor flows: the credential slot is checked (an A5 family will fill
+            // it), but NO method is advertised until that family is actually registered — a
+            // Required verdict with an empty method list renders as "sign-in not available yet",
+            // never a dead button.
+            AgentAuthScheme::OAuthFamily { .. } | AgentAuthScheme::DeviceCode { .. } => {
+                let configured = credential_present(&format!("{family}/oauth"));
+                let state = if configured {
+                    AgentAuthState::Authenticated
+                } else {
+                    AgentAuthState::Required
+                };
+                (state, Vec::new())
+            }
+            AgentAuthScheme::AcpAuthenticate => {
+                // The node-owned success marker (`agent/<name>/acp:<method_id>`): ACP
+                // `authenticate` returns no credential and the agent's dotfile state is opaque,
+                // so a completed node-run flow is the only derivable fact.
+                let marker_prefix = format!("{family}/acp:");
+                let marked = self.credentials.as_ref().is_some_and(|store| {
+                    store
+                        .list_redacted()
+                        .iter()
+                        .any(|c| c.present && c.profile.starts_with(&marker_prefix))
+                });
+                let state = if marked {
+                    AgentAuthState::Authenticated
+                } else {
+                    AgentAuthState::Required
+                };
+                let methods = if advertised.is_empty() {
+                    // A manual AcpAuthenticate descriptor without a captured method list (the
+                    // probe did not run / agent not installed): one synthetic method so the
+                    // client still has something runnable to offer.
+                    vec![AgentAuthMethod {
+                        id: "acp".into(),
+                        label: "Authenticate".into(),
+                        kind: daemon_api::AuthFlowKind::AcpAuthenticate,
+                        family: family.clone(),
+                    }]
+                } else {
+                    advertised
+                };
+                (state, methods)
+            }
+        };
+        // A6 refinement: a runtime-classified rejection (`agent/<name>/rejected`, stamped by the
+        // live-session pump) proves the configured credential/marker stale — the verdict flips
+        // back to Required until a re-auth through the `agent/<name>` flow clears the fact.
+        let state = if state == AgentAuthState::Authenticated
+            && credential_present(&format!("{family}/rejected"))
+        {
+            AgentAuthState::Required
+        } else {
+            state
+        };
+        entry.auth = Some(AgentAuth { state, methods });
+    }
+
+    /// Emit the node-wide `AgentsChanged` pointer (wire v46) — the foreign-agent catalog changed
+    /// (a discovery pass landed, or an agent was registered/removed), so subscribed clients
+    /// refetch `AgentCatalog`. Bumps + stamps the coalescing agents revision, mirroring
+    /// `ProfilesChanged`. A no-op when no node-event feed is wired (tests / a minimal node).
+    pub(super) fn emit_agents_changed(&self) {
+        if let Some(feed) = self.node_feed() {
+            let rev = feed.note_agents_change();
+            feed.emit(daemon_api::NodeEvent::AgentsChanged { rev });
+        }
+    }
+
     /// Auth 4 for the filesystem surface (Cluster A, F2): a [`FsRootId::Session`] root addresses that
     /// session's workspace sandbox, so reading/writing it is a per-session op and must carry the same
     /// ownership proof as the session log/history — own-or-[`SessionSeeAll`](daemon_auth::Capability::SessionSeeAll)
@@ -2720,6 +2920,53 @@ impl NodeApiImpl {
             .capture(sid.as_str(), &call_id, "operator_fs_write", &env)
             .await;
     }
+}
+
+/// Validate a manually supplied [`daemon_api::AgentAuthDescriptor`] at `AgentRegister` ingress
+/// (wire v47): the descriptor is a caller claim that fans out into env injection and runtime
+/// classification, so its fields must be sane BEFORE they are persisted. `ApiKeyEnv.var` must be
+/// a well-formed env-var name (`[A-Z_][A-Z0-9_]*`, at most 64 chars) with a non-empty label; a
+/// vendor family id and a rejection classifier's field/code must be non-empty.
+fn validate_auth_descriptor(descriptor: &daemon_api::AgentAuthDescriptor) -> Result<(), ApiError> {
+    use daemon_api::AgentAuthScheme;
+    match &descriptor.scheme {
+        AgentAuthScheme::None | AgentAuthScheme::AcpAuthenticate => {}
+        AgentAuthScheme::ApiKeyEnv { var, label } => {
+            let bytes = var.as_bytes();
+            let valid = !bytes.is_empty()
+                && bytes.len() <= 64
+                && (bytes[0].is_ascii_uppercase() || bytes[0] == b'_')
+                && bytes[1..]
+                    .iter()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || *b == b'_');
+            if !valid {
+                return Err(ApiError::Other(format!(
+                    "agent register: ApiKeyEnv var `{var}` is not a valid environment variable \
+                     name (uppercase letters, digits, `_`; must not start with a digit)"
+                )));
+            }
+            if label.trim().is_empty() {
+                return Err(ApiError::Other(
+                    "agent register: ApiKeyEnv label must not be empty".into(),
+                ));
+            }
+        }
+        AgentAuthScheme::OAuthFamily { family } | AgentAuthScheme::DeviceCode { family } => {
+            if family.trim().is_empty() {
+                return Err(ApiError::Other(
+                    "agent register: auth family must not be empty".into(),
+                ));
+            }
+        }
+    }
+    if let Some(rejection) = &descriptor.rejection {
+        if rejection.field.trim().is_empty() || rejection.code.trim().is_empty() {
+            return Err(ApiError::Other(
+                "agent register: rejection classifier field/code must not be empty".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Mint a fresh feedback id: `fb-<32 hex>` from 16 random bytes (mirrors `mint_session_id`). A

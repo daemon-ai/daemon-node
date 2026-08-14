@@ -58,6 +58,9 @@ enum Script {
     PhoneOtp,
     /// A `Qr` challenge, a poll, an informational `Message`, then a completing poll.
     QrPairing,
+    /// An informational `Message` challenge, then a completing poll (the agent-authenticate
+    /// shape: the flow completes via side effects, the client just watches).
+    MessagePoll,
 }
 
 /// A demo auth family: its wire family id, human name, discovered [`AuthFlowKind`], and the scripted
@@ -126,12 +129,19 @@ fn spec_for(kind: AuthFlowKind) -> DemoFlowSpec {
             script: Script::QrPairing,
             account_label: "demo-qr",
         },
+        AuthFlowKind::AcpAuthenticate => DemoFlowSpec {
+            family: "demo-acp",
+            display_name: "Demo agent authenticate (message + poll)",
+            flow_kind: AuthFlowKind::AcpAuthenticate,
+            script: Script::MessagePoll,
+            account_label: "demo-acp",
+        },
     }
 }
 
 /// The demo [`AuthFlowKind`] variants, in registration order. Kept beside the exhaustive
 /// [`spec_for`] match, which is the real coverage guarantee (a new variant fails the build there).
-const DEMO_FLOW_KINDS: [AuthFlowKind; 7] = [
+const DEMO_FLOW_KINDS: [AuthFlowKind; 8] = [
     AuthFlowKind::UserPassword,
     AuthFlowKind::MatrixSso,
     AuthFlowKind::OAuth2Pkce,
@@ -139,6 +149,7 @@ const DEMO_FLOW_KINDS: [AuthFlowKind; 7] = [
     AuthFlowKind::UserToken,
     AuthFlowKind::PhoneOtp,
     AuthFlowKind::QrPairing,
+    AuthFlowKind::AcpAuthenticate,
 ];
 
 /// Every demo interactive-auth factory (one per [`AuthFlowKind`]), ready to hand to the node
@@ -248,8 +259,9 @@ impl AuthFlowFactory for DemoAuthFlowFactory {
             Script::UserPassword => userpass_fields(),
             Script::PastedToken { with_region } => token_fields(with_region),
             Script::PhoneOtp => phone_fields(),
-            // Redirect + QR flows collect nothing up front (the client opens a URL / scans a QR).
-            Script::Redirect | Script::QrPairing => Vec::new(),
+            // Redirect / QR / message-poll flows collect nothing up front (the client opens a
+            // URL, scans a QR, or just watches for completion).
+            Script::Redirect | Script::QrPairing | Script::MessagePoll => Vec::new(),
         };
         AuthProviderInfo {
             family: self.spec.family.to_string(),
@@ -335,6 +347,9 @@ impl PendingAuthFlow for DemoPendingFlow {
                 image: None,
                 poll_interval_ms: 250,
             },
+            Script::MessagePoll => AuthChallenge::Message {
+                text: "The demo agent is completing authentication".into(),
+            },
         }
     }
 
@@ -397,6 +412,13 @@ impl PendingAuthFlow for DemoPendingFlow {
                 // Second poll: the peer device approved → complete.
                 Ok(self.complete(&self.account_label))
             }
+            Script::MessagePoll => {
+                let AuthStepInput::Poll = input else {
+                    return Err(ApiError::Other("this flow expects a poll".into()));
+                };
+                // The message challenge was the whole ceremony: the first poll completes.
+                Ok(self.complete(&self.account_label))
+            }
         }
     }
 }
@@ -422,8 +444,8 @@ fn required(fields: &BTreeMap<String, String>, key: &str) -> Result<String, ApiE
 mod tests {
     use super::*;
 
-    /// Every demo factory reports the flow kind its spec declares, and the set covers all seven
-    /// `AuthFlowKind` variants exactly once.
+    /// Every demo factory reports the flow kind its spec declares, and the set covers every
+    /// `AuthFlowKind` variant exactly once.
     #[test]
     fn one_factory_per_auth_flow_kind() {
         let factories = demo_auth_factories();

@@ -198,6 +198,30 @@ impl NodeApiImpl {
             self.rebuild_routing();
         }
 
+        // An agent-scoped credential (wire v47: `agent/<name>/...` from the dynamic `agent/*`
+        // families) flips that agent's derived auth verdict — nudge subscribers to refetch the
+        // catalog, exactly as a registration or discovery pass would. A completed re-auth also
+        // clears the runtime rejection fact (A6): the fresh credential supersedes the stale one
+        // the rejection proved.
+        if let Some(rest) = credential_ref.strip_prefix(crate::agent_auth::AGENT_FAMILY_PREFIX) {
+            if let Some((name, _)) = rest.split_once('/') {
+                if let Some(store) = &self.credentials {
+                    let _ = store.remove(&format!("agent/{name}/rejected"));
+                }
+                // The credential only reaches an agent process at spawn-time materialization, so
+                // resident sessions for this agent still run with the stale (or absent) secret —
+                // the very state the operator just fixed. Evict them (durable sessions survive in
+                // the store); the next turn re-`ensure`s a fresh spawn that carries the new
+                // credential. Best-effort async: completion must not block on process teardown.
+                let live = self.live.clone();
+                let agent = name.to_string();
+                tokio::spawn(async move {
+                    live.evict_foreign_for_agent(&agent).await;
+                });
+            }
+            self.emit_agents_changed();
+        }
+
         Ok(AuthCompleteResponse {
             credential_ref,
             account_label: outcome.account_label,

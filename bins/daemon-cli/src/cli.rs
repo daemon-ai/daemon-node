@@ -185,12 +185,63 @@ pub(crate) enum Command {
         #[command(subcommand)]
         cmd: DirectoryCmd,
     },
+    /// Manage the foreign-agent catalog (list, register with an optional auth descriptor, remove).
+    Agent {
+        #[command(subcommand)]
+        cmd: AgentCmd,
+    },
     /// Drive this node's VHC (decentralized training) participation over the node API: list/detail
     /// runs, join/leave, pause/resume, report hardware, and read the local base identity. Every
     /// verb maps 1:1 onto an existing `ApiRequest` variant (no wire change) and supports `--json`.
     Vhc {
         #[command(subcommand)]
         cmd: VhcCmd,
+    },
+}
+
+/// Foreign-agent catalog verbs. `register` is the full wire surface — including the auth
+/// descriptor with the rejection classifier the GUI form deliberately does not expose (a
+/// curated/power-user concern) — so scripted setups (e.g. the e2e auth journey) need no
+/// hand-rolled wire client.
+#[derive(Subcommand)]
+pub(crate) enum AgentCmd {
+    /// List the catalog (name, source, protocol, verification, auth verdict + methods).
+    Catalog,
+    /// Register (or update) a foreign agent. The node validates the slug + descriptor, forces
+    /// source=Manual, and re-probes installed-ness — caller-supplied verdicts are never trusted.
+    Register {
+        /// The catalog name (strict slug: `^[a-z0-9][a-z0-9._-]{0,63}$`).
+        name: String,
+        /// The wire protocol the agent speaks.
+        #[arg(long, value_parser = ["acp", "stream-json"], default_value = "acp")]
+        protocol: String,
+        /// The stdio program (PATH-resolved node-side). Mutually exclusive with --endpoint.
+        #[arg(long)]
+        program: Option<String>,
+        /// A program argument (repeatable, in order).
+        #[arg(long = "arg")]
+        args: Vec<String>,
+        /// An extra spawn-env entry, KEY=VALUE (repeatable).
+        #[arg(long = "env")]
+        env: Vec<String>,
+        /// A network endpoint (`tcp://host:port`) instead of a program.
+        #[arg(long)]
+        endpoint: Option<String>,
+        /// ApiKeyEnv auth descriptor: the env var the stored key materializes into at spawn.
+        #[arg(long)]
+        auth_var: Option<String>,
+        /// The sign-in form's field label (defaults to "API key"; needs --auth-var).
+        #[arg(long)]
+        auth_label: Option<String>,
+        /// A machine-readable auth-rejection classifier, FIELD=CODE (e.g. `subtype=error_auth`);
+        /// the ONLY signal that lets runtime errors flip this agent's auth verdict.
+        #[arg(long)]
+        rejection: Option<String>,
+    },
+    /// Remove an agent from the catalog.
+    Remove {
+        /// The catalog name.
+        name: String,
     },
 }
 

@@ -314,6 +314,10 @@ pub(crate) struct NodeFeedInner {
     /// The monotonic profiles revision (Phase 3): bumped on every profile author/edit/delete and
     /// stamped onto `ProfilesChanged` (its coalescing key; the client re-fetches the profile list).
     profiles_rev: u64,
+    /// The monotonic foreign-agent catalog revision (wire v46): bumped on every discovery-scan
+    /// landing (presence pass, background verification pass) and register/remove, stamped onto
+    /// `AgentsChanged` (its coalescing key; the client re-fetches `AgentCatalog`).
+    agents_rev: u64,
     /// The persons revision + delta index (rung 1 rev; rung 2 changed/removed): bumped on every
     /// person-registry mutation, stamped onto `PersonsChanged` AND echoed by `PersonList`, so the
     /// two agree on the reflected generation. Rung 2 delta reads (`PersonList.since_rev`) serve
@@ -355,6 +359,7 @@ impl NodeEventFeed {
                 removed: VecDeque::new(),
                 fleet_rev: 0,
                 profiles_rev: 0,
+                agents_rev: 0,
                 persons: DeltaIndex::default(),
                 notifications_rev: 0,
                 catalog_rev: 0,
@@ -446,6 +451,15 @@ impl NodeEventFeed {
         let mut g = self.inner.lock().unwrap();
         g.profiles_rev += 1;
         g.profiles_rev
+    }
+
+    /// Bump the foreign-agent catalog revision and return it (wire v46). The agent
+    /// discover/register/remove paths call this then stamp the returned `rev` onto an
+    /// `AgentsChanged`, so a scan's burst of updates collapses to one `AgentCatalog` refetch.
+    pub fn note_agents_change(&self) -> u64 {
+        let mut g = self.inner.lock().unwrap();
+        g.agents_rev += 1;
+        g.agents_rev
     }
 
     /// Test convenience: a null-provenance persons change (production stamps `current_op_id()`).
@@ -702,6 +716,12 @@ impl NodeEventFeed {
             g.ring
                 .coalesce(|e| matches!(e, NodeEvent::ProfilesChanged { .. }));
         }
+        // AgentsChanged coalesces globally (a refetch reads the whole agent catalog), so a
+        // discovery scan's presence + verification landings collapse to one client refetch.
+        if matches!(&event, NodeEvent::AgentsChanged { .. }) {
+            g.ring
+                .coalesce(|e| matches!(e, NodeEvent::AgentsChanged { .. }));
+        }
         // push assigns the cursor + raises the floor on a capacity eviction.
         let cursor = g.ring.push(event.clone());
         drop(g);
@@ -853,6 +873,14 @@ impl Drop for LiveSession {
     }
 }
 
+/// The client-facing surfaces of an evicted residency, parked so the replacement residency can
+/// adopt them (see `LiveSessions::evict_foreign_for_agent`): the merged log keeps every open
+/// `Subscribe` stream alive across the respawn, the delivery roster keeps push delivery bound.
+pub(crate) struct ParkedSurface {
+    delivery: Delivery,
+    log: Merged,
+}
+
 pub(crate) struct LiveSessions {
     sessions: DashMap<SessionId, LiveSession>,
     builder: SessionEngineBuilder,
@@ -892,6 +920,28 @@ pub(crate) struct LiveSessions {
     /// (surfaced as `SessionDetail.model_selector`); populated by the per-session watcher spawned in
     /// `ensure` and cleared when the session is shut down. Empty for native + non-advertising sessions.
     selectors: Arc<DashMap<SessionId, daemon_api::ModelSelector>>,
+    /// Per-session advertised slash commands (A10): the last-seen full-replace list a resident
+    /// foreign (ACP) session's agent advertised, mirrored from the backend's push feed exactly like
+    /// `selectors`. Read by `session_get` (surfaced as `SessionDetail.commands`); evicted together
+    /// with `selectors` when the session shuts down. Empty for native + non-advertising sessions.
+    commands: Arc<DashMap<SessionId, Vec<daemon_api::AgentSlashCommand>>>,
+    /// Which catalog agent each resident FOREIGN session spawned for (wire v47): the eviction key
+    /// for `evict_foreign_for_agent` — a completed `agent/<name>` auth flow drops that agent's
+    /// residencies so the next turn respawns with freshly materialized credentials (a resident
+    /// process keeps the env it spawned with). Populated at `ensure`, evicted with the session.
+    foreign_agents: Arc<DashMap<SessionId, String>>,
+    /// Live surfaces parked across a credential-driven eviction: the delivery roster
+    /// (Primary/Spectator bindings) AND the merged log (whose broadcast feeds every open
+    /// `Subscribe` stream) live on the residency, but the CLIENT is never told its agent was
+    /// respawned (residency is a node implementation detail). Both are carried over — the next
+    /// `ensure` adopts the parked `Arc`s, so open subscribe streams keep receiving with seq
+    /// continuity and push delivery resumes, all without a client re-subscribe.
+    parked_surfaces: DashMap<SessionId, ParkedSurface>,
+    /// The node credential store (wire v47 A6), shared from `NodeApiImpl`: the per-session pump
+    /// records CLASSIFIED agent auth rejections here (the `agent/<name>/rejected` fact + stale
+    /// ACP-marker clearing) so the derived catalog verdict flips. `None` until
+    /// `set_credentials` wires it (a node without a credential store never flips verdicts).
+    credentials: Mutex<Option<Arc<dyn crate::CredentialStore>>>,
 }
 
 /// Record a foreign session's freshly-captured `Model` selector in the sidecar and, when the current
@@ -922,6 +972,76 @@ fn emit_selector_change(
     }
 }
 
+/// Record a foreign session's freshly-advertised slash commands in the sidecar (A10) and, when the
+/// list actually changed, emit a `SessionMetaChanged` pointer so thin clients refetch `session_get`
+/// (dedup keeps a re-advertisement of the same list event-free) — the `emit_selector_change` twin.
+fn emit_commands_change(
+    commands: &DashMap<SessionId, Vec<daemon_api::AgentSlashCommand>>,
+    feed: &Option<Arc<NodeEventFeed>>,
+    session: &SessionId,
+    list: Vec<daemon_api::AgentSlashCommand>,
+) {
+    let changed = commands.get(session).map(|e| *e != list).unwrap_or(true);
+    commands.insert(session.clone(), list);
+    if changed {
+        if let Some(feed) = feed {
+            let rev = feed.note_roster_change(session);
+            feed.emit(NodeEvent::SessionMetaChanged {
+                session: session.clone(),
+                rev,
+                // Advertisement stamps carry no client op token (null provenance).
+                origin_op: None,
+            });
+        }
+    }
+}
+
+/// Record a CLASSIFIED foreign-agent auth rejection as node-owned facts (wire v47 A6): stamp the
+/// `agent/<name>/rejected` marker (the derivation reads it as "runtime proved the configured
+/// credential stale" and flips the verdict to `Required`) and clear any now-disproven ACP success
+/// markers (`agent/<name>/acp:*`). Emits `AgentsChanged` only when a fact actually changed, so a
+/// rejection while the verdict is already flipped is churn-free. A successful re-auth through the
+/// `agent/<name>` flow clears the rejection fact (see `finish_auth_outcome`).
+fn note_agent_auth_rejection(
+    credentials: Option<&Arc<dyn crate::CredentialStore>>,
+    feed: &Option<Arc<NodeEventFeed>>,
+    family: &str,
+) {
+    let Some(store) = credentials else { return };
+    let Some(name) = family.strip_prefix("agent/") else {
+        return;
+    };
+    if name.is_empty() {
+        return;
+    }
+    let mut changed = false;
+    let acp_prefix = format!("agent/{name}/acp:");
+    for cred in store.list_redacted() {
+        if cred.present
+            && cred.profile.starts_with(&acp_prefix)
+            && store.remove(&cred.profile).is_ok()
+        {
+            changed = true;
+        }
+    }
+    let rejected_ref = format!("agent/{name}/rejected");
+    if store.get(&rejected_ref).is_none() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis().to_string())
+            .unwrap_or_else(|_| "0".to_string());
+        if store.set(&rejected_ref, &stamp).is_ok() {
+            changed = true;
+        }
+    }
+    if changed {
+        if let Some(feed) = feed {
+            let rev = feed.note_agents_change();
+            feed.emit(NodeEvent::AgentsChanged { rev });
+        }
+    }
+}
+
 impl LiveSessions {
     pub(crate) fn new(
         builder: SessionEngineBuilder,
@@ -941,7 +1061,16 @@ impl LiveSessions {
             title_aux: Mutex::new(None),
             titled: Arc::new(DashMap::new()),
             selectors: Arc::new(DashMap::new()),
+            commands: Arc::new(DashMap::new()),
+            foreign_agents: Arc::new(DashMap::new()),
+            parked_surfaces: DashMap::new(),
+            credentials: Mutex::new(None),
         }
+    }
+
+    /// Wire the node credential store so classified agent auth rejections land as durable facts.
+    pub(crate) fn set_credentials(&self, credentials: Arc<dyn crate::CredentialStore>) {
+        *self.credentials.lock().unwrap() = Some(credentials);
     }
 
     /// Wire the auxiliary provider for background session-title generation.
@@ -998,6 +1127,19 @@ impl LiveSessions {
     /// Read by `session_get` to surface `SessionDetail.model_selector`.
     pub(crate) fn model_selector(&self, session: &SessionId) -> Option<daemon_api::ModelSelector> {
         self.selectors.get(session).map(|s| s.clone())
+    }
+
+    /// The last-advertised slash commands for a resident foreign session (A10), or empty for a
+    /// native session, a foreign agent that advertises none, or a non-resident session. Read by
+    /// `session_get` to surface `SessionDetail.commands`.
+    pub(crate) fn session_commands(
+        &self,
+        session: &SessionId,
+    ) -> Vec<daemon_api::AgentSlashCommand> {
+        self.commands
+            .get(session)
+            .map(|c| c.clone())
+            .unwrap_or_default()
     }
 
     /// Route a live model change to a resident foreign session's backend (Phase 3): a foreign ACP
@@ -1067,6 +1209,42 @@ impl LiveSessions {
     /// Fallible: a foreign-engine profile resolves its ACP catalog entry at spawn time (the recipe
     /// lives node-side, keyed by name), so a vanished or no-longer-installed agent fails the open
     /// with a clear [`ApiError`] here instead of a dead actor. Native construction cannot fail.
+    /// Evict every resident FOREIGN session spawned for `agent` (wire v47): a completed
+    /// `agent/<name>` auth flow stores a credential the already-running processes never saw —
+    /// a spawned process keeps the environment it was materialized with — so the residency is
+    /// dropped (the durable session survives in the store) and the next submit re-`ensure`s a
+    /// fresh spawn that materializes the new credential.
+    pub(crate) async fn evict_foreign_for_agent(&self, agent: &str) {
+        let victims: Vec<SessionId> = self
+            .foreign_agents
+            .iter()
+            .filter(|e| e.value() == agent)
+            .map(|e| e.key().clone())
+            .collect();
+        for session in victims {
+            self.foreign_agents.remove(&session);
+            if let Some((_, s)) = self.sessions.remove(&session) {
+                self.selectors.remove(&session);
+                self.commands.remove(&session);
+                // Park the client-facing surfaces: the subscriber is never told its agent was
+                // respawned (residency is a node implementation detail), so the delivery roster
+                // AND the merged log (whose broadcast feeds every open Subscribe stream) must
+                // survive the eviction — the next `ensure` adopts both, and the client's live
+                // stream + push delivery continue as if nothing happened.
+                self.parked_surfaces.insert(
+                    session.clone(),
+                    ParkedSurface {
+                        delivery: s.delivery.clone(),
+                        log: s.log.clone(),
+                    },
+                );
+                if let LiveHandle::Foreign(backend) = &s.handle {
+                    backend.submit(AgentCommand::Shutdown).await;
+                }
+            }
+        }
+    }
+
     pub(crate) async fn ensure(
         &self,
         session: &SessionId,
@@ -1105,12 +1283,23 @@ impl LiveSessions {
         let backend = (self.builder)(session.clone(), effective_profile, &overlay);
         let drain: Drain = Arc::new(Mutex::new(VecDeque::new()));
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
-        let log: Merged = Arc::new(Mutex::new(MergedLog::new(
-            session.clone(),
-            epoch,
-            self.node_feed(),
-        )));
-        let delivery: Delivery = Arc::new(Mutex::new(Vec::new()));
+        // Adopt the surfaces parked by a credential-driven eviction (see
+        // `evict_foreign_for_agent`): reusing the parked merged log keeps every open Subscribe
+        // stream receiving with seq/epoch continuity, and the parked delivery roster keeps the
+        // Primary/Spectator bindings — the respawn is invisible to connected clients. Absent a
+        // parked entry (the normal path), both start fresh.
+        let parked = self.parked_surfaces.remove(session).map(|(_, p)| p);
+        let (log, delivery): (Merged, Delivery) = match parked {
+            Some(p) => (p.log, p.delivery),
+            None => (
+                Arc::new(Mutex::new(MergedLog::new(
+                    session.clone(),
+                    epoch,
+                    self.node_feed(),
+                ))),
+                Arc::new(Mutex::new(Vec::new())),
+            ),
+        };
         // A per-session journal feeder (keyed by SessionId), shared by the event pump and the
         // request handler so the live transcript is sealed per turn into the unified journal.
         let feeder: Option<Arc<JournalFeeder>> = self.journal.lock().unwrap().as_ref().map(|cfg| {
@@ -1139,7 +1328,13 @@ impl LiveSessions {
         // are byte-for-byte the native shape.
         let handle: LiveHandle = match backend {
             SessionBackend::Core(engine) => LiveHandle::Core(spawn_agent_session(engine, host)),
-            SessionBackend::Foreign(factory) => LiveHandle::Foreign(factory(host).await?),
+            SessionBackend::Foreign { agent, factory } => {
+                let live = LiveHandle::Foreign(factory(host).await?);
+                // Key the residency by its catalog agent so a completed `agent/<name>` auth flow
+                // can evict (and thereby respawn-with-fresh-credentials) exactly these sessions.
+                self.foreign_agents.insert(session.clone(), agent);
+                live
+            }
         };
 
         // Phase 3: mirror a foreign backend's live `Model` selector into the per-session sidecar so
@@ -1157,6 +1352,22 @@ impl LiveSessions {
                             Ok(selector) => {
                                 emit_selector_change(&selectors, &feed, &sess, selector)
                             }
+                            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                });
+            }
+            // A10: mirror the agent's advertised slash commands the same way (full-replace
+            // snapshots; `SessionMetaChanged` on a real change; watcher ends with the session).
+            if let Some(mut updates) = backend.command_updates() {
+                let commands = self.commands.clone();
+                let feed = self.node_feed();
+                let sess = session.clone();
+                tokio::spawn(async move {
+                    loop {
+                        match updates.recv().await {
+                            Ok(list) => emit_commands_change(&commands, &feed, &sess, list),
                             Err(broadcast::error::RecvError::Lagged(_)) => continue,
                             Err(broadcast::error::RecvError::Closed) => break,
                         }
@@ -1187,6 +1398,7 @@ impl LiveSessions {
         let pump_aux = self.title_aux.lock().unwrap().clone();
         let pump_titled = self.titled.clone();
         let pump_session = session.clone();
+        let pump_credentials = self.credentials.lock().unwrap().clone();
         let pump = tokio::spawn(async move {
             // The internal snapshot request this pump is awaiting a reply to, if any (the latest
             // `TurnFinished` wins; a stale reply is still fresher than nothing and is used as-is).
@@ -1215,6 +1427,24 @@ impl LiveSessions {
                                 }
                             }
                             continue;
+                        }
+                        // A6: a CLASSIFIED agent auth rejection (structured `auth_required` from
+                        // the ACP adapter or a stream-json classifier match) is recorded as a
+                        // node-owned fact so the derived catalog verdict flips — the event itself
+                        // still flows to clients unchanged below.
+                        if let AgentEvent::Error {
+                            kind: Some(kind),
+                            family: Some(family),
+                            ..
+                        } = &ev
+                        {
+                            if kind == daemon_protocol::ERROR_KIND_AUTH_REQUIRED {
+                                note_agent_auth_rejection(
+                                    pump_credentials.as_ref(),
+                                    &pump_feed,
+                                    family,
+                                );
+                            }
                         }
                         let turn_finished = matches!(ev, AgentEvent::TurnFinished { .. });
                         // Stamp + record on the merged log, capturing the freshly-stamped entry so the
@@ -1371,8 +1601,13 @@ impl LiveSessions {
                     },
                 );
                 if let Some((_, s)) = self.sessions.remove(&session) {
-                    // Drop the live model-selector sidecar for the closing session (Phase 3).
+                    // Drop the live model-selector + advertised-command + foreign-agent sidecars
+                    // for the closing session (Phase 3 / A10 / v47) — all live-only state,
+                    // evicted together.
                     self.selectors.remove(&session);
+                    self.commands.remove(&session);
+                    self.foreign_agents.remove(&session);
+                    self.parked_surfaces.remove(&session);
                     match &s.handle {
                         LiveHandle::Core(handle) => handle.shutdown().await,
                         LiveHandle::Foreign(session) => {

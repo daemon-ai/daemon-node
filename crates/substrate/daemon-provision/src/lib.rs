@@ -287,10 +287,30 @@ impl ProcessProvisioner {
         Self
     }
 
-    /// Spawn the child and wire its stdio into a [`CutChannel`] with the requested [`Framing`].
-    /// Shared by the length-framed [`Provisioner::place`] and the newline-framed
-    /// [`Provisioner::place_lines`].
-    async fn spawn_framed(spec: PlacementSpec, framing: Framing) -> Result<Placement, ProvErr> {
+    /// Newline-framed placement with an explicit [`EnvPolicy`] — the isolation-aware variant of
+    /// [`Provisioner::place_lines`] for **less-trusted foreign agent children**: a `Clean` policy
+    /// starts the child from an empty environment (allowlist only), so no daemon-ambient secret
+    /// (provider keys, tokens) leaks into a foreign process. `spec.env` extras are set explicitly
+    /// under either policy, so injected credentials/state-home overrides always arrive.
+    pub async fn place_lines_with_policy(
+        &self,
+        _id: &SessionId,
+        spec: PlacementSpec,
+        policy: EnvPolicy,
+    ) -> Result<Placement, ProvErr> {
+        Self::spawn_framed(spec, Framing::Lines, policy).await
+    }
+
+    /// Spawn the child and wire its stdio into a [`CutChannel`] with the requested [`Framing`],
+    /// under the caller's declared [`EnvPolicy`]. Shared by the length-framed
+    /// [`Provisioner::place`], the newline-framed [`Provisioner::place_lines`] (both
+    /// `InheritFull`: a placed worker is a trusted node component that needs the daemon's ambient
+    /// environment by design) and the isolation-aware [`Self::place_lines_with_policy`].
+    async fn spawn_framed(
+        spec: PlacementSpec,
+        framing: Framing,
+        policy: EnvPolicy,
+    ) -> Result<Placement, ProvErr> {
         use std::process::Stdio;
 
         // Spawns a trusted node worker program (provisioner placement, argv-only, no shell).
@@ -302,11 +322,9 @@ impl ProcessProvisioner {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .kill_on_drop(true);
-        // Declared env policy (Cluster E): `InheritFull` — a placed worker is a trusted node
-        // component (a cut of the daemon itself) that needs the daemon's ambient environment
-        // (provider keys, PATH, locale) by design. `spec.env` extras layer on top exactly as
-        // before; only the *declaration* is new.
-        EnvPolicy::InheritFull.apply(&mut command, &spec.env);
+        // Declared env policy (Cluster E): stated by the caller at every spawn site; `spec.env`
+        // extras layer on top under either policy.
+        policy.apply(&mut command, &spec.env);
 
         let mut child = command.spawn().map_err(|e| ProvErr::Spawn(e.to_string()))?;
         let stdin = child
@@ -345,7 +363,7 @@ impl Provisioner for ProcessProvisioner {
     }
 
     async fn place(&self, _id: &SessionId, spec: PlacementSpec) -> Result<Placement, ProvErr> {
-        Self::spawn_framed(spec, Framing::Length).await
+        Self::spawn_framed(spec, Framing::Length, EnvPolicy::InheritFull).await
     }
 
     async fn place_lines(
@@ -353,7 +371,7 @@ impl Provisioner for ProcessProvisioner {
         _id: &SessionId,
         spec: PlacementSpec,
     ) -> Result<Placement, ProvErr> {
-        Self::spawn_framed(spec, Framing::Lines).await
+        Self::spawn_framed(spec, Framing::Lines, EnvPolicy::InheritFull).await
     }
 
     async fn reclaim(&self, _id: &SessionId) {

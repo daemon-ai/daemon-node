@@ -22,19 +22,20 @@
 #![forbid(unsafe_code)]
 
 use agent_client_protocol::schema::v1::{
-    CancelNotification, ContentBlock, ContentChunk, EnvVariable, InitializeRequest, McpServer,
-    McpServerStdio, NewSessionRequest, PermissionOptionKind, PromptRequest, PromptResponse,
-    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionConfigId, SessionConfigKind, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigSelectOptions,
-    SessionConfigValueId, SessionId, SessionNotification, SessionUpdate,
-    SetSessionConfigOptionRequest, StopReason, TextContent, ToolCall, ToolCallStatus,
-    ToolCallUpdate,
+    AuthenticateRequest, CancelNotification, ContentBlock, ContentChunk, EnvVariable,
+    InitializeRequest, McpServer, McpServerStdio, NewSessionRequest, PermissionOptionKind,
+    PromptRequest, PromptResponse, RequestPermissionOutcome, RequestPermissionRequest,
+    RequestPermissionResponse, SelectedPermissionOutcome, SessionConfigId, SessionConfigKind,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
+    SessionConfigSelectOptions, SessionConfigValueId, SessionId, SessionNotification,
+    SessionUpdate, SetSessionConfigOptionRequest, StopReason, TextContent, ToolCall,
+    ToolCallStatus, ToolCallUpdate,
 };
+use agent_client_protocol::schema::v1::{AvailableCommand, AvailableCommandInput};
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{AcpAgent, Agent, Client, ConnectionTo, Responder};
 use async_trait::async_trait;
-use daemon_api::{ModelChoice, ModelSelector};
+use daemon_api::{AgentSlashCommand, ModelChoice, ModelSelector};
 use daemon_common::env_policy::EnvPolicy;
 use daemon_common::{ReqId, UnitId};
 use daemon_host::{AgentSession, AgentUnit, JournalFeeder};
@@ -70,6 +71,10 @@ pub struct AcpLaunch {
     /// transport owns the actual spawn and exposes no env-clearing hook, so this field is private
     /// with no `Clean` constructor (declaration-only enforcement until upstream grows one).
     policy: EnvPolicy,
+    /// The interactive-auth family (`agent/<name>`) carried on a CLASSIFIED `auth_required`
+    /// failure event (wire v47 A6), so clients open the sign-in flow from data. `None` (probe /
+    /// authenticate launches) never classifies.
+    pub auth_family: Option<String>,
 }
 
 impl AcpLaunch {
@@ -82,6 +87,7 @@ impl AcpLaunch {
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
             desired_model: None,
             policy: EnvPolicy::InheritFull,
+            auth_family: None,
         }
     }
 
@@ -106,6 +112,12 @@ impl AcpLaunch {
     /// Set the desired model to steer the agent to (best-effort; see [`AcpLaunch::desired_model`]).
     pub fn model(mut self, model: Option<String>) -> Self {
         self.desired_model = model;
+        self
+    }
+
+    /// Set the interactive-auth family carried on classified `auth_required` failures (A6).
+    pub fn auth_family(mut self, family: Option<String>) -> Self {
+        self.auth_family = family;
         self
     }
 
@@ -148,6 +160,10 @@ pub struct AcpProbe {
     pub protocol_version: String,
     /// The agent capabilities advertised at `initialize`, flattened to opaque key/value pairs.
     pub capabilities: Vec<(String, String)>,
+    /// The auth methods advertised at `initialize` (`authMethods`), as `(id, label)` pairs —
+    /// the raw facts behind the catalog's derived auth verdict (wire v47). Empty when the agent
+    /// advertises none.
+    pub auth_methods: Vec<(String, String)>,
 }
 
 /// The discovery/probe timeout: a candidate that does not complete the ACP `initialize` handshake
@@ -158,7 +174,15 @@ const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// `InitializeResponse` (the "is this an ACP agent?" confirmation + its metadata). Returns `None` if
 /// the binary fails to spawn, does not speak ACP, or exceeds [`PROBE_TIMEOUT`]. This is the half of
 /// the connection [`drive`] discards — surfaced standalone for catalog discovery.
-pub async fn probe(launch: AcpLaunch) -> Option<AcpProbe> {
+pub async fn probe(mut launch: AcpLaunch) -> Option<AcpProbe> {
+    // A discovery probe must be headless. Candidates inherit the daemon env (`InheritFull`), so a
+    // GUI-capable agent (e.g. cursor-agent's Electron shell) would attach to the user's session
+    // display and pop login UI out of a *background scan*. The transport has no env-clearing
+    // hook, but blanking the display vars fails the toolkit's display connect while the stdio ACP
+    // handshake keeps working — such an agent probes as installed-but-unverified instead of
+    // spawning windows.
+    launch.env.push(("WAYLAND_DISPLAY".into(), String::new()));
+    launch.env.push(("DISPLAY".into(), String::new()));
     let (agent, _cwd) = launch.into_agent();
     let captured = Arc::new(std::sync::Mutex::new(None));
     let sink = captured.clone();
@@ -189,6 +213,7 @@ pub async fn probe(launch: AcpLaunch) -> Option<AcpProbe> {
     Some(AcpProbe {
         protocol_version: extract_protocol_version(&value),
         capabilities: flatten_capabilities(&value),
+        auth_methods: extract_auth_methods(&value),
     })
 }
 
@@ -236,6 +261,34 @@ fn scalar_string(v: &serde_json::Value) -> String {
     }
 }
 
+/// Extract the `authMethods` array of a serialized `InitializeResponse` as `(id, label)` pairs
+/// (camelCase or snake_case key; label falls back to the id when the agent names none). Schema-
+/// agnostic like [`flatten_capabilities`], so an authMethods-shape change degrades to an empty
+/// list instead of breaking discovery.
+fn extract_auth_methods(value: &serde_json::Value) -> Vec<(String, String)> {
+    let methods = value
+        .get("authMethods")
+        .or_else(|| value.get("auth_methods"));
+    let Some(serde_json::Value::Array(items)) = methods else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            let id = item.get("id").map(scalar_string)?;
+            if id.is_empty() {
+                return None;
+            }
+            let label = item
+                .get("name")
+                .map(scalar_string)
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| id.clone());
+            Some((id, label))
+        })
+        .collect()
+}
+
 /// Resolve a program name on `$PATH` (or as a direct path), returning the resolved path when found.
 /// The "is it installed?" half of discovery, independent of whether it actually speaks ACP.
 fn which(program: &str) -> Option<std::path::PathBuf> {
@@ -249,6 +302,24 @@ fn which(program: &str) -> Option<std::path::PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
+/// The curated auth column (wire v47): how a curated agent authenticates, when the vendor's
+/// mechanism is KNOWN. `None` means "no static claim" — ACP rows get their descriptor dynamically
+/// from the `initialize` probe (advertised authMethods → `AcpAuthenticate`; a verified handshake
+/// with none advertised → scheme `None` = no auth needed). A descriptor is a tested claim, not a
+/// guess: a vendor row only carries `ApiKeyEnv` once the env var is experimentally verified.
+enum CuratedAuth {
+    /// No static claim (the probe may still derive one for ACP agents).
+    Unknown,
+    /// A verified API-key env var (stream-json agents).
+    ApiKeyEnv {
+        var: &'static str,
+        label: &'static str,
+    },
+    /// A vendor OAuth flow served by a dedicated auth family (research-gated: the verdict stays
+    /// `Required` with no runnable method until that family is registered).
+    OAuthFamily,
+}
+
 /// One row of the curated direct-binary recipe table (I7): a display name, the program to exec, the
 /// protocol-mode args, and the wire protocol the daemon drives it with.
 struct Curated {
@@ -260,6 +331,8 @@ struct Curated {
     args: &'static [&'static str],
     /// The wire protocol this agent speaks (selects the adapter + whether discovery handshakes).
     protocol: daemon_api::AgentProtocol,
+    /// The static auth claim (wire v47), when the vendor mechanism is known.
+    auth: CuratedAuth,
 }
 
 /// The curated **direct-binary** foreign-agent recipe table (I7): agents whose own CLI speaks a wire
@@ -293,10 +366,16 @@ const CURATED: &[Curated] = &[
     acp("iflow", "iflow", &["--experimental-acp"]),
     acp("qoder", "qodercli", &["--acp"]),
     acp("kilocode", "kilocode", &["acp"]),
-    acp("mistral-vibe", "mistral-vibe", &[]),
+    // The mistral-vibe package ships `vibe` (the interactive CLI) + `vibe-acp` ("Run Mistral
+    // Vibe in ACP mode") — the ACP-mode entry point is the dedicated binary, not an `acp` flag.
+    acp("mistral-vibe", "vibe-acp", &[]),
     acp("junie", "junie", &[]),
     acp("eca", "eca", &[]),
     // --- stream-json direct-binary agents (no handshake → always surfaced unverified) -------------
+    // claude ships OAuthFamily, NOT ApiKeyEnv: whether Claude Code honors ANTHROPIC_API_KEY in
+    // --input-format stream-json mode has not been experimentally verified here (see
+    // scripts/verify-claude-api-key.sh); the verdict stays Required with no runnable method until
+    // the vendor OAuth family lands, rather than an ApiKeyEnv lie.
     stream_json(
         "claude",
         "claude",
@@ -307,32 +386,46 @@ const CURATED: &[Curated] = &[
             "stream-json",
             "--verbose",
         ],
+        CuratedAuth::OAuthFamily,
     ),
-    stream_json("amp", "amp", &["--stream-json", "--stream-json-input"]),
+    stream_json(
+        "amp",
+        "amp",
+        &["--stream-json", "--stream-json-input"],
+        CuratedAuth::ApiKeyEnv {
+            var: "AMP_API_KEY",
+            label: "Amp API key",
+        },
+    ),
 ];
 
 /// Build an [`AgentProtocol::Acp`](daemon_api::AgentProtocol::Acp) curated row (const-fn so the
-/// table stays a compile-time constant).
+/// table stays a compile-time constant). ACP rows never carry a static auth claim — the
+/// `initialize` probe derives it from the advertised authMethods.
 const fn acp(name: &'static str, program: &'static str, args: &'static [&'static str]) -> Curated {
     Curated {
         name,
         program,
         args,
         protocol: daemon_api::AgentProtocol::Acp,
+        auth: CuratedAuth::Unknown,
     }
 }
 
-/// Build an [`AgentProtocol::StreamJson`](daemon_api::AgentProtocol::StreamJson) curated row.
+/// Build an [`AgentProtocol::StreamJson`](daemon_api::AgentProtocol::StreamJson) curated row with
+/// its static auth claim (stream-json agents have no handshake to derive one from).
 const fn stream_json(
     name: &'static str,
     program: &'static str,
     args: &'static [&'static str],
+    auth: CuratedAuth,
 ) -> Curated {
     Curated {
         name,
         program,
         args,
         protocol: daemon_api::AgentProtocol::StreamJson,
+        auth,
     }
 }
 
@@ -346,6 +439,25 @@ fn curated_entry(row: &Curated) -> daemon_api::AgentEntry {
         env: Vec::new(),
         endpoint: None,
     };
+    // The static auth claim (wire v47): only rows with a KNOWN vendor mechanism carry one; the
+    // `initialize` probe derives descriptors for ACP rows. The derived `auth` verdict is always
+    // the HOST's (catalog assembly reads descriptor + credential presence), never set here.
+    let auth_descriptor = match row.auth {
+        CuratedAuth::Unknown => None,
+        CuratedAuth::ApiKeyEnv { var, label } => Some(daemon_api::AgentAuthDescriptor {
+            scheme: daemon_api::AgentAuthScheme::ApiKeyEnv {
+                var: var.to_string(),
+                label: label.to_string(),
+            },
+            rejection: None,
+        }),
+        CuratedAuth::OAuthFamily => Some(daemon_api::AgentAuthDescriptor {
+            scheme: daemon_api::AgentAuthScheme::OAuthFamily {
+                family: format!("agent/{}", row.name),
+            },
+            rejection: None,
+        }),
+    };
     let mut entry = daemon_api::AgentEntry {
         name: row.name.to_string(),
         installed: recipe_installed(&recipe),
@@ -355,11 +467,114 @@ fn curated_entry(row: &Curated) -> daemon_api::AgentEntry {
         version: None,
         capabilities: Vec::new(),
         verification: daemon_api::AgentVerification::NotInstalled,
+        auth_descriptor,
+        auth: None,
     };
     // Derive the trust status from the freshly-computed installed/protocol/version (the node's ONE
     // rule). `discover`/`probe` recompute it after the `initialize` enrich.
     entry.refresh_verification();
     entry
+}
+
+/// Fold a settled ACP `initialize` probe into an entry's auth facts (wire v47): a dynamically
+/// derived descriptor (advertised authMethods → `AcpAuthenticate`; a confirmed handshake with none
+/// advertised → scheme `None` = no auth needed) — but NEVER overriding an explicit descriptor a
+/// manual registration supplied — plus the advertised methods stashed on `entry.auth` for the
+/// host's derivation (which recomputes `state`; the placeholder here is `Unknown`).
+fn apply_probe_auth(entry: &mut daemon_api::AgentEntry, probe: &AcpProbe) {
+    let family = format!("agent/{}", entry.name);
+    if entry.auth_descriptor.is_none() {
+        entry.auth_descriptor = Some(daemon_api::AgentAuthDescriptor {
+            scheme: if probe.auth_methods.is_empty() {
+                daemon_api::AgentAuthScheme::None
+            } else {
+                daemon_api::AgentAuthScheme::AcpAuthenticate
+            },
+            rejection: None,
+        });
+    }
+    if !probe.auth_methods.is_empty() {
+        entry.auth = Some(daemon_api::AgentAuth {
+            state: daemon_api::AgentAuthState::Unknown,
+            methods: probe
+                .auth_methods
+                .iter()
+                .map(|(id, label)| daemon_api::AgentAuthMethod {
+                    id: id.clone(),
+                    label: label.clone(),
+                    kind: daemon_api::AuthFlowKind::AcpAuthenticate,
+                    family: family.clone(),
+                })
+                .collect(),
+        });
+    }
+}
+
+/// The authenticate-ceremony timeout: unlike a discovery probe, `authenticate` may involve the
+/// OPERATOR (the agent opens a vendor login page in a browser and blocks until it completes), so
+/// the window is minutes, not seconds. A hang past this is surfaced as a retryable flow error.
+const AUTHENTICATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The ACP half of the node's dynamic `agent/*` interactive-auth namespace (wire v47): spawns the
+/// cataloged agent from its recipe and runs its own advertised `authenticate(method_id)` method
+/// to completion. Injected at node assembly (like [`AcpDiscoverer`]) because `daemon-host` cannot
+/// link the ACP runtime. The spawn deliberately KEEPS the display env (unlike [`probe`]): the
+/// whole point of the ceremony is that the agent may open the vendor's login page.
+#[derive(Clone, Debug, Default)]
+pub struct AcpAuthenticator;
+
+impl AcpAuthenticator {
+    /// A fresh gateway (stateless; every call spawns from the entry's recipe).
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait]
+impl daemon_host::AcpAuthGateway for AcpAuthenticator {
+    async fn authenticate(
+        &self,
+        entry: &daemon_api::AgentEntry,
+        method_id: &str,
+    ) -> Result<(), daemon_api::ApiError> {
+        let launch = launch_from_recipe(&entry.recipe).ok_or_else(|| {
+            daemon_api::ApiError::Other(format!(
+                "{}: no spawnable stdio recipe to authenticate against",
+                entry.name
+            ))
+        })?;
+        let (agent, _cwd) = launch.into_agent();
+        let method = method_id.to_string();
+        let run = Client
+            .builder()
+            .name("daemon-acp-authenticate")
+            .connect_with(agent, move |cx: ConnectionTo<Agent>| {
+                let method = method.clone();
+                async move {
+                    // `authenticate` is only valid after `initialize` (and the method id must be
+                    // one the agent advertised there).
+                    cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+                    cx.send_request(AuthenticateRequest::new(method))
+                        .block_task()
+                        .await?;
+                    Ok(())
+                }
+            });
+        match tokio::time::timeout(AUTHENTICATE_TIMEOUT, run).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(daemon_api::ApiError::Other(format!(
+                "{} authenticate({method_id}) failed: {e}",
+                entry.name
+            ))),
+            Err(_) => Err(daemon_api::ApiError::Other(format!(
+                "{} authenticate({method_id}) timed out after {}s",
+                entry.name,
+                AUTHENTICATE_TIMEOUT.as_secs()
+            ))),
+        }
+    }
 }
 
 /// The server-side ACP discoverer (I7): probes the curated direct-binary recipe table on `$PATH` via
@@ -404,26 +619,47 @@ pub fn recipe_installed(recipe: &daemon_api::AgentRecipe) -> bool {
 #[async_trait]
 impl daemon_host::AgentDiscovery for AcpDiscoverer {
     async fn discover(&self) -> Vec<daemon_api::AgentEntry> {
-        let mut out = Vec::with_capacity(CURATED.len());
-        for row in CURATED {
-            let mut entry = curated_entry(row);
-            // Confirm ACP agents (and capture metadata) via the `initialize` handshake only when the
-            // binary is present. Stream-json agents have no handshake, so their `version`/`caps`
-            // stay empty — installed-on-PATH is the whole probe, and they surface as unverified.
-            if entry.installed && row.protocol == daemon_api::AgentProtocol::Acp {
-                if let Some(launch) = launch_from_recipe(&entry.recipe) {
-                    if let Some(p) = probe(launch).await {
-                        entry.version = Some(p.protocol_version);
-                        entry.capabilities = p.capabilities;
+        // Confirm ACP agents (and capture metadata) via the `initialize` handshake only when the
+        // binary is present. Stream-json agents have no handshake, so their `version`/`caps`
+        // stay empty — installed-on-PATH is the whole probe, and they surface as unverified.
+        // The probes fan out concurrently: the scan completes in one PROBE_TIMEOUT worst case
+        // instead of the table length times it (this is the background pass behind the fast
+        // presence reply, but there is no reason to serialize subprocess handshakes).
+        let handles: Vec<_> = CURATED
+            .iter()
+            .map(|row| {
+                let mut entry = curated_entry(row);
+                let probing = entry.installed && row.protocol == daemon_api::AgentProtocol::Acp;
+                let launch = probing.then(|| launch_from_recipe(&entry.recipe)).flatten();
+                tokio::spawn(async move {
+                    if let Some(launch) = launch {
+                        if let Some(p) = probe(launch).await {
+                            apply_probe_auth(&mut entry, &p);
+                            entry.version = Some(p.protocol_version);
+                            entry.capabilities = p.capabilities;
+                        }
                     }
-                }
-            }
-            // Re-derive the trust status now that the `initialize` handshake (if any) has settled
-            // `version` — the single node-side derivation, so no client re-implements it.
-            entry.refresh_verification();
-            out.push(entry);
+                    // Re-derive the trust status now that the `initialize` handshake (if any) has
+                    // settled `version` — the single node-side derivation, so no client
+                    // re-implements it.
+                    entry.refresh_verification();
+                    entry
+                })
+            })
+            .collect();
+        let mut out = Vec::with_capacity(CURATED.len());
+        for (row, handle) in CURATED.iter().zip(handles) {
+            // A panicked probe task degrades to the unprobed presence row (never poisons the scan).
+            out.push(handle.await.unwrap_or_else(|_| curated_entry(row)));
         }
         out
+    }
+
+    fn presence(&self) -> Vec<daemon_api::AgentEntry> {
+        // The cheap half only: recipe + PATH `installed` per curated row, no `initialize` probes
+        // (installed rows surface unverified until the background scan lands). Backs the fast
+        // `agent_discover` reply (wire v46).
+        CURATED.iter().map(curated_entry).collect()
     }
 
     async fn probe(&self, mut entry: daemon_api::AgentEntry) -> daemon_api::AgentEntry {
@@ -436,6 +672,7 @@ impl daemon_host::AgentDiscovery for AcpDiscoverer {
         if entry.protocol == daemon_api::AgentProtocol::Acp {
             if let Some(launch) = launch_from_recipe(&entry.recipe) {
                 if let Some(p) = probe(launch).await {
+                    apply_probe_auth(&mut entry, &p);
                     entry.version = Some(p.protocol_version);
                     entry.capabilities = p.capabilities;
                 }
@@ -485,6 +722,11 @@ pub struct AcpSession {
     /// The push half: every selector change is fan-out here so the host updates its per-session
     /// sidecar + emits a pointer event without polling.
     selector_updates: broadcast::Sender<ModelSelector>,
+    /// The last-seen advertised slash commands (A10), full-replace snapshots of
+    /// `available_commands_update`. Empty until the agent advertises (or if it never does).
+    advertised: Arc<Mutex<Vec<AgentSlashCommand>>>,
+    /// The push half of the command state: each advertisement fans out the full new list.
+    command_updates: broadcast::Sender<Vec<AgentSlashCommand>>,
 }
 
 /// Present a foreign ACP agent as a `UnitKind::Engine` managed unit identified by `id`, journaling
@@ -504,6 +746,8 @@ impl AcpSession {
         let (events, _) = broadcast::channel::<AgentEvent>(256);
         let (selector_updates, _) = broadcast::channel::<ModelSelector>(64);
         let selector: Arc<Mutex<Option<ModelSelector>>> = Arc::new(Mutex::new(None));
+        let (command_updates, _) = broadcast::channel::<Vec<AgentSlashCommand>>(64);
+        let advertised: Arc<Mutex<Vec<AgentSlashCommand>>> = Arc::new(Mutex::new(Vec::new()));
         let seq = Arc::new(AtomicU64::new(0));
 
         tokio::spawn(drive(DriveCtx {
@@ -515,6 +759,8 @@ impl AcpSession {
             control_rx,
             selector: selector.clone(),
             selector_updates: selector_updates.clone(),
+            advertised: advertised.clone(),
+            command_updates: command_updates.clone(),
         }));
 
         Arc::new(AcpSession {
@@ -523,6 +769,8 @@ impl AcpSession {
             control,
             selector,
             selector_updates,
+            advertised,
+            command_updates,
         })
     }
 }
@@ -551,6 +799,14 @@ impl AgentSession for AcpSession {
         Some(self.selector_updates.subscribe())
     }
 
+    fn available_commands(&self) -> Vec<AgentSlashCommand> {
+        self.advertised.lock().unwrap().clone()
+    }
+
+    fn command_updates(&self) -> Option<broadcast::Receiver<Vec<AgentSlashCommand>>> {
+        Some(self.command_updates.subscribe())
+    }
+
     async fn set_model(&self, model: String) -> Result<Option<ModelSelector>, String> {
         let (reply, rx) = oneshot::channel();
         self.control
@@ -574,6 +830,10 @@ struct DriveCtx {
     selector: Arc<Mutex<Option<ModelSelector>>>,
     /// The push half: a new selector snapshot is fan-out here on every change.
     selector_updates: broadcast::Sender<ModelSelector>,
+    /// The shared last-seen advertised slash commands (A10, pull half).
+    advertised: Arc<Mutex<Vec<AgentSlashCommand>>>,
+    /// The push half of the advertised-command state: each advertisement fans out the full list.
+    command_updates: broadcast::Sender<Vec<AgentSlashCommand>>,
 }
 
 /// Drive the ACP connection for the lifetime of the session: initialize, open a session, then relay
@@ -591,8 +851,11 @@ async fn drive(ctx: DriveCtx) {
         mut control_rx,
         selector,
         selector_updates,
+        advertised,
+        command_updates,
     } = ctx;
     let desired_model = launch.desired_model.clone();
+    let auth_family = launch.auth_family.clone();
     let (agent, cwd) = launch.into_agent();
 
     // Notification handler: stream `session/update`s up as §17 events, and capture a
@@ -601,6 +864,8 @@ async fn drive(ctx: DriveCtx) {
     let notif_seq = seq.clone();
     let notif_selector = selector.clone();
     let notif_selector_tx = selector_updates.clone();
+    let notif_advertised = advertised.clone();
+    let notif_commands_tx = command_updates.clone();
     // Permission handler: bridge `session/request_permission` to a §17 blocking host request.
     let perm_host = host.clone();
     let perm_req_ids = Arc::new(AtomicU64::new(1));
@@ -610,6 +875,7 @@ async fn drive(ctx: DriveCtx) {
     let loop_seq = seq.clone();
     let loop_selector = selector.clone();
     let loop_selector_tx = selector_updates.clone();
+    let loop_family = auth_family.clone();
 
     let result = Client
         .builder()
@@ -620,6 +886,8 @@ async fn drive(ctx: DriveCtx) {
                 let seq = notif_seq.clone();
                 let selector = notif_selector.clone();
                 let selector_tx = notif_selector_tx.clone();
+                let advertised = notif_advertised.clone();
+                let commands_tx = notif_commands_tx.clone();
                 async move {
                     // Phase 3: the agent autonomously changed its config — refresh the live Model
                     // selector before mapping the update to §17 events (which ignore this variant).
@@ -627,6 +895,13 @@ async fn drive(ctx: DriveCtx) {
                         if let Some(sel) = selector_from_options(Some(&update.config_options)) {
                             store_and_broadcast(&selector, &selector_tx, sel);
                         }
+                    }
+                    // A10: the agent (re)advertised its slash commands — full-replace the live
+                    // snapshot and fan it out to the host's per-session sidecar watcher.
+                    if let SessionUpdate::AvailableCommandsUpdate(update) = &notif.update {
+                        let mapped = map_available_commands(&update.available_commands);
+                        *advertised.lock().unwrap() = mapped.clone();
+                        let _ = commands_tx.send(mapped);
                     }
                     for ev in map_update(notif.update, &seq) {
                         let _ = events.send(ev);
@@ -720,7 +995,15 @@ async fn drive(ctx: DriveCtx) {
                             .await
                         {
                             Ok(PromptResponse { stop_reason, .. }) => map_stop(stop_reason),
-                            Err(_) => TurnSummary::ended(EndReason::Failed),
+                            Err(e) => {
+                                emit_classified_auth_error(
+                                    &e,
+                                    &loop_family,
+                                    &loop_events,
+                                    &loop_seq,
+                                );
+                                TurnSummary::ended(EndReason::Failed)
+                            }
                         };
                         let _ = loop_events.send(AgentEvent::TurnFinished {
                             seq: loop_seq.fetch_add(1, Ordering::Relaxed),
@@ -741,7 +1024,15 @@ async fn drive(ctx: DriveCtx) {
                             .await
                         {
                             Ok(PromptResponse { stop_reason, .. }) => map_stop(stop_reason),
-                            Err(_) => TurnSummary::ended(EndReason::Failed),
+                            Err(e) => {
+                                emit_classified_auth_error(
+                                    &e,
+                                    &loop_family,
+                                    &loop_events,
+                                    &loop_seq,
+                                );
+                                TurnSummary::ended(EndReason::Failed)
+                            }
                         };
                         let _ = loop_events.send(AgentEvent::TurnFinished {
                             seq: loop_seq.fetch_add(1, Ordering::Relaxed),
@@ -775,8 +1066,33 @@ async fn drive(ctx: DriveCtx) {
         .await;
 
     if let Err(err) = result {
+        // A `session/new` (or initialize) failure lands here — classify it too: an unauthenticated
+        // agent typically refuses at session open, and without this the driver would end silently.
+        emit_classified_auth_error(&err, &auth_family, &events, &seq);
         tracing::warn!(error = %err, "acp connection ended with error");
     }
+}
+
+/// A6 classification for a failed ACP request: `auth_required` (-32000) is structured and
+/// unambiguous, so — when the launch carries an interactive-auth family — emit the
+/// machine-readable `Error{kind: "auth_required", family}` event the node's pump and thin
+/// clients key on. Any other error stays unclassified (no event beyond the failed turn).
+fn emit_classified_auth_error(
+    err: &agent_client_protocol::Error,
+    family: &Option<String>,
+    events: &broadcast::Sender<AgentEvent>,
+    seq: &Arc<AtomicU64>,
+) {
+    let Some(family) = family else { return };
+    if err.code != agent_client_protocol::ErrorCode::AuthRequired {
+        return;
+    }
+    let _ = events.send(AgentEvent::Error {
+        seq: seq.fetch_add(1, Ordering::Relaxed),
+        failure: "agent needs sign-in (acp auth_required)".to_string(),
+        kind: Some(daemon_protocol::ERROR_KIND_AUTH_REQUIRED.into()),
+        family: Some(family.clone()),
+    });
 }
 
 /// Store a freshly-captured `Model` selector as the session's live state and fan it out to
@@ -788,6 +1104,24 @@ fn store_and_broadcast(
 ) {
     *selector.lock().unwrap() = Some(value.clone());
     let _ = selector_tx.send(value);
+}
+
+/// Project an ACP `available_commands_update` list into the node's wire [`AgentSlashCommand`]s
+/// (A10): name + description verbatim, the input hint flattened from `Unstructured.hint` (the only
+/// input variant the spec defines — a future structured variant simply carries no hint here).
+fn map_available_commands(commands: &[AvailableCommand]) -> Vec<AgentSlashCommand> {
+    commands
+        .iter()
+        .map(|cmd| AgentSlashCommand {
+            name: cmd.name.clone(),
+            description: cmd.description.clone(),
+            hint: cmd.input.as_ref().and_then(|input| match input {
+                AvailableCommandInput::Unstructured(u) => Some(u.hint.clone()),
+                // `#[non_exhaustive]`: a future structured input variant carries no ghost hint.
+                _ => None,
+            }),
+        })
+        .collect()
 }
 
 /// Project the agent's advertised `Model`-category `Select` config option into the node's wire
@@ -1090,6 +1424,7 @@ fn summarize(value: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use daemon_host::AgentDiscovery;
     use daemon_protocol::{HostRequest, HostResponse, HostResponseBody};
 
     struct NoopHost;
@@ -1120,6 +1455,153 @@ mod tests {
         assert!(
             !session.rewindable(),
             "foreign ACP sessions must advertise rewindable=false"
+        );
+    }
+
+    /// `extract_auth_methods` reads both key spellings, falls back to the id when the agent names
+    /// no label, and degrades to empty on anything malformed (schema-agnostic like capabilities).
+    #[test]
+    fn auth_methods_extraction_is_schema_agnostic() {
+        let camel = serde_json::json!({
+            "authMethods": [
+                { "id": "oauth", "name": "Log in with Vendor" },
+                { "id": "api-key" },
+                { "id": "", "name": "nameless id is dropped" },
+                { "name": "idless entry is dropped" },
+            ]
+        });
+        assert_eq!(
+            extract_auth_methods(&camel),
+            vec![
+                ("oauth".to_string(), "Log in with Vendor".to_string()),
+                ("api-key".to_string(), "api-key".to_string()),
+            ]
+        );
+        let snake = serde_json::json!({ "auth_methods": [{ "id": "sso", "name": "SSO" }] });
+        assert_eq!(
+            extract_auth_methods(&snake),
+            vec![("sso".to_string(), "SSO".to_string())]
+        );
+        for malformed in [
+            serde_json::json!({}),
+            serde_json::json!({ "authMethods": "not-an-array" }),
+            serde_json::json!({ "authMethods": { "id": "x" } }),
+        ] {
+            assert!(extract_auth_methods(&malformed).is_empty());
+        }
+    }
+
+    /// The curated auth column (wire v47): claude carries a research-gated `OAuthFamily` (its
+    /// ApiKeyEnv support is unverified — see scripts/verify-claude-api-key.sh), amp carries the
+    /// verified `ApiKeyEnv{AMP_API_KEY}`, and ACP rows carry NO static claim (the probe derives
+    /// theirs). No curated entry ever ships a derived `auth` verdict — that is the host's.
+    #[test]
+    fn curated_rows_carry_the_declared_auth_descriptors() {
+        let entries = AcpDiscoverer::new().presence();
+        let by_name = |name: &str| {
+            entries
+                .iter()
+                .find(|e| e.name == name)
+                .unwrap_or_else(|| panic!("curated table has a `{name}` row"))
+        };
+        match &by_name("claude").auth_descriptor {
+            Some(daemon_api::AgentAuthDescriptor {
+                scheme: daemon_api::AgentAuthScheme::OAuthFamily { family },
+                ..
+            }) => assert_eq!(family, "agent/claude"),
+            other => panic!("claude must claim OAuthFamily, got {other:?}"),
+        }
+        match &by_name("amp").auth_descriptor {
+            Some(daemon_api::AgentAuthDescriptor {
+                scheme: daemon_api::AgentAuthScheme::ApiKeyEnv { var, label },
+                ..
+            }) => {
+                assert_eq!(var, "AMP_API_KEY");
+                assert!(!label.is_empty());
+            }
+            other => panic!("amp must claim ApiKeyEnv, got {other:?}"),
+        }
+        for acp_row in entries
+            .iter()
+            .filter(|e| e.protocol == daemon_api::AgentProtocol::Acp)
+        {
+            assert!(
+                acp_row.auth_descriptor.is_none(),
+                "`{}` is ACP: its descriptor comes from the probe, not the table",
+                acp_row.name
+            );
+        }
+        assert!(
+            entries.iter().all(|e| e.auth.is_none()),
+            "no curated entry ships a derived verdict"
+        );
+    }
+
+    /// `apply_probe_auth` derives the ACP descriptor from advertised authMethods (none -> scheme
+    /// `None`; some -> `AcpAuthenticate` + the methods stashed for the host's derivation) and
+    /// never overrides an explicit manual descriptor.
+    #[test]
+    fn probe_auth_derivation_respects_explicit_descriptors() {
+        let base = || {
+            let mut e = curated_entry(&CURATED[0]);
+            e.auth_descriptor = None;
+            e.auth = None;
+            e
+        };
+        let quiet = AcpProbe {
+            protocol_version: "1".into(),
+            capabilities: Vec::new(),
+            auth_methods: Vec::new(),
+        };
+        let advertising = AcpProbe {
+            protocol_version: "1".into(),
+            capabilities: Vec::new(),
+            auth_methods: vec![("oauth".into(), "Log in".into())],
+        };
+
+        let mut entry = base();
+        apply_probe_auth(&mut entry, &quiet);
+        assert!(matches!(
+            entry.auth_descriptor,
+            Some(daemon_api::AgentAuthDescriptor {
+                scheme: daemon_api::AgentAuthScheme::None,
+                ..
+            })
+        ));
+        assert!(entry.auth.is_none(), "no methods to stash");
+
+        let mut entry = base();
+        apply_probe_auth(&mut entry, &advertising);
+        assert!(matches!(
+            entry.auth_descriptor,
+            Some(daemon_api::AgentAuthDescriptor {
+                scheme: daemon_api::AgentAuthScheme::AcpAuthenticate,
+                ..
+            })
+        ));
+        let stashed = entry.auth.expect("advertised methods are stashed");
+        assert_eq!(stashed.state, daemon_api::AgentAuthState::Unknown);
+        assert_eq!(stashed.methods.len(), 1);
+        assert_eq!(stashed.methods[0].id, "oauth");
+        assert_eq!(
+            stashed.methods[0].kind,
+            daemon_api::AuthFlowKind::AcpAuthenticate
+        );
+
+        let mut entry = base();
+        let explicit = daemon_api::AgentAuthDescriptor {
+            scheme: daemon_api::AgentAuthScheme::ApiKeyEnv {
+                var: "X_KEY".into(),
+                label: "X key".into(),
+            },
+            rejection: None,
+        };
+        entry.auth_descriptor = Some(explicit.clone());
+        apply_probe_auth(&mut entry, &advertising);
+        assert_eq!(
+            entry.auth_descriptor,
+            Some(explicit),
+            "an explicit descriptor survives the probe"
         );
     }
 }

@@ -5,10 +5,11 @@
 
 use crate::supervisor::{Backoff, MeltdownPolicy};
 use daemon_common::PartitionId;
+use std::path::PathBuf;
 use std::time::Duration;
 
 /// Configuration for a [`Host`](crate::Host) and its resident-service tree.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct HostConfig {
     /// The partition this host owns.
     pub partition: PartitionId,
@@ -23,6 +24,13 @@ pub struct HostConfig {
     pub backoff: Backoff,
     /// Meltdown threshold for the resident tree.
     pub meltdown: MeltdownPolicy,
+    /// Root directory for node-owned per-agent state homes (wire v47 A4). When set, stream-json
+    /// foreign agents spawn with a `Clean` scrubbed environment and `HOME`/`XDG_*` repointed to
+    /// `<root>/<agent-name>`, so agent dotfile state is node-owned and no daemon-ambient secret
+    /// leaks into the child. `None` (the default) preserves the historical `InheritFull` spawn.
+    /// ACP agents are NOT isolated by this knob: the ACP transport owns process creation without
+    /// an env-scrubbing hook (a documented deferral).
+    pub agent_state_root: Option<PathBuf>,
 }
 
 impl Default for HostConfig {
@@ -34,6 +42,7 @@ impl Default for HostConfig {
             schedule_interval: Duration::from_secs(1),
             backoff: Backoff::default(),
             meltdown: MeltdownPolicy::default(),
+            agent_state_root: None,
         }
     }
 }

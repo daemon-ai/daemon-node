@@ -132,6 +132,8 @@ async fn register_mock_agent(node: &Arc<NodeApiImpl>, name: &str) {
         version: None,
         capabilities: Vec::new(),
         verification: AgentVerification::NotInstalled, // untrusted; the node re-derives on register
+        auth_descriptor: None,
+        auth: None,
     })
     .await
     .expect("register the mock ACP agent");
@@ -402,6 +404,8 @@ async fn acp_profile_validation_rejects_unknown_and_uninstalled_agents() {
         version: None,
         capabilities: Vec::new(),
         verification: AgentVerification::NotInstalled, // untrusted; the node re-derives on register
+        auth_descriptor: None,
+        auth: None,
     })
     .await
     .expect("register the ghost agent");
@@ -452,6 +456,8 @@ async fn acp_register_rejects_a_blank_agent_name() {
                 version: None,
                 capabilities: Vec::new(),
                 verification: AgentVerification::NotInstalled,
+                auth_descriptor: None,
+                auth: None,
             })
             .await
             .expect_err("a blank agent name must fail agent_register");
@@ -468,6 +474,69 @@ async fn acp_register_rejects_a_blank_agent_name() {
             .all(|e| !e.name.trim().is_empty()),
         "a refused registration must not reach the catalog"
     );
+}
+
+/// Wire v46 fast discovery: `agent_discover` answers the PATH-presence pass immediately — every
+/// curated builtin row in the reply is handshake-free (`version = None`; installed rows surface
+/// unverified) — and the scan pings the L3 feed with the coalesced `AgentsChanged` pointer. The
+/// `initialize` verification sweep runs in the background and lands via a later `AgentsChanged`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agent_discover_replies_presence_first_and_pings_agents_changed() {
+    daemon_host::with_request_context(daemon_host::RequestContext::system(), async {
+        let (node, _resolver_called, _handle) = assemble_acp_node();
+
+        let entries = node.agent_discover().await;
+        assert!(!entries.is_empty(), "the curated table surfaces");
+        for e in entries.iter().filter(|e| e.source == AgentSource::Builtin) {
+            assert_eq!(
+                e.version, None,
+                "the presence reply must not block on the '{}' initialize probe",
+                e.name
+            );
+        }
+
+        let page = node.events_page(0, 0).await;
+        assert!(
+            page.events
+                .iter()
+                .any(|e| matches!(e, daemon_api::NodeEvent::AgentsChanged { .. })),
+            "the discover presence pass pings AgentsChanged"
+        );
+    })
+    .await;
+}
+
+/// Wire v46: registering and removing an agent each ping `AgentsChanged`, so every subscribed
+/// client (not just the caller) refetches the catalog without polling.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agent_register_and_remove_ping_agents_changed() {
+    daemon_host::with_request_context(daemon_host::RequestContext::system(), async {
+        let (node, _resolver_called, _handle) = assemble_acp_node();
+
+        register_mock_agent(&node, "feed-ping").await;
+        let page = node.events_page(0, 0).await;
+        assert!(
+            page.events
+                .iter()
+                .any(|e| matches!(e, daemon_api::NodeEvent::AgentsChanged { .. })),
+            "register pings AgentsChanged"
+        );
+
+        // Read past the register ping first — AgentsChanged coalesces globally in the backlog, so
+        // the remove's ping is only distinguishable from a cursor past the register's.
+        let cursor = page.next_cursor;
+        node.agent_remove("feed-ping".into())
+            .await
+            .expect("remove the registered agent");
+        let page = node.events_page(cursor, 0).await;
+        assert!(
+            page.events
+                .iter()
+                .any(|e| matches!(e, daemon_api::NodeEvent::AgentsChanged { .. })),
+            "remove pings AgentsChanged"
+        );
+    })
+    .await;
 }
 
 /// Poll `session_get` until the resident foreign session's live `model_selector.current` reaches
@@ -649,6 +718,112 @@ async fn config_option_update_notification_updates_the_surfaced_state_impl() {
     // No client set was issued — the surfaced selector advanced purely from the agent notification.
     let selector = wait_for_selector_current(&node, &session, "mock-model-b").await;
     assert_eq!(selector.current, "mock-model-b");
+}
+
+/// Poll `session_get` until the resident foreign session's advertised commands satisfy `pred`
+/// (the sidecar is refreshed asynchronously off the backend's push feed), then return them.
+async fn wait_for_commands(
+    node: &Arc<NodeApiImpl>,
+    session: &daemon_common::SessionId,
+    what: &str,
+    pred: impl Fn(&[daemon_api::AgentSlashCommand]) -> bool,
+) -> Vec<daemon_api::AgentSlashCommand> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(detail) = node.session_get(session.clone()).await {
+            if pred(&detail.commands) {
+                return detail.commands;
+            }
+        }
+        if Instant::now() >= deadline {
+            panic!("timed out waiting for advertised commands: {what}");
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// A10 (advertise): a resident foreign session surfaces its agent's push-advertised slash commands
+/// as live `SessionDetail.commands` — captured from `available_commands_update` right after
+/// `session/new` — with the input hint flattened; and a mid-session re-advertisement REPLACES the
+/// list (ACP advertisement is full-replace) and pings `SessionMetaChanged` so thin clients refetch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acp_session_detail_surfaces_advertised_commands() {
+    daemon_host::with_request_context(
+        daemon_host::RequestContext::system(),
+        acp_session_detail_surfaces_advertised_commands_impl(),
+    )
+    .await;
+}
+
+async fn acp_session_detail_surfaces_advertised_commands_impl() {
+    let (node, _resolver_called, _handle) = assemble_acp_node();
+    register_mock_agent(&node, "fake-echo").await;
+    node.profile_create(foreign_profile("acp-commands", "fake-echo"))
+        .await
+        .expect("create a foreign profile");
+    let session = node
+        .session_create(None, Some(ProfileRef::new("acp-commands")))
+        .await
+        .expect("create a session bound to the ACP profile");
+    // One turn makes the session resident (spawns the ACP backend; the mock advertises right
+    // after session/new).
+    node.submit(
+        session.clone(),
+        AgentCommand::StartTurn {
+            input: UserMsg::new("hello foreign agent"),
+            request_id: ReqId(1),
+        },
+    )
+    .await
+    .expect("submit a turn");
+    drain_turn(&node, &session).await;
+
+    // The initial advertisement: two commands, one carrying the flattened Unstructured hint.
+    let commands = wait_for_commands(&node, &session, "the initial web+plan pair", |cmds| {
+        cmds.len() == 2
+    })
+    .await;
+    let web = commands
+        .iter()
+        .find(|c| c.name == "web")
+        .expect("the web command is advertised");
+    assert_eq!(web.description, "Search the web");
+    assert_eq!(
+        web.hint.as_deref(),
+        Some("query"),
+        "the Unstructured input hint is flattened onto the wire command"
+    );
+    let plan = commands
+        .iter()
+        .find(|c| c.name == "plan")
+        .expect("the plan command is advertised");
+    assert_eq!(plan.hint, None, "a command without input carries no hint");
+
+    // A mid-session re-advertisement REPLACES the list and pings SessionMetaChanged.
+    let cursor = node.events_page(0, 0).await.next_cursor;
+    node.submit(
+        session.clone(),
+        AgentCommand::StartTurn {
+            input: UserMsg::new("readvertise-commands"),
+            request_id: ReqId(2),
+        },
+    )
+    .await
+    .expect("submit the re-advertising turn");
+    drain_turn(&node, &session).await;
+    let replaced = wait_for_commands(&node, &session, "the full-replace deploy list", |cmds| {
+        cmds.len() == 1 && cmds[0].name == "deploy"
+    })
+    .await;
+    assert_eq!(replaced[0].description, "Ship it");
+    let page = node.events_page(cursor, 0).await;
+    assert!(
+        page.events.iter().any(|e| matches!(
+            e,
+            daemon_api::NodeEvent::SessionMetaChanged { session: s, .. } if s == &session
+        )),
+        "a command-list change pings SessionMetaChanged for the session"
+    );
 }
 
 /// A `Foreign` profile whose backend routes through the node gateway (`NodeProvider`): the

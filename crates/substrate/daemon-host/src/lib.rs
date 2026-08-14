@@ -36,6 +36,7 @@
 #![cfg_attr(test, allow(clippy::disallowed_methods, clippy::disallowed_types))]
 
 pub mod adapters;
+pub mod agent_auth;
 pub mod agent_session;
 pub mod auth;
 pub mod auth_audit;
@@ -80,11 +81,12 @@ pub mod workspace_fs;
 pub mod ws;
 
 pub use adapters::AdapterRegistry;
+pub use agent_auth::{AcpAuthGateway, AgentAuthFamilies, AGENT_FAMILY_PREFIX};
 pub use agent_session::AgentSession;
 pub use agent_session::AgentUnit;
 pub use auth::{
-    AuthFlowFactory, AuthOutcome, AuthStepOutcome, CredentialSlotKind, FlowStep, PendingAuthFlow,
-    PendingAuthFlows, DEFAULT_FLOW_TTL_SECS,
+    AuthFlowFactory, AuthOutcome, AuthStepOutcome, CredentialSlotKind, DynamicAuthFamilies,
+    FlowStep, PendingAuthFlow, PendingAuthFlows, DEFAULT_FLOW_TTL_SECS,
 };
 pub use auth_audit::{AuthAudit, AUTH_JOURNAL_UNIT};
 pub use authn::{
@@ -160,7 +162,7 @@ pub use socket::{windows_pipe_component, windows_pipe_path};
 pub use socket::{serve_api_unix, serve_api_unix_authenticated, MuxApiClient};
 #[cfg(windows)]
 pub use socket::{serve_api_windows_pipe, serve_api_windows_pipe_authenticated};
-pub use streamjson::StreamJsonCodec;
+pub use streamjson::{StreamJsonCodec, StreamJsonRejection};
 pub use supervisor::{
     Backoff, ChildSpec, HealthStatus, MeltdownPolicy, RestartPolicy, ServiceError, Supervisor,
     SupervisorHandle, SupervisorObserver,
@@ -350,7 +352,7 @@ impl Host {
 
     /// Start the resident tree under a caller-supplied cancellation token.
     pub fn start_with_cancel(&self, cancel: CancellationToken) -> SupervisorHandle {
-        let cfg = self.config;
+        let cfg = self.config.clone();
         // The job-outbox dispatcher runs the injected fleet worker if present, else the substrate's
         // built-in echo worker.
         let job_tick = match &self.job_worker {

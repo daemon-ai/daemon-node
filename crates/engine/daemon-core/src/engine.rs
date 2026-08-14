@@ -466,7 +466,12 @@ impl Engine {
             return self.finish_interrupted(events);
         }
         let text = failure.to_string();
-        events.emit(|seq| AgentEvent::Error { seq, failure: text });
+        events.emit(|seq| AgentEvent::Error {
+            seq,
+            failure: text,
+            kind: None,
+            family: None,
+        });
         let summary = TurnSummary::ended(EndReason::Failed);
         let emitted = summary.clone();
         events.emit(|seq| AgentEvent::TurnFinished {

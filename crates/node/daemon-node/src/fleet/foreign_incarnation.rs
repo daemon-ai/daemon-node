@@ -38,7 +38,6 @@ use daemon_telemetry::{TraceSigner, GENESIS_ROOT};
 use tokio::sync::broadcast;
 
 use crate::fleet::foreign_live::spawn_foreign_session;
-use crate::GatewayCoords;
 
 /// The node subsystems a durable foreign incarnation needs (beyond the Core factory): the profile
 /// store (to resolve the child's bound `Foreign{agent}` spec), the session store (durable inputs +
@@ -51,8 +50,10 @@ pub(crate) struct ForeignConfig {
     pub(crate) store: Arc<dyn SessionStore>,
     /// The node's verifiable-journal signer (the durable/live/fleet paths share this key).
     pub(crate) signer: Arc<TraceSigner>,
-    /// The node gateway coordinates for a `NodeProvider`-routed foreign backend; `None` disables it.
-    pub(crate) gateway: Option<GatewayCoords>,
+    /// Spawn-time materials (wire v47 A4): the credential store the agent's `ApiKeyEnv` key is
+    /// injected from, the optional node-owned state-home root gating the isolated spawn, and
+    /// the node gateway coordinates for a `NodeProvider`-routed backend.
+    pub(crate) materials: crate::fleet::foreign_live::SpawnMaterials,
 }
 
 /// The node's durable [`EngineFactory`]: builds a [`DispatchingIncarnation`] that resolves Core vs
@@ -139,7 +140,7 @@ impl Incarnation for DispatchingIncarnation {
                 backend,
                 foreign.store.clone(),
                 foreign.signer.clone(),
-                foreign.gateway.clone(),
+                foreign.materials.clone(),
             )),
             None => self.core.create(),
         };
@@ -183,7 +184,9 @@ pub(crate) struct ForeignIncarnation {
     backend: ForeignBackend,
     store: Arc<dyn SessionStore>,
     signer: Arc<TraceSigner>,
-    gateway: Option<GatewayCoords>,
+    /// Spawn-time materials: credential materialization, isolated state home, gateway routing
+    /// (wire v47 A4).
+    materials: crate::fleet::foreign_live::SpawnMaterials,
     /// The spawned foreign backend, materialized at hydrate.
     session: Option<Arc<dyn AgentSession>>,
     /// The durable pending inputs drained at hydrate (the delegated task + any queued `send`s).
@@ -200,7 +203,7 @@ impl ForeignIncarnation {
         backend: ForeignBackend,
         store: Arc<dyn SessionStore>,
         signer: Arc<TraceSigner>,
-        gateway: Option<GatewayCoords>,
+        materials: crate::fleet::foreign_live::SpawnMaterials,
     ) -> Self {
         Self {
             session_id,
@@ -208,7 +211,7 @@ impl ForeignIncarnation {
             backend,
             store,
             signer,
-            gateway,
+            materials,
             session: None,
             inputs: Vec::new(),
             completion_payload: None,
@@ -262,8 +265,8 @@ impl Incarnation for ForeignIncarnation {
             None,
             self.session_id.clone(),
             self.store.clone(),
-            self.gateway.clone(),
             host,
+            self.materials.clone(),
         )
         .await
         .map_err(|e| EngineError::Other(format!("spawn foreign session `{}`: {e}", self.agent)))?;

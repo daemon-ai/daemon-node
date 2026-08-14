@@ -6,7 +6,7 @@
 //! (e.g. the filesystem surface). Because this arm is total, the compiler still proves every
 //! `ApiResponse` variant is handled across the render chain.
 
-use daemon_api::{AgentVerification, ApiResponse};
+use daemon_api::{AgentAuthState, AgentVerification, ApiResponse};
 
 pub(super) fn render_rest(resp: ApiResponse) {
     match resp {
@@ -20,9 +20,29 @@ pub(super) fn render_rest(resp: ApiResponse) {
                     AgentVerification::Unverified => "unverified",
                     AgentVerification::NotInstalled => "not-installed",
                 };
+                // The auth verdict + runnable method ids (wire v47), verbatim from the node —
+                // scripted callers (the e2e auth journey) parse this line, keep it stable.
+                let auth = match e.auth.as_ref().map(|a| a.state).unwrap_or_default() {
+                    AgentAuthState::NotRequired => "not-required",
+                    AgentAuthState::Unknown => "unknown",
+                    AgentAuthState::Required => "required",
+                    AgentAuthState::Authenticated => "authenticated",
+                    AgentAuthState::Expired => "expired",
+                };
+                let methods = e
+                    .auth
+                    .as_ref()
+                    .map(|a| {
+                        a.methods
+                            .iter()
+                            .map(|m| m.id.as_str())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    })
+                    .unwrap_or_default();
                 println!(
-                    "  - {} [{:?}/{:?}] {} version={:?}",
-                    e.name, e.source, e.protocol, status, e.version
+                    "  - {} [{:?}/{:?}] {} version={:?} auth={} methods=[{}]",
+                    e.name, e.source, e.protocol, status, e.version, auth, methods
                 );
             }
         }

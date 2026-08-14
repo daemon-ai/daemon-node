@@ -61,10 +61,17 @@ pub trait ProfileStore: Send + Sync {
     /// has any profile — including one whose operator replaced and deleted the seeded
     /// placeholder — is left untouched, so a deleted placeholder is never resurrected on
     /// reboot. Returns whether it was inserted.
+    ///
+    /// The inserted row is stamped `seeded = true` (wire v47) — the ONLY writer of that marker.
+    /// Every wire ingress normalizes the flag to `false` and the first operator update clears it,
+    /// so `seeded` remains a precise "still exactly the placeholder `seed()` minted" predicate
+    /// that the node-side retirement on operator `ProfileCreate` keys off.
     fn seed(&self, spec: ProfileSpec) -> Result<bool, ProfileError> {
         if !self.list()?.is_empty() {
             return Ok(false);
         }
+        let mut spec = spec;
+        spec.seeded = true;
         let id = spec.id.clone();
         self.create(spec)?;
         if self.active()?.is_none() {
@@ -317,6 +324,9 @@ mod tests {
             reopened.get("opus").unwrap().unwrap().model,
             "claude-opus-4-8"
         );
+        // seed() is the sole minter of the marker (wire v47), and it survives a reopen — the
+        // retirement predicate must still hold after a daemon restart.
+        assert!(reopened.get("opus").unwrap().unwrap().seeded);
         assert_eq!(reopened.list().unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -324,8 +334,9 @@ mod tests {
     #[test]
     fn seed_only_when_store_empty() {
         let s = MemProfileStore::new();
-        // Empty store: the placeholder seeds and becomes the active default.
+        // Empty store: the placeholder seeds (marker stamped) and becomes the active default.
         assert!(s.seed(sample("default")).unwrap());
+        assert!(s.get("default").unwrap().unwrap().seeded);
         assert_eq!(s.active().unwrap().as_deref(), Some("default"));
         // Non-empty store with the placeholder DELETED (the wizard replaced it): re-seeding must
         // not resurrect it, and the operator's profile/active selection stays intact.

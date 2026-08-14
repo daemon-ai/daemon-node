@@ -1152,10 +1152,14 @@ pub trait ControlApi: Send + Sync {
     // -- Foreign-agent discovery + registry (catalog-style; the daemon probes its own PATH) --
 
     /// Trigger a server-side foreign-agent discovery scan: resolve each entry of the curated
-    /// known-agent recipe table on the daemon's `PATH`, confirming each installed ACP candidate via
-    /// the `initialize` handshake (stream-json entries are PATH-probed only). Agents outside the
-    /// curated table reach the catalog through `agent_register`, not this scan. Operator-triggered
-    /// (spawns subprocesses), like `model_search`. Default: empty.
+    /// known-agent recipe table on the daemon's `PATH` and answer **immediately** with the
+    /// presence results (installed rows surface `Unverified`). The ACP `initialize` handshakes
+    /// that confirm candidates (filling `version`/`capabilities` -> `Verified`) run as a
+    /// background pass; its completion updates the catalog and emits
+    /// [`NodeEvent::AgentsChanged`] (wire v46), so clients refetch rather than block on the
+    /// slowest probe. Stream-json entries are PATH-probed only. Agents outside the curated table
+    /// reach the catalog through `agent_register`, not this scan. Operator-triggered (spawns
+    /// subprocesses), like `model_search`. Default: empty.
     async fn agent_discover(&self) -> Vec<AgentEntry> {
         Vec::new()
     }
@@ -1933,6 +1937,12 @@ pub enum AuthFlowKind {
     /// the exchange and is never itself stored. (Contrast [`BotToken`](Self::BotToken) /
     /// [`UserToken`](Self::UserToken), where the pasted secret IS the stored credential.)
     UserPassword,
+    /// A foreign agent's own ACP `authenticate` method driven node-side (wire v47): the node
+    /// spawns the agent short-lived, completes `initialize`, and calls `authenticate(methodId)`.
+    /// ACP defines no standardized interim-challenge payload — the client renders a `Message`
+    /// challenge with the method label and polls for completion; the agent may complete via its
+    /// own side effects (opening a browser itself, persisting its own state).
+    AcpAuthenticate,
 }
 
 /// A single challenge a flow presents to the client at some step — how the client should collect the
@@ -2569,6 +2579,23 @@ pub struct ModelSelector {
     pub choices: Vec<ModelChoice>,
 }
 
+/// One slash command a foreign (ACP) agent advertises for a live session (wire v47, A10): captured
+/// by `daemon-acp` from `session/update`'s `available_commands_update` (push-based, full-replace).
+/// Invocation is plain prompt text (`/<name> args` in an ordinary turn) per the ACP slash-commands
+/// spec — advertising is the only protocol surface, so this type is read-only session state.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSlashCommand {
+    /// The command name, invoked as `/<name>` (e.g. `create_plan`).
+    pub name: String,
+    /// The agent's human-readable description of what the command does.
+    pub description: String,
+    /// The agent's input hint (ACP `Unstructured.hint`), shown as ghost text after the name while
+    /// the argument text is still empty. `None` when the command takes no input.
+    #[serde(default)]
+    pub hint: Option<String>,
+}
+
 /// The full detail of one session — the single round-trip a GUI detail pane reads: roster `info`
 /// plus the resolved overlay/model/provider, delivery targets, parent/children ids, and a
 /// checkpoint count.
@@ -2608,6 +2635,12 @@ pub struct SessionDetail {
     /// gateway-routed `NodeProvider` sessions (whose model is chosen node-side).
     #[serde(default)]
     pub model_selector: Option<ModelSelector>,
+    /// For a resident foreign (ACP) session: the slash commands the agent currently advertises
+    /// (wire v47, A10) — full-replace snapshots of `available_commands_update`, live-only (agents
+    /// re-advertise on resume; nothing is persisted). Empty for native sessions and agents that
+    /// advertise none. A change rides `SessionMetaChanged`, like `model_selector`.
+    #[serde(default)]
+    pub commands: Vec<AgentSlashCommand>,
 }
 
 /// One full-text session-search hit — the transport-stable mirror of the store's `SessionSearchHit`
@@ -2890,6 +2923,142 @@ pub enum AgentVerification {
     NotInstalled,
 }
 
+/// The node-derived authentication verdict for a cataloged agent (wire v47).
+///
+/// **Semantics, stated honestly:** [`Authenticated`](Self::Authenticated) means *credential
+/// configured* — a credential (or, for `AcpAuthenticate` agents, a node-owned success marker from a
+/// completed node-run flow) is present in the node's `CredentialStore` — NOT vendor-verified
+/// acceptance. The runtime feedback loop is what refines it: a machine-classified rejection flips
+/// the verdict back to `Required`/`Expired`. Clients render this verbatim and never over-promise.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AgentAuthState {
+    /// The agent needs no credential (descriptor says so).
+    NotRequired,
+    /// The node has no auth facts for this agent (no descriptor, no advertised methods). The
+    /// serde default, so an absent/pre-v47 encoding decodes here.
+    #[default]
+    Unknown,
+    /// Auth is needed and no credential/marker is configured.
+    Required,
+    /// A credential/marker is configured (see the type doc: configured, not vendor-verified).
+    Authenticated,
+    /// A configured credential is past its known expiry (refresh/re-auth needed).
+    Expired,
+}
+
+/// One runnable authentication method for a cataloged agent (wire v47): what a client offers when
+/// the verdict is [`AgentAuthState::Required`]. `family` is the interactive-auth family id the
+/// client passes to `auth_begin` (always `agent/<name>`); `id` selects the method within the family
+/// (`auth_begin` params carry `method_id` when more than one is offered).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentAuthMethod {
+    /// Method id within the family (e.g. `"api-key"`, or an ACP-advertised method id).
+    pub id: String,
+    /// Human label (e.g. `"Amp API key"`, or the ACP-advertised method name).
+    pub label: String,
+    /// How the flow renders/drives ([`AuthFlowKind`]).
+    pub kind: AuthFlowKind,
+    /// The `auth_begin` family id (`agent/<name>`).
+    pub family: String,
+}
+
+/// The node-derived auth block on a catalog entry (wire v47): the verdict plus the RUNNABLE
+/// methods (a descriptor scheme with no registered flow factory yet advertises no methods — the
+/// verdict can be `Required` with an empty method list, which a client renders as "sign-in not
+/// available yet" rather than a dead button).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentAuth {
+    /// The node's verdict (see [`AgentAuthState`] for the honest semantics).
+    pub state: AgentAuthState,
+    /// The runnable methods when auth is possible now (empty otherwise).
+    #[serde(default)]
+    pub methods: Vec<AgentAuthMethod>,
+}
+
+/// A machine-readable auth-rejection classifier on an agent's result frames (wire v47): the ONLY
+/// signal that lets the runtime loop flip a stream-json agent's verdict (a generic error never
+/// does — no text pattern-matching of vendor output, ever). `field` names a JSON field in the
+/// agent's result frame; `code` is the value that means "auth rejected".
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RejectionClassifier {
+    /// The result-frame field to inspect (e.g. `"subtype"`).
+    pub field: String,
+    /// The field value meaning "auth rejected" (e.g. `"error_authentication"`).
+    pub code: String,
+}
+
+/// How a cataloged agent authenticates (wire v47) — the INPUT half of the auth story: curated
+/// rows carry one, and a manual `AgentRegister` may supply one. The node derives the served
+/// [`AgentAuth`] verdict from this plus credential/marker presence; a caller-supplied derived
+/// `auth` is never trusted.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AgentAuthScheme {
+    /// The agent needs no credential.
+    #[default]
+    None,
+    /// An API key delivered as an environment variable at spawn (stream-json agents).
+    ApiKeyEnv {
+        /// The environment variable name (validated: `[A-Z_][A-Z0-9_]*`).
+        var: String,
+        /// Human label for the key form (e.g. `"Amp API key"`).
+        label: String,
+    },
+    /// A vendor OAuth browser flow served by a dedicated auth family (research-gated; until that
+    /// family is registered the verdict is `Required` with no runnable method).
+    OAuthFamily {
+        /// The interactive-auth family id serving the vendor flow.
+        family: String,
+    },
+    /// A vendor device-code flow served by a dedicated auth family (research-gated, as above).
+    DeviceCode {
+        /// The interactive-auth family id serving the vendor flow.
+        family: String,
+    },
+    /// The ACP `authenticate` method: the node spawns the agent short-lived and drives the
+    /// agent's own advertised auth method over the ACP handshake.
+    AcpAuthenticate,
+}
+
+/// The auth descriptor a catalog entry carries (wire v47): the scheme plus an optional
+/// machine-readable rejection classifier (see [`RejectionClassifier`]).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentAuthDescriptor {
+    /// How the agent authenticates.
+    #[serde(default)]
+    pub scheme: AgentAuthScheme,
+    /// The rejection classifier, when the vendor documents one.
+    #[serde(default)]
+    pub rejection: Option<RejectionClassifier>,
+}
+
+/// Whether an agent name is a valid catalog slug (wire v47 registration rule):
+/// `^[a-z0-9][a-z0-9._-]{0,63}$` — no `/`, no whitespace, no `..` traversal. Agent names fan out
+/// into auth family ids (`agent/<name>`), credential refs (`agent/<name>/<var>`) and state-home
+/// path segments, so the node enforces this at `AgentRegister` ingress; a pre-existing
+/// non-conforming stored row keeps working for catalog/spawn but is excluded from auth derivation
+/// until re-registered under a conforming name.
+pub fn is_valid_agent_slug(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    if bytes.is_empty() || bytes.len() > 64 {
+        return false;
+    }
+    if !(bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit()) {
+        return false;
+    }
+    if name.contains("..") {
+        return false;
+    }
+    bytes[1..]
+        .iter()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-'))
+}
+
 /// One entry in the foreign-agent catalog ([`ControlApi::agent_catalog`] /
 /// [`ControlApi::agent_discover`]): a known/registered agent, the protocol it speaks, whether it is
 /// installed, and (for ACP) the `initialize`-verified metadata.
@@ -2922,6 +3091,16 @@ pub struct AgentEntry {
     /// caller-supplied value on a registration is not trusted.
     #[serde(default)]
     pub verification: AgentVerification,
+    /// How this agent authenticates (wire v47) — the INPUT half: set by the curated table, an ACP
+    /// probe that captured advertised auth methods, or a manual `AgentRegister`. Validated at
+    /// registration ingress; `None` = no auth facts (the derived verdict is then `Unknown`).
+    #[serde(default)]
+    pub auth_descriptor: Option<AgentAuthDescriptor>,
+    /// The node-DERIVED auth verdict + runnable methods (wire v47), recomputed at catalog assembly
+    /// from `auth_descriptor` + credential/marker presence (the auth analogue of `verification`).
+    /// A caller-supplied value on a registration is never trusted; rides `AgentsChanged`.
+    #[serde(default)]
+    pub auth: Option<AgentAuth>,
 }
 
 impl AgentEntry {
@@ -4738,6 +4917,15 @@ pub enum NodeEvent {
         /// The coalescing vhc-feed revision (compared to skip an unchanged refetch).
         rev: u64,
     },
+    /// The foreign-agent catalog changed (wire v46): a discovery scan landed (the immediate
+    /// PATH-presence pass, or the background `initialize` verification pass completing), or an
+    /// agent was registered/removed. A payload-free node-wide invalidation pointer (clients
+    /// refetch `AgentCatalog`), mirroring [`NodeEvent::ProfilesChanged`]. Carries a coalescing
+    /// `rev` so a burst of scan updates collapses to one refetch.
+    AgentsChanged {
+        /// The new agents-catalog revision. In-memory; a restart resets it -> full read.
+        rev: u64,
+    },
 }
 
 /// A page of the node-wide event feed (`EventsSince` -> `EventsPage`): a batch of [`NodeEvent`]s past
@@ -5645,6 +5833,8 @@ mod tests {
                     version: Some("0.1".into()),
                     capabilities: vec![("fs".into(), "true".into())],
                     verification: AgentVerification::Verified,
+                    auth_descriptor: None,
+                    auth: None,
                 },
             },
             ApiRequest::AgentRegister {
@@ -5662,6 +5852,19 @@ mod tests {
                     version: None,
                     capabilities: Vec::new(),
                     verification: AgentVerification::Unverified,
+                    // The wire v47 auth surface round-trips: a manual ApiKeyEnv descriptor with
+                    // a rejection classifier (the register-time input shape).
+                    auth_descriptor: Some(AgentAuthDescriptor {
+                        scheme: AgentAuthScheme::ApiKeyEnv {
+                            var: "ANTHROPIC_API_KEY".into(),
+                            label: "Anthropic API key".into(),
+                        },
+                        rejection: Some(RejectionClassifier {
+                            field: "result".into(),
+                            code: "invalid_api_key".into(),
+                        }),
+                    }),
+                    auth: None,
                 },
             },
         ];
@@ -5706,6 +5909,11 @@ mod tests {
                         },
                     ],
                 }),
+                commands: vec![AgentSlashCommand {
+                    name: "web".into(),
+                    description: "Search the web".into(),
+                    hint: Some("query".into()),
+                }],
             })),
             ApiResponse::SessionSearch(vec![SessionSearchHit {
                 session: SessionId::new("s1"),
@@ -5803,6 +6011,38 @@ mod tests {
             epoch: 0,
         });
         assert_eq!(page, from_cbor::<ApiResponse>(&to_cbor(&page)).unwrap());
+    }
+
+    /// The agent-slug rule (wire v47 registration): `^[a-z0-9][a-z0-9._-]{0,63}$`, no `..`. The
+    /// exact boundary cases the register gate depends on — names fan out into family ids,
+    /// credential refs and state paths, so a drift here widens an injection surface.
+    #[test]
+    fn agent_slug_rule_boundaries() {
+        for good in [
+            "claude",
+            "mistral-vibe",
+            "agent_2",
+            "0zero",
+            "a.b-c_d",
+            &"x".repeat(64),
+        ] {
+            assert!(is_valid_agent_slug(good), "`{good}` must be a valid slug");
+        }
+        for bad in [
+            "",
+            "UPPER",
+            "Bad Name",
+            "a/b",
+            "-lead",
+            "_lead",
+            ".lead",
+            "dots..inside",
+            "trailing..",
+            "emoji😀",
+            &"x".repeat(65),
+        ] {
+            assert!(!is_valid_agent_slug(bad), "`{bad}` must be rejected");
+        }
     }
 
     /// The default `SessionApi` implementations of the live-log reads degrade gracefully: an empty

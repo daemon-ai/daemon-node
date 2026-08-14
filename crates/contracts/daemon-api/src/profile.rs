@@ -181,6 +181,15 @@ pub struct ProfileSpec {
     /// encoding.
     #[serde(default)]
     pub owner: Option<String>,
+    /// Node-seeded placeholder marker (wire v47): `true` ONLY on the profile
+    /// `ProfileStore::seed` mints on a fresh boot. The flag never comes from outside — every wire
+    /// ingress (create/update/clone/import/revert) normalizes it to `false` node-side — and the
+    /// first operator `ProfileUpdate` targeting the row clears it (an operator who configured the
+    /// placeholder has adopted it). An operator `ProfileCreate` retires a still-seeded, session-free
+    /// placeholder (node-authoritative first-run replacement; clients never guess). Absent on a
+    /// pre-v47 / legacy encoding => `false`, so a legacy row is never treated as retireable.
+    #[serde(default)]
+    pub seeded: bool,
 }
 
 impl ProfileSpec {
@@ -207,6 +216,7 @@ impl ProfileSpec {
             foreign_backend: ForeignBackend::default(),
             created_by: None,
             owner: None,
+            seeded: false,
         }
     }
 
@@ -330,6 +340,11 @@ pub struct ProfileInfo {
     /// scope the profile list to a session's own subtree.
     #[serde(default)]
     pub owner: Option<String>,
+    /// Node-seeded placeholder marker (wire v47): mirrors [`ProfileSpec::seeded`] so a client can
+    /// render the first-boot placeholder distinctly. Read-only: the node computes it; retirement is
+    /// node-side (an operator create replaces a still-seeded, session-free placeholder).
+    #[serde(default)]
+    pub seeded: bool,
 }
 
 impl ProfileInfo {
@@ -343,6 +358,7 @@ impl ProfileInfo {
             bound_accounts: spec.bound_accounts.clone(),
             created_by: spec.created_by.clone(),
             owner: spec.owner.clone(),
+            seeded: spec.seeded,
         }
     }
 }

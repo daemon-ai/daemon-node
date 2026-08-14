@@ -153,6 +153,8 @@ async fn streamjson_profile_spawns_and_completes_a_turn_impl() {
         version: None,
         capabilities: Vec::new(),
         verification: AgentVerification::NotInstalled, // untrusted; the node re-derives on register
+        auth_descriptor: None,
+        auth: None,
     })
     .await
     .expect("register the mock stream-json agent");

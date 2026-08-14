@@ -12,6 +12,7 @@ use daemon_host::ApiClient;
 
 use crate::cli::Command;
 
+mod agent;
 mod contact;
 mod conv;
 mod cron;
@@ -26,6 +27,7 @@ mod vhc;
 /// Route a parsed top-level command to its handler.
 pub(crate) async fn dispatch(client: &ApiClient, command: Command) -> anyhow::Result<()> {
     match command {
+        Command::Agent { cmd } => agent::run(client, cmd).await,
         Command::Model { cmd } => model::run(client, cmd).await,
         Command::Curator { cmd } => curator::run(client, cmd).await,
         Command::Cron { cmd } => cron::run(client, cmd).await,

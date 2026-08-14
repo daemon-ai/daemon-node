@@ -26,6 +26,21 @@ use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;
 
+/// A descriptor-declared machine-readable rejection classifier for `result` frames (wire v47
+/// A6): when the raw frame's top-level `field` equals `code` (string compare), the failure is a
+/// CLASSIFIED auth rejection and the codec emits a structured `Error{kind: "auth_required",
+/// family}` alongside the failed turn. This is data-driven from the agent's catalog descriptor —
+/// never text pattern-matching of vendor output.
+#[derive(Clone, Debug)]
+pub struct StreamJsonRejection {
+    /// The top-level result-frame field to inspect (e.g. `"subtype"`).
+    pub field: String,
+    /// The value of that field that means "auth rejected" (e.g. `"error_auth"`).
+    pub code: String,
+    /// The interactive-auth family that resolves it (`agent/<name>`), carried on the event.
+    pub family: String,
+}
+
 /// The Claude-Code `stream-json` codec. One per session (it carries the turn's `seq` cursor and the
 /// permission-request correlation map).
 #[derive(Default)]
@@ -39,12 +54,21 @@ pub struct StreamJsonCodec {
     /// Maps a synthetic [`ReqId`] back to the agent's original string `request_id`, so the host's
     /// reply can be addressed to the right `control_request`.
     pending: HashMap<u64, String>,
+    /// The agent's descriptor-declared rejection classifier, when it has one (wire v47 A6).
+    rejection: Option<StreamJsonRejection>,
 }
 
 impl StreamJsonCodec {
     /// Construct a fresh codec.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Attach the agent's descriptor-declared rejection classifier (wire v47 A6). Without one,
+    /// result-frame errors are never classified (a bare `is_error` can mean anything).
+    pub fn with_rejection(mut self, rejection: StreamJsonRejection) -> Self {
+        self.rejection = Some(rejection);
+        self
     }
 
     fn next_seq(&mut self) -> u64 {
@@ -157,7 +181,35 @@ impl Codec for StreamJsonCodec {
             }
             "result" => {
                 self.ensure_turn_started(&mut out);
-                let end_reason = if env.is_error.unwrap_or(false) {
+                let failed = env.is_error.unwrap_or(false);
+                // A6 classification: a failed result frame matching the agent's
+                // descriptor-declared classifier is a structured auth rejection — emit the
+                // machine-readable error BEFORE the failed turn close. A bare `is_error` with no
+                // classifier (or no match) is never classified: it can mean anything.
+                if failed {
+                    if let Some(rejection) = self.rejection.clone() {
+                        let matched = serde_json::from_slice::<serde_json::Value>(msg)
+                            .ok()
+                            .and_then(|raw| {
+                                raw.get(&rejection.field)
+                                    .and_then(|v| v.as_str().map(str::to_owned))
+                            })
+                            .is_some_and(|value| value == rejection.code);
+                        if matched {
+                            let seq = self.next_seq();
+                            out.push(Outbound::Event(AgentEvent::Error {
+                                seq,
+                                failure: format!(
+                                    "agent needs sign-in ({}={})",
+                                    rejection.field, rejection.code
+                                ),
+                                kind: Some(daemon_protocol::ERROR_KIND_AUTH_REQUIRED.into()),
+                                family: Some(rejection.family),
+                            }));
+                        }
+                    }
+                }
+                let end_reason = if failed {
                     EndReason::Failed
                 } else {
                     EndReason::Completed
@@ -424,5 +476,60 @@ mod tests {
         assert!(codec
             .decode(br#"{"type":"some_future_thing","foo":1}"#)
             .is_empty());
+    }
+
+    /// The A6 rejection classifier: a failed result frame whose declared field/code matches emits
+    /// the structured `auth_required` error before the failed turn close; a failed frame that
+    /// does NOT match (or any frame with no classifier attached) stays unclassified — a bare
+    /// `is_error` can mean anything.
+    #[test]
+    fn rejection_classifier_flags_only_the_declared_code() {
+        let classified = |codec: &mut StreamJsonCodec, frame: &[u8]| {
+            codec.decode(frame).iter().any(|o| {
+                matches!(
+                    o,
+                    Outbound::Event(AgentEvent::Error { kind: Some(k), family: Some(f), .. })
+                        if k == daemon_protocol::ERROR_KIND_AUTH_REQUIRED && f == "agent/claude"
+                )
+            })
+        };
+        let rejection = || StreamJsonRejection {
+            field: "subtype".into(),
+            code: "error_auth".into(),
+            family: "agent/claude".into(),
+        };
+
+        let mut codec = StreamJsonCodec::new().with_rejection(rejection());
+        assert!(
+            classified(
+                &mut codec,
+                br#"{"type":"result","subtype":"error_auth","is_error":true,"result":"login"}"#
+            ),
+            "a matching failed frame is classified"
+        );
+        let mut codec = StreamJsonCodec::new().with_rejection(rejection());
+        assert!(
+            !classified(
+                &mut codec,
+                br#"{"type":"result","subtype":"error_max_turns","is_error":true}"#
+            ),
+            "a non-matching failure stays unclassified"
+        );
+        let mut codec = StreamJsonCodec::new().with_rejection(rejection());
+        assert!(
+            !classified(
+                &mut codec,
+                br#"{"type":"result","subtype":"error_auth","is_error":false}"#
+            ),
+            "a successful frame is never classified even when the field matches"
+        );
+        let mut codec = StreamJsonCodec::new();
+        assert!(
+            !classified(
+                &mut codec,
+                br#"{"type":"result","subtype":"error_auth","is_error":true}"#
+            ),
+            "no classifier attached -> never classified"
+        );
     }
 }

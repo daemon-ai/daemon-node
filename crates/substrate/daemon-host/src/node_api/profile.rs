@@ -36,11 +36,13 @@ impl ProfileApi for NodeApiImpl {
     }
 
     async fn profile_create(&self, spec: ProfileSpec) -> Result<(), ApiError> {
+        let created_id = spec.id.clone();
         // Author through the shared `ProfileOps` (one validation + persistence + revision path with
         // the agent `profile_manage` tool). The inline fallback is the same three operations for a
         // minimal node that wires no shared facade.
         match &self.profile_ops {
-            // The shared facade stamps provenance + emits `ProfilesChanged` on its own.
+            // The shared facade stamps provenance + normalizes `seeded` + emits `ProfilesChanged`
+            // on its own.
             Some(ops) => ops.create(spec, daemon_common::Author::Operator).await?,
             None => {
                 self.validate_engine(&spec).await?;
@@ -48,12 +50,19 @@ impl ProfileApi for NodeApiImpl {
                 let mut spec = spec;
                 spec.created_by = Some(daemon_common::Author::Operator);
                 spec.owner = None;
+                // Ingress normalization (wire v47): only `ProfileStore::seed` mints the marker.
+                spec.seeded = false;
                 let id = spec.id.clone();
                 self.profile_store()?.create(spec).map_err(profile_err)?;
                 self.record_profile(&id, daemon_common::Author::Operator, "create");
                 self.emit_profiles_changed();
             }
         }
+        // Node-authoritative first-run replacement (wire v47): this wire handler is OPERATOR-only
+        // by construction (the agent `profile_manage` tool authors through `ProfileOps` directly
+        // and never passes here), so a successful operator create retires the still-seeded,
+        // session-free first-boot placeholder — clients never guess which default is disposable.
+        self.retire_seeded_placeholder(&created_id).await;
         // A created profile can declare `bound_accounts`: rebuild the live routing table so its
         // account baseline takes effect without a restart (§5.9 hot-reload).
         self.rebuild_routing();
@@ -72,6 +81,9 @@ impl ProfileApi for NodeApiImpl {
                     spec.created_by = existing.created_by;
                     spec.owner = existing.owner;
                 }
+                // Force-cleared, never preserved (wire v47): an update targeting the first-boot
+                // placeholder ADOPTS it, and no update may re-mint the marker.
+                spec.seeded = false;
                 let id = spec.id.clone();
                 self.profile_store()?.update(spec).map_err(profile_err)?;
                 self.record_profile(&id, daemon_common::Author::Operator, "update");
@@ -111,9 +123,11 @@ impl ProfileApi for NodeApiImpl {
             .map_err(profile_err)?
             .ok_or_else(|| ApiError::UnknownSession(source.clone()))?;
         spec.id = new_id.clone();
-        // A clone is a new operator-authored profile: it inherits none of the source's provenance.
+        // A clone is a new operator-authored profile: it inherits none of the source's provenance,
+        // and never the `seeded` marker (cloning the placeholder must not mint a second one).
         spec.created_by = Some(daemon_common::Author::Operator);
         spec.owner = None;
+        spec.seeded = false;
         store.create(spec).map_err(profile_err)?;
         self.record_profile(
             &new_id,
@@ -190,9 +204,11 @@ impl ProfileApi for NodeApiImpl {
         self.validate_engine(&spec).await?;
         validate_inference(&spec)?;
         // An imported profile is operator-authored on THIS node (its origin provenance does not
-        // travel — a distribution carries no owner/created_by that this node would honor).
+        // travel — a distribution carries no owner/created_by that this node would honor), and it
+        // is never the local first-boot placeholder (the `seeded` marker does not travel either).
         spec.created_by = Some(daemon_common::Author::Operator);
         spec.owner = None;
+        spec.seeded = false;
         let id = spec.id.clone();
         // The created spec is moved into the store; keep a copy for the SOUL import's
         // Foreign-engine guard below.
@@ -257,7 +273,10 @@ impl ProfileApi for NodeApiImpl {
     }
 
     async fn profile_revert(&self, id: String, seq: u64) -> Result<(), ApiError> {
-        let spec = self.profile_at(id.clone(), seq).await?;
+        let mut spec = self.profile_at(id.clone(), seq).await?;
+        // A revert is an operator write like any update: it never resurrects the `seeded` marker
+        // from a historical snapshot (the reverted-to row was recorded before adoption cleared it).
+        spec.seeded = false;
         self.profile_store()?.update(spec).map_err(profile_err)?;
         self.record_profile(
             &id,
@@ -453,6 +472,50 @@ impl NodeApiImpl {
         if let Some(feed) = &self.node_events {
             crate::profile_ops::ProfileEvents::profiles_changed(feed.as_ref());
         }
+    }
+
+    /// Retire the first-boot placeholder after a successful OPERATOR `profile_create` (wire v47).
+    ///
+    /// The placeholder is removed only while it is still EXACTLY what `ProfileStore::seed` minted:
+    /// `seeded == true` (any update clears the marker — adoption) AND no session, live or durable,
+    /// archived or not, is bound to it. When the placeholder was the active default, the newly
+    /// created profile takes over as default — the first-run wizard's first commit replaces the
+    /// placeholder atomically node-side instead of the client guessing which default is disposable
+    /// and racing a remove against other clients.
+    ///
+    /// Best-effort by design: a store/roster hiccup skips retirement (the placeholder lingers,
+    /// harmless) rather than failing the create that already landed.
+    async fn retire_seeded_placeholder(&self, created_id: &str) {
+        let Ok(store) = self.profile_store() else {
+            return;
+        };
+        let Ok(specs) = store.list() else {
+            return;
+        };
+        let Some(placeholder) = specs.iter().find(|s| s.seeded && s.id != created_id) else {
+            return;
+        };
+        // The UNSCOPED roster (every principal's sessions): retirement must not delete a profile
+        // some other principal's session is bound to just because this requester cannot see it.
+        let bound = self.roster_rows().await.into_iter().any(|(info, _)| {
+            info.bound_profile
+                .as_ref()
+                .map(daemon_common::ProfileRef::as_str)
+                == Some(placeholder.id.as_str())
+        });
+        if bound {
+            return;
+        }
+        let was_active = store.active().ok().flatten().as_deref() == Some(placeholder.id.as_str());
+        if store.delete(&placeholder.id).is_err() {
+            return;
+        }
+        if was_active {
+            let _ = store.set_active(created_id);
+        }
+        // No revision for the deletion (a deletion has no snapshot to record — same as
+        // profile_delete); ping the feed so clients drop the row and re-read the default.
+        self.emit_profiles_changed();
     }
 
     /// The profile store, or [`ApiError::Unsupported`] when this node hosts no profile management.

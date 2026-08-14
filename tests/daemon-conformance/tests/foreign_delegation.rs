@@ -158,6 +158,8 @@ async fn register_mock_agent(node: &Arc<NodeApiImpl>, name: &str) {
         version: None,
         capabilities: Vec::new(),
         verification: AgentVerification::NotInstalled, // untrusted; the node re-derives on register
+        auth_descriptor: None,
+        auth: None,
     })
     .await
     .expect("register the mock ACP agent");

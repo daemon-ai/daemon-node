@@ -97,6 +97,20 @@ pub trait AgentSession: Send + Sync {
         None
     }
 
+    /// The slash commands the agent currently advertises for this live session (A10) — the
+    /// last-seen full-replace snapshot of an ACP `available_commands_update`. Empty for the native
+    /// engine and agents that advertise none. A live consumer watches [`Self::command_updates`].
+    fn available_commands(&self) -> Vec<daemon_api::AgentSlashCommand> {
+        Vec::new()
+    }
+
+    /// A live subscription to this session's advertised-command changes (A10): each item is the
+    /// full new command list (ACP advertisement is push-based and full-replace). `None` when the
+    /// backend has no advertised-command feed (native engine, non-ACP).
+    fn command_updates(&self) -> Option<broadcast::Receiver<Vec<daemon_api::AgentSlashCommand>>> {
+        None
+    }
+
     /// Set the session's model on the LIVE backend: a foreign ACP `AgentNative` session issues an
     /// ACP `set_config_option` on its `Model` category; a gateway-routed `NodeProvider` session
     /// re-binds its per-session gateway token to the new model. Returns the resulting
@@ -265,7 +279,7 @@ fn map_event(ev: AgentEvent, last_work: &Arc<Mutex<Option<WorkId>>>) -> Option<M
                 },
             },
         },
-        AgentEvent::Error { seq, failure } => ManageEvent::Error {
+        AgentEvent::Error { seq, failure, .. } => ManageEvent::Error {
             seq,
             failure: FailureView::new(FailureClass::Internal, failure),
         },

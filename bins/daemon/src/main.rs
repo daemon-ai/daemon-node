@@ -887,6 +887,9 @@ fn default_profile_spec(
         // operator-authored / node-wide.
         created_by: None,
         owner: None,
+        // `ProfileStore::seed` stamps the marker itself (and only on a first-boot empty store);
+        // the spec never claims it.
+        seeded: false,
     }
 }
 
@@ -2680,6 +2683,12 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
         partition: cfg.partition,
         dispatch_interval: cfg.dispatch_interval,
         scan_interval: cfg.scan_interval,
+        // `[agents] isolate_state`: node-owned per-agent state homes under the data dir (wire
+        // v47 A4); `None` (the default) preserves the historical full-inherit foreign spawn.
+        agent_state_root: cfg
+            .agents
+            .isolate_state
+            .then(|| cfg.data_dir.join("agent-homes")),
         ..HostConfig::default()
     };
 

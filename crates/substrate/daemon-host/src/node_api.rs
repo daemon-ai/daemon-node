@@ -219,8 +219,14 @@ pub type ForeignSessionFactory = Box<
 pub enum SessionBackend {
     /// The native in-process `daemon-core` engine (run on the §17 actor).
     Core(Engine),
-    /// A foreign engine, materialized by the injected factory at `ensure` time.
-    Foreign(ForeignSessionFactory),
+    /// A foreign engine, materialized by the injected factory at `ensure` time. Carries the
+    /// catalog agent NAME the factory resolves so the live registry can key the residency by
+    /// agent — the seam that lets a completed `agent/<name>` auth flow evict (and thereby
+    /// respawn-with-fresh-credentials) exactly that agent's resident sessions.
+    Foreign {
+        agent: String,
+        factory: ForeignSessionFactory,
+    },
 }
 
 /// Resolve a session's effective [`EngineProfile`] from its bound profile ref + persisted overlay —
@@ -318,6 +324,14 @@ pub trait AgentDiscovery: Send + Sync {
     /// Probe PATH + the curated direct-binary recipe table, confirming each ACP candidate via the
     /// `initialize` handshake; return verified catalog entries (`source = Builtin`).
     async fn discover(&self) -> Vec<daemon_api::AgentEntry>;
+    /// The cheap presence half of [`discover`](Self::discover): the curated table with only the
+    /// PATH `installed` check — **no** `initialize` handshakes, so it answers in microseconds and
+    /// installed rows surface `Unverified`. Backs the fast `agent_discover` reply (wire v46);
+    /// the host runs the slow verified scan in the background afterwards. Default: empty (a
+    /// minimal discoverer that only implements the full scan).
+    fn presence(&self) -> Vec<daemon_api::AgentEntry> {
+        Vec::new()
+    }
     /// Verify/enrich a single (manual) recipe: a PATH-presence `installed` check, plus the ACP
     /// `initialize` handshake for `protocol = Acp` entries — fills in `installed` / `version` /
     /// `capabilities`. Returns the entry unchanged on a failed probe.
@@ -450,6 +464,11 @@ pub struct NodeApiImpl {
     /// alongside the durable manual entries without re-probing every read (discovery is the
     /// operator-triggered, subprocess-spawning scan; manual entries are the persisted half).
     last_agents: Arc<std::sync::RwLock<Vec<daemon_api::AgentEntry>>>,
+    /// Whether a background verification sweep (the `initialize`-handshake half of
+    /// `agent_discover`, wire v46) is in flight — a reconnect storm of discover calls must not
+    /// stack subprocess sweeps; late callers get the fast presence pass only and the running
+    /// sweep's `AgentsChanged` when it lands.
+    agents_scan_running: Arc<std::sync::atomic::AtomicBool>,
     /// The §12 tool-checkpoint store backing the `Checkpoint{List,Rewind}` ops. `None` => those ops
     /// resolve to an empty list / [`ApiError::Unsupported`] (a node with no checkpoint store).
     checkpoints: Option<Arc<dyn daemon_core::CheckpointStore>>,

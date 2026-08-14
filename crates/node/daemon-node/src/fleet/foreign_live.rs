@@ -17,17 +17,38 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use daemon_api::{from_cbor, AgentEntry, AgentProtocol, ApiError, ForeignBackend, ModelSelector};
+use daemon_api::{
+    from_cbor, AgentAuthScheme, AgentEntry, AgentProtocol, ApiError, ForeignBackend, ModelSelector,
+};
 use daemon_common::SessionId;
 use daemon_host::{
-    AgentDiscovery, AgentSession, CodecSession, ForeignSessionFactory, StreamJsonCodec,
+    AgentDiscovery, AgentSession, CodecSession, CredentialStore, ForeignSessionFactory,
+    StreamJsonCodec,
 };
 use daemon_protocol::{AgentCommand, AgentEvent, HostRequestHandler};
-use daemon_provision::{PlacementSpec, ProcessProvisioner, Provisioner};
+use daemon_provision::{PlacementSpec, ProcessProvisioner};
 use daemon_store::SessionStore;
 use tokio::sync::broadcast;
 
 use crate::{GatewayBinding, GatewayCoords, GatewayLease};
+
+/// The node-held inputs every foreign spawn path materializes at the shared seam (wire v47 A4):
+/// the credential store the agent's `ApiKeyEnv` secret is read from, and the optional node-owned
+/// state-home root that gates the `Clean` scrubbed-env + repointed-`HOME` spawn for stream-json
+/// agents. Bundled so the live builder and the durable incarnation thread one value, not a
+/// growing parameter list.
+#[derive(Clone, Default)]
+pub(crate) struct SpawnMaterials {
+    /// The node credential store (`agent/<name>/<VAR>` refs). `None` on credential-less
+    /// assemblies: nothing is materialized.
+    pub(crate) credentials: Option<Arc<dyn CredentialStore>>,
+    /// Root for node-owned per-agent state homes (`HostConfig::agent_state_root`). `None` (the
+    /// default) preserves the historical `InheritFull` spawn.
+    pub(crate) state_root: Option<PathBuf>,
+    /// The node gateway coordinates for a `NodeProvider`-routed foreign backend; `None`
+    /// disables the routed path (no token minted, no OpenAI-wire env injected).
+    pub(crate) gateway: Option<GatewayCoords>,
+}
 
 /// An [`AgentSession`] decorator that owns a [`GatewayLease`] for a `NodeProvider`-routed foreign
 /// session: it forwards every §17 command/subscribe to the inner session and, when it is dropped
@@ -94,6 +115,7 @@ pub(crate) fn foreign_session_factory(
     store: Arc<dyn SessionStore>,
     extra_env: Vec<(String, String)>,
     lease: Option<GatewayLease>,
+    materials: SpawnMaterials,
 ) -> ForeignSessionFactory {
     Box::new(move |host| {
         Box::pin(async move {
@@ -104,6 +126,11 @@ pub(crate) fn foreign_session_factory(
             if !extra_env.is_empty() {
                 entry.recipe.env.extend(extra_env);
             }
+            // Auth materialization (wire v47 A4): the node-held agent credential is injected into
+            // the spawn env HERE — the one seam every foreign spawn path funnels through (the
+            // live builder and the durable incarnation share this factory), so no path can spawn
+            // an ApiKeyEnv agent without its key.
+            materialize_agent_credential(&mut entry, materials.credentials.as_ref());
             // Spawn-time re-check: validation at create/update proved installed-ness THEN; the
             // binary can have been removed since. `recipe_installed` is a cheap PATH/file probe
             // (protocol-independent — both ACP and stream-json agents are PATH binaries).
@@ -125,7 +152,10 @@ pub(crate) fn foreign_session_factory(
                         // AgentNative model steer: steer the agent to the profile's
                         // node-validated model (best-effort inside daemon-acp after session/new);
                         // the recipe still comes only from the catalog by name.
-                        .model(model);
+                        .model(model)
+                        // A6: a structured ACP `auth_required` failure is classified against
+                        // this family so the node flips the verdict and clients render sign-in.
+                        .auth_family(Some(format!("agent/{}", entry.name)));
                     Ok(with_lease(
                         daemon_acp::AcpSession::connect(launch, host),
                         lease,
@@ -138,6 +168,16 @@ pub(crate) fn foreign_session_factory(
                              not spawnable as session engines yet"
                         ))
                     })?;
+                    // Node-owned state home (wire v47 A4, config-gated): under an isolation root
+                    // the child runs with a scrubbed env and its dotfile state confined to
+                    // `<root>/<agent>`. Without one, the historical `InheritFull` spawn.
+                    let policy = prepare_isolation(&mut entry, materials.state_root.as_deref())
+                        .await
+                        .map_err(|e| {
+                            ApiError::Other(format!(
+                                "preparing state home for agent `{agent}` failed: {e}"
+                            ))
+                        })?;
                     // NDJSON over the line transport, driven by the generic codec session driver —
                     // the same provisioner + codec wiring the fleet's `ProfileChildSpawner` uses
                     // for `ForeignProtocol::StreamJson` children.
@@ -147,7 +187,7 @@ pub(crate) fn foreign_session_factory(
                         env: entry.recipe.env.clone(),
                     };
                     let placement = ProcessProvisioner
-                        .place_lines(&session, spec)
+                        .place_lines_with_policy(&session, spec, policy)
                         .await
                         .map_err(|e| {
                             ApiError::Other(format!(
@@ -155,17 +195,114 @@ pub(crate) fn foreign_session_factory(
                             ))
                         })?;
                     let daemon_provision::Placement { channel, child } = placement;
+                    // A6: attach the agent's descriptor-declared rejection classifier (when it
+                    // has one) so a matching failed result frame emits the structured
+                    // `auth_required` error. No classifier -> failures stay unclassified.
+                    let mut codec = StreamJsonCodec::new();
+                    if let Some(rejection) = entry
+                        .auth_descriptor
+                        .as_ref()
+                        .and_then(|d| d.rejection.clone())
+                    {
+                        codec = codec.with_rejection(daemon_host::StreamJsonRejection {
+                            field: rejection.field,
+                            code: rejection.code,
+                            family: format!("agent/{}", entry.name),
+                        });
+                    }
                     let session = Arc::new(CodecSession::from_channel(
                         channel,
                         Some(child),
                         host,
-                        StreamJsonCodec::new(),
+                        codec,
                         Some(agent.clone()),
                     )) as Arc<dyn AgentSession>;
                     Ok(with_lease(session, lease))
                 }
             }
         })
+    })
+}
+
+/// Materialize the agent's node-held credential into its spawn env (wire v47 A4): an `ApiKeyEnv`
+/// descriptor whose credential is present under the agent-scoped ref `agent/<name>/<var>` injects
+/// `<var>=<secret>` into the recipe env — UNLESS the recipe (or the NodeProvider gateway
+/// injection) already sets that var, because an explicit env always wins (the node never
+/// silently overrides an operator's recipe). Other schemes materialize nothing: `AcpAuthenticate`
+/// state lives in the agent's own home (the node holds only the success marker), and the
+/// research-gated vendor schemes have no credential to inject until their families land (A5).
+/// A missing credential is NOT an error here — the spawn proceeds and the runtime loop (A6)
+/// surfaces the vendor rejection; blocking the spawn is the wizard/badge layer's job.
+fn materialize_agent_credential(
+    entry: &mut AgentEntry,
+    credentials: Option<&Arc<dyn CredentialStore>>,
+) {
+    let Some(store) = credentials else { return };
+    let Some(descriptor) = &entry.auth_descriptor else {
+        return;
+    };
+    let AgentAuthScheme::ApiKeyEnv { var, .. } = &descriptor.scheme else {
+        return;
+    };
+    if entry.recipe.env.iter().any(|(k, _)| k == var) {
+        return;
+    }
+    if let Some(secret) = store.get(&format!("agent/{}/{}", entry.name, var)) {
+        entry.recipe.env.push((var.clone(), secret));
+    }
+}
+
+/// Ambient variables carried through a `Clean` isolated spawn: process basics only — never a
+/// credential-bearing var. `PATH` keeps the agent's own subprocess spawns working; the locale/TTY
+/// vars keep CLI output sane.
+const ISOLATION_ALLOWLIST: [&str; 7] = ["PATH", "TERM", "LANG", "LC_ALL", "TZ", "USER", "LOGNAME"];
+
+/// Resolve the env policy for a stream-json spawn (wire v47 A4, config-gated). With no isolation
+/// root: `InheritFull` (the historical spawn, unchanged). With one: create the node-owned state
+/// home `<root>/<agent-name>` and return `Clean` — the child starts from a scrubbed environment
+/// (allowlist + explicit recipe env) with `HOME` and the `XDG_*` dirs repointed INTO the state
+/// home, so agent dotfile state (OAuth blobs, caches) is node-owned and survives under a path the
+/// node controls instead of the daemon operator's real home. An explicit recipe env for any of
+/// the repointed vars wins — the node never silently overrides an operator's recipe.
+async fn prepare_isolation(
+    entry: &mut AgentEntry,
+    state_root: Option<&std::path::Path>,
+) -> std::io::Result<daemon_common::env_policy::EnvPolicy> {
+    use daemon_common::env_policy::EnvPolicy;
+    let Some(root) = state_root else {
+        return Ok(EnvPolicy::InheritFull);
+    };
+    // Catalog names are slug-validated at manual registration and curated for builtins, so the
+    // join cannot traverse; belt-and-braces, refuse anything else.
+    if !daemon_api::is_valid_agent_slug(&entry.name) {
+        return Err(std::io::Error::other(format!(
+            "agent name `{}` is not a valid state-home slug",
+            entry.name
+        )));
+    }
+    let home = root.join(&entry.name);
+    // Node-owned state home under the configured isolation root (slug-validated component).
+    #[allow(clippy::disallowed_methods)]
+    tokio::fs::create_dir_all(&home).await?;
+    let home_str = home.to_string_lossy().into_owned();
+    for (var, sub) in [
+        ("HOME", None),
+        ("XDG_CONFIG_HOME", Some(".config")),
+        ("XDG_DATA_HOME", Some(".local/share")),
+        ("XDG_STATE_HOME", Some(".local/state")),
+        ("XDG_CACHE_HOME", Some(".cache")),
+    ] {
+        if entry.recipe.env.iter().any(|(k, _)| k == var) {
+            continue;
+        }
+        let value = match sub {
+            None => home_str.clone(),
+            Some(sub) => home.join(sub).to_string_lossy().into_owned(),
+        };
+        entry.recipe.env.push((var.to_string(), value));
+    }
+    Ok(EnvPolicy::Clean {
+        allowlist: ISOLATION_ALLOWLIST.iter().map(|s| s.to_string()).collect(),
     })
 }
 
@@ -230,12 +367,13 @@ pub(crate) async fn spawn_foreign_session(
     overlay_model: Option<String>,
     session: SessionId,
     store: Arc<dyn SessionStore>,
-    gateway: Option<GatewayCoords>,
     host: Arc<dyn HostRequestHandler>,
+    materials: SpawnMaterials,
 ) -> Result<Arc<dyn AgentSession>, ApiError> {
     let (extra_env, model, lease) =
-        foreign_env_and_model(&agent, &backend, overlay_model, &gateway);
-    let factory = foreign_session_factory(agent, model, session, store, extra_env, lease);
+        foreign_env_and_model(&agent, &backend, overlay_model, &materials.gateway);
+    let factory =
+        foreign_session_factory(agent, model, session, store, extra_env, lease, materials);
     factory(host).await
 }
 
@@ -306,6 +444,65 @@ mod tests {
     use crate::GatewayTokenMinter;
     use daemon_api::ProviderSelector;
     use std::sync::Mutex;
+
+    /// The A4 materialization rule at the unit level: an ApiKeyEnv agent's stored credential is
+    /// injected into the recipe env; an explicit recipe env for the var wins; no descriptor (or
+    /// no credential, or no store) injects nothing.
+    #[test]
+    fn credential_materialization_honors_the_explicit_env() {
+        use daemon_host::MemCredentialStore;
+
+        let entry = |env: Vec<(String, String)>,
+                     descriptor: Option<daemon_api::AgentAuthDescriptor>| {
+            daemon_api::AgentEntry {
+                name: "keyed".into(),
+                recipe: daemon_api::AgentRecipe {
+                    program: Some("/bin/true".into()),
+                    args: Vec::new(),
+                    env,
+                    endpoint: None,
+                },
+                source: daemon_api::AgentSource::Manual,
+                protocol: AgentProtocol::StreamJson,
+                installed: true,
+                version: None,
+                capabilities: Vec::new(),
+                verification: daemon_api::AgentVerification::Unverified,
+                auth_descriptor: descriptor,
+                auth: None,
+            }
+        };
+        let descriptor = daemon_api::AgentAuthDescriptor {
+            scheme: AgentAuthScheme::ApiKeyEnv {
+                var: "X_KEY".into(),
+                label: "X key".into(),
+            },
+            rejection: None,
+        };
+        let store: Arc<dyn CredentialStore> = Arc::new(MemCredentialStore::new());
+        store.set("agent/keyed/X_KEY", "sk-stored").unwrap();
+
+        // Stored credential + no explicit env: injected.
+        let mut e = entry(Vec::new(), Some(descriptor.clone()));
+        materialize_agent_credential(&mut e, Some(&store));
+        assert_eq!(e.recipe.env, vec![("X_KEY".into(), "sk-stored".into())]);
+
+        // Explicit recipe env: wins, nothing appended.
+        let mut e = entry(
+            vec![("X_KEY".into(), "recipe-wins".into())],
+            Some(descriptor.clone()),
+        );
+        materialize_agent_credential(&mut e, Some(&store));
+        assert_eq!(e.recipe.env, vec![("X_KEY".into(), "recipe-wins".into())]);
+
+        // No descriptor / no store: untouched.
+        let mut e = entry(Vec::new(), None);
+        materialize_agent_credential(&mut e, Some(&store));
+        assert!(e.recipe.env.is_empty());
+        let mut e = entry(Vec::new(), Some(descriptor));
+        materialize_agent_credential(&mut e, None);
+        assert!(e.recipe.env.is_empty());
+    }
 
     /// A test minter recording the live token→binding table: `mint` registers a deterministic
     /// token, `revoke` drops it, so a test can assert both the injected env and the revoke-on-drop.

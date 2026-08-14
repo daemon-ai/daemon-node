@@ -119,6 +119,8 @@ async fn tree_nodes_carry_lifetime_and_engine_impl() {
         version: None,
         capabilities: Vec::new(),
         verification: AgentVerification::NotInstalled, // untrusted; the node re-derives on register
+        auth_descriptor: None,
+        auth: None,
     })
     .await
     .expect("register the mock stream-json agent");

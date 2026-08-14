@@ -151,6 +151,24 @@ pub trait AuthFlowFactory: Send + Sync {
     ) -> Result<Box<dyn PendingAuthFlow>, ApiError>;
 }
 
+/// A resolver serving a whole NAMESPACE of auth families (wire v47): the `agent/*` catalog is
+/// open-ended (families appear when an agent is registered), so its factories cannot be fixed at
+/// assembly like the transport/provider ones. Exact [`AuthFlowFactory::family`] registration
+/// always wins over a namespace resolver (a dedicated vendor family like a research-gated
+/// `agent/claude` OAuth flow shadows the generic dynamic handling of the same id), and dynamic
+/// families deliberately do NOT ride `auth_providers` — clients discover them from the domain
+/// object that names them (the agent catalog's derived auth methods), not from a flat provider
+/// list.
+#[async_trait]
+pub trait DynamicAuthFamilies: Send + Sync {
+    /// The namespace this resolver serves, as a family-id prefix (e.g. `"agent/"`).
+    fn prefix(&self) -> &str;
+
+    /// Mint the factory for one family inside the namespace, or `None` when the family does not
+    /// resolve (unknown agent, no auth descriptor, a scheme this resolver does not serve).
+    async fn resolve(&self, family: &str) -> Option<Arc<dyn AuthFlowFactory>>;
+}
+
 /// A parked flow plus the bind request to honor (if any) and its expiry. The flow is held behind an
 /// `Arc` so a `step` can borrow it across the family's `await` without holding the registry lock, and
 /// a non-completing (challenge) step can leave it parked for the next step.
@@ -180,6 +198,10 @@ pub enum FlowStep {
 /// registry only mints, parks, and hands back flows.
 pub struct PendingAuthFlows {
     factories: HashMap<String, std::sync::Arc<dyn AuthFlowFactory>>,
+    /// Namespace resolvers (wire v47), consulted only when no exact factory matches. Set once
+    /// post-construction (the `agent/*` resolver needs node state that exists only after the
+    /// registry is built), hence the `OnceLock` rather than a constructor parameter.
+    dynamic: std::sync::OnceLock<Arc<dyn DynamicAuthFamilies>>,
     parked: Mutex<HashMap<String, ParkedFlow>>,
     ttl_secs: u64,
 }
@@ -198,14 +220,23 @@ impl PendingAuthFlows {
             .collect();
         Self {
             factories,
+            dynamic: std::sync::OnceLock::new(),
             parked: Mutex::new(HashMap::new()),
             ttl_secs,
         }
     }
 
+    /// Install the namespace resolver (wire v47; single-shot — a second install is ignored).
+    /// Called post-construction by the node assembly once the resolver's inputs (catalog state,
+    /// credential store) exist.
+    pub fn set_dynamic(&self, resolver: Arc<dyn DynamicAuthFamilies>) {
+        let _ = self.dynamic.set(resolver);
+    }
+
     /// Whether any factory is registered (the node reports the surface as available only then).
+    /// A namespace resolver counts: the surface is live even with zero static families.
     pub fn is_empty(&self) -> bool {
-        self.factories.is_empty()
+        self.factories.is_empty() && self.dynamic.get().is_none()
     }
 
     /// The registered providers, for client-side capability discovery (`auth_providers`).
@@ -217,13 +248,30 @@ impl PendingAuthFlows {
     }
 
     /// Begin a flow: dispatch to the family factory, park the continuation under a fresh `flow_id`, and
-    /// return the authorization URL + handle. Evicts any expired flows first.
+    /// return the authorization URL + handle. Evicts any expired flows first. An exact factory
+    /// match wins; otherwise a family inside the dynamic namespace is resolved on demand (wire
+    /// v47 — the `agent/*` catalog is open-ended, so its factories cannot be fixed at assembly).
     pub async fn begin(&self, req: AuthBeginRequest) -> Result<AuthBeginResponse, ApiError> {
-        let factory = self
-            .factories
-            .get(&req.family)
-            .ok_or_else(|| ApiError::Unsupported(format!("auth family: {}", req.family)))?
-            .clone();
+        let factory = match self.factories.get(&req.family) {
+            Some(factory) => factory.clone(),
+            None => {
+                let dynamic = self
+                    .dynamic
+                    .get()
+                    .filter(|d| req.family.starts_with(d.prefix()));
+                match dynamic {
+                    Some(d) => d.resolve(&req.family).await.ok_or_else(|| {
+                        ApiError::Unsupported(format!("auth family: {}", req.family))
+                    })?,
+                    None => {
+                        return Err(ApiError::Unsupported(format!(
+                            "auth family: {}",
+                            req.family
+                        )))
+                    }
+                }
+            }
+        };
         // Box -> Arc so the flow can be parked and borrowed across `step`'s await (multi-step flows
         // stay parked between challenges).
         let flow: Arc<dyn PendingAuthFlow> =

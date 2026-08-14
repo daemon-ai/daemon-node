@@ -75,6 +75,7 @@ impl NodeApiImpl {
             chat_journals: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             agents: None,
             last_agents: Arc::new(std::sync::RwLock::new(Vec::new())),
+            agents_scan_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             checkpoints: None,
             auth_flows: None,
             fleet_events: None,
@@ -609,6 +610,9 @@ impl NodeApiImpl {
     /// Attach the persisted credential store backing the `CredentialApi` sub-surface. Call during
     /// assembly (the same store the node's credential authority provisions from).
     pub fn with_credential_store(mut self, credentials: Arc<dyn CredentialStore>) -> Self {
+        // The live-session pump shares the store (wire v47 A6): classified agent auth
+        // rejections land as durable facts the catalog derivation reads.
+        self.live.set_credentials(credentials.clone());
         self.credentials = Some(credentials);
         self
     }
@@ -627,6 +631,28 @@ impl NodeApiImpl {
         } else {
             Some(Arc::new(PendingAuthFlows::new(factories)))
         };
+        self
+    }
+
+    /// Install the dynamic `agent/*` interactive-auth namespace (wire v47): one resolver mints a
+    /// login flow per cataloged foreign agent from its `auth_descriptor` (`ApiKeyEnv` form;
+    /// `AcpAuthenticate` via the injected gateway — `None` serves ApiKeyEnv only). Call during
+    /// assembly AFTER [`with_auth_factories`](Self::with_auth_factories) (which replaces the flow
+    /// registry) and after the store/discovery state is bound; creates the registry when no
+    /// static factory did, so the auth surface is live for agents alone.
+    pub fn with_agent_auth(
+        mut self,
+        acp: Option<Arc<dyn crate::agent_auth::AcpAuthGateway>>,
+    ) -> Self {
+        let resolver = Arc::new(crate::agent_auth::AgentAuthFamilies::new(
+            self.store.clone(),
+            self.last_agents.clone(),
+            acp,
+        ));
+        let flows = self
+            .auth_flows
+            .get_or_insert_with(|| Arc::new(PendingAuthFlows::new(Vec::new())));
+        flows.set_dynamic(resolver);
         self
     }
 

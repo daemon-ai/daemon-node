@@ -737,6 +737,12 @@ pub struct ToolResultView {
     pub detail: Option<ToolDetail>,
 }
 
+/// The machine-readable [`AgentEvent::Error`] kind for a CLASSIFIED foreign-agent auth rejection
+/// (wire v47 A6): an ACP `auth_required` error, or a stream-json result frame matching the
+/// agent's descriptor-declared rejection classifier. The one value clients key the sign-in
+/// affordance on.
+pub const ERROR_KIND_AUTH_REQUIRED: &str = "auth_required";
+
 /// Events the engine streams up to the host (§17, core -> host). Each carries a monotonic `seq`;
 /// the stream is lossless-primary, so a lossy live consumer resyncs from the last acked `seq`.
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
@@ -829,6 +835,18 @@ pub enum AgentEvent {
         seq: u64,
         /// Human-readable failure description.
         failure: String,
+        /// Machine-readable failure kind, when the failure was CLASSIFIED from a structured
+        /// signal (wire v47 A6): `"auth_required"` when a foreign agent rejected the turn for
+        /// lack of authentication (an ACP `auth_required` error, or a stream-json result frame
+        /// matching the agent's descriptor-declared rejection classifier). `None` for ordinary
+        /// unclassified errors — clients render affordances from this field, never by matching
+        /// `failure` text.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
+        /// The interactive-auth family that can resolve a classified auth failure
+        /// (`agent/<name>`), so a client can open the sign-in flow pre-narrowed from data.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        family: Option<String>,
     },
     /// A steer command was acknowledged (drained at a phase boundary or opened a steer turn).
     Steered {

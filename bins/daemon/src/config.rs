@@ -1295,6 +1295,19 @@ pub struct TelemetryConfig {
     pub feedback_endpoint: Option<String>,
 }
 
+/// Foreign-agent spawn tuning (`[agents]` / `DAEMON_AGENTS__*`).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentsConfig {
+    /// Isolate stream-json foreign agents in node-owned state homes (wire v47 A4). When `true`,
+    /// each stream-json agent spawns with a scrubbed environment (allowlist + recipe env only —
+    /// no daemon-ambient secret reaches the child) and `HOME`/`XDG_*` repointed to
+    /// `<data_dir>/agent-homes/<agent-name>`, so its dotfile state (OAuth blobs, caches) is
+    /// node-owned. `false` (the default) preserves the historical full-inherit spawn. ACP agents
+    /// are not affected: their transport owns process creation without an env-scrubbing hook.
+    pub isolate_state: bool,
+}
+
 /// The prompt-architecture composition policy (`[prompt]` / `DAEMON_PROMPT__*`, hermes parity):
 /// which guidance blocks compose into every engine's system prompt, the content caps, the USER.md
 /// surface, and the prompt-cache TTL override. Defaults mirror hermes (everything on, hermes
@@ -1594,6 +1607,9 @@ pub struct NodeConfig {
     /// Telemetry / feedback export tuning (`[telemetry]`): the OTLP feedback log-event endpoint
     /// (off by default). Distinct from the operator `OTEL_EXPORTER_OTLP_ENDPOINT` trace gate.
     pub telemetry: TelemetryConfig,
+    /// Foreign-agent spawn tuning (`[agents]`): node-owned state-home isolation (off by default).
+    #[serde(default)]
+    pub agents: AgentsConfig,
 }
 
 impl Default for NodeConfig {
@@ -1659,6 +1675,7 @@ impl Default for NodeConfig {
             shell: daemon_processes::ShellConfig::default(),
             processes: daemon_processes::RegistryConfig::default(),
             telemetry: TelemetryConfig::default(),
+            agents: AgentsConfig::default(),
         }
     }
 }

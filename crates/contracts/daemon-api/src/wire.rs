@@ -2454,20 +2454,20 @@ mod auth_contract_tests {
     }
 
     /// The contract wire version (`daemon_common::WireVersion::CURRENT`, mirrored by
-    /// [`crate::API_WIRE_VERSION`]) is pinned to the sealed surface: v45 (the additive vhc
-    /// disk-custody surface — `VhcDiskUsage` report + identity-preserving `VhcDiskWipe` — on top
-    /// of v44's per-round det-state digest, v43's `VhcSwitchModule` request + `VhcSwitchOutcome`
-    /// response, v42's `VhcHardwareReport.shared_mb` UMA-spillover mirror, v41's crash-consent
-    /// surface, and v40's `VhcApi` surface). Distinct from the transport-envelope
-    /// [`WIRE_VERSION`] above (= 2), which these additive rungs did not touch. Bumping the contract
-    /// version is a deliberate act — this assertion is the gate.
+    /// [`crate::API_WIRE_VERSION`]) is pinned to the sealed surface: v47 (the additive
+    /// `profile-spec`/`profile-info` node-seeded placeholder marker + node-side retirement — on
+    /// top of v46's `AgentsChanged` agents-catalog pointer + fast `AgentDiscover` presence reply,
+    /// v45's vhc disk-custody surface, v44's per-round det-state digest, and v43's
+    /// `VhcSwitchModule` request + `VhcSwitchOutcome` response). Distinct from the
+    /// transport-envelope [`WIRE_VERSION`] above (= 2), which these additive rungs did not touch.
+    /// Bumping the contract version is a deliberate act — this assertion is the gate.
     #[test]
-    fn contract_wire_version_is_v45() {
+    fn contract_wire_version_is_v47() {
         assert_eq!(
             daemon_common::WireVersion::CURRENT,
-            daemon_common::WireVersion(45)
+            daemon_common::WireVersion(47)
         );
-        assert_eq!(crate::API_WIRE_VERSION, daemon_common::WireVersion(45));
+        assert_eq!(crate::API_WIRE_VERSION, daemon_common::WireVersion(47));
     }
 
     /// The `api/<N>` feature string is formatted from the API mirror version (never hardcoded)

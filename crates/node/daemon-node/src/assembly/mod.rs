@@ -238,7 +238,7 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
     // parent-bound durable child session seeded from the same orchestrator profile (moved in here).
     let job_worker = build_job_worker(&a, orchestrator_profile, &session_ctx, &shared);
     // The resident cron scheduler (`cron.cron_worker`, built above) drives the 5th supervised service.
-    let host = Host::new(a.store.clone(), factory, a.host_config)
+    let host = Host::new(a.store.clone(), factory, a.host_config.clone())
         .with_job_worker(Arc::new(job_worker))
         .with_cron_scheduler(cron.cron_worker.clone() as Arc<dyn CronScheduler>);
     let handle = host.start();
@@ -256,7 +256,11 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
         &session_ctx,
         session_profile,
         a.store.clone(),
-        a.foreign_gateway.clone(),
+        crate::fleet::foreign_live::SpawnMaterials {
+            credentials: a.credential_store.clone(),
+            state_root: a.host_config.agent_state_root.clone(),
+            gateway: a.foreign_gateway.clone(),
+        },
     );
 
     let mut node_api = NodeApiImpl::new(NodeApiParts {
@@ -694,7 +698,11 @@ fn build_factory(
                 profiles: profiles.clone(),
                 store: a.store.clone(),
                 signer: shared.signer.clone(),
-                gateway: a.foreign_gateway.clone(),
+                materials: crate::fleet::foreign_live::SpawnMaterials {
+                    credentials: a.credential_store.clone(),
+                    state_root: a.host_config.agent_state_root.clone(),
+                    gateway: a.foreign_gateway.clone(),
+                },
             },
         )),
         // No profile store: no foreign bindings are possible, so the plain Core factory suffices.
@@ -771,7 +779,7 @@ fn build_session_builder(
     session_ctx: &Option<(Arc<dyn ProfileStore>, Arc<SessionFactoryCtx>)>,
     session_profile: EngineProfile,
     session_store: Arc<dyn daemon_store::SessionStore>,
-    foreign_gateway: Option<crate::GatewayCoords>,
+    materials: crate::fleet::foreign_live::SpawnMaterials,
 ) -> SessionEngineBuilder {
     match session_ctx {
         Some((store, ctx)) => {
@@ -812,21 +820,24 @@ fn build_session_builder(
                                 let agent = agent.clone();
                                 let backend = spec.foreign_backend.clone();
                                 let store = session_store.clone();
-                                let gateway = foreign_gateway.clone();
-                                SessionBackend::Foreign(Box::new(move |host| {
-                                    Box::pin(async move {
-                                        crate::fleet::foreign_live::spawn_foreign_session(
-                                            agent,
-                                            backend,
-                                            overlay_model,
-                                            id,
-                                            store,
-                                            gateway,
-                                            host,
-                                        )
-                                        .await
-                                    })
-                                }))
+                                let materials = materials.clone();
+                                SessionBackend::Foreign {
+                                    agent: agent.clone(),
+                                    factory: Box::new(move |host| {
+                                        Box::pin(async move {
+                                            crate::fleet::foreign_live::spawn_foreign_session(
+                                                agent,
+                                                backend,
+                                                overlay_model,
+                                                id,
+                                                store,
+                                                host,
+                                                materials,
+                                            )
+                                            .await
+                                        })
+                                    }),
+                                }
                             }
                         },
                         None => SessionBackend::Core(fallback.fresh(id)),
@@ -1034,6 +1045,11 @@ fn bind_discovery_surfaces(
     // cannot link the ACP runtime directly (`daemon-acp` depends on `daemon-host`), so the
     // discoverer is injected here.
     node_api = node_api.with_agent_discovery(Arc::new(daemon_acp::AcpDiscoverer::new()));
+    // The dynamic `agent/*` interactive-auth namespace (wire v47): one resolver serves a login
+    // flow per cataloged foreign agent (ApiKeyEnv form / the agent's own ACP `authenticate`).
+    // Wired here — after `bind_identity_surfaces` installed any static factories — because
+    // `with_auth_factories` replaces the flow registry this attaches to.
+    node_api = node_api.with_agent_auth(Some(Arc::new(daemon_acp::AcpAuthenticator::new())));
     // Bind the live model-switch factory when this node resolves per-session profiles: a
     // `SetSessionModel` rebuilds a running session's provider for the new model id from the
     // (model-overridden) profile bundle via the same provider resolver.

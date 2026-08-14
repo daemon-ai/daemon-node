@@ -136,6 +136,9 @@ impl ProfileOps {
             Author::Operator => None,
             Author::Agent(_) => owner_from_id(&spec.id),
         };
+        // Ingress normalization (wire v47): `seeded` is minted only by `ProfileStore::seed` — a
+        // created profile can never claim to be the first-boot placeholder.
+        spec.seeded = false;
         self.validate(&spec).await?;
         let id = spec.id.clone();
         self.store.create(spec).map_err(profile_err)?;
@@ -147,11 +150,16 @@ impl ProfileOps {
     /// Replace an existing profile: validate, PRESERVE the stored provenance (an update never
     /// rewrites who created/owns the profile), persist (errors if the id is absent), record an
     /// `update` revision attributed to `author`, and emit the `ProfilesChanged` pointer.
+    ///
+    /// The `seeded` marker (wire v47) is force-cleared — never preserved, never honored from the
+    /// wire: an update targeting the first-boot placeholder means someone configured it and has
+    /// thereby ADOPTED it (it stops being retireable), and no update may re-mint the marker.
     pub async fn update(&self, mut spec: ProfileSpec, author: Author) -> Result<(), ApiError> {
         if let Ok(Some(existing)) = self.store.get(&spec.id) {
             spec.created_by = existing.created_by;
             spec.owner = existing.owner;
         }
+        spec.seeded = false;
         self.validate(&spec).await?;
         let id = spec.id.clone();
         self.store.update(spec).map_err(profile_err)?;

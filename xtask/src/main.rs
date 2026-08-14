@@ -4633,6 +4633,8 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                 version: Some("1".into()),
                 capabilities: vec![("fs".into(), "true".into())],
                 verification: daemon_api::AgentVerification::Verified,
+                auth_descriptor: None,
+                auth: None,
             },
             daemon_api::AgentEntry {
                 name: "claude".into(),
@@ -4648,6 +4650,8 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                 version: None,
                 capabilities: Vec::new(),
                 verification: daemon_api::AgentVerification::Unverified,
+                auth_descriptor: None,
+                auth: None,
             },
         ]),
     )?;

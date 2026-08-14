@@ -26,6 +26,14 @@ of node state that sends intents back — so design the API accordingly:
   it. If two clients would each re-implement the same rule, that rule belongs in the node.
 - Requests are intents ("do X"), and the node validates them fully server-side; client-side
   checks are UX sugar, never the enforcement point.
+- Answers that take real time (probes, scans, network round-trips) reply fast with the cheap
+  part and emit a coalescing `NodeEvent` invalidation pointer when the enriched result lands, so
+  clients refetch instead of blocking or polling. A client UI gating on "the slowest probe in a
+  sweep" is an API-shape defect, not a client bug.
+- Anything the node spawns in the background (discovery probes, scans, workers) must be
+  non-interactive and display-scrubbed (blank `DISPLAY`/`WAYLAND_DISPLAY` in the child env): a
+  background subprocess popping UI on the user's desktop is a defect. When a candidate needs a
+  display to fully answer, degrade to the partial/unverified result instead.
 
 ## Wire contract (CDDL) — keep it in lockstep with the Rust types
 

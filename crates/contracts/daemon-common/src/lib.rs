@@ -799,7 +799,31 @@ impl WireVersion {
     /// on explicit request), answering with the typed outcome. Two additive request arms + two
     /// additive response arms + their CDDL rules; strict-equal `is_compatible` still holds;
     /// clients feature-detect via the `api/45` Hello feature.
-    pub const CURRENT: Self = Self(45);
+    ///
+    /// (v46) additive foreign-agent catalog pointer — `NodeEvent::AgentsChanged { rev }`, the
+    /// agents-catalog invalidation pointer (refetch `AgentCatalog`), emitted when a discovery
+    /// scan lands (presence immediately; the background `initialize` verification pass when it
+    /// completes) and on `AgentRegister`/`AgentRemove`. Pairs with the fast-discovery split:
+    /// `AgentDiscover` now answers with PATH-presence rows at once instead of blocking on the
+    /// per-agent handshake probes. One additive node-event arm + its CDDL rule; strict-equal
+    /// `is_compatible` still holds; clients feature-detect via the `api/46` Hello feature.
+    ///
+    /// (v47) additive node-seeded profile marker + foreign-agent auth surface.
+    /// Profiles: `profile-spec`/`profile-info` gain `? "seeded": bool`, `true` only on the
+    /// first-boot placeholder `ProfileStore::seed` mints. Never honored from the wire (every
+    /// profile ingress normalizes it false node-side); the first operator `ProfileUpdate` clears
+    /// it (adoption). Placeholder retirement moves node-side: an operator `ProfileCreate` removes
+    /// a still-seeded, session-free placeholder (making the new profile default when the
+    /// placeholder was), so clients stop guessing which default is disposable.
+    /// Agents: `agent-entry` gains `? "auth_descriptor"` (input: how the agent authenticates —
+    /// ApiKeyEnv / OAuthFamily / DeviceCode / AcpAuthenticate + an optional machine-readable
+    /// rejection classifier; validated at `AgentRegister` ingress along with the new strict
+    /// agent-name slug rule) and `? "auth"` (the node-DERIVED verdict + runnable methods,
+    /// recomputed at catalog assembly from descriptor + credential/marker presence; rides
+    /// `AgentsChanged`). `auth-flow-kind` gains the `AcpAuthenticate` arm. All additive optional
+    /// map fields / union arms + their CDDL rules; strict-equal `is_compatible` still holds;
+    /// clients feature-detect via the `api/47` Hello feature.
+    pub const CURRENT: Self = Self(47);
 
     /// The version this build speaks (alias for [`WireVersion::CURRENT`]).
     pub fn current() -> Self {

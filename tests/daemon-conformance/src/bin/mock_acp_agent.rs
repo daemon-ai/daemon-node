@@ -21,12 +21,13 @@
 use std::sync::{Arc, Mutex};
 
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, ConfigOptionUpdate, ContentBlock, ContentChunk, InitializeRequest,
-    InitializeResponse, NewSessionRequest, NewSessionResponse, PermissionOption,
-    PermissionOptionKind, PromptRequest, PromptResponse, RequestPermissionRequest,
-    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
-    SessionConfigValueId, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, StopReason, TextContent, ToolCallUpdate, ToolCallUpdateFields,
+    AgentCapabilities, AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate,
+    ConfigOptionUpdate, ContentBlock, ContentChunk, InitializeRequest, InitializeResponse,
+    NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionKind, PromptRequest,
+    PromptResponse, RequestPermissionRequest, SessionConfigOption, SessionConfigOptionCategory,
+    SessionConfigSelectOption, SessionConfigValueId, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason, TextContent,
+    ToolCallUpdate, ToolCallUpdateFields, UnstructuredCommandInput,
 };
 use agent_client_protocol::{Agent, ConnectionTo, Responder, Result, Stdio};
 
@@ -72,11 +73,24 @@ async fn main() -> Result<()> {
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(
-            async move |_req: NewSessionRequest, responder: Responder<NewSessionResponse>, _cx| {
+            async move |_req: NewSessionRequest, responder: Responder<NewSessionResponse>, cx| {
                 responder.respond(
                     NewSessionResponse::new("mock-acp-session")
                         .config_options(vec![model_option(MODEL_A)]),
-                )
+                )?;
+                // A10: advertise two slash commands right after session/new (one with an input
+                // hint), so a test can assert the adapter captures the push-based advertisement.
+                cx.send_notification(SessionNotification::new(
+                    "mock-acp-session",
+                    SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(vec![
+                        AvailableCommand::new("web", "Search the web").input(
+                            AvailableCommandInput::Unstructured(UnstructuredCommandInput::new(
+                                "query",
+                            )),
+                        ),
+                        AvailableCommand::new("plan", "Create a plan"),
+                    ])),
+                ))
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -107,6 +121,11 @@ async fn main() -> Result<()> {
                 let wants_switch = prompt.prompt.iter().any(|block| {
                     matches!(block, ContentBlock::Text(t) if t.text.contains("switch-model"))
                 });
+                // A10: a "readvertise-commands" prompt makes the mock push a REPLACEMENT command
+                // list mid-session, so a test can assert full-replace semantics on the sidecar.
+                let wants_readvertise = prompt.prompt.iter().any(|block| {
+                    matches!(block, ContentBlock::Text(t) if t.text.contains("readvertise-commands"))
+                });
                 cx.spawn(async move {
                     let sid = prompt.session_id.clone();
                     cx2.send_notification(SessionNotification::new(
@@ -136,6 +155,15 @@ async fn main() -> Result<()> {
                             SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(vec![
                                 model_option(MODEL_B),
                             ])),
+                        ))?;
+                    }
+                    // A10: full-replace re-advertisement — "deploy" replaces the initial pair.
+                    if wants_readvertise {
+                        cx2.send_notification(SessionNotification::new(
+                            sid.clone(),
+                            SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(
+                                vec![AvailableCommand::new("deploy", "Ship it")],
+                            )),
                         ))?;
                     }
                     let _ = cx2

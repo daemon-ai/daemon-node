@@ -19,7 +19,7 @@ kv-pair = [k: tstr, v: tstr]
 ; cap) - the fix that lets arbitrary file sizes round-trip. Fixed 32-byte hashes stay arrays
 ; (`content-hash`, below) since they are small and `ContentHash([u8; 32])` serializes as a sequence.
 byte-array = bstr
-wire_version = uint                 ; daemon-common WireVersion (current = 44)
+wire_version = uint                 ; daemon-common WireVersion (current = 46)
 
 ; ----- uniform wire pagination (wire v25) -----
 ; Every list op that can exceed the client codec's fixed 64-element array buffers is paginated
@@ -117,7 +117,11 @@ context-status = { "used_tokens": uint64, "max_tokens": (uint64 / null), "budget
 agent-event-context = { "Context": { "seq": uint64, "status": context-status } }
 agent-event-rate-limit = { "RateLimit": { "seq": uint64, "snapshot": rate-limit-snapshot } }
 agent-event-turn-finished = { "TurnFinished": { "seq": uint64, "summary": turn-summary } }
-agent-event-error = { "Error": { "seq": uint64, "failure": tstr } }
+; `kind` marks a CLASSIFIED failure (v47 A6): `"auth_required"` = the foreign agent rejected the
+; turn for lack of authentication (ACP `auth_required`, or the agent's descriptor-declared
+; stream-json rejection classifier matched); `family` is the interactive-auth family that
+; resolves it (`agent/<name>`). Clients key affordances on `kind`, never on `failure` text.
+agent-event-error = { "Error": { "seq": uint64, "failure": tstr, ? "kind": tstr, ? "family": tstr } }
 agent-event-steered = { "Steered": { "seq": uint64, "request_id": req-id, "accepted": bool } }
 agent-event-snapshot = { "Snapshot": { "seq": uint64, "request_id": req-id, "view": conv-view } }
 agent-event-rewound = { "Rewound": { "seq": uint64, "request_id": req-id, "to_cursor": uint64, "epoch": uint64 } }
@@ -283,6 +287,7 @@ session-detail = {
   ? "engine": engine-selector,
   ? "foreign_backend": foreign-backend,
   ? "model_selector": (model-selector / null),
+  ? "commands": [* agent-slash-command],
 }
 
 ; A resident foreign (ACP) session's advertised Model selector, surfaced as live session state
@@ -290,6 +295,11 @@ session-detail = {
 ; Only present for a foreign session whose agent advertises a Model config option.
 model-choice = { "id": tstr, "label": tstr }
 model-selector = { "option_id": tstr, "current": tstr, "choices": [* model-choice] }
+
+; One slash command a foreign (ACP) agent advertises for a live session (wire v47, A10): a
+; full-replace snapshot of the agent's available_commands_update. Invocation is plain prompt text
+; ("/<name> args" in an ordinary turn); "hint" is the ghost text shown while the argument is empty.
+agent-slash-command = { "name": tstr, "description": tstr, ? "hint": (tstr / null) }
 
 session-search-hit = { "session": session-id, "title": tstr, "snippet": tstr }
 
@@ -611,6 +621,7 @@ node-event = node-event-session-advanced
            / node-event-persons-changed
            / node-event-messages-changed
            / node-event-vhc-changed
+           / node-event-agents-changed
 node-event-session-advanced     = { "SessionAdvanced":    { "session": session-id, "epoch": uint64, "head_seq": uint64 } }
 ; rung 3 (api/39): + `? "origin_op"` (carrier 3) — the causing op when the emit site knows it
 ; (a SessionUpdateMeta that carried one); null otherwise.
@@ -649,6 +660,10 @@ node-event-messages-changed     = { "MessagesChanged":    { "transport": transpo
 ; vhc-training run pointer (spec §10.4): payload-free invalidation — the client refetches
 ; VhcRunDetail. `run_id` absent => a roster-level change (a run appeared/vanished).
 node-event-vhc-changed        = { "VhcChanged":       { ? "run_id": tstr, "rev": uint64 } }
+; wire v46: the foreign-agent catalog changed (a discovery scan landed — presence immediately,
+; the background initialize-verification pass on completion — or an agent was registered/removed)
+; -> refetch AgentCatalog. Like ProfilesChanged, a payload-free pointer with a coalescing rev.
+node-event-agents-changed     = { "AgentsChanged":    { "rev": uint64 } }
 events-page = {
   "events": [0*64 node-event],
   "next_cursor": uint64,                ; pass as the next EventsSince cursor
@@ -848,6 +863,39 @@ agent-recipe = {
   ? "endpoint": (tstr / null),
 }
 
+; The node-derived auth verdict for a cataloged agent (wire v47). "Authenticated" means credential
+; CONFIGURED (present in the node's CredentialStore, or a node-owned ACP success marker) — NOT
+; vendor-verified acceptance; the runtime loop refines it. "Unknown" = no auth facts (the default;
+; an absent/pre-v47 encoding decodes here). (Named `-verdict` so zcbor's generated symbol does not
+; collide with the `agent-auth` map's own `state` member accessor; rule names never hit the wire.)
+agent-auth-verdict = "NotRequired"
+                   / "Unknown"
+                   / "Required"
+                   / "Authenticated"
+                   / "Expired"
+; One RUNNABLE auth method: family is the auth_begin family id (always "agent/<name>"), id selects
+; the method within it (auth_begin params carry method_id when more than one is offered).
+agent-auth-method = { "id": tstr, "label": tstr, "kind": auth-flow-kind, "family": tstr }
+; The derived auth block: verdict + runnable methods. A scheme whose flow family is not registered
+; yet advertises NO methods (verdict can be "Required" with an empty list — sign-in not available).
+agent-auth = { "state": agent-auth-verdict, ? "methods": [* agent-auth-method] }
+; Machine-readable auth-rejection classifier (wire v47): the ONLY signal that flips a stream-json
+; agent's verdict at runtime (a generic error never does). field names a JSON field in the agent's
+; result frame; code is the value meaning "auth rejected".
+rejection-classifier = { "field": tstr, "code": tstr }
+; How an agent authenticates (wire v47) — the INPUT half (curated table / manual AgentRegister).
+; The node derives the served agent-auth from this + credential presence; a caller-supplied derived
+; auth is never trusted.
+agent-auth-scheme-api-key-env = { "ApiKeyEnv": { "var": tstr, "label": tstr } }
+agent-auth-scheme-oauth-family = { "OAuthFamily": { "family": tstr } }
+agent-auth-scheme-device-code = { "DeviceCode": { "family": tstr } }
+agent-auth-scheme = "None"
+                  / agent-auth-scheme-api-key-env
+                  / agent-auth-scheme-oauth-family
+                  / agent-auth-scheme-device-code
+                  / "AcpAuthenticate"
+agent-auth-descriptor = { ? "scheme": agent-auth-scheme, ? "rejection": (rejection-classifier / null) }
+
 agent-entry = {
   "name": tstr,
   "recipe": agent-recipe,
@@ -857,6 +905,10 @@ agent-entry = {
   ? "version": (tstr / null),
   ? "capabilities": [* kv-pair],
   ? "verification": agent-verification,
+  ; wire v47: the auth descriptor (input; validated at AgentRegister ingress) + the node-DERIVED
+  ; verdict (recomputed at catalog assembly; rides AgentsChanged). Optional: pre-v47 omits both.
+  ? "auth_descriptor": (agent-auth-descriptor / null),
+  ? "auth": (agent-auth / null),
 }
 
 ; ----- long-tail surface stub DTOs (wire v14; tool-info enriched in v29) -----
@@ -1033,11 +1085,17 @@ profile-spec = {
   ; pre-provenance encoding omits both and decodes as null/null (treated as operator-authored).
   ? "created_by": (author / null),
   ? "owner": (tstr / null),
+  ; node-seeded placeholder marker (wire v47): true only on the first-boot placeholder the node
+  ; seeds. NEVER honored from the wire (every ingress normalizes it false node-side); cleared by
+  ; the first operator update (adoption). An operator ProfileCreate retires a still-seeded,
+  ; session-free placeholder node-side. Optional: a pre-v47 encoding omits it => false.
+  ? "seeded": bool,
 }
 bound-account = { "transport_instance": tstr, "credential_ref": tstr }
 ; profile-info provenance (wire v31): mirrors profile-spec's created_by/owner so a client can badge +
 ; subtree-filter the profile list. Optional (pre-provenance encodings omit both).
-profile-info = { "id": tstr, "provider": provider-selector, "model": tstr, "is_active": bool, "bound_accounts": [* bound-account], ? "created_by": (author / null), ? "owner": (tstr / null) }
+; seeded (wire v47): mirrors profile-spec's node-seeded placeholder marker (read-only for clients).
+profile-info = { "id": tstr, "provider": provider-selector, "model": tstr, "is_active": bool, "bound_accounts": [* bound-account], ? "created_by": (author / null), ? "owner": (tstr / null), ? "seeded": bool }
 credential-info = { "profile": tstr, "present": bool, "hint": tstr, ? "label": (tstr / null) }
 provider-selector = "mock"
                   / "genai"
@@ -1153,6 +1211,8 @@ auth-flow-kind = "MatrixSso"
                / "PhoneOtp"
                / "QrPairing"
                / "UserPassword"          ; wire v38: username+password exchanged at sign-in
+               / "AcpAuthenticate"       ; wire v47: an ACP agent's own authenticate method,
+                                         ; driven node-side (Message challenge + poll)
 ; how a client renders + validates one auth-param-field (wire v38; default Text).
 auth-field-kind = "Text" / "Password" / "Number" / "Choice"
 auth-param-field = {
