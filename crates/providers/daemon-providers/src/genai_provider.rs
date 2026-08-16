@@ -210,19 +210,53 @@ fn prompt_cache_key(req: &Request) -> String {
 pub const DAEMON_CLOUD_BASE: &str = "https://api.daemon.ai/api/v1/";
 
 /// The genai cloud vendors the node enumerates for provider + model discovery. genai 0.6.5 exposes
-/// no public enumeration of [`AdapterKind`], so this is the curated set the picker offers. Each is
-/// queried for models only when a credential resolves (a transient/stored key, or its env var), so a
-/// no-key node makes no network calls for it.
+/// no public enumeration of [`AdapterKind`], so this is the curated set the picker offers — every
+/// distinct vendor genai ships, EXCEPT `OpenAIResp` (a protocol variant of the OpenAI vendor: same
+/// endpoint + key, not a second provider) and `BedrockSigv4` (an auth variant of `BedrockApi`).
+/// Each is queried for models only when a credential resolves (a transient/stored key, or its env
+/// var), so a no-key node makes no network calls for it; Ollama is the one keyless entry (a local
+/// server — genai names no key env for it).
+///
+/// ORDER IS THE WIRE ORDER clients render (after Daemon Cloud + the local engines): estimated
+/// popularity, OpenRouter first as the aggregator default.
 pub const DISCOVERY_ADAPTERS: &[AdapterKind] = &[
+    AdapterKind::OpenRouter,
     AdapterKind::OpenAI,
     AdapterKind::Anthropic,
     AdapterKind::Gemini,
-    AdapterKind::Groq,
     AdapterKind::DeepSeek,
     AdapterKind::Xai,
+    AdapterKind::Groq,
+    AdapterKind::Ollama,
+    AdapterKind::Moonshot,
+    AdapterKind::Zai,
+    AdapterKind::MiniMax,
+    AdapterKind::Fireworks,
+    AdapterKind::Together,
+    AdapterKind::Nebius,
     AdapterKind::Cohere,
-    AdapterKind::OpenRouter,
+    AdapterKind::Aliyun,
+    AdapterKind::Vertex,
+    AdapterKind::BedrockApi,
+    AdapterKind::Baidu,
+    AdapterKind::BigModel,
+    AdapterKind::OllamaCloud,
+    AdapterKind::GithubCopilot,
+    AdapterKind::Aihubmix,
+    AdapterKind::Mimo,
+    AdapterKind::OpenCodeGo,
 ];
+
+/// Whether a discovery vendor lists + runs turns WITHOUT any credential. Exactly the adapters genai
+/// names no key env for — today only Ollama (a local server on `:11434`). The picker renders these
+/// keyless (no key field, no API badge) and the classified listing proceeds straight to the call.
+#[must_use]
+pub fn vendor_keyless(vendor_id: &str) -> bool {
+    DISCOVERY_ADAPTERS
+        .iter()
+        .find(|a| a.as_lower_str() == vendor_id)
+        .is_some_and(|a| a.default_key_env_name().is_none())
+}
 
 /// Live model ids for a single genai `adapter`, credential-aware: when `key` is `Some`, the LIST
 /// call authenticates with it (a first-run transient key or a stored credential); when `None`, genai
@@ -231,6 +265,18 @@ pub const DISCOVERY_ADAPTERS: &[AdapterKind] = &[
 /// list (one unreachable/keyless vendor never blanks the picker). This is the genai-native model
 /// discovery the `ProviderModels` op drives per vendor.
 pub async fn genai_models_for(adapter: AdapterKind, key: Option<&str>) -> Vec<String> {
+    genai_models_for_result(adapter, key)
+        .await
+        .unwrap_or_default()
+}
+
+/// The error-preserving core of [`genai_models_for`]: the same credential-aware LIST, but a
+/// failure surfaces the stringified genai error instead of an empty list, so classified callers
+/// (the wire `ProviderModels` structured-error path) can report *why* the vendor listed nothing.
+pub async fn genai_models_for_result(
+    adapter: AdapterKind,
+    key: Option<&str>,
+) -> Result<Vec<String>, String> {
     let client = Client::default();
     // `AuthData` converts into a genai `ProviderConfig { endpoint: None, auth: Some(..) }`; `()`
     // resolves the adapter's default endpoint + env key.
@@ -243,11 +289,11 @@ pub async fn genai_models_for(adapter: AdapterKind, key: Option<&str>) -> Vec<St
         None => client.all_model_names(adapter, ()).await,
     };
     match listed {
-        Ok(names) => names
+        Ok(names) => Ok(names
             .iter()
             .map(|name| namespace_model(adapter, name))
-            .collect(),
-        Err(_) => Vec::new(),
+            .collect()),
+        Err(e) => Err(e.to_string()),
     }
 }
 
@@ -260,12 +306,12 @@ pub async fn genai_models_for(adapter: AdapterKind, key: Option<&str>) -> Vec<St
 pub async fn genai_listed_models() -> Vec<String> {
     let mut out = Vec::new();
     for &adapter in DISCOVERY_ADAPTERS {
-        let has_key = adapter
-            .default_key_env_name()
-            .map(|env| std::env::var(env).is_ok())
-            .unwrap_or(false);
-        if !has_key {
-            continue;
+        // Skip a vendor whose named key env is absent; a KEYLESS adapter (Ollama — genai names no
+        // env) proceeds: its local server either answers or refuses fast, and the error is swallowed.
+        if let Some(env) = adapter.default_key_env_name() {
+            if std::env::var(env).is_err() {
+                continue;
+            }
         }
         // `None` => genai resolves the adapter's default endpoint + env key for the listing call.
         out.extend(genai_models_for(adapter, None).await);
@@ -277,14 +323,31 @@ pub async fn genai_listed_models() -> Vec<String> {
 /// genai's lowercase adapter name for any vendor without a curated label.
 fn vendor_display_name(adapter: AdapterKind) -> String {
     match adapter {
+        AdapterKind::OpenRouter => "OpenRouter",
         AdapterKind::OpenAI => "OpenAI",
         AdapterKind::Anthropic => "Anthropic",
         AdapterKind::Gemini => "Google Gemini",
-        AdapterKind::Groq => "Groq",
         AdapterKind::DeepSeek => "DeepSeek",
         AdapterKind::Xai => "xAI",
+        AdapterKind::Groq => "Groq",
+        AdapterKind::Ollama => "Ollama",
+        AdapterKind::Moonshot => "Moonshot AI (Kimi)",
+        AdapterKind::Zai => "Z.ai (GLM)",
+        AdapterKind::MiniMax => "MiniMax",
+        AdapterKind::Fireworks => "Fireworks AI",
+        AdapterKind::Together => "Together AI",
+        AdapterKind::Nebius => "Nebius AI Studio",
         AdapterKind::Cohere => "Cohere",
-        AdapterKind::OpenRouter => "OpenRouter",
+        AdapterKind::Aliyun => "Alibaba Cloud (Qwen)",
+        AdapterKind::Vertex => "Google Vertex AI",
+        AdapterKind::BedrockApi => "AWS Bedrock",
+        AdapterKind::Baidu => "Baidu (ERNIE)",
+        AdapterKind::BigModel => "Zhipu BigModel",
+        AdapterKind::OllamaCloud => "Ollama Cloud",
+        AdapterKind::GithubCopilot => "GitHub Copilot",
+        AdapterKind::Aihubmix => "AiHubMix",
+        AdapterKind::Mimo => "Xiaomi MiMo",
+        AdapterKind::OpenCodeGo => "OpenCode",
         other => return other.as_lower_str().to_string(),
     }
     .to_string()
@@ -310,6 +373,46 @@ pub async fn genai_models_for_id(vendor_id: &str, key: Option<&str>) -> Vec<Stri
         return Vec::new();
     };
     genai_models_for(adapter, key).await
+}
+
+/// A classified vendor-listing outcome (wire v48): success, no resolvable credential, a failed
+/// call, or an unknown vendor id — so the wire `ProviderModels` structured-error path reports the
+/// right affordance (key prompt vs retry) instead of a silent empty catalog.
+pub enum VendorListing {
+    /// The listing succeeded (possibly genuinely empty).
+    Ok(Vec<String>),
+    /// No credential is resolvable: no key was supplied and the adapter's default env key
+    /// (`env`, when the adapter names one) is absent — a listing call would only 401.
+    NoKey(Option<&'static str>),
+    /// The listing call itself failed (network/vendor error; stringified genai error).
+    Failed(String),
+    /// The id names no discovery adapter.
+    UnknownVendor,
+}
+
+/// [`genai_models_for_id`], but classified (see [`VendorListing`]). When `key` is `None` and the
+/// adapter's default env key is absent, the call is skipped and `NoKey` returned — cheaper and
+/// more honest than mapping the resulting 401 back after the fact.
+pub async fn genai_models_for_id_classified(vendor_id: &str, key: Option<&str>) -> VendorListing {
+    let Some(&adapter) = DISCOVERY_ADAPTERS
+        .iter()
+        .find(|a| a.as_lower_str() == vendor_id)
+    else {
+        return VendorListing::UnknownVendor;
+    };
+    if key.is_none() {
+        // A keyless adapter (genai names NO key env — Ollama's local server) lists without any
+        // credential: proceed straight to the call instead of misreporting `NoKey`.
+        if let Some(env) = adapter.default_key_env_name() {
+            if std::env::var(env).is_err() {
+                return VendorListing::NoKey(Some(env));
+            }
+        }
+    }
+    match genai_models_for_result(adapter, key).await {
+        Ok(models) => VendorListing::Ok(models),
+        Err(e) => VendorListing::Failed(e),
+    }
 }
 
 /// Prefix a model id with its `genai` adapter namespace (`groq::…`) unless the id already

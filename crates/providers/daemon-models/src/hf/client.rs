@@ -33,6 +33,40 @@ pub(crate) struct Paged<T> {
     pub next: Option<String>,
 }
 
+/// A classified fetch failure, so callers can make endpoint-fallback decisions (5xx vs 4xx vs
+/// decode drift) without string-matching. Converted to [`ModelError`] at the public boundary via
+/// [`FetchError::into_model_error`].
+#[derive(Debug)]
+pub(crate) enum FetchError {
+    /// The endpoint answered with a non-2xx HTTP status.
+    Status {
+        /// The HTTP status code.
+        code: u16,
+        /// The status line + a body excerpt.
+        detail: String,
+    },
+    /// The request never completed (network / DNS / TLS).
+    Network(String),
+    /// The body did not parse as the expected shape.
+    Decode(String),
+}
+
+impl FetchError {
+    /// Map onto the crate's public [`ModelError`] classification.
+    pub(crate) fn into_model_error(self) -> ModelError {
+        match self {
+            FetchError::Status { code: 404, detail } => ModelError::NotFound(detail),
+            FetchError::Status {
+                code: 401 | 403,
+                detail,
+            } => ModelError::AccessDenied(detail),
+            FetchError::Status { detail, .. } => ModelError::Http(detail),
+            FetchError::Network(detail) => ModelError::Http(detail),
+            FetchError::Decode(detail) => ModelError::Decode(detail),
+        }
+    }
+}
+
 impl HfClient {
     /// A client against the default Hub endpoint with an optional token.
     pub fn new(token: Option<String>) -> Self {
@@ -64,6 +98,17 @@ impl HfClient {
         self.get_url(&url, query).await.map(|p| p.body)
     }
 
+    /// GET an endpoint-relative `path` with a **classified** failure (see [`FetchError`]) — the
+    /// seam the search fallback logic decides on.
+    pub(crate) async fn get_json_classified<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        query: &[(&str, String)],
+    ) -> std::result::Result<T, FetchError> {
+        let url = format!("{}{}", self.endpoint, path);
+        self.get_url_classified(&url, query).await.map(|p| p.body)
+    }
+
     /// GET an absolute `url` with `query` params, decoding the JSON body and parsing the `Link`
     /// header's `rel="next"` URL for cursor pagination.
     pub(crate) async fn get_url<T: DeserializeOwned>(
@@ -71,6 +116,17 @@ impl HfClient {
         url: &str,
         query: &[(&str, String)],
     ) -> Result<Paged<T>> {
+        self.get_url_classified(url, query)
+            .await
+            .map_err(FetchError::into_model_error)
+    }
+
+    /// The classified core of [`Self::get_url`].
+    pub(crate) async fn get_url_classified<T: DeserializeOwned>(
+        &self,
+        url: &str,
+        query: &[(&str, String)],
+    ) -> std::result::Result<Paged<T>, FetchError> {
         let mut req = self.client.get(url);
         if !query.is_empty() {
             req = req.query(query);
@@ -81,16 +137,15 @@ impl HfClient {
         let resp = req
             .send()
             .await
-            .map_err(|e| ModelError::Http(e.to_string()))?;
+            .map_err(|e| FetchError::Network(e.to_string()))?;
 
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             let detail = format!("{status}: {}", body.chars().take(200).collect::<String>());
-            return Err(match status.as_u16() {
-                404 => ModelError::NotFound(detail),
-                401 | 403 => ModelError::AccessDenied(detail),
-                _ => ModelError::Http(detail),
+            return Err(FetchError::Status {
+                code: status.as_u16(),
+                detail,
             });
         }
 
@@ -102,9 +157,9 @@ impl HfClient {
         let body = resp
             .text()
             .await
-            .map_err(|e| ModelError::Http(e.to_string()))?;
+            .map_err(|e| FetchError::Network(e.to_string()))?;
         let decoded = serde_json::from_str::<T>(&body).map_err(|e| {
-            ModelError::Decode(format!(
+            FetchError::Decode(format!(
                 "{e} (body: {})",
                 body.chars().take(200).collect::<String>()
             ))

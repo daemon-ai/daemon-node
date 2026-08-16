@@ -64,8 +64,9 @@ use daemon_models::{ActiveModels, ManagerConfig, ModelManager};
 use daemon_node::{assemble, AssembledNode, NodeAssembly, ProviderResolver};
 use daemon_protocol::{IsolationPolicy, TransportId};
 use daemon_providers::{
-    discovery_vendor_ids, genai_listed_models, genai_models_for_id, GenAiEmbedder, GenAiProvider,
-    LocalEmbedder, SwitchableLocalProvider, WorkerConfig, DAEMON_CLOUD_BASE,
+    discovery_vendor_ids, genai_listed_models, genai_models_for_id_classified, vendor_keyless,
+    GenAiEmbedder, GenAiProvider, LocalEmbedder, SwitchableLocalProvider, VendorListing,
+    WorkerConfig, DAEMON_CLOUD_BASE,
 };
 use daemon_provision::CutChannel;
 use daemon_pytool_client::{PyToolConfig, PyToolProvider};
@@ -305,7 +306,13 @@ fn pricing_for(model: &str) -> Option<daemon_common::Pricing> {
 /// never links `genai`). Asks `genai` for the models of every adapter whose key resolves, unions
 /// them with the static catalog (which also carries the pricing/context overlay), and namespaces
 /// live ids so they round-trip through adapter inference.
-struct GenAiCloudCatalog;
+#[derive(Default)]
+struct GenAiCloudCatalog {
+    /// The boot-time `daemon-infer engines` probe verdict: annotates the local engine rows
+    /// (`available` / `unavailable_reason`) so clients grey out engines the deployed worker
+    /// cannot run. `Default` = both available (test stubs probe nothing).
+    engines: daemon_providers::EngineProbe,
+}
 
 /// Overlay a genai-listed cloud model id with the static catalog's pricing/context (genai supplies
 /// neither), tagged as the `GenAi` provider. Shared by `list()` and per-vendor `provider_models`.
@@ -339,47 +346,62 @@ struct GatewayModel {
 /// Fetch OpenAI-compatible gateway models via `GET {base}/models`, credential-aware: when `key` is
 /// `Some` it rides as `Authorization: Bearer` (dropped on any cross-origin redirect by the egress
 /// client); when `None` the probe is keyless (the Daemon Cloud MVP path). Tolerates both the OpenAI
-/// `{ "data": [..] }` envelope and a bare array; a non-200 (incl. the 500 "Registry not published")
-/// or a transport error yields an empty list (never an error to the picker). Ids stay `author/slug`
-/// (or whatever the gateway returns) so they feed `ProfileSpec.model` verbatim. Shared by the
-/// hardcoded Daemon Cloud row and every user-defined custom provider.
-async fn daemon_cloud_gateway_models(base: &str, key: Option<&str>) -> Vec<ModelDescriptor> {
+/// `{ "data": [..] }` envelope and a bare array. Structured failure (wire v48): a 401/403 maps to
+/// `AuthRequired`, any other non-success / transport error to `Network`, a body that will not parse
+/// to `Decode` — so the client renders a key prompt vs a retry instead of a silent empty catalog.
+/// Ids stay `author/slug` (or whatever the gateway returns) so they feed `ProfileSpec.model`
+/// verbatim. Shared by the hardcoded Daemon Cloud row and every user-defined custom provider.
+async fn daemon_cloud_gateway_models(
+    base: &str,
+    key: Option<&str>,
+) -> Result<Vec<ModelDescriptor>, daemon_api::ProviderListError> {
+    use daemon_api::{ProviderListError, ProviderListErrorKind};
     let url = format!("{}models", NodeConfig::ensure_trailing_slash(base));
     // Route through the SSRF-safe egress client. `base` is operator/user-configured (config-
     // influenced), so `Redirects::None` is used: it may legitimately be a private/self-hosted host,
     // and a `/models` probe never needs to follow a redirect.
-    let client = match daemon_egress::EgressClient::new(daemon_egress::EgressConfig::default()) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::debug!(error = %e, "daemon cloud gateway egress client init");
-            return Vec::new();
-        }
-    };
+    let client =
+        daemon_egress::EgressClient::new(daemon_egress::EgressConfig::default()).map_err(|e| {
+            ProviderListError {
+                kind: ProviderListErrorKind::Network,
+                message: format!("egress client init failed: {e}"),
+            }
+        })?;
     let mut req = daemon_egress::EgressRequest::get(&url);
     if let Some(key) = key {
         req = req.bearer_auth(key);
     }
     let resp = match client.execute(req, daemon_egress::Redirects::None).await {
         Ok(r) if r.status().is_success() => r,
+        Ok(r) if r.status().as_u16() == 401 || r.status().as_u16() == 403 => {
+            return Err(ProviderListError {
+                kind: ProviderListErrorKind::AuthRequired,
+                message: format!("the endpoint rejected the listing ({})", r.status()),
+            });
+        }
         Ok(r) => {
-            tracing::debug!(status = %r.status(), "daemon cloud gateway /models non-success");
-            return Vec::new();
+            return Err(ProviderListError {
+                kind: ProviderListErrorKind::Network,
+                message: format!("the endpoint answered {}", r.status()),
+            });
         }
         Err(e) => {
-            tracing::debug!(error = %e, "daemon cloud gateway /models unreachable");
-            return Vec::new();
+            return Err(ProviderListError {
+                kind: ProviderListErrorKind::Network,
+                message: format!("the endpoint could not be reached: {e}"),
+            });
         }
     };
-    let body: serde_json::Value = match resp.json().await {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::debug!(error = %e, "daemon cloud gateway /models parse");
-            return Vec::new();
-        }
-    };
+    let body: serde_json::Value = resp.json().await.map_err(|e| ProviderListError {
+        kind: ProviderListErrorKind::Decode,
+        message: format!("the endpoint's response did not parse: {e}"),
+    })?;
     let raw = body.get("data").cloned().unwrap_or(body);
-    let models: Vec<GatewayModel> = serde_json::from_value(raw).unwrap_or_default();
-    models
+    let models: Vec<GatewayModel> = serde_json::from_value(raw).map_err(|e| ProviderListError {
+        kind: ProviderListErrorKind::Decode,
+        message: format!("the endpoint's model list did not parse: {e}"),
+    })?;
+    Ok(models
         .into_iter()
         .map(|m| ModelDescriptor {
             id: m.id,
@@ -390,7 +412,7 @@ async fn daemon_cloud_gateway_models(base: &str, key: Option<&str>) -> Vec<Model
             output_price_micros_per_mtok: None,
             local: false,
         })
-        .collect()
+        .collect())
 }
 
 #[async_trait::async_trait]
@@ -410,64 +432,74 @@ impl CloudCatalog for GenAiCloudCatalog {
     }
 
     async fn providers(&self) -> Vec<ProviderDescriptor> {
+        // Catalog order IS the wire order clients render: Daemon Cloud (the product default)
+        // first, then the local engines, then the genai cloud vendors. Local-ness is carried by
+        // `kind` (the client renders its own indicator), never baked into the display name.
+        // The canonical rows (Daemon Cloud + the managed local engines) live on
+        // `ProviderDescriptor` so binary, host fallback, and test stubs share one definition of
+        // the v48 capability split (list vs turn auth, install strategy, node-owned actions).
+        // The local engine rows carry the boot probe's verdict: an engine the deployed worker
+        // was not built with stays LISTED but unavailable (greyed client-side, acquisition
+        // refused host-side) — the node is authoritative about what it can actually run.
+        let mut llama = ProviderDescriptor::llama_cpp();
+        if let Some(reason) = &self.engines.llama_unavailable {
+            llama.available = false;
+            llama.unavailable_reason = Some(reason.clone());
+        }
+        let mut mistral = ProviderDescriptor::mistral_rs();
+        if let Some(reason) = &self.engines.mistralrs_unavailable {
+            mistral.available = false;
+            mistral.unavailable_reason = Some(reason.clone());
+        }
         let mut out = vec![
-            // Local inference engines (models come from the ModelManager catalog, node-owned).
-            ProviderDescriptor {
-                id: "llama_cpp".into(),
-                display_name: "llama.cpp (local)".into(),
-                kind: ProviderKindWire::Local,
-                wire_selector: ProviderSelector::LlamaCpp,
-                requires_key: false,
-                supports_model_discovery: true,
-                default_base_url: None,
-                sign_in: None,
-            },
-            ProviderDescriptor {
-                id: "mistral_rs".into(),
-                display_name: "mistral.rs (local)".into(),
-                kind: ProviderKindWire::Local,
-                wire_selector: ProviderSelector::MistralRs,
-                requires_key: false,
-                supports_model_discovery: true,
-                default_base_url: None,
-                sign_in: None,
-            },
+            ProviderDescriptor::daemon_cloud(DAEMON_CLOUD_BASE),
+            llama,
+            mistral,
         ];
         // One row per genai cloud vendor (all bind `ProviderSelector::GenAi`; the vendor dimension is
-        // carried by `id`). Listing their models needs a key.
+        // carried by `id`), in DISCOVERY_ADAPTERS' popularity order — catalog order is wire order.
         for (id, display_name) in discovery_vendor_ids() {
-            // [waveA:node-v30] CON-15: the OpenRouter genai row advertises interactive sign-in via
-            // the `provider/openrouter` auth family (the sibling registers the factory under it);
-            // every other vendor carries `None`.
-            let sign_in = (id == "open_router").then(|| ProviderSignIn {
-                family: "provider/openrouter".into(),
-                label: "Sign in with OpenRouter".into(),
-            });
+            // Interactive sign-in rides only where a node-owned auth factory registers
+            // unconditionally: OpenRouter (PKCE key-mint) and GitHub Copilot (RFC 8628 device
+            // flow). Config-gated families (Hugging Face pattern) advertise nothing here until
+            // an operator supplies their client id; every other vendor is key-in-field.
+            let sign_in = match id.as_str() {
+                "open_router" => Some(ProviderSignIn {
+                    family: "provider/openrouter".into(),
+                    label: "Sign in with OpenRouter".into(),
+                }),
+                "github_copilot" => Some(ProviderSignIn {
+                    family: "provider/github_copilot".into(),
+                    label: "Sign in with GitHub".into(),
+                }),
+                _ => None,
+            };
+            // A keyless vendor (Ollama — a local server genai names no key env for) lists and
+            // runs turns without any credential; every other genai vendor gates both on a key.
+            let auth = if vendor_keyless(&id) {
+                daemon_api::ProviderAuth::None
+            } else {
+                daemon_api::ProviderAuth::ApiKey
+            };
             out.push(ProviderDescriptor {
                 id,
                 display_name,
                 kind: ProviderKindWire::Cloud,
                 wire_selector: ProviderSelector::GenAi,
-                requires_key: true,
+                // Enumerated catalog — nothing to install, no managed actions.
+                list_auth: auth,
+                turn_auth: auth,
+                install: daemon_api::InstallStrategy::None,
+                actions: Vec::new(),
                 supports_model_discovery: true,
                 default_base_url: None,
                 sign_in,
+                // Cloud vendors are always runnable (the wire turn is genai's HTTP call); only
+                // the local engine rows carry the worker probe's verdict.
+                available: true,
+                unavailable_reason: None,
             });
         }
-        // Daemon Cloud (OpenRouter clone). Needs a key to RUN TURNS (its
-        // `/api/v1/chat/completions` is bearer-authed), so `requires_key` is true — but model
-        // LISTING stays keyless (the public gateway `/models` is unauth; `provider_models` never
-        // gates on this flag). Carries the gateway base so the app never hardcodes it.
-        out.push(ProviderDescriptor {
-            id: "daemon_cloud".into(),
-            display_name: "Daemon Cloud".into(),
-            kind: ProviderKindWire::DaemonCloud,
-            wire_selector: ProviderSelector::DaemonApi,
-            requires_key: true,
-            supports_model_discovery: true,
-            default_base_url: Some(DAEMON_CLOUD_BASE.to_string()),
-            sign_in: None,
-        });
         out
     }
 
@@ -475,18 +507,37 @@ impl CloudCatalog for GenAiCloudCatalog {
         &self,
         provider_id: &str,
         key: Option<String>,
-    ) -> Vec<ModelDescriptor> {
+    ) -> Result<Vec<ModelDescriptor>, daemon_api::ProviderListError> {
+        use daemon_api::{ProviderListError, ProviderListErrorKind};
         match provider_id {
             // Local engines are served by the host from the ModelManager catalog, not here.
-            "llama_cpp" | "mistral_rs" => Vec::new(),
+            "llama_cpp" | "mistral_rs" => Ok(Vec::new()),
             // Daemon Cloud: keyless gateway listing (author/slug).
             "daemon_cloud" => daemon_cloud_gateway_models(DAEMON_CLOUD_BASE, None).await,
-            // A genai cloud vendor: credential-aware live listing, overlaid with static pricing.
-            vendor => genai_models_for_id(vendor, key.as_deref())
-                .await
-                .into_iter()
-                .map(genai_model_descriptor)
-                .collect(),
+            // A genai cloud vendor: credential-aware live listing, classified (wire v48) so a
+            // keyless vendor renders a key prompt instead of a silent empty catalog.
+            vendor => match genai_models_for_id_classified(vendor, key.as_deref()).await {
+                VendorListing::Ok(models) => {
+                    Ok(models.into_iter().map(genai_model_descriptor).collect())
+                }
+                VendorListing::NoKey(env) => Err(ProviderListError {
+                    kind: ProviderListErrorKind::AuthRequired,
+                    message: match env {
+                        Some(env) => {
+                            format!("an API key is required to list {vendor} models (or set {env})")
+                        }
+                        None => format!("an API key is required to list {vendor} models"),
+                    },
+                }),
+                VendorListing::Failed(e) => Err(ProviderListError {
+                    kind: ProviderListErrorKind::Network,
+                    message: format!("listing {vendor} models failed: {e}"),
+                }),
+                VendorListing::UnknownVendor => Err(ProviderListError {
+                    kind: ProviderListErrorKind::Unsupported,
+                    message: format!("{vendor:?} is not a known provider"),
+                }),
+            },
         }
     }
 
@@ -494,7 +545,7 @@ impl CloudCatalog for GenAiCloudCatalog {
         &self,
         base_url: &str,
         key: Option<String>,
-    ) -> Vec<ModelDescriptor> {
+    ) -> Result<Vec<ModelDescriptor>, daemon_api::ProviderListError> {
         // A user-defined custom provider is a Daemon-Cloud-style OpenAI gateway at an arbitrary base;
         // the same `GET {base}/models` probe serves it, credential-aware.
         daemon_cloud_gateway_models(base_url, key.as_deref()).await
@@ -1957,6 +2008,21 @@ fn local_worker_config(cfg: &NodeConfig, engine: Engine) -> WorkerConfig {
         mmproj: None,
     };
     wc.max_tokens = local.max_tokens;
+    // Sampling penalties: upstream-neutral defaults unless the operator tuned them (e.g. raising
+    // `penalty_repeat` for a degeneration-prone model).
+    wc.sampling.penalty_last_n = local.penalty_last_n;
+    wc.sampling.penalty_repeat = local.penalty_repeat;
+    wc.sampling.penalty_freq = local.penalty_freq;
+    wc.sampling.penalty_present = local.penalty_present;
+    wc.stop = local.stop.clone();
+    // Tool-advertisement policy: resolve for the statically configured model now; the switchable
+    // provider re-resolves from the same overrides when it hot-swaps models.
+    wc.tool_advertisement_overrides = local
+        .tool_advertisement
+        .iter()
+        .map(|(k, v)| (k.clone(), *v))
+        .collect();
+    wc.resolve_tool_advertisement(&[&cfg.model]);
     wc.load_timeout = local.load_timeout;
     wc.ttft_timeout = local.ttft_timeout;
     wc.inter_token_timeout = local.inter_token_timeout;
@@ -2746,6 +2812,13 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
             daemon_oauth::DescriptorFlowFactory::new(daemon_oauth::openrouter())
                 .map_err(|e| anyhow::anyhow!("registering the openrouter auth factory: {e}"))?,
         ),
+        // The GitHub Copilot DEVICE flow (RFC 8628): fully node-owned (well-known public client
+        // id), so it registers unconditionally next to OpenRouter; the `github_copilot` provider
+        // row advertises it via `sign_in`.
+        Arc::new(
+            daemon_oauth::DeviceFlowFactory::new(daemon_oauth::github_copilot())
+                .map_err(|e| anyhow::anyhow!("registering the github copilot auth factory: {e}"))?,
+        ),
     ];
     if let Some(client_id) = cfg.oauth.huggingface_client_id.clone() {
         auth_factories.push(Arc::new(
@@ -2855,6 +2928,17 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
         }
     };
 
+    // Probe the deployed worker's compiled engines ONCE at boot (`daemon-infer engines`): the
+    // provider catalog annotates the local engine rows from this, so a stub worker build is
+    // advertised as unavailable instead of failing at first inference.
+    let engine_probe = daemon_providers::probe_worker_engines(&cfg.infer.worker_bin).await;
+    if let Some(reason) = &engine_probe.llama_unavailable {
+        tracing::warn!(reason, "llama.cpp engine unavailable on this node");
+    }
+    if let Some(reason) = &engine_probe.mistralrs_unavailable {
+        tracing::warn!(reason, "mistral.rs engine unavailable on this node");
+    }
+
     let AssembledNode {
         node,
         handle,
@@ -2886,7 +2970,9 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
         profiles: Some(profile_store),
         provider_resolver: Some(provider_resolver),
         credential_store: Some(credential_store),
-        cloud_catalog: Some(Arc::new(GenAiCloudCatalog)),
+        cloud_catalog: Some(Arc::new(GenAiCloudCatalog {
+            engines: engine_probe,
+        })),
         prompt_sources,
         revisions,
         skills: skills_provider,
@@ -4254,7 +4340,7 @@ mod tests {
     /// is independent of the launch config (an unconfigured node still lists providers).
     #[tokio::test]
     async fn provider_catalog_lists_local_all_genai_vendors_and_daemon_cloud() {
-        let catalog = GenAiCloudCatalog;
+        let catalog = GenAiCloudCatalog::default();
         let providers = CloudCatalog::providers(&catalog).await;
         let ids: std::collections::HashSet<&str> =
             providers.iter().map(|p| p.id.as_str()).collect();
@@ -4270,35 +4356,116 @@ mod tests {
             );
         }
         // Daemon Cloud carries the gateway base so the app never hardcodes it, needs a key to RUN
-        // TURNS (requires_key = true; model LISTING stays keyless — see the keyless-gateway test),
-        // and binds the DaemonApi selector.
+        // TURNS (turn_auth; model LISTING stays keyless — see the keyless-gateway test), and binds
+        // the DaemonApi selector.
         let daemon_cloud = providers
             .iter()
             .find(|p| p.id == "daemon_cloud")
             .expect("daemon_cloud present");
         assert_eq!(daemon_cloud.kind, ProviderKindWire::DaemonCloud);
         assert_eq!(daemon_cloud.wire_selector, ProviderSelector::DaemonApi);
-        assert!(
-            daemon_cloud.requires_key,
-            "Daemon Cloud needs a key to run turns (lists keyless)"
-        );
+        assert_eq!(daemon_cloud.turn_auth, daemon_api::ProviderAuth::ApiKey);
+        assert_eq!(daemon_cloud.list_auth, daemon_api::ProviderAuth::None);
         assert_eq!(
             daemon_cloud.default_base_url.as_deref(),
             Some(DAEMON_CLOUD_BASE)
         );
 
-        // Genai vendors require a key to run turns; local engines do not.
+        // Genai vendors require a key to list AND run turns; local engines are keyless managed
+        // catalogs with node-owned actions (wire v48).
         let anthropic = providers.iter().find(|p| p.id == "anthropic").unwrap();
-        assert!(anthropic.requires_key, "genai vendors need a key");
+        assert_eq!(anthropic.list_auth, daemon_api::ProviderAuth::ApiKey);
+        assert_eq!(anthropic.turn_auth, daemon_api::ProviderAuth::ApiKey);
         assert_eq!(anthropic.wire_selector, ProviderSelector::GenAi);
+        let llama = providers.iter().find(|p| p.id == "llama_cpp").unwrap();
+        assert_eq!(llama.turn_auth, daemon_api::ProviderAuth::None);
+        assert_eq!(llama.install, daemon_api::InstallStrategy::Artifact);
+        assert!(llama
+            .actions
+            .contains(&daemon_api::ProviderAction::Requantize));
+        let mistral = providers.iter().find(|p| p.id == "mistral_rs").unwrap();
+        assert_eq!(mistral.install, daemon_api::InstallStrategy::Repository);
+        assert!(!mistral
+            .actions
+            .contains(&daemon_api::ProviderAction::Requantize));
+
+        // Ollama is the one KEYLESS genai vendor (a local server; genai names no key env), so its
+        // list AND turn auth are None — the picker renders no key field for it.
+        let ollama = providers.iter().find(|p| p.id == "ollama").unwrap();
+        assert_eq!(ollama.list_auth, daemon_api::ProviderAuth::None);
+        assert_eq!(ollama.turn_auth, daemon_api::ProviderAuth::None);
+        assert_eq!(ollama.wire_selector, ProviderSelector::GenAi);
     }
 
-    /// CON-15 (wire v30, item 5): the OpenRouter genai row advertises interactive sign-in via the
-    /// EXACT `provider/openrouter` auth family + label; every other row carries `None`. The full
-    /// catalog↔factory cross-check lands at integration; this asserts the advertised family/label.
+    /// The boot probe's verdict annotates the local engine rows (wire v48 additive): an engine the
+    /// deployed worker lacks stays LISTED but `available: false` with the probe's reason; cloud
+    /// rows are untouched. A default (unprobed) catalog leaves everything available.
+    #[tokio::test]
+    async fn engine_probe_verdict_greys_local_engine_rows() {
+        let catalog = GenAiCloudCatalog {
+            engines: daemon_providers::EngineProbe {
+                llama_unavailable: Some("worker built without the llama.cpp engine".into()),
+                mistralrs_unavailable: None,
+            },
+        };
+        let providers = CloudCatalog::providers(&catalog).await;
+        let llama = providers.iter().find(|p| p.id == "llama_cpp").unwrap();
+        assert!(!llama.available);
+        assert_eq!(
+            llama.unavailable_reason.as_deref(),
+            Some("worker built without the llama.cpp engine")
+        );
+        let mistral = providers.iter().find(|p| p.id == "mistral_rs").unwrap();
+        assert!(mistral.available && mistral.unavailable_reason.is_none());
+        // Cloud + gateway rows never carry an engine verdict.
+        assert!(providers
+            .iter()
+            .filter(|p| p.id != "llama_cpp")
+            .all(|p| p.available));
+    }
+
+    /// Catalog order IS the wire order clients render: Daemon Cloud (the product default) first,
+    /// the local engines next, then the genai cloud vendors by estimated popularity with
+    /// OpenRouter (the aggregator default) leading them — never alphabetical.
+    #[tokio::test]
+    async fn provider_catalog_order_is_popularity_with_openrouter_first() {
+        let catalog = GenAiCloudCatalog::default();
+        let providers = CloudCatalog::providers(&catalog).await;
+        let ids: Vec<&str> = providers.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(
+            &ids[..7],
+            &[
+                "daemon_cloud",
+                "llama_cpp",
+                "mistral_rs",
+                "open_router",
+                "openai",
+                "anthropic",
+                "gemini"
+            ],
+            "the head of the catalog is the product default + local engines + top cloud vendors"
+        );
+        // The cloud tail follows DISCOVERY_ADAPTERS' declared (popularity) order exactly.
+        let cloud_ids: Vec<&str> = ids[3..].to_vec();
+        let declared: Vec<String> = discovery_vendor_ids()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(
+            cloud_ids,
+            declared.iter().map(String::as_str).collect::<Vec<_>>(),
+            "wire order must equal DISCOVERY_ADAPTERS order"
+        );
+    }
+
+    /// CON-15 (wire v30, item 5): interactive sign-in is advertised by EXACTLY the rows whose
+    /// node-owned auth factories register unconditionally — OpenRouter (`provider/openrouter`,
+    /// PKCE key-mint) and GitHub Copilot (`provider/github_copilot`, RFC 8628 device flow); every
+    /// other row carries `None`. The full catalog↔factory cross-check lands at integration; this
+    /// asserts the advertised family/label pairs.
     #[tokio::test] // [waveA:node-v30]
-    async fn openrouter_row_advertises_sign_in() {
-        let catalog = GenAiCloudCatalog;
+    async fn sign_in_rows_are_openrouter_and_github_copilot() {
+        let catalog = GenAiCloudCatalog::default();
         let providers = CloudCatalog::providers(&catalog).await;
         let openrouter = providers
             .iter()
@@ -4310,11 +4477,24 @@ mod tests {
             .expect("openrouter advertises interactive sign-in");
         assert_eq!(sign_in.family, "provider/openrouter");
         assert_eq!(sign_in.label, "Sign in with OpenRouter");
+        let copilot = providers
+            .iter()
+            .find(|p| p.id == "github_copilot")
+            .expect("github_copilot row present");
+        let sign_in = copilot
+            .sign_in
+            .as_ref()
+            .expect("github copilot advertises interactive sign-in");
+        assert_eq!(sign_in.family, "provider/github_copilot");
+        assert_eq!(sign_in.label, "Sign in with GitHub");
         // Every other provider row (local, daemon_cloud, other genai vendors) advertises none.
-        for p in providers.iter().filter(|p| p.id != "open_router") {
+        for p in providers
+            .iter()
+            .filter(|p| p.id != "open_router" && p.id != "github_copilot")
+        {
             assert!(
                 p.sign_in.is_none(),
-                "only the OpenRouter row advertises sign-in; {} must not",
+                "only OpenRouter + GitHub Copilot advertise sign-in; {} must not",
                 p.id
             );
         }
@@ -4334,7 +4514,7 @@ mod tests {
         use daemon_host::{AuthFlowFactory, PendingAuthFlows};
 
         // (1) Catalog side (node-v30): the OpenRouter row advertises the exact family constant.
-        let catalog = GenAiCloudCatalog;
+        let catalog = GenAiCloudCatalog::default();
         let providers = CloudCatalog::providers(&catalog).await;
         let openrouter = providers
             .iter()
@@ -4361,6 +4541,10 @@ mod tests {
                 daemon_oauth::DescriptorFlowFactory::new(daemon_oauth::openrouter())
                     .expect("build the openrouter factory"),
             ),
+            Arc::new(
+                daemon_oauth::DeviceFlowFactory::new(daemon_oauth::github_copilot())
+                    .expect("build the github copilot factory"),
+            ),
         ];
         let served = PendingAuthFlows::new(auth_factories).providers();
         let info = served
@@ -4376,6 +4560,24 @@ mod tests {
             "the provider-bound family owns every parameter (empty schema), got {:?}",
             info.params_schema
         );
+
+        // Same lock for the Copilot half: the catalog row's family == the device-flow constant,
+        // and the registered device factory serves it (empty schema, DeviceCode kind).
+        let copilot = providers
+            .iter()
+            .find(|p| p.id == "github_copilot")
+            .expect("github_copilot row present");
+        let copilot_sign_in = copilot
+            .sign_in
+            .as_ref()
+            .expect("copilot advertises sign-in");
+        assert_eq!(copilot_sign_in.family, daemon_oauth::GITHUB_COPILOT_FAMILY);
+        let info = served
+            .iter()
+            .find(|p| p.family == daemon_oauth::GITHUB_COPILOT_FAMILY)
+            .expect("the github copilot family is served by the registered factories");
+        assert_eq!(info.flow_kind, daemon_api::AuthFlowKind::DeviceCode);
+        assert!(info.params_schema.is_empty());
     }
 
     /// `ProviderModels(daemon_cloud)` lists the gateway's `author/slug` models keyless via
@@ -4401,7 +4603,9 @@ mod tests {
         });
 
         let base = format!("http://{addr}/");
-        let models = daemon_cloud_gateway_models(&base, None).await;
+        let models = daemon_cloud_gateway_models(&base, None)
+            .await
+            .expect("gateway listing");
         server.await.unwrap();
 
         assert_eq!(models.len(), 1, "one gateway model: {models:?}");
@@ -4412,13 +4616,16 @@ mod tests {
         assert_eq!(m.context_length, Some(200_000));
     }
 
-    /// A gateway that reports the 500 "Registry not published" (or is unreachable) yields an empty
-    /// list, never an error to the picker.
+    /// A gateway that is unreachable yields a classified `Network` failure (wire v48) — the
+    /// structured error the picker renders as a retry, never a silent empty list.
     #[tokio::test]
-    async fn daemon_cloud_models_empty_on_gateway_error() {
-        // An unroutable/closed port: the GET fails and the picker sees an empty list.
-        let models = daemon_cloud_gateway_models("http://127.0.0.1:1/", None).await;
-        assert!(models.is_empty(), "gateway error => empty list: {models:?}");
+    async fn daemon_cloud_models_classified_error_on_gateway_failure() {
+        // An unroutable/closed port: the GET fails and the failure is classified.
+        let err = daemon_cloud_gateway_models("http://127.0.0.1:1/", None)
+            .await
+            .expect_err("unreachable gateway is a classified failure");
+        assert_eq!(err.kind, daemon_api::ProviderListErrorKind::Network);
+        assert!(!err.message.is_empty());
     }
 
     /// A custom provider's `GET {base}/models` probe forwards the resolved key as
@@ -4446,7 +4653,9 @@ mod tests {
         });
 
         let base = format!("http://{addr}/");
-        let models = daemon_cloud_gateway_models(&base, Some("sk-gw-secret")).await;
+        let models = daemon_cloud_gateway_models(&base, Some("sk-gw-secret"))
+            .await
+            .expect("gateway listing");
         server.await.unwrap();
 
         assert_eq!(models.len(), 1, "one model: {models:?}");

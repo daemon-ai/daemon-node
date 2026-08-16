@@ -282,17 +282,21 @@ async fn serve_models(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse>
             ok_or_err(api.model_search(query).await, ApiResponse::ModelSearch)
         }
         ApiRequest::ModelFiles {
+            provider,
             repo,
             revision,
-            engine,
             after,
         } => ok_or_err(
-            api.model_files(repo, revision, engine, after).await,
+            api.model_files(provider, repo, revision, after).await,
             ApiResponse::ModelFiles,
         ),
-        ApiRequest::ModelDownload { model } => ok_or_err(
-            api.model_download(model).await,
+        ApiRequest::ModelDownload { provider, source } => ok_or_err(
+            api.model_download(provider, source).await,
             ApiResponse::ModelDownloadStarted,
+        ),
+        ApiRequest::ModelInstallFromUrl { provider, url } => ok_or_err(
+            api.model_install_from_url(provider, url).await,
+            ApiResponse::ModelInstallFromUrl,
         ),
         ApiRequest::ModelDownloads => ApiResponse::ModelDownloads(api.model_downloads().await),
         ApiRequest::ModelCancel { id } => unit_or_err(api.model_cancel(id).await),

@@ -142,6 +142,7 @@ pub fn required_capability(req: &ApiRequest) -> RequiredAccess {
         | ProviderModels { .. }
         | CustomProviderList => C::ModelsRead,
         ModelDownload { .. }
+        | ModelInstallFromUrl { .. }
         | ModelCancel { .. }
         | ModelPause { .. }
         | ModelResume { .. }

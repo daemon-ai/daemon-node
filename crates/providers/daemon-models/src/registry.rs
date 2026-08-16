@@ -159,6 +159,7 @@ mod tests {
         let model = ModelRef::new(ModelEngine::Llama, ModelSource::hf_file(repo, "m.gguf"));
         InstalledModel {
             id: model_id(&model),
+            provider: model.engine.provider_id().to_string(),
             model,
             display_name: repo.to_string(),
             local_path: PathBuf::from("/tmp/m.gguf"),

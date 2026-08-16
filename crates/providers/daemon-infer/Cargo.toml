@@ -44,6 +44,12 @@ clap = { workspace = true }
 # Protocol (light; this is all `daemon-providers` pulls with default-features = false).
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Chat-template rendering + capability probing (engine-independent, stub-build tested — pure Rust,
+# no native deps; already resolved in-tree transitively via mistralrs). chrono backs the templates'
+# `strftime_now` helper (date-stamped system preambles in the SmolLM/Granite families).
+minijinja = { workspace = true }
+minijinja-contrib = { workspace = true }
+chrono = { workspace = true }
 ciborium = { workspace = true }
 thiserror = { workspace = true }
 # Worker runtime + the engine-agnostic backend seam.

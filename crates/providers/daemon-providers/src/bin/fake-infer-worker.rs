@@ -62,14 +62,17 @@ async fn main() {
                                 supports_streaming: true,
                                 tool_call_format: ToolCallFormat::Native,
                                 max_context: Some(4096),
+                                template_tools: false,
                             },
                         },
                     )
                     .await;
                 }
             }
-            Command::Generate { request_id, .. } => {
-                run_generate(&writer, &scenario, spawn_index, request_id).await;
+            Command::Generate {
+                request_id, tools, ..
+            } => {
+                run_generate(&writer, &scenario, spawn_index, request_id, tools.len()).await;
             }
             Command::Embed { request_id, texts } => {
                 run_embed(&writer, &scenario, request_id, &texts).await;
@@ -82,11 +85,23 @@ async fn main() {
 }
 
 /// Play the scenario's generation behavior for `request_id`.
-async fn run_generate(writer: &CutWriter, scenario: &str, spawn_index: u64, request_id: u64) {
+async fn run_generate(
+    writer: &CutWriter,
+    scenario: &str,
+    spawn_index: u64,
+    request_id: u64,
+    tools_received: usize,
+) {
     // `exit-midgen` / `hang` misbehave on the *first* spawn (index 0) and stream cleanly on the
     // respawn (index >= 1), so a test can assert restart-then-retry succeeds.
     let misbehave = spawn_index == 0;
     match scenario {
+        // Echo how many tools arrived on the wire — exercises the parent's tool-advertisement
+        // gate (Ready reported no tool-capable path, so `auto` must strip them).
+        "echo-tools" => {
+            send_text(writer, request_id, &format!("tools:{tools_received}")).await;
+            send_done(writer, request_id).await;
+        }
         "tool" => {
             send(
                 writer,

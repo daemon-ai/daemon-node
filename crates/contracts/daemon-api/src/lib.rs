@@ -25,12 +25,13 @@
 
 use async_trait::async_trait;
 pub use daemon_common::{
-    Author, BlobRef, ByteRange, Revision, RevisionKind, SkillBundle, WorkspaceBinding,
+    Author, BlobRef, ByteRange, InstallFromUrlOutcome, ModelSource, Revision, RevisionKind,
+    SkillBundle, WorkspaceBinding,
 };
 use daemon_common::{
-    ContentHash, DownloadId, DownloadStatus, GgufInfo, InstalledModel, ModelEngine, ModelFile,
-    ModelId, ModelRef, ProfileRef, QuantRecommendation, QuantizeId, QuantizeStatus, SearchPage,
-    SearchQuery, SessionId, TraceId, UnitId, UsageDelta, WireVersion,
+    ContentHash, DownloadId, DownloadStatus, GgufInfo, InstalledModel, ModelFile, ModelId,
+    ProfileRef, QuantRecommendation, QuantizeId, QuantizeStatus, SearchPage, SearchQuery,
+    SessionId, TraceId, UnitId, UsageDelta, WireVersion,
 };
 use daemon_protocol::{
     session_id_for, AgentCommand, DeliveryTarget, HostResponse, IsolationPolicy, Origin,
@@ -57,8 +58,9 @@ pub use daemon_common::{SkillCreator, SkillState, SkillUsage};
 pub use profile::{
     BoundAccount, BudgetSpec, ContextEngineSel, CredentialInfo, CuratorChange, CuratorEntry,
     CustomProvider, CustomProviderSource, Distribution, EngineSelector, EngineTunables,
-    ForeignBackend, MemoryProviderSel, ModelDescriptor, ProfileInfo, ProfileSpec,
-    ProviderDescriptor, ProviderKindWire, ProviderSelector, ProviderSignIn, SessionOverlay,
+    ForeignBackend, InstallStrategy, MemoryProviderSel, ModelDescriptor, ProfileInfo, ProfileSpec,
+    ProviderAction, ProviderAuth, ProviderDescriptor, ProviderKindWire, ProviderListError,
+    ProviderListErrorKind, ProviderModelsResult, ProviderSelector, ProviderSignIn, SessionOverlay,
     ToolsOverride,
 };
 
@@ -1551,24 +1553,47 @@ pub trait ModelApi: Send + Sync {
         Err(ApiError::Unsupported("model_search".into()))
     }
 
-    /// Step 2 — list a repo's loadable files for `engine` (the set a client selects to download),
-    /// paged at [`WIRE_PAGE_MAX`] in `path` order.
+    /// Step 2 — list a repo's loadable files for `provider` (the set a client selects to
+    /// download), paged at [`WIRE_PAGE_MAX`] in `path` order. Provider-keyed (wire v48): the node
+    /// resolves the provider to its engine/format filter.
     async fn model_files(
         &self,
+        _provider: String,
         _repo: String,
         _revision: Option<String>,
-        _engine: ModelEngine,
         _after: Option<String>,
     ) -> Result<WirePage<ModelFile>, ApiError> {
         Err(ApiError::Unsupported("model_files".into()))
     }
 
-    /// Start downloading a model into the shared cache; returns the job handle.
-    async fn model_download(&self, _model: ModelRef) -> Result<DownloadId, ApiError> {
+    /// Start downloading `source` into `provider`'s managed catalog; returns the job handle.
+    /// Provider-keyed (wire v48): the node resolves provider → engine and builds the internal
+    /// [`ModelRef`] itself.
+    async fn model_download(
+        &self,
+        _provider: String,
+        _source: ModelSource,
+    ) -> Result<DownloadId, ApiError> {
         Err(ApiError::Unsupported("model_download".into()))
     }
 
-    /// All download job statuses (in-flight + finished this run).
+    /// One atomic install-from-URL intent (wire v48): validate + parse a pasted Hugging Face URL
+    /// (model page, `/tree/...`, or a direct `/resolve/.../<file>.gguf`) node-side and either
+    /// start the acquisition or report that a file choice is required (artifact-strategy
+    /// providers given a bare repo). The node owns all URL safety checks.
+    async fn model_install_from_url(
+        &self,
+        _provider: String,
+        _url: String,
+    ) -> Result<InstallFromUrlOutcome, ApiError> {
+        Err(ApiError::Unsupported("model_install_from_url".into()))
+    }
+
+    /// All download job statuses — in-flight plus those finished **this node run**. The job list
+    /// is deliberately session-scoped (it is an activity feed, not an archive): a restart forgets
+    /// completed/failed jobs. The durable record of an acquisition is the installed catalog
+    /// ([`ModelApi::model_catalog`]); a completed job links to it via
+    /// [`DownloadStatus::result_model_id`].
     async fn model_downloads(&self) -> Vec<DownloadStatus> {
         Vec::new()
     }
@@ -1657,16 +1682,17 @@ pub trait ModelApi: Send + Sync {
 
     /// One provider's discoverable models. Credential-aware for genai vendors (authenticate the LIST
     /// call with the `transient_key`, else the stored `credential_ref`); Daemon Cloud lists keyless;
-    /// local providers return the installed models. Paged at [`WIRE_PAGE_MAX`] in descriptor-id
-    /// order. Default: empty.
+    /// managed providers return the installed models. Paged at [`WIRE_PAGE_MAX`] in descriptor-id
+    /// order. Structured outcome (wire v48): a listing failure sets
+    /// [`ProviderModelsResult::error`] instead of masquerading as an empty catalog. Default: empty.
     async fn provider_models(
         &self,
         _provider: String,
         _credential_ref: Option<String>,
         _transient_key: Option<String>,
         _after: Option<String>,
-    ) -> WirePage<ModelDescriptor> {
-        WirePage::default()
+    ) -> ProviderModelsResult {
+        ProviderModelsResult::default()
     }
 
     /// The persisted user-defined custom OpenAI-compatible providers (the editor's read-your-writes
@@ -1943,6 +1969,11 @@ pub enum AuthFlowKind {
     /// challenge with the method label and polls for completion; the agent may complete via its
     /// own side effects (opening a browser itself, persisting its own state).
     AcpAuthenticate,
+    /// An RFC 8628 OAuth device flow (wire v48): the node mints the vendor's `user_code`, the
+    /// client renders a "visit URL, enter code" [`AuthChallenge::Message`] and polls with
+    /// [`AuthStepInput::Poll`] while the node exchanges the parked `device_code` (e.g. the
+    /// GitHub Copilot sign-in).
+    DeviceCode,
 }
 
 /// A single challenge a flow presents to the client at some step — how the client should collect the
@@ -4770,6 +4801,33 @@ pub enum NodeEvent {
         downloaded_bytes: u64,
         /// Total bytes to transfer, when known (0 when the Hub reported no sizes).
         total_bytes: u64,
+        /// Node-computed transfer rate (bytes/second, smoothed EMA; wire v48). Absent until the
+        /// first sample.
+        #[serde(default)]
+        rate_bps: Option<u64>,
+        /// Node-computed remaining-time estimate in seconds (wire v48). Absent when the rate or
+        /// total is unknown.
+        #[serde(default)]
+        eta_seconds: Option<u64>,
+        /// The catalog id of the installed model a completed job produced (wire v48). Absent
+        /// until the post-completion catalog step stamps it and re-announces — the emit a
+        /// client's wizard auto-select keys on (`QuantizeProgress::model_id` parity).
+        #[serde(default)]
+        result_model_id: Option<ModelId>,
+    },
+    /// A quantization job advanced (wire v48; replaces the client's `ModelQuantizes` poll).
+    /// Mirrors `DownloadProgress`: emitted on state transitions and throttled progress advances.
+    QuantizeProgress {
+        /// The quantize job id.
+        id: QuantizeId,
+        /// The job state string (a `QuantizeState` name).
+        state: String,
+        /// The catalog id of the produced model, once cataloged (on the `Completed` emit).
+        #[serde(default)]
+        model_id: Option<ModelId>,
+        /// A failure reason on the `Failed` emit.
+        #[serde(default)]
+        error: Option<String>,
     },
     /// The installed-model registry changed (a finished download was cataloged / a model was
     /// deleted): the client refetches `ModelCatalog`. Globally coalesced in the backlog (a refetch

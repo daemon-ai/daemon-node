@@ -9,9 +9,78 @@ use serde_json::json;
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+/// The primary `models-json` search: rich filters (library + pipeline + params buckets), a total
+/// count, numeric-parameter coercion, and the node-supplied canonical `web_url`.
 #[tokio::test]
-async fn search_parses_and_filters_gguf() {
+async fn search_uses_models_json_with_filters_and_total() {
     let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/models-json"))
+        .and(query_param("library", "gguf"))
+        .and(query_param("pipeline_tag", "text-generation"))
+        .and(query_param("search", "llama"))
+        .and(query_param("withCount", "true"))
+        .and(query_param("num_parameters", "min:7B,max:32B"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "numTotalItems": 2,
+            "models": [
+                {
+                    "id": "TheBloke/Llama-2-7B-GGUF",
+                    "downloads": 12345,
+                    "likes": 67,
+                    "numParameters": 6_738_415_616u64,
+                    "pipeline_tag": "text-generation",
+                    "lastModified": "2024-01-02T03:04:05.000Z",
+                    "gated": false,
+                    "private": false
+                },
+                {
+                    "id": "org/Other-GGUF",
+                    "downloads": 9,
+                    "likes": 1,
+                    "gated": "auto",
+                    "private": false
+                }
+            ]
+        })))
+        .mount(&server)
+        .await;
+
+    let client = HfClient::with_endpoint(server.uri(), None);
+    let mut query = SearchQuery::new("llama", "llama_cpp");
+    query.params_min = Some(7_000_000_000);
+    query.params_max = Some(32_000_000_000);
+    let page = search::search(&client, ModelEngine::Llama, &query)
+        .await
+        .expect("search");
+    assert_eq!(page.results.len(), 2);
+    assert_eq!(page.total, Some(2));
+    assert!(page.params_filter_applied);
+    assert!(!page.degraded);
+    assert!(!page.has_more, "2 of 2 served on page 0");
+    let first = &page.results[0];
+    assert_eq!(first.repo, "TheBloke/Llama-2-7B-GGUF");
+    assert_eq!(first.author.as_deref(), Some("TheBloke"));
+    assert_eq!(first.downloads, 12345);
+    assert_eq!(first.num_parameters, Some(6_738_415_616));
+    assert_eq!(
+        first.web_url.as_deref(),
+        Some(format!("{}/TheBloke/Llama-2-7B-GGUF", server.uri()).as_str())
+    );
+    assert!(!first.gated);
+    assert!(page.results[1].gated, "string 'auto' means gated");
+}
+
+/// A primary-endpoint 5xx falls back (bounded) to `/api/models`, marked `degraded`: no total, no
+/// parameter filter.
+#[tokio::test]
+async fn search_falls_back_to_api_models_on_5xx_as_degraded() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/models-json"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
     Mock::given(method("GET"))
         .and(path("/api/models"))
         .and(query_param("filter", "gguf"))
@@ -21,15 +90,7 @@ async fn search_parses_and_filters_gguf() {
                 "downloads": 12345,
                 "likes": 67,
                 "pipeline_tag": "text-generation",
-                "lastModified": "2024-01-02T03:04:05.000Z",
                 "gated": false,
-                "private": false
-            },
-            {
-                "id": "org/Other-GGUF",
-                "downloads": 9,
-                "likes": 1,
-                "gated": "auto",
                 "private": false
             }
         ])))
@@ -37,15 +98,66 @@ async fn search_parses_and_filters_gguf() {
         .await;
 
     let client = HfClient::with_endpoint(server.uri(), None);
-    let query = SearchQuery::new("llama", ModelEngine::Llama);
-    let page = search::search(&client, &query).await.expect("search");
-    assert_eq!(page.results.len(), 2);
-    let first = &page.results[0];
-    assert_eq!(first.repo, "TheBloke/Llama-2-7B-GGUF");
-    assert_eq!(first.author.as_deref(), Some("TheBloke"));
-    assert_eq!(first.downloads, 12345);
-    assert!(!first.gated);
-    assert!(page.results[1].gated, "string 'auto' means gated");
+    let mut query = SearchQuery::new("llama", "llama_cpp");
+    query.params_min = Some(7_000_000_000);
+    let page = search::search(&client, ModelEngine::Llama, &query)
+        .await
+        .expect("fallback search");
+    assert_eq!(page.results.len(), 1);
+    assert!(page.degraded, "fallback pages are marked degraded");
+    assert_eq!(page.total, None, "the fallback endpoint has no total");
+    assert!(
+        !page.params_filter_applied,
+        "the fallback endpoint cannot filter by parameters"
+    );
+}
+
+/// Response drift on the primary (a payload without `models`) also takes the bounded fallback.
+#[tokio::test]
+async fn search_falls_back_on_primary_response_drift() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/models-json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"unexpected": true})))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&server)
+        .await;
+
+    let client = HfClient::with_endpoint(server.uri(), None);
+    let query = SearchQuery::new("llama", "llama_cpp");
+    let page = search::search(&client, ModelEngine::Llama, &query)
+        .await
+        .expect("drift falls back");
+    assert!(page.degraded);
+    assert!(page.results.is_empty());
+}
+
+/// A 4xx from the primary is a real error — never silently-unfiltered fallback results.
+#[tokio::test]
+async fn search_4xx_is_an_error_not_a_fallback() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/models-json"))
+        .respond_with(ResponseTemplate::new(400))
+        .mount(&server)
+        .await;
+    // No /api/models mock: a fallback attempt would 404 and fail the test differently.
+
+    let client = HfClient::with_endpoint(server.uri(), None);
+    let query = SearchQuery::new("llama", "llama_cpp");
+    let err = search::search(&client, ModelEngine::Llama, &query)
+        .await
+        .expect_err("a 4xx surfaces as an error");
+    let requests = server.received_requests().await.expect("captured");
+    assert!(
+        requests.iter().all(|r| r.url.path() != "/api/models"),
+        "the fallback endpoint must not be consulted on a 4xx"
+    );
+    let _ = err;
 }
 
 #[tokio::test]

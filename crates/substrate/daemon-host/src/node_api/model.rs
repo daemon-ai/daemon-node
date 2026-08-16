@@ -2,22 +2,25 @@
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
 use super::*;
+use daemon_common::ModelSource;
 
 #[async_trait]
 impl ModelApi for NodeApiImpl {
     async fn model_search(&self, query: SearchQuery) -> Result<SearchPage, ApiError> {
         let m = self.require_models()?;
-        m.search(query).await.map_err(map_model_err)
+        let engine = self.resolve_available_engine(&query.provider).await?;
+        m.search(engine, query).await.map_err(map_model_err)
     }
 
     async fn model_files(
         &self,
+        provider: String,
         repo: String,
         revision: Option<String>,
-        engine: ModelEngine,
         after: Option<String>,
     ) -> Result<daemon_api::WirePage<ModelFile>, ApiError> {
         let m = self.require_models()?;
+        let engine = self.resolve_available_engine(&provider).await?;
         // The manager returns the full listing already sorted by `path` (the cursor key).
         let files = m
             .model_files(&repo, revision.as_deref(), engine)
@@ -31,9 +34,45 @@ impl ModelApi for NodeApiImpl {
         ))
     }
 
-    async fn model_download(&self, model: ModelRef) -> Result<DownloadId, ApiError> {
+    async fn model_download(
+        &self,
+        provider: String,
+        source: ModelSource,
+    ) -> Result<DownloadId, ApiError> {
         let m = self.require_models()?;
-        m.download(model).await.map_err(map_model_err)
+        let engine = self.resolve_available_engine(&provider).await?;
+        m.download(ModelRef::new(engine, source))
+            .await
+            .map_err(map_model_err)
+    }
+
+    async fn model_install_from_url(
+        &self,
+        provider: String,
+        url: String,
+    ) -> Result<daemon_api::InstallFromUrlOutcome, ApiError> {
+        let m = self.require_models()?;
+        let engine = self.resolve_available_engine(&provider).await?;
+        let parsed = daemon_models::hf::url::parse_hf_url(&url).map_err(map_model_err)?;
+        // An artifact-strategy catalog (llama.cpp) needs a single file: a bare repo/tree URL is a
+        // "pick a file" answer, not a job. Repository-strategy (mistral.rs) installs the whole
+        // repo, so the bare form starts immediately; a file-pinning URL always starts.
+        if parsed.file.is_none() && matches!(engine, ModelEngine::Llama) {
+            return Ok(daemon_api::InstallFromUrlOutcome::NeedsFileChoice {
+                repo: parsed.repo,
+                revision: parsed.revision,
+            });
+        }
+        let source = ModelSource::Hf {
+            repo: parsed.repo,
+            file: parsed.file,
+            revision: parsed.revision,
+        };
+        let id = m
+            .download(ModelRef::new(engine, source))
+            .await
+            .map_err(map_model_err)?;
+        Ok(daemon_api::InstallFromUrlOutcome::Started { id })
     }
 
     async fn model_downloads(&self) -> Vec<DownloadStatus> {
@@ -86,10 +125,11 @@ impl ModelApi for NodeApiImpl {
         let ModelRecommendArgs {
             repo,
             revision,
-            engine,
+            provider,
             budget_bytes,
         } = args;
         let m = self.require_models()?;
+        let engine = self.resolve_available_engine(&provider).await?;
         m.recommend(&repo, revision.as_deref(), engine, budget_bytes)
             .await
             .map_err(map_model_err)
@@ -183,11 +223,11 @@ impl ModelApi for NodeApiImpl {
         credential_ref: Option<String>,
         transient_key: Option<String>,
         after: Option<String>,
-    ) -> daemon_api::WirePage<ModelDescriptor> {
+    ) -> daemon_api::ProviderModelsResult {
         // Local engines: the node is the single source of truth — return the installed models from
-        // the ModelManager catalog (the client appends its own "Discover More" affordance).
-        let mut models = if provider == "llama_cpp" || provider == "mistral_rs" {
-            self.installed_models_for(&provider).await
+        // the ModelManager catalog. An empty list here genuinely means "nothing installed yet".
+        let listed = if daemon_common::ModelEngine::from_provider_id(&provider).is_some() {
+            Ok(self.installed_models_for(&provider).await)
         } else if let Some(custom) = self.custom_provider_by_id(&provider).await {
             // A user-defined custom provider: list its OpenAI-compatible endpoint, credential-aware.
             // A first-run transient key wins; else the stored credential the request (or the
@@ -201,7 +241,7 @@ impl ModelApi for NodeApiImpl {
             });
             match &self.cloud_catalog {
                 Some(catalog) => catalog.openai_compat_models(&custom.base_url, key).await,
-                None => Vec::new(),
+                None => Err(no_discovery_hook()),
             }
         } else {
             // Resolve the LIST credential: a first-run transient key wins, else the stored
@@ -214,14 +254,29 @@ impl ModelApi for NodeApiImpl {
             });
             match &self.cloud_catalog {
                 Some(catalog) => catalog.provider_models(&provider, key).await,
-                None => Vec::new(),
+                None => Err(no_discovery_hook()),
+            }
+        };
+        let mut models = match listed {
+            Ok(models) => models,
+            Err(error) => {
+                return daemon_api::ProviderModelsResult {
+                    models: Vec::new(),
+                    next: None,
+                    error: Some(error),
+                }
             }
         };
         // Cursor order: descriptor id ascending (vendor listings arrive in vendor order).
         models.sort_by(|a, b| a.id.cmp(&b.id));
-        daemon_api::paginate(models, after.as_deref(), daemon_api::WIRE_PAGE_MAX, |m| {
+        let page = daemon_api::paginate(models, after.as_deref(), daemon_api::WIRE_PAGE_MAX, |m| {
             m.id.clone()
-        })
+        });
+        daemon_api::ProviderModelsResult {
+            models: page.items,
+            next: page.next,
+            error: None,
+        }
     }
 
     async fn custom_provider_list(&self) -> Vec<CustomProvider> {
@@ -347,7 +402,9 @@ impl NodeApiImpl {
                 out.push(ModelDescriptor {
                     id: im.id.as_str().to_string(),
                     provider,
-                    display_name: None,
+                    // The record's human-friendly name (repo id / file stem) — without it a
+                    // client renders the opaque catalog-id hash.
+                    display_name: (!im.display_name.is_empty()).then(|| im.display_name.clone()),
                     context_length: im.context_length,
                     input_price_micros_per_mtok: None,
                     output_price_micros_per_mtok: None,
@@ -361,39 +418,14 @@ impl NodeApiImpl {
     /// The catalog-less fallback provider list: local engines + Daemon Cloud (the genai cloud vendors
     /// require the binary's genai hook). Used by test stubs / remote-only nodes.
     fn static_provider_catalog() -> Vec<ProviderDescriptor> {
+        // Catalog order IS the wire order clients render: Daemon Cloud (the product default)
+        // first, then the local engines. Local-ness is carried by `kind` (the client renders its
+        // own indicator), never baked into the display name. The canonical rows live on
+        // `ProviderDescriptor` so binary + host + test stubs share one definition.
         vec![
-            ProviderDescriptor {
-                id: "llama_cpp".into(),
-                display_name: "llama.cpp (local)".into(),
-                kind: ProviderKindWire::Local,
-                wire_selector: ProviderSelector::LlamaCpp,
-                requires_key: false,
-                supports_model_discovery: true,
-                default_base_url: None,
-                sign_in: None,
-            },
-            ProviderDescriptor {
-                id: "mistral_rs".into(),
-                display_name: "mistral.rs (local)".into(),
-                kind: ProviderKindWire::Local,
-                wire_selector: ProviderSelector::MistralRs,
-                requires_key: false,
-                supports_model_discovery: true,
-                default_base_url: None,
-                sign_in: None,
-            },
-            ProviderDescriptor {
-                id: "daemon_cloud".into(),
-                display_name: "Daemon Cloud".into(),
-                kind: ProviderKindWire::DaemonCloud,
-                wire_selector: ProviderSelector::DaemonApi,
-                // Needs a key to RUN TURNS (bearer-authed inference); model LISTING stays keyless
-                // (the public gateway `/models` is unauth; `provider_models` never gates on this).
-                requires_key: true,
-                supports_model_discovery: true,
-                default_base_url: Some("https://api.daemon.ai/api/v1/".into()),
-                sign_in: None,
-            },
+            ProviderDescriptor::daemon_cloud("https://api.daemon.ai/api/v1/"),
+            ProviderDescriptor::llama_cpp(),
+            ProviderDescriptor::mistral_rs(),
         ]
     }
 
@@ -421,7 +453,9 @@ impl NodeApiImpl {
                 (provider == want).then(|| ModelDescriptor {
                     id: im.id.as_str().to_string(),
                     provider,
-                    display_name: None,
+                    // Same rule as models_all: the record's display name rides along so the
+                    // wizard's ProviderModels list never shows the catalog-id hash.
+                    display_name: (!im.display_name.is_empty()).then(|| im.display_name.clone()),
                     context_length: im.context_length,
                     input_price_micros_per_mtok: None,
                     output_price_micros_per_mtok: None,
@@ -429,6 +463,49 @@ impl NodeApiImpl {
                 })
             })
             .collect()
+    }
+}
+
+/// Resolve a managed provider id (`"llama_cpp"` / `"mistral_rs"`) to its engine, or refuse: the
+/// acquisition surface (search/files/download/install/recommend) only exists for managed catalogs.
+fn resolve_managed_provider(provider: &str) -> Result<ModelEngine, ApiError> {
+    ModelEngine::from_provider_id(provider).ok_or_else(|| {
+        ApiError::Unsupported(format!(
+            "provider {provider:?} has no managed catalog (only llama_cpp / mistral_rs install models)"
+        ))
+    })
+}
+
+impl NodeApiImpl {
+    /// [`resolve_managed_provider`] PLUS the availability gate: the provider-catalog row carries
+    /// the boot-time worker engine probe's verdict, and acquisition (search/files/download/
+    /// install/recommend) into an engine the deployed worker cannot run is refused with the
+    /// row's reason — no more downloading models that can't run.
+    async fn resolve_available_engine(&self, provider: &str) -> Result<ModelEngine, ApiError> {
+        let engine = resolve_managed_provider(provider)?;
+        let rows = match &self.cloud_catalog {
+            Some(catalog) => catalog.providers().await,
+            None => Self::static_provider_catalog(),
+        };
+        if let Some(row) = rows.iter().find(|p| p.id == provider) {
+            if !row.available {
+                return Err(ApiError::Unsupported(format!(
+                    "provider {provider:?} is unavailable on this node: {}",
+                    row.unavailable_reason
+                        .as_deref()
+                        .unwrap_or("its inference engine is not available")
+                )));
+            }
+        }
+        Ok(engine)
+    }
+}
+
+/// The structured listing failure for a node with no discovery hook wired.
+fn no_discovery_hook() -> daemon_api::ProviderListError {
+    daemon_api::ProviderListError {
+        kind: daemon_api::ProviderListErrorKind::Unsupported,
+        message: "this node has no provider discovery hook wired".into(),
     }
 }
 

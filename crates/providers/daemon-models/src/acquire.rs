@@ -143,6 +143,57 @@ impl ProgressThrottle {
 /// The default throttle floor between byte-level emits that did not advance a whole percent.
 const PROGRESS_MIN_INTERVAL_MS: u64 = 500;
 
+/// The minimum sampling interval for the rate estimator (below this, byte deltas are too noisy).
+const RATE_SAMPLE_MIN_MS: u64 = 250;
+
+/// A lock-free rolling transfer-rate estimator (wire v48): sampled from the byte sink, smoothed
+/// with a ~30% EMA so the surfaced `rate_bps`/`eta_seconds` don't flicker. Node-computed once —
+/// every client renders the same number.
+#[derive(Default)]
+pub(crate) struct RateTracker {
+    /// Wall-clock ms of the last accepted sample (0 = none yet).
+    last_ms: AtomicU64,
+    /// Cumulative bytes at the last accepted sample.
+    last_bytes: AtomicU64,
+    /// The smoothed rate in bytes/second (0 = unknown).
+    ema_bps: AtomicU64,
+}
+
+impl RateTracker {
+    /// Feed a cumulative byte count observed at `now_ms`.
+    pub(crate) fn sample(&self, done_bytes: u64, now_ms: u64) {
+        let last_ms = self.last_ms.load(Ordering::Relaxed);
+        if last_ms == 0 {
+            self.last_ms.store(now_ms.max(1), Ordering::Relaxed);
+            self.last_bytes.store(done_bytes, Ordering::Relaxed);
+            return;
+        }
+        let dt = now_ms.saturating_sub(last_ms);
+        if dt < RATE_SAMPLE_MIN_MS {
+            return;
+        }
+        let db = done_bytes.saturating_sub(self.last_bytes.load(Ordering::Relaxed));
+        let inst = db.saturating_mul(1000) / dt;
+        let prev = self.ema_bps.load(Ordering::Relaxed);
+        let next = if prev == 0 {
+            inst
+        } else {
+            (prev.saturating_mul(7) + inst.saturating_mul(3)) / 10
+        };
+        self.ema_bps.store(next, Ordering::Relaxed);
+        self.last_ms.store(now_ms, Ordering::Relaxed);
+        self.last_bytes.store(done_bytes, Ordering::Relaxed);
+    }
+
+    /// The smoothed rate, when at least one interval has been sampled.
+    pub(crate) fn bps(&self) -> Option<u64> {
+        match self.ema_bps.load(Ordering::Relaxed) {
+            0 => None,
+            r => Some(r),
+        }
+    }
+}
+
 /// Wall-clock milliseconds since the Unix epoch (throttle bookkeeping only, never persisted).
 fn epoch_ms() -> u64 {
     std::time::SystemTime::now()
@@ -166,6 +217,8 @@ struct Job {
     progress: Arc<std::sync::Mutex<Option<DownloadProgressCb>>>,
     /// Byte-level emission throttle (per job; a resume starts a fresh one).
     throttle: ProgressThrottle,
+    /// The rolling rate estimator (per run; a resume starts a fresh one).
+    rate: RateTracker,
 }
 
 /// The acquisition engine: an `hf-hub` API over the shared cache plus a job table.
@@ -235,6 +288,7 @@ impl Downloader {
         let id = DownloadId(self.next_id.fetch_add(1, Ordering::Relaxed));
         let status = DownloadStatus {
             id,
+            provider: model.engine.provider_id().to_string(),
             model: model.clone(),
             state: DownloadState::Queued,
             downloaded_bytes: 0,
@@ -242,6 +296,9 @@ impl Downloader {
             files_done: 0,
             files_total: plan.files.len() as u32,
             error: None,
+            rate_bps: None,
+            eta_seconds: None,
+            result_model_id: None,
         };
         let job = Arc::new(Job {
             status: Arc::new(Mutex::new(status)),
@@ -253,6 +310,7 @@ impl Downloader {
             artifact: Arc::new(Mutex::new(None)),
             progress: self.progress.clone(),
             throttle: ProgressThrottle::new(PROGRESS_MIN_INTERVAL_MS),
+            rate: RateTracker::default(),
         });
         self.jobs.lock().await.insert(id, job.clone());
         self.by_model.lock().await.insert(model, id);
@@ -291,17 +349,10 @@ impl Downloader {
         artifact
     }
 
-    /// Fold the live byte counters into the stored status.
+    /// Fold the live byte counters + rate estimate into the stored status.
     async fn read_status(&self, job: &Arc<Job>) -> DownloadStatus {
         let mut status = job.status.lock().await.clone();
-        if matches!(
-            status.state,
-            DownloadState::Downloading | DownloadState::Queued
-        ) {
-            let base = job.counters.base.load(Ordering::Relaxed);
-            let current = job.counters.current.load(Ordering::Relaxed);
-            status.downloaded_bytes = base + current;
-        }
+        fold_live_progress(job, &mut status);
         status
     }
 
@@ -321,6 +372,16 @@ impl Downloader {
         Ok(())
     }
 
+    /// Record the catalog id a completed job produced (set by the manager's catalog step, wire
+    /// v48) and re-announce the status so subscribers see the completed job with its result.
+    pub async fn set_result_model_id(&self, id: DownloadId, model_id: daemon_common::ModelId) {
+        let Some(job) = self.jobs.lock().await.get(&id).cloned() else {
+            return;
+        };
+        job.status.lock().await.result_model_id = Some(model_id);
+        notify_progress(&job).await;
+    }
+
     /// Resume a paused/failed job by re-spawning its transfer (hf-hub continues from the part file).
     pub async fn resume(&self, id: DownloadId) -> Result<()> {
         let old = self.require(id).await?;
@@ -335,6 +396,7 @@ impl Downloader {
             artifact: old.artifact.clone(),
             progress: self.progress.clone(),
             throttle: ProgressThrottle::new(PROGRESS_MIN_INTERVAL_MS),
+            rate: RateTracker::default(),
         });
         {
             let mut s = job.status.lock().await;
@@ -376,13 +438,15 @@ impl Progress for Sink {
         let counters = &self.job.counters;
         counters.current.fetch_add(size as u64, Ordering::Relaxed);
         let done = counters.base.load(Ordering::Relaxed) + counters.current.load(Ordering::Relaxed);
+        let now = epoch_ms();
+        self.job.rate.sample(done, now);
         // A zero total (the Hub reported no sizes) pins pct to 0: the interval arm still emits.
         let pct = done
             .saturating_mul(100)
             .checked_div(self.total_bytes)
             .unwrap_or(0)
             .min(100);
-        if self.job.throttle.should_emit(pct, epoch_ms()) {
+        if self.job.throttle.should_emit(pct, now) {
             notify_progress(&self.job).await;
         }
     }
@@ -584,6 +648,26 @@ async fn fail(job: &Arc<Job>, message: String) {
     notify_progress(job).await;
 }
 
+/// Fold the live byte counters + node-computed rate/ETA (wire v48) into a status snapshot.
+/// Active states carry the live counters and estimates; terminal states keep the stored values
+/// (rate/ETA stay absent — there is nothing left to estimate).
+fn fold_live_progress(job: &Arc<Job>, status: &mut DownloadStatus) {
+    if !matches!(
+        status.state,
+        DownloadState::Downloading | DownloadState::Queued
+    ) {
+        return;
+    }
+    let base = job.counters.base.load(Ordering::Relaxed);
+    let current = job.counters.current.load(Ordering::Relaxed);
+    status.downloaded_bytes = base + current;
+    status.rate_bps = job.rate.bps();
+    status.eta_seconds = status.rate_bps.and_then(|rate| {
+        (status.total_bytes > 0 && rate > 0)
+            .then(|| status.total_bytes.saturating_sub(status.downloaded_bytes) / rate)
+    });
+}
+
 /// Fan the job's current status onto the wired node-wide progress callback (L3), folding the live
 /// byte counters into the snapshot (mirrors [`Downloader::read_status`]). No-op when no callback is
 /// wired (the lock is held only to clone the `Arc`, never across the callback).
@@ -593,14 +677,7 @@ async fn notify_progress(job: &Arc<Job>) {
         return;
     };
     let mut status = job.status.lock().await.clone();
-    if matches!(
-        status.state,
-        DownloadState::Downloading | DownloadState::Queued
-    ) {
-        let base = job.counters.base.load(Ordering::Relaxed);
-        let current = job.counters.current.load(Ordering::Relaxed);
-        status.downloaded_bytes = base + current;
-    }
+    fold_live_progress(job, &mut status);
     cb(status);
 }
 

@@ -4711,16 +4711,18 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
         &out,
         "response-provider-catalog.cbor",
         &ApiResponse::ProviderCatalog(vec![
-            ProviderDescriptor {
-                id: "daemon_cloud".into(),
-                display_name: "Daemon Cloud".into(),
-                kind: ProviderKindWire::DaemonCloud,
-                wire_selector: ProviderSelector::DaemonApi,
-                // Daemon Cloud needs a key to run turns (lists keyless — host-spec semantics).
-                requires_key: true,
-                supports_model_discovery: true,
-                default_base_url: Some("https://api.daemon.ai/api/v1/".into()),
-                sign_in: None,
+            // The canonical constructors carry the v48 capability split (list vs turn auth,
+            // install strategy, node-owned actions).
+            ProviderDescriptor::daemon_cloud("https://api.daemon.ai/api/v1/"),
+            // The llama.cpp row exercises the v48 additive availability annotation (the boot-time
+            // worker engine probe's verdict: listed but greyed, acquisition refused).
+            {
+                let mut llama = ProviderDescriptor::llama_cpp();
+                llama.available = false;
+                llama.unavailable_reason = Some(
+                    "the deployed inference worker was built without the llama.cpp engine".into(),
+                );
+                llama
             },
             // The OpenRouter genai row advertises interactive sign-in (wire v30, CON-15): the node
             // states the auth family + label; the client calls `auth_begin { family, params: {} }`.
@@ -4729,21 +4731,26 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                 display_name: "OpenRouter".into(),
                 kind: ProviderKindWire::Cloud,
                 wire_selector: ProviderSelector::GenAi,
-                requires_key: true,
+                list_auth: daemon_api::ProviderAuth::ApiKey,
+                turn_auth: daemon_api::ProviderAuth::ApiKey,
+                install: daemon_api::InstallStrategy::None,
+                actions: Vec::new(),
                 supports_model_discovery: true,
                 default_base_url: None,
                 sign_in: Some(ProviderSignIn {
                     family: "provider/openrouter".into(),
                     label: "Sign in with OpenRouter".into(),
                 }),
+                available: true,
+                unavailable_reason: None,
             },
         ]),
     )?;
     write_cbor(
         &out,
         "response-provider-models.cbor",
-        &ApiResponse::ProviderModels(daemon_api::WirePage {
-            items: vec![ModelDescriptor {
+        &ApiResponse::ProviderModels(daemon_api::ProviderModelsResult {
+            models: vec![ModelDescriptor {
                 id: "anthropic/claude-sonnet-4-5".into(),
                 provider: ProviderSelector::DaemonApi,
                 display_name: Some("Claude Sonnet 4.5".into()),
@@ -4753,6 +4760,19 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                 local: false,
             }],
             next: None,
+            error: None,
+        }),
+    )?;
+    write_cbor(
+        &out,
+        "response-provider-models-error.cbor",
+        &ApiResponse::ProviderModels(daemon_api::ProviderModelsResult {
+            models: Vec::new(),
+            next: None,
+            error: Some(daemon_api::ProviderListError {
+                kind: daemon_api::ProviderListErrorKind::AuthRequired,
+                message: "an API key is required to list anthropic models".into(),
+            }),
         }),
     )?;
     // Custom providers (generalized Daemon Cloud): the write-model CRUD ops + the list response, so
@@ -4919,6 +4939,22 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                     state: "Downloading".into(),
                     downloaded_bytes: 46_000_000,
                     total_bytes: 92_000_000,
+                    // wire v48: node-computed rate/ETA ride the progress event; the completed
+                    // re-announce also stamps the produced catalog id (auto-select seam) —
+                    // exercised here so the generated decoder accepts the optional field.
+                    rate_bps: Some(12_500_000),
+                    eta_seconds: Some(3),
+                    result_model_id: Some(daemon_common::ModelId::new(
+                        "hf/org/repo/model-Q2_K_L.gguf",
+                    )),
+                },
+                // wire v48: the quantize push (retires the client `ModelQuantizes` poll), so
+                // verify-codec proves the generated decoder accepts the new node-event arm.
+                NodeEvent::QuantizeProgress {
+                    id: daemon_common::QuantizeId(1),
+                    state: "Completed".into(),
+                    model_id: Some(daemon_common::ModelId::new("hf/org/repo/model-Q4_K_M.gguf")),
+                    error: None,
                 },
                 NodeEvent::CatalogChanged { rev: 2 },
                 // v29: the presence-push event, so verify-codec proves the generated decoder
@@ -5056,11 +5092,16 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
             "request-model-search.cbor",
             &ApiRequest::ModelSearch {
                 query: SearchQuery {
+                    provider: "llama_cpp".into(),
                     text: "SmolLM2".into(),
-                    engine: ModelEngine::Llama,
                     sort: SearchSort::Trending,
                     page: 0,
                     limit: 25,
+                    // wire v48: numeric parameter-count bounds (node maps to Hub buckets).
+                    params_min: Some(100_000_000),
+                    params_max: Some(3_000_000_000),
+                    // wire v48: selected canonical quant families (the quant filter).
+                    quants: Some(vec!["Q4".into(), "F16".into()]),
                 },
             },
         )?;
@@ -5068,16 +5109,45 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
             &out,
             "request-model-files.cbor",
             &ApiRequest::ModelFiles {
+                provider: "llama_cpp".into(),
                 repo: repo.into(),
                 revision: None,
-                engine: ModelEngine::Llama,
                 after: None,
             },
         )?;
         write_cbor(
             &out,
             "request-model-download.cbor",
-            &ApiRequest::ModelDownload { model: hf_ref() },
+            &ApiRequest::ModelDownload {
+                provider: "llama_cpp".into(),
+                source: hf_ref().source,
+            },
+        )?;
+        // wire v48: the atomic paste-a-Hub-URL install intent + both structured outcomes.
+        write_cbor(
+            &out,
+            "request-model-install-from-url.cbor",
+            &ApiRequest::ModelInstallFromUrl {
+                provider: "llama_cpp".into(),
+                url: format!("https://huggingface.co/{repo}/resolve/main/{gguf}"),
+            },
+        )?;
+        write_cbor(
+            &out,
+            "response-model-install-from-url.cbor",
+            &ApiResponse::ModelInstallFromUrl(daemon_common::InstallFromUrlOutcome::Started {
+                id: daemon_common::DownloadId(1),
+            }),
+        )?;
+        write_cbor(
+            &out,
+            "response-model-install-from-url-choice.cbor",
+            &ApiResponse::ModelInstallFromUrl(
+                daemon_common::InstallFromUrlOutcome::NeedsFileChoice {
+                    repo: repo.into(),
+                    revision: "main".into(),
+                },
+            ),
         )?;
         write_cbor(
             &out,
@@ -5095,7 +5165,7 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
             &ApiRequest::ModelRecommend(daemon_api::ModelRecommendArgs {
                 repo: repo.into(),
                 revision: None,
-                engine: ModelEngine::Llama,
+                provider: "llama_cpp".into(),
                 budget_bytes: Some(6 * 1024 * 1024 * 1024),
             }),
         )?;
@@ -5116,8 +5186,17 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                     last_modified: Some("2025-01-01T00:00:00Z".into()),
                     gated: false,
                     private: false,
+                    // wire v48: node-supplied canonical repo page.
+                    web_url: Some(format!("https://huggingface.co/{repo}")),
+                    // wire v48: canonical quant families present in the repo.
+                    quants: Some(vec!["Q4".into(), "Q8".into(), "F16".into()]),
                 }],
                 has_more: false,
+                // wire v48: result total + capability flags.
+                total: Some(1),
+                params_filter_applied: true,
+                degraded: false,
+                quant_filter_applied: true,
             }),
         )?;
         write_cbor(
@@ -5160,6 +5239,9 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
             "response-model-downloads.cbor",
             &ApiResponse::ModelDownloads(vec![DownloadStatus {
                 id: daemon_common::DownloadId(1),
+                // wire v48: provider attribution + node-computed rate/ETA + the produced catalog
+                // id (None while in flight).
+                provider: "llama_cpp".into(),
                 model: hf_ref(),
                 state: DownloadState::Downloading,
                 downloaded_bytes: 46_000_000,
@@ -5167,6 +5249,9 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                 files_done: 0,
                 files_total: 1,
                 error: None,
+                rate_bps: Some(12_500_000),
+                eta_seconds: Some(3),
+                result_model_id: None,
             }]),
         )?;
         write_cbor(
@@ -5174,6 +5259,8 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
             "response-model-catalog.cbor",
             &ApiResponse::ModelCatalog(vec![InstalledModel {
                 id: ModelId::new("smollm2-135m-q4km"),
+                // wire v48: provider attribution (node-derived from the engine).
+                provider: "llama_cpp".into(),
                 model: hf_ref(),
                 display_name: "SmolLM2-135M-Instruct".into(),
                 local_path: "/cache/models/SmolLM2-135M-Instruct-Q4_K_M.gguf".into(),

@@ -43,47 +43,27 @@ impl CloudCatalog for DiscoveryChatCatalog {
 
     async fn providers(&self) -> Vec<ProviderDescriptor> {
         vec![
-            ProviderDescriptor {
-                id: "llama_cpp".into(),
-                display_name: "llama.cpp (local)".into(),
-                kind: ProviderKindWire::Local,
-                wire_selector: ProviderSelector::LlamaCpp,
-                requires_key: false,
-                supports_model_discovery: true,
-                default_base_url: None,
-                sign_in: None,
-            },
-            ProviderDescriptor {
-                id: "mistral_rs".into(),
-                display_name: "mistral.rs (local)".into(),
-                kind: ProviderKindWire::Local,
-                wire_selector: ProviderSelector::MistralRs,
-                requires_key: false,
-                supports_model_discovery: true,
-                default_base_url: None,
-                sign_in: None,
-            },
+            ProviderDescriptor::llama_cpp(),
+            ProviderDescriptor::mistral_rs(),
             ProviderDescriptor {
                 id: "anthropic".into(),
                 display_name: "Anthropic".into(),
                 kind: ProviderKindWire::Cloud,
                 wire_selector: ProviderSelector::GenAi,
-                requires_key: true,
+                // A genai vendor gates both LIST and turns on a key (wire v48 split).
+                list_auth: daemon_api::ProviderAuth::ApiKey,
+                turn_auth: daemon_api::ProviderAuth::ApiKey,
+                install: daemon_api::InstallStrategy::None,
+                actions: Vec::new(),
                 supports_model_discovery: true,
                 default_base_url: None,
                 sign_in: None,
+                available: true,
+                unavailable_reason: None,
             },
-            ProviderDescriptor {
-                id: "daemon_cloud".into(),
-                display_name: "Daemon Cloud".into(),
-                kind: ProviderKindWire::DaemonCloud,
-                wire_selector: ProviderSelector::DaemonApi,
-                // Needs a key to RUN TURNS; model LISTING stays keyless (proven below).
-                requires_key: true,
-                supports_model_discovery: true,
-                default_base_url: Some(self.models_base.clone()),
-                sign_in: None,
-            },
+            // Turn-authed, keyless-listing (proven below) — the canonical constructor, pinned at
+            // the mock gateway base.
+            ProviderDescriptor::daemon_cloud(self.models_base.clone()),
         ]
     }
 
@@ -91,8 +71,8 @@ impl CloudCatalog for DiscoveryChatCatalog {
         &self,
         provider_id: &str,
         key: Option<String>,
-    ) -> Vec<ModelDescriptor> {
-        match provider_id {
+    ) -> Result<Vec<ModelDescriptor>, daemon_api::ProviderListError> {
+        Ok(match provider_id {
             "daemon_cloud" => {
                 *self.last_daemon_cloud_key.lock().unwrap() = Some(key.clone());
                 // Keyless `GET {base}/models` against the mock gateway (no Authorization header).
@@ -139,7 +119,7 @@ impl CloudCatalog for DiscoveryChatCatalog {
             }],
             // Local engines are served by the host from its ModelManager catalog, not here.
             _ => Vec::new(),
-        }
+        })
     }
 }
 
@@ -259,25 +239,25 @@ async fn daemon_cloud_discovery_configure_and_chat() {
         .expect("daemon_cloud present in catalog");
     assert_eq!(daemon_cloud.kind, ProviderKindWire::DaemonCloud);
     assert_eq!(daemon_cloud.wire_selector, ProviderSelector::DaemonApi);
-    assert!(
-        daemon_cloud.requires_key,
-        "Daemon Cloud needs a key to run turns (corrected semantics)"
-    );
+    // The v48 split: turns are bearer-authed, the LIST call is keyless.
+    assert_eq!(daemon_cloud.turn_auth, daemon_api::ProviderAuth::ApiKey);
+    assert_eq!(daemon_cloud.list_auth, daemon_api::ProviderAuth::None);
     assert_eq!(
         daemon_cloud.default_base_url.as_deref(),
         Some(base.as_str())
     );
     assert!(
-        providers
-            .iter()
-            .any(|p| p.id == "anthropic" && p.requires_key),
-        "a genai vendor requires a key"
+        providers.iter().any(|p| p.id == "anthropic"
+            && p.list_auth == daemon_api::ProviderAuth::ApiKey
+            && p.turn_auth == daemon_api::ProviderAuth::ApiKey),
+        "a genai vendor requires a key for both listing and turns"
     );
     assert!(
-        providers
-            .iter()
-            .any(|p| p.id == "llama_cpp" && !p.requires_key),
-        "local engines do not require a key"
+        providers.iter().any(|p| p.id == "llama_cpp"
+            && p.turn_auth == daemon_api::ProviderAuth::None
+            && p.install == daemon_api::InstallStrategy::Artifact
+            && p.actions.contains(&daemon_api::ProviderAction::Requantize)),
+        "local engines are keyless managed catalogs with node-owned actions"
     );
 
     // 2) List Daemon Cloud's models KEYLESS via the gateway.
@@ -291,7 +271,10 @@ async fn daemon_cloud_discovery_configure_and_chat() {
         .await
         .expect("provider models")
     {
-        ApiResponse::ProviderModels(page) => page.items,
+        ApiResponse::ProviderModels(result) => {
+            assert!(result.error.is_none(), "a served listing carries no error");
+            result.models
+        }
         other => panic!("expected ProviderModels, got {other:?}"),
     };
     let model_id = "anthropic/claude-sonnet-4-5";

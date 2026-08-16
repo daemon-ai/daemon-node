@@ -129,6 +129,26 @@ impl LocalInferenceStatus {
     }
 }
 
+/// How tools are advertised to a local model — the node-side gate over [`Command::Generate`]'s
+/// `tools`. The worker renders whatever arrives (natively through the model's chat template when
+/// it can, via the legacy text preamble otherwise); this policy decides whether tools are SENT.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolAdvertisement {
+    /// The worker-reported capabilities decide (default): tools are advertised only when the model
+    /// emits native tool calls or its chat template consumes a `tools` input. A model trained
+    /// without tools gets none — a text preamble of schemas makes small models parrot tool names.
+    #[default]
+    Auto,
+    /// Always send tools, expecting the template-native render (operator override).
+    Native,
+    /// Always send tools, accepting the legacy text-preamble fallback for a template without tool
+    /// support (operator escape hatch).
+    Preamble,
+    /// Never send tools.
+    Off,
+}
+
 /// Construction + tuning for a [`LocalProvider`]'s worker.
 #[derive(Clone, Debug)]
 pub struct WorkerConfig {
@@ -144,6 +164,14 @@ pub struct WorkerConfig {
     pub env: Vec<(String, String)>,
     /// Sampling parameters applied to every generation.
     pub sampling: Sampling,
+    /// The tool-advertisement policy for this model (the resolved value the generation path reads).
+    pub tool_advertisement: ToolAdvertisement,
+    /// Per-model policy overrides, matched against a model's identity keys (the configured `model`
+    /// string, `org/repo[/file]`, or a resolved local path; `"*"` = every model). Carried on the
+    /// config so the switchable provider re-resolves when it hot-swaps models.
+    pub tool_advertisement_overrides: Vec<(String, ToolAdvertisement)>,
+    /// Stop sequences applied to every generation (the worker cuts + strips them).
+    pub stop: Vec<String>,
     /// The output-token cap (`0` = the worker default).
     pub max_tokens: u32,
     /// How long to wait for `Event::Ready` after `Command::Load`.
@@ -168,6 +196,9 @@ impl WorkerConfig {
             params: ModelParams::default(),
             env: Vec::new(),
             sampling: Sampling::default(),
+            tool_advertisement: ToolAdvertisement::default(),
+            tool_advertisement_overrides: Vec::new(),
+            stop: Vec::new(),
             max_tokens: 0,
             load_timeout: Duration::from_secs(120),
             ttft_timeout: Duration::from_secs(60),
@@ -175,6 +206,100 @@ impl WorkerConfig {
             max_restarts: 3,
             restart_window: Duration::from_secs(60),
         }
+    }
+
+    /// Resolve [`WorkerConfig::tool_advertisement`] from the overrides for a model identified by
+    /// any of `keys` (identity aliases: config string, `org/repo[/file]`, resolved path). The first
+    /// exact key match wins, then the `"*"` wildcard; no match keeps the current (default) policy.
+    pub fn resolve_tool_advertisement(&mut self, keys: &[&str]) {
+        let lookup = |wanted: &str| {
+            self.tool_advertisement_overrides
+                .iter()
+                .find(|(k, _)| k == wanted)
+                .map(|(_, policy)| *policy)
+        };
+        if let Some(policy) = keys.iter().find_map(|key| lookup(key)) {
+            self.tool_advertisement = policy;
+        } else if let Some(policy) = lookup("*") {
+            self.tool_advertisement = policy;
+        }
+    }
+}
+
+/// The boot-time worker engine-capability verdict (the `daemon-infer engines` probe): per engine,
+/// `None` = compiled and runnable, `Some(reason)` = unavailable and why (human-renderable — it
+/// becomes `ProviderDescriptor::unavailable_reason`). `Default` = both available, the correct
+/// stance for consumers with no worker to probe (test stubs, remote-only nodes).
+#[derive(Clone, Debug, Default)]
+pub struct EngineProbe {
+    /// Why the llama.cpp engine is unavailable; `None` = available.
+    pub llama_unavailable: Option<String>,
+    /// Why the mistral.rs engine is unavailable; `None` = available.
+    pub mistralrs_unavailable: Option<String>,
+}
+
+impl EngineProbe {
+    /// Both engines unavailable for the same `reason` (a failed/missing worker probe).
+    fn all_unavailable(reason: String) -> Self {
+        Self {
+            llama_unavailable: Some(reason.clone()),
+            mistralrs_unavailable: Some(reason),
+        }
+    }
+}
+
+/// Ask the worker binary which engines it was compiled with (`daemon-infer engines`, one JSON
+/// line: `{"llama": bool, "mistralrs": bool}`) — the node's boot-time capability probe, so the
+/// catalog never advertises an engine the worker will refuse at `Load`. A probe failure (missing
+/// binary, a pre-probe worker build, timeout) marks BOTH engines unavailable with that reason.
+pub async fn probe_worker_engines(worker_bin: &std::path::Path) -> EngineProbe {
+    // Spawns the daemon-controlled inference worker binary (argv-only, no shell).
+    #[allow(clippy::disallowed_methods)]
+    let run = tokio::process::Command::new(worker_bin)
+        .arg("engines")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    let output = match tokio::time::timeout(Duration::from_secs(10), run).await {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => {
+            return EngineProbe::all_unavailable(format!(
+                "the inference worker at {} could not be probed: {e}",
+                worker_bin.display()
+            ));
+        }
+        Err(_) => {
+            return EngineProbe::all_unavailable(
+                "the inference worker's engine probe timed out".to_string(),
+            );
+        }
+    };
+    if !output.status.success() {
+        // A worker predating the `engines` subcommand exits with a CLI error — same verdict as a
+        // missing worker: nothing provable is runnable.
+        return EngineProbe::all_unavailable(format!(
+            "the inference worker at {} does not support the engine probe (exit {})",
+            worker_bin.display(),
+            output.status
+        ));
+    }
+    let parsed: serde_json::Value = match serde_json::from_slice(&output.stdout) {
+        Ok(v) => v,
+        Err(e) => {
+            return EngineProbe::all_unavailable(format!(
+                "the inference worker's engine probe answered garbage: {e}"
+            ));
+        }
+    };
+    let compiled = |key: &str| parsed.get(key).and_then(|v| v.as_bool()).unwrap_or(false);
+    let reason = |engine: &str, feature: &str| {
+        format!("the deployed inference worker was built without the {engine} engine (rebuild daemon-infer with --features {feature})")
+    };
+    EngineProbe {
+        llama_unavailable: (!compiled("llama")).then(|| reason("llama.cpp", "llama")),
+        mistralrs_unavailable: (!compiled("mistralrs")).then(|| reason("mistral.rs", "mistralrs")),
     }
 }
 
@@ -423,6 +548,10 @@ struct Worker {
     child: ChildGuard,
     next_request_id: u64,
     reader: JoinHandle<()>,
+    /// The loaded model's capabilities as reported by `Event::Ready` — the authoritative,
+    /// post-load view (vs the pre-load [`default_capabilities`] guess). Feeds the
+    /// tool-advertisement gate.
+    capabilities: protocol::Capabilities,
 }
 
 impl Worker {
@@ -467,6 +596,14 @@ impl Worker {
             child,
             next_request_id: 1,
             reader,
+            // Pre-Ready placeholder; overwritten by the worker's authoritative Ready report.
+            capabilities: protocol::Capabilities {
+                supports_native_tools: false,
+                supports_streaming: true,
+                tool_call_format: protocol::ToolCallFormat::HermesXml,
+                max_context: None,
+                template_tools: false,
+            },
         };
 
         let load = Command::Load {
@@ -490,7 +627,10 @@ impl Worker {
                     "worker exited during load".into(),
                 ))
             }
-            Ok(Some(Event::Ready { .. })) => Ok(worker),
+            Ok(Some(Event::Ready { capabilities })) => {
+                worker.capabilities = capabilities;
+                Ok(worker)
+            }
             Ok(Some(Event::Error { class, message, .. })) => {
                 worker.shutdown().await;
                 Err(class_to_failure(class, message))
@@ -531,24 +671,51 @@ async fn drive_generation(
     worker.next_request_id += 1;
 
     let (sampling, max_tokens) = effective_sampling(cfg, req);
-    let cmd = Command::Generate {
-        request_id,
-        system: req.system.clone(),
-        messages: req.messages.iter().map(to_proto_msg).collect(),
-        tools: req
-            .tools
+
+    // Tool-advertisement gate — the node decides, from the worker's Ready-reported capabilities
+    // (policy `auto`) or an explicit config override. A model that neither emits native tool calls
+    // nor has a tools-aware chat template gets NO tools: advertising them anyway (as a text
+    // preamble) makes small models parrot tool names instead of answering.
+    let advertise_tools = !req.tools.is_empty()
+        && match cfg.tool_advertisement {
+            ToolAdvertisement::Off => false,
+            ToolAdvertisement::Native | ToolAdvertisement::Preamble => true,
+            ToolAdvertisement::Auto => {
+                worker.capabilities.supports_native_tools || worker.capabilities.template_tools
+            }
+        };
+    if !req.tools.is_empty() && !advertise_tools {
+        tracing::debug!(
+            model = %cfg.model,
+            policy = ?cfg.tool_advertisement,
+            tools = req.tools.len(),
+            "local: dropping tool advertisement (model has no tool-capable path)"
+        );
+    }
+    let tools = if advertise_tools {
+        req.tools
             .iter()
             .map(|t| protocol::ToolDef {
                 name: t.name.clone(),
                 schema: t.schema.clone(),
             })
-            .collect(),
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let cmd = Command::Generate {
+        request_id,
+        system: req.system.clone(),
+        messages: req.messages.iter().map(to_proto_msg).collect(),
+        tools,
         sampling,
         max_tokens,
         constraint: req.constraint.as_ref().map(|c| protocol::Constraint {
             lark: c.lark.clone(),
             gbnf: c.gbnf.clone(),
         }),
+        stop: cfg.stop.clone(),
     };
     worker
         .send(&cmd)
@@ -830,6 +997,17 @@ impl SwitchInner {
                     .map_err(|e| Failure::Fatal(format!("resolve model: {e}")))?;
                 let mut wc = self.template.clone();
                 wc.model = artifact.local_path.to_string_lossy().into_owned();
+                // Re-resolve the per-model tool-advertisement policy for the swapped-in model:
+                // config keys may name it by `org/repo[/file]` or by its resolved local path.
+                let source_key = match &model.source {
+                    ModelSource::Hf { repo, file, .. } => match file {
+                        Some(file) => format!("{repo}/{file}"),
+                        None => repo.clone(),
+                    },
+                    ModelSource::Local { path } => path.to_string_lossy().into_owned(),
+                };
+                let path_key = wc.model.clone();
+                wc.resolve_tool_advertisement(&[source_key.as_str(), path_key.as_str()]);
                 // The paired vision projector (when cataloged) rides along; a worker without
                 // multimodal support ignores it with a log line.
                 wc.params.mmproj = artifact
@@ -931,6 +1109,57 @@ mod tests {
         WorkerConfig::new("daemon-infer", Engine::Llama, "model.gguf")
     }
 
+    /// A missing worker binary marks BOTH engines unavailable with the probe-failure reason —
+    /// the catalog must never advertise an engine nothing can run.
+    #[tokio::test]
+    async fn probe_missing_worker_marks_both_engines_unavailable() {
+        let probe =
+            probe_worker_engines(std::path::Path::new("/nonexistent/daemon-infer-nope")).await;
+        assert!(probe.llama_unavailable.is_some());
+        assert!(probe.mistralrs_unavailable.is_some());
+        assert!(
+            probe
+                .llama_unavailable
+                .as_deref()
+                .unwrap()
+                .contains("probed"),
+            "{probe:?}"
+        );
+    }
+
+    /// A worker answering the probe JSON yields per-engine verdicts: compiled = available (`None`),
+    /// not compiled = a rebuild-hint reason. (A stand-in script prints the worker's exact payload.)
+    // Phase 4: raw fs writes a throwaway stand-in script under the test's own temp dir — test-only,
+    // not attacker-influenced.
+    #[allow(clippy::disallowed_methods)]
+    #[tokio::test]
+    async fn probe_parses_per_engine_verdicts() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!(
+            "fake-daemon-infer-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        {
+            let mut f = std::fs::File::create(&path).expect("create script");
+            writeln!(f, "#!/bin/sh").unwrap();
+            writeln!(f, "echo '{{\"llama\": true, \"mistralrs\": false}}'").unwrap();
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let probe = probe_worker_engines(&path).await;
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            probe.llama_unavailable, None,
+            "compiled engine is available"
+        );
+        let reason = probe.mistralrs_unavailable.expect("mistralrs unavailable");
+        assert!(reason.contains("--features mistralrs"), "{reason}");
+    }
+
     #[test]
     fn configured_cap_wins() {
         let mut c = cfg();
@@ -982,5 +1211,35 @@ mod tests {
         let (sampling, max_tokens) = effective_sampling(&c, &Request::default());
         assert_eq!(sampling, c.sampling);
         assert_eq!(max_tokens, effective_max_output(&c));
+    }
+
+    /// Exact model key beats the `"*"` wildcard; no match keeps the default (`Auto`).
+    #[test]
+    fn tool_advertisement_resolution_prefers_exact_key_over_wildcard() {
+        let mut c = cfg();
+        c.tool_advertisement_overrides = vec![
+            ("*".to_string(), ToolAdvertisement::Off),
+            ("org/repo/m.gguf".to_string(), ToolAdvertisement::Preamble),
+        ];
+
+        c.resolve_tool_advertisement(&["org/repo/m.gguf", "/cache/m.gguf"]);
+        assert_eq!(c.tool_advertisement, ToolAdvertisement::Preamble);
+
+        c.tool_advertisement = ToolAdvertisement::Auto;
+        c.resolve_tool_advertisement(&["other/model"]);
+        assert_eq!(
+            c.tool_advertisement,
+            ToolAdvertisement::Off,
+            "wildcard applies"
+        );
+
+        c.tool_advertisement_overrides.clear();
+        c.tool_advertisement = ToolAdvertisement::Auto;
+        c.resolve_tool_advertisement(&["other/model"]);
+        assert_eq!(
+            c.tool_advertisement,
+            ToolAdvertisement::Auto,
+            "no match keeps default"
+        );
     }
 }

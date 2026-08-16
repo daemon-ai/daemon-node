@@ -40,6 +40,15 @@ pub struct QuantizeRequest {
     pub nthread: i32,
 }
 
+/// A progress callback the host wires to fan a job's [`QuantizeStatus`] onto the node-wide event
+/// feed (wire v48 `QuantizeProgress`), invoked on every state transition — the push that retires
+/// the client's `ModelQuantizes` poll.
+pub type QuantizeProgressCb = Arc<dyn Fn(QuantizeStatus) + Send + Sync>;
+
+/// The shared, late-wireable slot a [`QuantizeProgressCb`] lives in (set after assembly, read by
+/// the background job tasks).
+type QuantizeProgressSlot = Arc<std::sync::Mutex<Option<QuantizeProgressCb>>>;
+
 /// The quantization engine: a worker-bin path, an output directory, the catalog, and a job table.
 #[derive(Clone)]
 pub struct Quantizer {
@@ -48,6 +57,7 @@ pub struct Quantizer {
     registry: Registry,
     jobs: Arc<Mutex<HashMap<QuantizeId, Arc<Mutex<QuantizeStatus>>>>>,
     next_id: Arc<AtomicU64>,
+    progress: QuantizeProgressSlot,
 }
 
 impl Quantizer {
@@ -60,7 +70,14 @@ impl Quantizer {
             registry,
             jobs: Arc::new(Mutex::new(HashMap::new())),
             next_id: Arc::new(AtomicU64::new(1)),
+            progress: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    /// Wire the node-wide quantize-progress callback (wire v48 `QuantizeProgress`). Shared across
+    /// clones + in-flight jobs, so it can be set after the manager is constructed.
+    pub fn set_progress(&self, cb: QuantizeProgressCb) {
+        *self.progress.lock().unwrap() = Some(cb);
     }
 
     /// Start a quantization job, returning its handle. The job runs in the background; poll it via
@@ -98,8 +115,19 @@ impl Quantizer {
 
         let registry = self.registry.clone();
         let output_dir = self.output_dir.clone();
+        let progress = self.progress.clone();
+        notify(&progress, &status).await; // the Queued transition
         tokio::spawn(async move {
-            run_job(worker_bin, output_dir, output_path, req, status, registry).await;
+            run_job(
+                worker_bin,
+                output_dir,
+                output_path,
+                req,
+                status,
+                registry,
+                progress,
+            )
+            .await;
         });
         Ok(id)
     }
@@ -131,14 +159,16 @@ async fn run_job(
     req: QuantizeRequest,
     status: Arc<Mutex<QuantizeStatus>>,
     registry: Registry,
+    progress: QuantizeProgressSlot,
 ) {
     set_state(&status, QuantizeState::Quantizing).await;
+    notify(&progress, &status).await;
 
     // Output dir is under the daemon-controlled model cache; not attacker-influenced.
     #[allow(clippy::disallowed_methods)]
     let mk = tokio::fs::create_dir_all(&output_dir).await;
     if let Err(e) = mk {
-        return fail(&status, format!("creating output dir: {e}")).await;
+        return fail(&status, &progress, format!("creating output dir: {e}")).await;
     }
 
     // Spawns the daemon-controlled quantize worker binary (argv-only, no shell).
@@ -161,6 +191,7 @@ async fn run_job(
         Err(e) => {
             return fail(
                 &status,
+                &progress,
                 format!("spawning worker {}: {e}", worker_bin.display()),
             )
             .await
@@ -171,6 +202,7 @@ async fn run_job(
         let tail: String = stderr.lines().rev().take(3).collect::<Vec<_>>().join(" | ");
         return fail(
             &status,
+            &progress,
             format!("worker exited with {}: {tail}", out.status),
         )
         .await;
@@ -179,8 +211,15 @@ async fn run_job(
     // Verify the produced file is a real GGUF before cataloging.
     match gguf::verify_gguf_magic(&output_path) {
         Ok(true) => {}
-        Ok(false) => return fail(&status, "produced file is not a valid GGUF".into()).await,
-        Err(e) => return fail(&status, format!("reading produced file: {e}")).await,
+        Ok(false) => {
+            return fail(
+                &status,
+                &progress,
+                "produced file is not a valid GGUF".into(),
+            )
+            .await
+        }
+        Err(e) => return fail(&status, &progress, format!("reading produced file: {e}")).await,
     }
 
     let model = ModelRef::new(
@@ -195,6 +234,7 @@ async fn run_job(
         .unwrap_or(0);
     let mut record = InstalledModel {
         id: model_id(&model),
+        provider: ModelEngine::Llama.provider_id().to_string(),
         display_name: format!("{} ({})", req.repo, req.target_quant),
         local_path: output_path.clone(),
         size_bytes,
@@ -212,13 +252,21 @@ async fn run_job(
     inspect::enrich_installed(&mut record);
     let record_id = record.id.clone();
     if let Err(e) = registry.upsert(record).await {
-        return fail(&status, format!("cataloging quantized model: {e}")).await;
+        return fail(
+            &status,
+            &progress,
+            format!("cataloging quantized model: {e}"),
+        )
+        .await;
     }
 
-    let mut s = status.lock().await;
-    s.state = QuantizeState::Completed;
-    s.output_path = Some(output_path);
-    s.model_id = Some(record_id);
+    {
+        let mut s = status.lock().await;
+        s.state = QuantizeState::Completed;
+        s.output_path = Some(output_path);
+        s.model_id = Some(record_id);
+    }
+    notify(&progress, &status).await; // the Completed transition (carries the produced model_id)
 }
 
 /// Set a job's state.
@@ -227,11 +275,29 @@ async fn set_state(status: &Arc<Mutex<QuantizeStatus>>, state: QuantizeState) {
 }
 
 /// Mark a job failed with `reason`.
-async fn fail(status: &Arc<Mutex<QuantizeStatus>>, reason: String) {
+async fn fail(
+    status: &Arc<Mutex<QuantizeStatus>>,
+    progress: &QuantizeProgressSlot,
+    reason: String,
+) {
     tracing::warn!(error = %reason, "quantization failed");
-    let mut s = status.lock().await;
-    s.state = QuantizeState::Failed;
-    s.error = Some(reason);
+    {
+        let mut s = status.lock().await;
+        s.state = QuantizeState::Failed;
+        s.error = Some(reason);
+    }
+    notify(progress, status).await;
+}
+
+/// Fan a job's current status onto the wired quantize-progress callback (no-op when unwired; the
+/// slot lock is held only to clone the `Arc`, never across the callback).
+async fn notify(progress: &QuantizeProgressSlot, status: &Arc<Mutex<QuantizeStatus>>) {
+    let cb = progress.lock().unwrap().clone();
+    let Some(cb) = cb else {
+        return;
+    };
+    let snapshot = status.lock().await.clone();
+    cb(snapshot);
 }
 
 /// The output filename for a quantized model: `<org__name>-<quant>.gguf`.

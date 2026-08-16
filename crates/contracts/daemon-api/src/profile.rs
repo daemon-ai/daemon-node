@@ -554,6 +554,105 @@ pub enum ProviderKindWire {
     DaemonCloud,
 }
 
+/// What a provider operation needs by way of credentials (wire v48). Split per operation on the
+/// descriptor (`list_auth` vs `turn_auth`) because they genuinely differ: Daemon Cloud lists
+/// keylessly but needs a bearer key to run turns; genai vendors gate both.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderAuth {
+    /// No credential needed.
+    #[default]
+    None,
+    /// An API key (pasted into a field or stored via a credential ref).
+    ApiKey,
+}
+
+/// How a managed provider's catalog is populated (wire v48). `None` for enumerated providers
+/// (cloud/custom endpoints — the provider lists its own models); the managed local engines
+/// install either a single selected **artifact** (llama.cpp: one GGUF) or a whole **repository**
+/// (mistral.rs: repo directory for ISQ).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InstallStrategy {
+    /// Enumerated catalog — nothing to install.
+    #[default]
+    None,
+    /// Install one selected file (llama.cpp: a GGUF artifact).
+    Artifact,
+    /// Install a whole repo (mistral.rs: directory + in-engine ISQ).
+    Repository,
+}
+
+/// One catalog-management action a provider advertises (wire v48). The node owns this list — the
+/// UI renders exactly the advertised actions and never infers capability from provider ids.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderAction {
+    /// Search the upstream hub (`ModelSearch`).
+    Search,
+    /// Install a model into the catalog (`ModelDownload`).
+    Install,
+    /// Remove an installed model (`ModelDelete`).
+    Remove,
+    /// Activate an installed model for a profile (`ModelActivate`).
+    Activate,
+    /// Re-quantize an installed GGUF (`ModelQuantize`) — artifact-strategy only.
+    Requantize,
+    /// Enqueue directly from a pasted Hub URL (`ModelInstallFromUrl`).
+    AddFromUrl,
+    /// Remove this provider's registration itself (`CustomProviderRemove`). Advertised only on
+    /// wire-removable entries — user-registered custom endpoints; config-seeded ones are owned by
+    /// node config (the remove op rejects them) and advertise nothing.
+    RemoveProvider,
+}
+
+/// Why a provider's model listing could not be served (wire v48) — the structured outcome
+/// `ProviderModels` carries instead of silently returning an empty page. Machine-classified so
+/// clients can render the right affordance (a key prompt vs a retry) without string-matching.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderListErrorKind {
+    /// The endpoint rejected the listing for want of a (valid) credential.
+    AuthRequired,
+    /// The endpoint could not be reached (DNS/TLS/timeout/5xx).
+    Network,
+    /// The endpoint answered but the payload did not parse.
+    Decode,
+    /// This node cannot list the provider (no discovery hook wired).
+    Unsupported,
+}
+
+/// A structured provider-listing failure (wire v48). See [`ProviderListErrorKind`].
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderListError {
+    /// The machine classification.
+    pub kind: ProviderListErrorKind,
+    /// A human-readable detail line (already user-presentable; clients do not parse it).
+    pub message: String,
+}
+
+/// The `ProviderModels` result (wire v48): a page of models plus an explicit failure channel. An
+/// empty list with `error = None` genuinely means "this provider offers nothing" (e.g. a managed
+/// engine with no installed models); a listing failure always sets `error` so clients can render
+/// the right affordance instead of a silent empty state.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderModelsResult {
+    /// The models on this page (descriptor-id order).
+    pub models: Vec<ModelDescriptor>,
+    /// Resume cursor for the next page (the last served descriptor id), when more remain.
+    #[serde(default)]
+    pub next: Option<String>,
+    /// The structured failure when the listing could not be served; `models` is empty then.
+    #[serde(default)]
+    pub error: Option<ProviderListError>,
+}
+
 /// The interactive sign-in a provider advertises (wire v30, CON-15). The node states the auth
 /// family and render label; the client calls `auth_begin { family, params: {} }` and the node fills
 /// every flow detail. Clients key nothing off vendor ids.
@@ -580,12 +679,25 @@ pub struct ProviderDescriptor {
     pub kind: ProviderKindWire,
     /// The wire selector a persisted `ProfileSpec` must use for this provider.
     pub wire_selector: ProviderSelector,
-    /// Whether LISTING this provider's models needs a key: `false` for Daemon Cloud (keyless list)
-    /// and local engines; `true` for genai cloud vendors. (A turn always uses the stored profile
-    /// credential regardless.)
-    pub requires_key: bool,
-    /// Whether `ProviderModels` can enumerate this provider (local providers still support it — they
-    /// return the installed models; the client appends its own "Discover More").
+    /// Whether LISTING this provider's models needs a credential (wire v48; replaces the
+    /// conflated `requires_key`): `ApiKey` for genai cloud vendors, `None` for Daemon Cloud
+    /// (keyless list) and the managed local engines.
+    #[serde(default)]
+    pub list_auth: ProviderAuth,
+    /// Whether RUNNING TURNS through this provider needs a credential (wire v48): `ApiKey` for
+    /// Daemon Cloud + every cloud vendor, `None` for the managed local engines.
+    #[serde(default)]
+    pub turn_auth: ProviderAuth,
+    /// How this provider's catalog is populated (wire v48): `None` = enumerated (the provider
+    /// lists its own models); `Artifact`/`Repository` = managed (we install into it).
+    #[serde(default)]
+    pub install: InstallStrategy,
+    /// The catalog-management actions this provider advertises (wire v48). The UI renders exactly
+    /// these — empty for enumerated providers.
+    #[serde(default)]
+    pub actions: Vec<ProviderAction>,
+    /// Whether `ProviderModels` can enumerate this provider (managed providers support it too —
+    /// they return the installed models).
     pub supports_model_discovery: bool,
     /// The gateway/base URL the client should persist for this provider, so it never hardcodes one.
     /// Daemon Cloud carries `https://api.daemon.ai/api/v1/`; `None` for genai vendors + local.
@@ -595,6 +707,92 @@ pub struct ProviderDescriptor {
     /// "provider/openrouter"`); `None` for key-in-a-field-only and local providers.
     #[serde(default)]
     pub sign_in: Option<ProviderSignIn>,
+    /// Whether this provider can actually RUN on this node right now (wire v48, additive):
+    /// `false` when a local engine is missing from the deployed worker build (the boot-time
+    /// `daemon-infer engines` probe). Unavailable rows stay LISTED — the client renders them
+    /// greyed with [`unavailable_reason`](Self::unavailable_reason) — and the node refuses
+    /// acquisition (install/recommend/download) into them.
+    #[serde(default = "crate::default_true")]
+    pub available: bool,
+    /// Why [`available`](Self::available) is `false` (human-renderable, e.g. "worker built
+    /// without the llama engine"); `None` when available.
+    #[serde(default)]
+    pub unavailable_reason: Option<String>,
+}
+
+impl ProviderDescriptor {
+    /// The canonical Daemon Cloud row (the product default, always first in catalog order).
+    /// Turns are bearer-authed; the public gateway `/models` listing is keyless.
+    pub fn daemon_cloud(base_url: impl Into<String>) -> Self {
+        Self {
+            id: "daemon_cloud".into(),
+            display_name: "Daemon Cloud".into(),
+            kind: ProviderKindWire::DaemonCloud,
+            wire_selector: ProviderSelector::DaemonApi,
+            list_auth: ProviderAuth::None,
+            turn_auth: ProviderAuth::ApiKey,
+            install: InstallStrategy::None,
+            actions: Vec::new(),
+            supports_model_discovery: true,
+            default_base_url: Some(base_url.into()),
+            sign_in: None,
+            available: true,
+            unavailable_reason: None,
+        }
+    }
+
+    /// The canonical llama.cpp managed-local row: an **artifact**-installing catalog (one selected
+    /// GGUF per install) with the full managed action set, including GGUF re-quantization.
+    pub fn llama_cpp() -> Self {
+        Self {
+            id: "llama_cpp".into(),
+            display_name: "llama.cpp".into(),
+            kind: ProviderKindWire::Local,
+            wire_selector: ProviderSelector::LlamaCpp,
+            list_auth: ProviderAuth::None,
+            turn_auth: ProviderAuth::None,
+            install: InstallStrategy::Artifact,
+            actions: vec![
+                ProviderAction::Search,
+                ProviderAction::Install,
+                ProviderAction::Remove,
+                ProviderAction::Activate,
+                ProviderAction::Requantize,
+                ProviderAction::AddFromUrl,
+            ],
+            supports_model_discovery: true,
+            default_base_url: None,
+            sign_in: None,
+            available: true,
+            unavailable_reason: None,
+        }
+    }
+
+    /// The canonical mistral.rs managed-local row: a **repository**-installing catalog (whole repo
+    /// for in-engine ISQ). No `Requantize` — offline GGUF re-quantization is artifact-only.
+    pub fn mistral_rs() -> Self {
+        Self {
+            id: "mistral_rs".into(),
+            display_name: "mistral.rs".into(),
+            kind: ProviderKindWire::Local,
+            wire_selector: ProviderSelector::MistralRs,
+            list_auth: ProviderAuth::None,
+            turn_auth: ProviderAuth::None,
+            install: InstallStrategy::Repository,
+            actions: vec![
+                ProviderAction::Search,
+                ProviderAction::Install,
+                ProviderAction::Remove,
+                ProviderAction::Activate,
+                ProviderAction::AddFromUrl,
+            ],
+            supports_model_discovery: true,
+            default_base_url: None,
+            sign_in: None,
+            available: true,
+            unavailable_reason: None,
+        }
+    }
 }
 
 /// The provenance of a persisted [`CustomProvider`]: whether it was seeded from node config at boot
@@ -649,15 +847,37 @@ impl CustomProvider {
     /// OpenAI gateway); `default_base_url` seeds the profile so the app never hardcodes an endpoint;
     /// model discovery is always supported (`GET {base}/models`); there is no interactive sign-in.
     pub fn to_descriptor(&self) -> ProviderDescriptor {
+        // An OpenAI-compatible gateway that requires a key generally gates both the `/models`
+        // listing and the turn; a keyless one gates neither. The single write-model toggle maps
+        // onto both split fields.
+        let auth = if self.requires_key {
+            ProviderAuth::ApiKey
+        } else {
+            ProviderAuth::None
+        };
+        // A custom gateway is an enumerated catalog — nothing to install, no managed model
+        // actions. A user-registered entry IS wire-removable and advertises exactly that; a
+        // config-seeded one is node-config-owned (`CustomProviderRemove` rejects it) so it
+        // advertises nothing. The UI renders the token, never infers removability from ids.
+        let actions = if self.source == CustomProviderSource::User {
+            vec![ProviderAction::RemoveProvider]
+        } else {
+            Vec::new()
+        };
         ProviderDescriptor {
             id: self.id.clone(),
             display_name: self.display_name.clone(),
             kind: ProviderKindWire::DaemonCloud,
             wire_selector: self.wire_selector,
-            requires_key: self.requires_key,
+            list_auth: auth,
+            turn_auth: auth,
+            install: InstallStrategy::None,
+            actions,
             supports_model_discovery: true,
             default_base_url: Some(self.base_url.clone()),
             sign_in: None,
+            available: true,
+            unavailable_reason: None,
         }
     }
 }
@@ -730,13 +950,35 @@ mod tests {
         assert_eq!(d.display_name, "My Gateway");
         assert_eq!(d.kind, ProviderKindWire::DaemonCloud);
         assert_eq!(d.wire_selector, ProviderSelector::DaemonApi);
-        assert!(d.requires_key);
+        // The single write-model toggle maps onto both split auth fields (wire v48); a custom
+        // gateway is an enumerated catalog — nothing to install, no managed model actions. A
+        // user-registered entry advertises its own removability (and nothing else).
+        assert_eq!(d.list_auth, ProviderAuth::ApiKey);
+        assert_eq!(d.turn_auth, ProviderAuth::ApiKey);
+        assert_eq!(d.install, InstallStrategy::None);
+        assert_eq!(d.actions, vec![ProviderAction::RemoveProvider]);
         assert!(d.supports_model_discovery);
         assert_eq!(
             d.default_base_url.as_deref(),
             Some("https://gw.example/v1/")
         );
         assert!(d.sign_in.is_none());
+    }
+
+    #[test]
+    fn config_seeded_custom_provider_advertises_no_removal() {
+        let custom = CustomProvider {
+            id: "custom/seeded".into(),
+            display_name: "Seeded".into(),
+            base_url: "https://seeded.example/v1/".into(),
+            wire_selector: ProviderSelector::DaemonApi,
+            requires_key: false,
+            credential_ref: None,
+            source: CustomProviderSource::Config,
+        };
+        // Config-seeded entries are node-config-owned: `CustomProviderRemove` rejects them, so
+        // the descriptor must not advertise RemoveProvider.
+        assert!(custom.to_descriptor().actions.is_empty());
     }
 
     #[test]

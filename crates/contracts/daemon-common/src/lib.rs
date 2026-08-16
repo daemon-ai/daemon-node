@@ -823,7 +823,28 @@ impl WireVersion {
     /// `AgentsChanged`). `auth-flow-kind` gains the `AcpAuthenticate` arm. All additive optional
     /// map fields / union arms + their CDDL rules; strict-equal `is_compatible` still holds;
     /// clients feature-detect via the `api/47` Hello feature.
-    pub const CURRENT: Self = Self(47);
+    ///
+    /// (v48) provider-centric model catalog. Breaking on the model sub-surface (one
+    /// coordinated node+app release; `is_compatible` is strict-equal so mixed versions already
+    /// refuse):
+    /// - `provider-descriptor` replaces `requires_key` with split `list_auth`/`turn_auth`, and
+    ///   gains `install` (none/artifact/repository) + `actions` (node-owned per-row action list).
+    /// - Provider-keyed acquisition: `search-query` swaps `engine` for `provider` and gains
+    ///   `? params_min`/`? params_max` (numeric parameter-count bounds); `ModelFiles` swaps
+    ///   `engine` for `provider`; `ModelDownload` carries `{ provider, source }` instead of a
+    ///   `model-ref`; `model-recommend-args` swaps `engine` for `provider`.
+    /// - `search-hit` gains `? web_url`; `search-page` gains `? total`,
+    ///   `? params_filter_applied`, `? degraded` (primary `models-json` endpoint with a bounded
+    ///   `/api/models` fallback).
+    /// - New `ModelInstallFromUrl { provider, url }` → `InstallFromUrlOutcome`
+    ///   (Started / NeedsFileChoice) — node-owned URL validation.
+    /// - `ProviderModels` answers `provider-models-result` (models + `? error`, a machine-
+    ///   classified `provider-list-error`) instead of a bare page.
+    /// - `download-status` gains `provider`, `? rate_bps`, `? eta_seconds`,
+    ///   `? result_model_id`; `installed-model` gains `provider`; `DownloadProgress` gains
+    ///   `? rate_bps`/`? eta_seconds`; new `QuantizeProgress` node event (retires the client
+    ///   quantize poll).
+    pub const CURRENT: Self = Self(48);
 
     /// The version this build speaks (alias for [`WireVersion::CURRENT`]).
     pub fn current() -> Self {
@@ -1286,6 +1307,24 @@ impl ModelEngine {
             ModelEngine::MistralRs => "mistralrs",
         }
     }
+
+    /// The provider id this engine's managed catalog is served under (wire v48) — the single
+    /// engine⇄provider mapping; clients see only provider ids.
+    pub fn provider_id(self) -> &'static str {
+        match self {
+            ModelEngine::Llama => "llama_cpp",
+            ModelEngine::MistralRs => "mistral_rs",
+        }
+    }
+
+    /// The engine backing a managed provider id, if the id names one.
+    pub fn from_provider_id(id: &str) -> Option<Self> {
+        match id {
+            "llama_cpp" => Some(ModelEngine::Llama),
+            "mistral_rs" => Some(ModelEngine::MistralRs),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for ModelEngine {
@@ -1372,7 +1411,7 @@ pub enum SearchSort {
 }
 
 impl SearchSort {
-    /// The Hugging Face `sort` query value.
+    /// The Hugging Face `/api/models` `sort` query value (the fallback endpoint's dialect).
     pub fn as_query(self) -> &'static str {
         match self {
             // The `/api/models` endpoint expects `trendingScore`; a bare `trending` is rejected
@@ -1384,33 +1423,63 @@ impl SearchSort {
             SearchSort::Created => "createdAt",
         }
     }
+
+    /// The Hugging Face `models-json` `sort` query value (the primary endpoint's dialect —
+    /// a *separate* mapping; `as_query` stays `/api/models`-only).
+    pub fn as_models_json_query(self) -> &'static str {
+        match self {
+            SearchSort::Trending => "trending",
+            SearchSort::Downloads => "downloads",
+            SearchSort::Likes => "likes",
+            SearchSort::Modified => "modified",
+            SearchSort::Created => "created",
+        }
+    }
 }
 
 /// A model-search request a client issues (step 1 of the two-step search→select→download flow).
+/// Provider-keyed (wire v48): the node resolves `provider` to the engine/format filter — clients
+/// never carry engine knowledge.
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchQuery {
+    /// The managed provider whose catalog is being populated (e.g. `"llama_cpp"`).
+    pub provider: String,
     /// The free-text query (matched against repo id / name).
     pub text: String,
-    /// The engine the results must be loadable by (filters the file/format the repo must carry).
-    pub engine: ModelEngine,
     /// The result ordering.
     pub sort: SearchSort,
     /// The 0-based result page.
     pub page: u32,
     /// The page size (results per page).
     pub limit: u32,
+    /// Minimum model parameter count (raw count, e.g. `7_000_000_000`). The node maps it onto the
+    /// nearest Hub filter bucket; `SearchPage::params_filter_applied` reports whether the endpoint
+    /// honored it.
+    #[serde(default)]
+    pub params_min: Option<u64>,
+    /// Maximum model parameter count (raw count). See `params_min`.
+    #[serde(default)]
+    pub params_max: Option<u64>,
+    /// Selected canonical quantization families (e.g. `["Q4", "F16"]`) — wire v48 quant filter.
+    /// Empty/absent = no quant filter. The node normalizes raw tags into families and serves
+    /// only hits carrying at least one selected family (`SearchPage::quant_filter_applied`).
+    #[serde(default)]
+    pub quants: Option<Vec<String>>,
 }
 
 impl SearchQuery {
-    /// A first-page query for `text` against `engine`, ordered by the Hub default.
-    pub fn new(text: impl Into<String>, engine: ModelEngine) -> Self {
+    /// A first-page query for `text` against `provider`, ordered by the Hub default.
+    pub fn new(text: impl Into<String>, provider: impl Into<String>) -> Self {
         Self {
+            provider: provider.into(),
             text: text.into(),
-            engine,
             sort: SearchSort::default(),
             page: 0,
             limit: 25,
+            params_min: None,
+            params_max: None,
+            quants: None,
         }
     }
 }
@@ -1437,6 +1506,15 @@ pub struct SearchHit {
     pub gated: bool,
     /// Whether the repo is private.
     pub private: bool,
+    /// The node-supplied canonical web page for the repo (wire v48) — clients render this link and
+    /// never string-build Hub URLs themselves.
+    #[serde(default)]
+    pub web_url: Option<String>,
+    /// The canonical quantization families present in the repo (wire v48), canonical order —
+    /// enriched progressively by the node (cache-first; a fresh page may serve `None` = not yet
+    /// known). Clients render these as chips and never re-derive them.
+    #[serde(default)]
+    pub quants: Option<Vec<String>>,
 }
 
 /// A page of search results (step 1 result).
@@ -1449,6 +1527,23 @@ pub struct SearchPage {
     pub results: Vec<SearchHit>,
     /// Whether another page is likely available (the page came back full).
     pub has_more: bool,
+    /// The total result count across all pages, when the endpoint reports one (wire v48).
+    #[serde(default)]
+    pub total: Option<u64>,
+    /// Whether the requested parameter-count filter was honored by the serving endpoint (wire
+    /// v48). `false` when the query carried no params filter or when the degraded fallback path
+    /// (which cannot filter by parameters) served the page.
+    #[serde(default)]
+    pub params_filter_applied: bool,
+    /// Whether this page was served by the degraded fallback endpoint (wire v48): the primary
+    /// endpoint failed (5xx / response drift) and `/api/models` answered instead — no total, no
+    /// params filter.
+    #[serde(default)]
+    pub degraded: bool,
+    /// Whether the requested quant filter was applied to this page (wire v48): `false` when the
+    /// query carried no quant selection.
+    #[serde(default)]
+    pub quant_filter_applied: bool,
 }
 
 /// One downloadable file within a repo (step 2 result — what the client selects to download).
@@ -1482,6 +1577,27 @@ impl fmt::Display for DownloadId {
     }
 }
 
+/// The outcome of `ModelInstallFromUrl` (wire v48): either the node could resolve the pasted URL
+/// to a concrete acquisition and started it, or the URL names a bare repo whose artifact-strategy
+/// provider needs the client to pick a file first (step 2 of the normal flow).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InstallFromUrlOutcome {
+    /// The download job was started.
+    Started {
+        /// The job handle (poll `ModelDownloads` / watch `DownloadProgress`).
+        id: DownloadId,
+    },
+    /// The URL names a repo but the provider installs single artifacts — the client must list the
+    /// repo's files (`ModelFiles`) and choose one.
+    NeedsFileChoice {
+        /// The `org/name` repo the URL resolved to.
+        repo: String,
+        /// The git revision the URL pinned (`"main"` when unspecified).
+        revision: String,
+    },
+}
+
 /// The lifecycle state of a download job.
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1506,6 +1622,10 @@ pub enum DownloadState {
 pub struct DownloadStatus {
     /// The job handle.
     pub id: DownloadId,
+    /// The managed provider whose catalog this job populates (wire v48; node-derived from the
+    /// engine — clients group/label by this, never by engine).
+    #[serde(default)]
+    pub provider: String,
     /// The model being acquired.
     pub model: ModelRef,
     /// The current lifecycle state.
@@ -1520,6 +1640,18 @@ pub struct DownloadStatus {
     pub files_total: u32,
     /// A failure reason when `state == Failed`.
     pub error: Option<String>,
+    /// Node-computed transfer rate (bytes/second, smoothed EMA; wire v48). `None` until the first
+    /// progress sample and for terminal states.
+    #[serde(default)]
+    pub rate_bps: Option<u64>,
+    /// Node-computed remaining-time estimate in seconds (wire v48). `None` when the rate or the
+    /// total is unknown and for terminal states.
+    #[serde(default)]
+    pub eta_seconds: Option<u64>,
+    /// The catalog id of the installed model this job produced, once `state == Completed` and the
+    /// artifact is cataloged (wire v48) — the handle a client uses to auto-select the result.
+    #[serde(default)]
+    pub result_model_id: Option<ModelId>,
 }
 
 /// An installed (downloaded + cataloged) model the daemon can activate and load.
@@ -1528,6 +1660,10 @@ pub struct DownloadStatus {
 pub struct InstalledModel {
     /// The stable catalog id.
     pub id: ModelId,
+    /// The managed provider whose catalog this model belongs to (wire v48; node-derived from the
+    /// engine — legacy records decode empty and are backfilled at read time).
+    #[serde(default)]
+    pub provider: String,
     /// The reference that resolves this model.
     pub model: ModelRef,
     /// A human-friendly display name (the repo id, or file stem).

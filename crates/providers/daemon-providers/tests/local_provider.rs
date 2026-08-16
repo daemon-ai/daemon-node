@@ -96,6 +96,39 @@ async fn tool_call_is_decoded() {
     assert_eq!(out.tool_calls[0].name, "read_file");
 }
 
+/// A request carrying tools for a model with NO tool-capable path (the fake worker's Ready reports
+/// neither native tools nor a tools-aware template): the `auto` gate must strip the advertisement
+/// from the wire — advertising anyway is what makes small models parrot tool names.
+#[tokio::test]
+async fn auto_gate_strips_tools_for_incapable_model() {
+    let state = temp_state("gate-auto");
+    let provider = LocalProvider::new(worker_config("echo-tools", &state));
+    let mut req = user_request("hi");
+    req.tools = vec![daemon_core::ToolDef {
+        name: "mnemosyne_recall".into(),
+        schema: r#"{"type":"object"}"#.into(),
+    }];
+    let out = provider.chat(req).await.expect("chat ok");
+    assert_eq!(out.text, "tools:0");
+}
+
+/// The `preamble` override forces the advertisement through despite the capability verdict (the
+/// operator escape hatch) — the tools must reach the worker.
+#[tokio::test]
+async fn preamble_override_forces_tool_advertisement() {
+    let state = temp_state("gate-preamble");
+    let mut wc = worker_config("echo-tools", &state);
+    wc.tool_advertisement = daemon_providers::ToolAdvertisement::Preamble;
+    let provider = LocalProvider::new(wc);
+    let mut req = user_request("hi");
+    req.tools = vec![daemon_core::ToolDef {
+        name: "mnemosyne_recall".into(),
+        schema: r#"{"type":"object"}"#.into(),
+    }];
+    let out = provider.chat(req).await.expect("chat ok");
+    assert_eq!(out.text, "tools:1");
+}
+
 #[tokio::test]
 async fn worker_crash_midgen_then_retry_succeeds() {
     let state = temp_state("midgen");

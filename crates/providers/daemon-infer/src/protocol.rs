@@ -69,6 +69,13 @@ pub struct Capabilities {
     pub tool_call_format: ToolCallFormat,
     /// The model's maximum context window, if known.
     pub max_context: Option<u32>,
+    /// Whether the loaded model's chat template consumes a `tools` input (probed at load — see
+    /// `template::TemplateCaps`). The node's tool-advertisement gate reads this: a model whose
+    /// template was never trained on tools gets NO tool advertisement (a text preamble of schemas
+    /// makes small models parrot tool names instead of answering). Defaulted for wire back-compat
+    /// with older workers.
+    #[serde(default)]
+    pub template_tools: bool,
 }
 
 /// Model load parameters (the subset both engines understand; engine-specific knobs are optional).
@@ -96,6 +103,10 @@ pub struct ModelParams {
 }
 
 /// Token-sampling parameters for one [`Command::Generate`].
+///
+/// The penalty knobs default to upstream llama.cpp's NEUTRAL defaults (`repeat 1.0` / `freq 0.0` /
+/// `present 0.0` = disabled, window `64`) — they are operator-tunable config, not a baked-in
+/// anti-degeneration stance. All four are serde-defaulted for wire back-compat with older parents.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Sampling {
     /// Softmax temperature.
@@ -106,6 +117,38 @@ pub struct Sampling {
     pub top_k: u32,
     /// RNG seed for reproducible sampling.
     pub seed: u64,
+    /// Repetition-penalty window: the last N sampled tokens penalties consider (`0` = disabled;
+    /// bounded so long generations never rescan the full context).
+    #[serde(default = "default_penalty_last_n")]
+    pub penalty_last_n: i32,
+    /// Multiplicative repeat penalty over the window (`1.0` = disabled).
+    #[serde(default = "default_penalty_repeat")]
+    pub penalty_repeat: f32,
+    /// Additive frequency penalty over the window (`0.0` = disabled).
+    #[serde(default)]
+    pub penalty_freq: f32,
+    /// Additive presence penalty over the window (`0.0` = disabled).
+    #[serde(default)]
+    pub penalty_present: f32,
+}
+
+fn default_penalty_last_n() -> i32 {
+    64
+}
+
+fn default_penalty_repeat() -> f32 {
+    1.0
+}
+
+impl Sampling {
+    /// Whether any penalty knob departs from the neutral (disabled) defaults — the backend only
+    /// adds the penalties sampler to the chain when this is true.
+    pub fn penalties_active(&self) -> bool {
+        self.penalty_last_n != 0
+            && (self.penalty_repeat != 1.0
+                || self.penalty_freq != 0.0
+                || self.penalty_present != 0.0)
+    }
 }
 
 impl Default for Sampling {
@@ -115,6 +158,10 @@ impl Default for Sampling {
             top_p: 0.95,
             top_k: 40,
             seed: 0,
+            penalty_last_n: default_penalty_last_n(),
+            penalty_repeat: default_penalty_repeat(),
+            penalty_freq: 0.0,
+            penalty_present: 0.0,
         }
     }
 }
@@ -235,6 +282,11 @@ pub enum Command {
         /// An optional grammar constraint bounding the output (e.g. MeTTa). `None` = unconstrained.
         #[serde(default)]
         constraint: Option<Constraint>,
+        /// Stop sequences: generation cuts (and the sequence is stripped from the output) when one
+        /// is produced — the guard for models that ramble past their turn without emitting EOG.
+        /// Defaulted for wire back-compat with older parents.
+        #[serde(default)]
+        stop: Vec<String>,
     },
     /// Embed a batch of texts against an embedding-mode model (loaded with
     /// [`ModelParams::embeddings`]). The worker answers [`Event::Embeddings`] or [`Event::Error`].
@@ -406,12 +458,19 @@ mod tests {
                 name: "read_file".into(),
                 schema: r#"{"type":"object"}"#.into(),
             }],
-            sampling: Sampling::default(),
+            sampling: Sampling {
+                penalty_last_n: 128,
+                penalty_repeat: 1.1,
+                penalty_freq: 0.2,
+                penalty_present: 0.3,
+                ..Default::default()
+            },
             max_tokens: 512,
             constraint: Some(Constraint {
                 gbnf: Some("root ::= \"a\"".into()),
                 lark: None,
             }),
+            stop: vec!["<|im_end|>".into()],
         });
         round_trip_command(Command::Embed {
             request_id: 9,
@@ -430,6 +489,7 @@ mod tests {
                 supports_streaming: true,
                 tool_call_format: ToolCallFormat::HermesXml,
                 max_context: Some(8192),
+                template_tools: true,
             },
         });
         round_trip_event(Event::TextDelta {

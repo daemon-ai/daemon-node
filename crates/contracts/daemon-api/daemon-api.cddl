@@ -19,7 +19,7 @@ kv-pair = [k: tstr, v: tstr]
 ; cap) - the fix that lets arbitrary file sizes round-trip. Fixed 32-byte hashes stay arrays
 ; (`content-hash`, below) since they are small and `ContentHash([u8; 32])` serializes as a sequence.
 byte-array = bstr
-wire_version = uint                 ; daemon-common WireVersion (current = 46)
+wire_version = uint                 ; daemon-common WireVersion (current = 48)
 
 ; ----- uniform wire pagination (wire v25) -----
 ; Every list op that can exceed the client codec's fixed 64-element array buffers is paginated
@@ -611,6 +611,7 @@ node-event = node-event-session-advanced
            / node-event-profiles-changed
            / node-event-approval-pending
            / node-event-download-progress
+           / node-event-quantize-progress
            / node-event-catalog-changed
            / node-event-transport-changed
            / node-event-conversations-changed
@@ -633,7 +634,11 @@ node-event-fleet-changed        = { "FleetChanged":       { "rev": uint64 } }
 node-event-profiles-changed     = { "ProfilesChanged":   { "rev": uint64 } }
 node-event-approval-pending     = { "ApprovalPending":    { "session": session-id, "request_id": tstr } }
 ; v26: byte counters ride the event (throttled byte-level emission node-side).
-node-event-download-progress    = { "DownloadProgress":   { "id": download-id, "pct": uint, "state": tstr, "downloaded_bytes": uint64, "total_bytes": uint64 } }
+; v48: + node-computed transfer rate / remaining-time estimate (absent until the first sample).
+node-event-download-progress    = { "DownloadProgress":   { "id": download-id, "pct": uint, "state": tstr, "downloaded_bytes": uint64, "total_bytes": uint64, ? "rate_bps": (uint64 / null), ? "eta_seconds": (uint64 / null), ? "result_model_id": (model-id / null) } }
+; v48: a quantize job advanced (state transitions; the Completed emit carries the produced catalog
+; id) — the push that retires the client's ModelQuantizes poll.
+node-event-quantize-progress    = { "QuantizeProgress":   { "id": quantize-id, "state": tstr, ? "model_id": (model-id / null), ? "error": (tstr / null) } }
 ; v26: the installed-model registry changed (download cataloged / model deleted) -> refetch ModelCatalog.
 ; rung 1 (api/39): gains a coalescing rev (breaking arm-shape change, bundled into the deferred bump).
 node-event-catalog-changed      = { "CatalogChanged":     { "rev": uint64 } }
@@ -711,14 +716,27 @@ search-sort = "Trending"
             / "Modified"
             / "Created"
 
+; v48: provider-keyed (the node resolves provider -> engine) + numeric parameter-count bounds
+; (the node maps them onto Hub filter buckets; search-page.params_filter_applied echoes whether
+; the serving endpoint honored them).
 search-query = {
+  "provider": tstr,
   "text": tstr,
-  "engine": model-engine,
   "sort": search-sort,
   "page": uint,
   "limit": uint,
+  ? "params_min": (uint64 / null),
+  ? "params_max": (uint64 / null),
+  ; v48 quant filter: selected canonical quant families (empty/absent = no filter).
+  ; Named value rules (query-quants / hit-quants) keep the generated codec identifiers distinct
+  ; while the wire key stays "quants" on both structs.
+  ? "quants": (query-quants / null),
 }
 
+query-quants = [* tstr]
+hit-quants = [* tstr]
+
+; web_url (v48): the node-supplied canonical repo page (clients never string-build Hub links).
 search-hit = {
   "repo": tstr,
   "author": (tstr / null),
@@ -729,9 +747,25 @@ search-hit = {
   "last_modified": (tstr / null),
   "gated": bool,
   "private": bool,
+  ? "web_url": (tstr / null),
+  ; v48: canonical quant families present in the repo (progressive, cache-first enrichment —
+  ; absent/null = not yet known). Clients render, never re-derive.
+  ? "quants": (hit-quants / null),
 }
 
-search-page = { "page": uint, "results": [* search-hit], "has_more": bool }
+; v48: + total result count (when the endpoint reports one), whether the params filter was
+; honored, and the degraded-fallback marker (served by /api/models after primary breakage:
+; no total, no params filter).
+search-page = {
+  "page": uint,
+  "results": [* search-hit],
+  "has_more": bool,
+  ? "total": (uint64 / null),
+  ? "params_filter_applied": bool,
+  ? "degraded": bool,
+  ; v48: whether the requested quant filter was applied to this page.
+  ? "quant_filter_applied": bool,
+}
 
 ; is_mmproj (wire v27): a vision-projector (mmproj) companion — listed and downloadable, but
 ; never a chat model (the client badges it; recommendation skips it).
@@ -751,8 +785,12 @@ download-state = "Queued"
                / "Cancelled"
                / "Failed"
 
+; v48: + provider attribution (node-derived from the engine), node-computed rate/ETA (absent
+; until the first sample and for terminal states), and the produced catalog id once a completed
+; job is cataloged (the handle a client auto-selects).
 download-status = {
   "id": download-id,
+  ? "provider": tstr,
   "model": model-ref,
   "state": download-state,
   "downloaded_bytes": uint64,
@@ -760,13 +798,19 @@ download-status = {
   "files_done": uint,
   "files_total": uint,
   "error": (tstr / null),
+  ? "rate_bps": (uint64 / null),
+  ? "eta_seconds": (uint64 / null),
+  ? "result_model_id": (model-id / null),
 }
 
 ; mmproj_path (wire v27): the paired vision-projector companion on a *text* record (fetched with
 ; the download or matched from the local catalog); null/absent for text-only models and for
 ; projector records themselves.
+; provider (v48): the managed provider this record belongs to (node-derived from the engine;
+; legacy records are backfilled at read time).
 installed-model = {
   "id": model-id,
+  ? "provider": tstr,
   "model": model-ref,
   "display_name": tstr,
   "local_path": tstr,
@@ -1106,7 +1150,25 @@ model-descriptor = { "id": tstr, "provider": provider-selector, ? "display_name"
 provider-kind-wire = "local" / "cloud" / "daemon_cloud"
 ; provider-sign-in (wire v30, CON-15): the node advertises interactive sign-in via an auth family.
 provider-sign-in = { "family": tstr, "label": tstr }
-provider-descriptor = { "id": tstr, "display_name": tstr, "kind": provider-kind-wire, "wire_selector": provider-selector, "requires_key": bool, "supports_model_discovery": bool, "default_base_url": (tstr / null), ? "sign_in": (provider-sign-in / null) }
+; v48 capability split (replaces the conflated requires_key): list_auth vs turn_auth, how the
+; catalog is populated (install strategy), and the node-owned catalog-management action list the
+; UI renders verbatim (empty for enumerated providers; a user-registered custom endpoint
+; advertises exactly remove_provider — its registration is wire-removable).
+provider-auth = "none" / "api_key"
+install-strategy = "none" / "artifact" / "repository"
+provider-action = "search" / "install" / "remove" / "activate" / "requantize" / "add_from_url" / "remove_provider"
+; v48 additive: `available` (absent = true) + `unavailable_reason` — the boot-time worker engine
+; probe's verdict; unavailable rows stay listed (greyed client-side) and refuse acquisition.
+provider-descriptor = { "id": tstr, "display_name": tstr, "kind": provider-kind-wire, "wire_selector": provider-selector, ? "list_auth": provider-auth, ? "turn_auth": provider-auth, ? "install": install-strategy, ? "actions": [* provider-action], "supports_model_discovery": bool, "default_base_url": (tstr / null), ? "sign_in": (provider-sign-in / null), ? "available": bool, ? "unavailable_reason": (tstr / null) }
+
+; v48: the structured ProviderModels outcome — a listing failure is classified (a key prompt vs a
+; retry), never a silent empty page. An empty models list with no error genuinely means "this
+; provider offers nothing" (e.g. a managed engine with nothing installed).
+; (rule deliberately NOT named provider-list-error-kind: zcbor derives the same function name
+; for the rule and for the "kind" member accessor below, which collides.)
+list-error-kind = "auth_required" / "network" / "decode" / "unsupported"
+provider-list-error = { "kind": list-error-kind, "message": tstr }
+provider-models-result = { "models": [0*64 model-descriptor], ? "next": (tstr / null), ? "error": (provider-list-error / null) }
 
 ; ----- vhc training surface DTOs (swarm-training-spec.md §10.4) -----
 ; The node is the single authority for vhc participation; the app is a thin mirror (ADR-003):
@@ -1213,6 +1275,8 @@ auth-flow-kind = "MatrixSso"
                / "UserPassword"          ; wire v38: username+password exchanged at sign-in
                / "AcpAuthenticate"       ; wire v47: an ACP agent's own authenticate method,
                                          ; driven node-side (Message challenge + poll)
+               / "DeviceCode"            ; wire v48: RFC 8628 device flow — "visit URL, enter
+                                         ; code" Message challenge + poll (GitHub Copilot)
 ; how a client renders + validates one auth-param-field (wire v38; default Text).
 auth-field-kind = "Text" / "Password" / "Number" / "Choice"
 auth-param-field = {
@@ -1492,8 +1556,12 @@ request-credential-list = "CredentialList"
 request-credential-remove = { "CredentialRemove": { "profile": tstr } }
 request-credential-set-label = { "CredentialSetLabel": { "profile": tstr, ? "label": (tstr / null) } }
 request-model-search = { "ModelSearch": { "query": search-query } }
-request-model-files = { "ModelFiles": { "repo": tstr, "revision": (tstr / null), "engine": model-engine, ? "after": (tstr / null) } }
-request-model-download = { "ModelDownload": { "model": model-ref } }
+request-model-files = { "ModelFiles": { "provider": tstr, "repo": tstr, "revision": (tstr / null), ? "after": (tstr / null) } }
+; v48: provider-keyed — the node resolves provider -> engine and builds the ModelRef itself.
+request-model-download = { "ModelDownload": { "provider": tstr, "source": model-source } }
+; v48: one atomic paste-a-Hub-URL install intent (model page, /tree/..., or a direct
+; /resolve/.../<file>); the node owns every URL safety check.
+request-model-install-from-url = { "ModelInstallFromUrl": { "provider": tstr, "url": tstr } }
 request-model-downloads = "ModelDownloads"
 request-model-cancel = { "ModelCancel": { "id": download-id } }
 request-model-pause = { "ModelPause": { "id": download-id } }
@@ -1501,7 +1569,8 @@ request-model-resume = { "ModelResume": { "id": download-id } }
 request-model-catalog = "ModelCatalog"
 request-model-delete = { "ModelDelete": { "id": model-id } }
 request-model-activate = { "ModelActivate": { "id": model-id, "profile": (tstr / null) } }
-model-recommend-args = { "repo": tstr, "revision": (tstr / null), "engine": model-engine, "budget_bytes": (uint64 / null) }
+; v48: provider-keyed (was engine-keyed).
+model-recommend-args = { "repo": tstr, "revision": (tstr / null), "provider": tstr, "budget_bytes": (uint64 / null) }
 request-model-recommend = { "ModelRecommend": model-recommend-args }
 model-quantize-args = { "repo": tstr, "revision": (tstr / null), "target_quant": tstr, "source_file": (tstr / null) }
 request-model-quantize = { "ModelQuantize": model-quantize-args }
@@ -1796,6 +1865,7 @@ api-request = request-submit
             / request-model-search
             / request-model-files
             / request-model-download
+            / request-model-install-from-url
             / request-model-downloads
             / request-model-cancel
             / request-model-pause
@@ -1957,7 +2027,7 @@ approval-page = { "items": [0*64 approval-info], ? "next": (tstr / null) }
 checkpoint-page = { "items": [0*64 checkpoint-info], ? "next": (tstr / null) }
 delivery-session-page = { "items": [0*64 session-id], ? "next": (tstr / null) }
 model-file-page = { "items": [0*64 model-file], ? "next": (tstr / null) }
-model-page = { "items": [0*64 model-descriptor], ? "next": (tstr / null) }   ; Models + ProviderModels
+model-page = { "items": [0*64 model-descriptor], ? "next": (tstr / null) }   ; Models
 revision-page = { "items": [0*64 revision], ? "next": (tstr / null) }
 chat-route-page = { "items": [0*64 chat-route], ? "next": (tstr / null) }
 room-page = { "items": [0*64 room-info], ? "next": (tstr / null) }
@@ -1989,6 +2059,13 @@ response-verifying-key = { "VerifyingKey": (tstr / null) }
 response-model-search = { "ModelSearch": search-page }
 response-model-files = { "ModelFiles": model-file-page }
 response-model-download-started = { "ModelDownloadStarted": download-id }
+; v48: the atomic URL-install outcome — started, or "pick a file" for a bare repo on an
+; artifact-strategy provider.
+install-from-url-started = { "Started": { "id": download-id } }
+install-from-url-needs-file-choice = { "NeedsFileChoice": { "repo": tstr, "revision": tstr } }
+install-from-url-outcome = install-from-url-started
+                         / install-from-url-needs-file-choice
+response-model-install-from-url = { "ModelInstallFromUrl": install-from-url-outcome }
 response-model-downloads = { "ModelDownloads": [* download-status] }
 response-model-catalog = { "ModelCatalog": [* installed-model] }
 response-model-recommend = { "ModelRecommend": quant-recommendation }
@@ -2015,7 +2092,8 @@ response-credentials = { "Credentials": [* credential-info] }
 response-models = { "Models": model-page }
 response-model-current = { "ModelCurrent": (model-descriptor / null) }
 response-provider-catalog = { "ProviderCatalog": [* provider-descriptor] }
-response-provider-models = { "ProviderModels": model-page }
+; v48: the structured result (models + explicit failure channel) replaces the bare model page.
+response-provider-models = { "ProviderModels": provider-models-result }
 response-custom-providers = { "CustomProviders": [* custom-provider] }
 response-distribution = { "Distribution": distribution }
 response-profile-id = { "ProfileId": tstr }
@@ -2133,6 +2211,7 @@ api-response = response-ok
              / response-model-search
              / response-model-files
              / response-model-download-started
+             / response-model-install-from-url
              / response-model-downloads
              / response-model-catalog
              / response-model-recommend

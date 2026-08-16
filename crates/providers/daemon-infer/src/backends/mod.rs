@@ -76,6 +76,18 @@ pub fn system_info() -> String {
     llama_cpp_4::print_system_info()
 }
 
+/// The compiled-engine capability map as one JSON line — the payload of the worker's one-shot
+/// `engines` subcommand (the node's boot-time capability probe). The SAME `cfg!` truth
+/// [`backend_name`] and [`load`] encode, so a stub build advertises exactly what it will refuse.
+#[must_use]
+pub fn engines_json() -> String {
+    format!(
+        r#"{{"llama":{},"mistralrs":{}}}"#,
+        cfg!(feature = "llama"),
+        cfg!(feature = "mistralrs")
+    )
+}
+
 /// The identifier of the engine compiled for `engine` (for [`crate::protocol::Event::Health`]).
 pub fn backend_name(engine: Engine) -> &'static str {
     match engine {
@@ -93,5 +105,26 @@ pub fn backend_name(engine: Engine) -> &'static str {
                 "stub"
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The probe line is valid JSON whose booleans agree with [`backend_name`]'s stub verdicts —
+    /// one truth, two views.
+    #[test]
+    fn engines_json_matches_backend_names() {
+        let parsed: serde_json::Value =
+            serde_json::from_str(&engines_json()).expect("probe line is JSON");
+        assert_eq!(
+            parsed["llama"].as_bool().unwrap(),
+            backend_name(Engine::Llama) == "llama"
+        );
+        assert_eq!(
+            parsed["mistralrs"].as_bool().unwrap(),
+            backend_name(Engine::MistralRs) == "mistralrs"
+        );
     }
 }

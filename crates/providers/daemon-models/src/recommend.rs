@@ -58,6 +58,15 @@ fn quality_rank(label: &str) -> usize {
         .unwrap_or(LLAMA_QUALITY.len())
 }
 
+/// The recommendation "sweet spot" band: quality ranks from `Q6_K_L` through `Q4_0` inclusive.
+/// Above-band precisions (F32/BF16/F16/Q8_*) are what the vast majority of users do NOT want as a
+/// default — near-lossless quality at 2–4× the memory and compute of a Q4–Q6 quant. The band is
+/// preferred even when a bigger quant would fit (the "BF16 problem" fix); above-band is
+/// recommended only when nothing in or below the band exists that fits.
+fn llama_band() -> std::ops::RangeInclusive<usize> {
+    quality_rank("Q6_K_L")..=quality_rank("Q4_0")
+}
+
 /// The portion of `budget_bytes` to fit weights into.
 fn weight_budget(budget_bytes: u64) -> u64 {
     (budget_bytes as f64 * WEIGHT_BUDGET_FRACTION) as u64
@@ -143,10 +152,25 @@ pub fn recommend_llama(repo: &str, files: &[ModelFile], budget_bytes: u64) -> Qu
         };
     }
 
-    // The best-quality candidate that fits the weight budget; else the smallest available.
+    // Band-clamped policy (wire v48): prefer the best-quality FITTING quant inside the Q6_K_L–
+    // Q4_0 sweet spot; else the best-quality fitting quant below the band; else (nothing in or
+    // below the band fits — only above-band candidates can fit then) the smallest fitting one;
+    // else the smallest overall, flagged as exceeding the budget.
+    let band = llama_band();
+    let in_band = |c: &&LlamaCandidate| band.contains(&quality_rank(&c.quant));
+    let below_band = |c: &&LlamaCandidate| quality_rank(&c.quant) > *band.end();
+    let fitting = |c: &&LlamaCandidate| c.size_bytes <= usable;
+
     let chosen = aggregated
         .iter()
-        .find(|c| c.size_bytes <= usable)
+        .find(|c| in_band(c) && fitting(c))
+        .or_else(|| aggregated.iter().find(|c| below_band(c) && fitting(c)))
+        .or_else(|| {
+            aggregated
+                .iter()
+                .filter(fitting)
+                .min_by_key(|c| c.size_bytes)
+        })
         .unwrap_or_else(|| {
             aggregated
                 .iter()
@@ -154,15 +178,25 @@ pub fn recommend_llama(repo: &str, files: &[ModelFile], budget_bytes: u64) -> Qu
                 .expect("non-empty")
         });
     let fits = chosen.size_bytes <= usable;
-    let reason = if fits {
+    let reason = if !fits {
         format!(
-            "highest-quality GGUF fitting ~{} of budget ({} usable for weights)",
+            "smallest available GGUF; none fit the ~{} budget — expect offload/swap",
+            human_bytes(budget_bytes)
+        )
+    } else if in_band(&chosen) {
+        format!(
+            "best quality in the Q4–Q6 sweet spot fitting ~{} of budget ({} usable for weights)",
             human_bytes(budget_bytes),
             human_bytes(usable)
         )
+    } else if below_band(&chosen) {
+        format!(
+            "no Q4–Q6 quant fits ~{}; best quality below the sweet spot that does",
+            human_bytes(budget_bytes)
+        )
     } else {
         format!(
-            "smallest available GGUF; none fit the ~{} budget — expect offload/swap",
+            "only above-Q6 precisions are available; smallest one fitting ~{}",
             human_bytes(budget_bytes)
         )
     };
@@ -226,24 +260,42 @@ pub fn recommend_mistralrs(
         })
         .collect();
 
-    let chosen = MISTRALRS_ISQ
-        .iter()
-        .find(|(_, bits)| est(*bits) <= usable)
-        .or_else(|| MISTRALRS_ISQ.last())
-        .expect("non-empty isq table");
+    // Band-clamped policy (wire v48), mirroring the llama sweet spot: prefer the best fitting
+    // level in Q6K–Q4K; else the best fitting below (Q3K/Q2K); Q8_0 only when nothing in or
+    // below the band fits; else the smallest level, flagged.
+    let band = 1..=3usize; // MISTRALRS_ISQ indices: Q6K, Q5K, Q4K
+    let fitting = |i: usize| est(MISTRALRS_ISQ[i].1) <= usable;
+    let chosen_idx = band
+        .clone()
+        .find(|i| fitting(*i))
+        .or_else(|| (*band.end() + 1..MISTRALRS_ISQ.len()).find(|i| fitting(*i)))
+        .or_else(|| (0..*band.start()).rev().find(|i| fitting(*i)))
+        .unwrap_or(MISTRALRS_ISQ.len() - 1);
+    let chosen = &MISTRALRS_ISQ[chosen_idx];
     let chosen_size = est(chosen.1);
     let fits = chosen_size <= usable;
-    let reason = if fits {
-        format!(
-            "highest-quality ISQ fitting ~{} of budget for a {} model",
-            human_bytes(budget_bytes),
-            human_params(params)
-        )
-    } else {
+    let reason = if !fits {
         format!(
             "lowest ISQ level; a {} model does not fit ~{} — expect offload/swap",
             human_params(params),
             human_bytes(budget_bytes)
+        )
+    } else if band.contains(&chosen_idx) {
+        format!(
+            "best ISQ in the Q4–Q6 sweet spot fitting ~{} of budget for a {} model",
+            human_bytes(budget_bytes),
+            human_params(params)
+        )
+    } else if chosen_idx > *band.end() {
+        format!(
+            "no Q4–Q6 ISQ fits ~{}; best level below the sweet spot that does",
+            human_bytes(budget_bytes)
+        )
+    } else {
+        format!(
+            "only above-Q6 ISQ fits the ~{} budget for a {} model",
+            human_bytes(budget_bytes),
+            human_params(params)
         )
     };
 
@@ -434,9 +486,10 @@ mod tests {
     #[test]
     fn mistralrs_picks_isq_by_params_and_budget() {
         let gib = 1024 * 1024 * 1024;
-        // 7B params, 24 GiB budget -> 19.2 GiB usable -> Q8_0 (~7.4 GiB) fits and is best.
+        // 7B params, 24 GiB budget -> 19.2 GiB usable. Q8_0 (~7.4 GiB) would fit, but the band
+        // clamp prefers the Q6K sweet spot (~5.8 GiB) — near-identical quality, smaller resident.
         let rec = recommend_mistralrs("org/m", Some(7_000_000_000), 24 * gib);
-        assert_eq!(rec.quant, "Q8_0");
+        assert_eq!(rec.quant, "Q6K");
         assert!(rec.fits);
     }
 
@@ -453,5 +506,99 @@ mod tests {
         let rec = recommend_mistralrs("org/m", None, 24 * 1024 * 1024 * 1024);
         assert_eq!(rec.quant, "Q4K");
         assert!(rec.fits);
+    }
+
+    // -- band clamp (wire v48): table-driven policy cases ---------------------------------------
+
+    /// A band-clamp policy row: named files as (path, GiB) against a budget, with the expected
+    /// pick. One row per policy branch.
+    struct BandClampCase {
+        name: &'static str,
+        files: &'static [(&'static str, u64)],
+        budget_gib: u64,
+        expect_quant: &'static str,
+        expect_fits: bool,
+    }
+
+    #[test]
+    fn llama_band_clamp_policy_table() {
+        let gib: u64 = 1024 * 1024 * 1024;
+        let cases: &[BandClampCase] = &[
+            BandClampCase {
+                name: "huge budget still prefers the sweet spot over BF16/Q8",
+                files: &[
+                    ("m-BF16.gguf", 16),
+                    ("m-Q8_0.gguf", 8),
+                    ("m-Q6_K.gguf", 6),
+                    ("m-Q4_K_M.gguf", 4),
+                ],
+                budget_gib: 1000,
+                expect_quant: "Q6_K",
+                expect_fits: true,
+            },
+            BandClampCase {
+                name: "band exists but none fit -> best below-band that fits",
+                files: &[
+                    ("m-Q6_K.gguf", 6),
+                    ("m-Q4_K_M.gguf", 4),
+                    ("m-Q3_K_M.gguf", 3),
+                    ("m-Q2_K.gguf", 1),
+                ],
+                // 1.6 GiB usable: no band quant fits; Q3_K_M (3) misses, Q2_K (1) fits.
+                budget_gib: 2,
+                expect_quant: "Q2_K",
+                expect_fits: true,
+            },
+            BandClampCase {
+                name: "no in-band candidates -> below-band wins over a fitting F16",
+                files: &[("m-F16.gguf", 2), ("m-Q2_K.gguf", 1)],
+                budget_gib: 1000,
+                expect_quant: "Q2_K",
+                expect_fits: true,
+            },
+            BandClampCase {
+                name: "only above-band candidates -> smallest fitting one",
+                files: &[("m-F32.gguf", 8), ("m-F16.gguf", 4)],
+                budget_gib: 1000,
+                expect_quant: "F16",
+                expect_fits: true,
+            },
+            BandClampCase {
+                name: "nothing fits -> smallest overall, flagged",
+                files: &[("m-Q8_0.gguf", 80), ("m-Q4_K_M.gguf", 40)],
+                budget_gib: 4,
+                expect_quant: "Q4_K_M",
+                expect_fits: false,
+            },
+        ];
+        for case in cases {
+            let files: Vec<ModelFile> = case
+                .files
+                .iter()
+                .map(|(path, size_gib)| gguf_file(path, size_gib * gib))
+                .collect();
+            let rec = recommend_llama("org/m", &files, case.budget_gib * gib);
+            assert_eq!(rec.quant, case.expect_quant, "case: {}", case.name);
+            assert_eq!(rec.fits, case.expect_fits, "case: {}", case.name);
+        }
+    }
+
+    /// The mistral.rs mirror of the band clamp: sweet spot preferred, below-band fallback,
+    /// smallest-flagged when nothing fits.
+    #[test]
+    fn mistralrs_band_clamp_policy_table() {
+        let gib: u64 = 1024 * 1024 * 1024;
+        // 20B model, 24 GiB budget: Q6K (~16.5 GiB) fits the 19.2 GiB usable -> sweet spot.
+        let rec = recommend_mistralrs("org/m", Some(20_000_000_000), 24 * gib);
+        assert_eq!(rec.quant, "Q6K");
+        assert!(rec.fits);
+        // 40B model, 24 GiB budget: band needs >= 22.5 GiB -> below-band Q3K (~17 GiB) fits.
+        let rec = recommend_mistralrs("org/m", Some(40_000_000_000), 24 * gib);
+        assert_eq!(rec.quant, "Q3K");
+        assert!(rec.fits);
+        // 70B model, 24 GiB budget: nothing fits -> smallest level, flagged.
+        let rec = recommend_mistralrs("org/m", Some(70_000_000_000), 24 * gib);
+        assert_eq!(rec.quant, "Q2K");
+        assert!(!rec.fits);
     }
 }

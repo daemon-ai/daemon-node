@@ -18,8 +18,8 @@ const STABLE_REPO: &str = "TheBloke/Llama-2-7B-GGUF";
 #[ignore = "hits the live Hugging Face Hub"]
 async fn live_search_returns_gguf_repos() {
     let client = HfClient::new(None);
-    let query = SearchQuery::new("llama gguf", ModelEngine::Llama);
-    let page = daemon_models::hf::search::search(&client, &query)
+    let query = SearchQuery::new("llama gguf", "llama_cpp");
+    let page = daemon_models::hf::search::search(&client, ModelEngine::Llama, &query)
         .await
         .expect("live search");
     assert!(!page.results.is_empty(), "expected some GGUF repos");
@@ -194,10 +194,10 @@ async fn live_smollm2_search_files_recommend_download() {
 
     // Step 1: search surfaces the repo.
     let page = manager
-        .search(SearchQuery::new(
-            "SmolLM2 Instruct GGUF",
+        .search(
             ModelEngine::Llama,
-        ))
+            SearchQuery::new("SmolLM2 Instruct GGUF", "llama_cpp"),
+        )
         .await
         .expect("search");
     assert!(!page.results.is_empty(), "expected SmolLM2 search hits");

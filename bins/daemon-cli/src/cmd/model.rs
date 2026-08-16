@@ -5,9 +5,7 @@
 //! the `up` quickstart (recommend → pull → activate orchestrated client-side).
 
 use daemon_api::{ApiRequest, ApiResponse};
-use daemon_common::{
-    DownloadId, ModelEngine, ModelId, ModelRef, ModelSource, SearchQuery, SearchSort,
-};
+use daemon_common::{DownloadId, ModelEngine, ModelId, ModelSource, SearchQuery, SearchSort};
 use daemon_host::ApiClient;
 
 use crate::cli::ModelCmd;
@@ -19,22 +17,18 @@ fn parse_engine(s: &str) -> anyhow::Result<ModelEngine> {
         .ok_or_else(|| anyhow::anyhow!("unknown engine {s:?} (expected llama|mistralrs)"))
 }
 
-/// Build a [`ModelRef`] from CLI repo/file/revision/engine args.
-fn build_model_ref(
-    engine: ModelEngine,
-    repo: String,
-    file: Option<String>,
-    revision: Option<String>,
-) -> ModelRef {
-    let revision = revision.unwrap_or_else(|| "main".to_string());
-    ModelRef::new(
-        engine,
-        ModelSource::Hf {
-            repo,
-            file,
-            revision,
-        },
-    )
+/// The wire provider id for a CLI engine selector (the wire is provider-keyed; wire v48).
+fn parse_provider(s: &str) -> anyhow::Result<String> {
+    Ok(parse_engine(s)?.provider_id().to_string())
+}
+
+/// Build a Hub [`ModelSource`] from CLI repo/file/revision args.
+fn build_source(repo: String, file: Option<String>, revision: Option<String>) -> ModelSource {
+    ModelSource::Hf {
+        repo,
+        file,
+        revision: revision.unwrap_or_else(|| "main".to_string()),
+    }
 }
 
 /// GiB → bytes.
@@ -64,11 +58,14 @@ pub(super) async fn run(client: &ApiClient, cmd: ModelCmd) -> anyhow::Result<()>
             page,
         } => ApiRequest::ModelSearch {
             query: SearchQuery {
+                provider: parse_provider(&engine)?,
                 text: query,
-                engine: parse_engine(&engine)?,
                 sort: SearchSort::default(),
                 page,
                 limit,
+                params_min: None,
+                params_max: None,
+                quants: None,
             },
         },
         ModelCmd::Files {
@@ -76,9 +73,9 @@ pub(super) async fn run(client: &ApiClient, cmd: ModelCmd) -> anyhow::Result<()>
             revision,
             engine,
         } => ApiRequest::ModelFiles {
+            provider: parse_provider(&engine)?,
             repo,
             revision,
-            engine: parse_engine(&engine)?,
             after: None,
         },
         ModelCmd::Pull {
@@ -87,7 +84,8 @@ pub(super) async fn run(client: &ApiClient, cmd: ModelCmd) -> anyhow::Result<()>
             revision,
             engine,
         } => ApiRequest::ModelDownload {
-            model: build_model_ref(parse_engine(&engine)?, repo, file, revision),
+            provider: parse_provider(&engine)?,
+            source: build_source(repo, file, revision),
         },
         ModelCmd::Downloads => ApiRequest::ModelDownloads,
         ModelCmd::Cancel { id } => ApiRequest::ModelCancel { id: DownloadId(id) },
@@ -109,7 +107,7 @@ pub(super) async fn run(client: &ApiClient, cmd: ModelCmd) -> anyhow::Result<()>
         } => ApiRequest::ModelRecommend(daemon_api::ModelRecommendArgs {
             repo,
             revision,
-            engine: parse_engine(&engine)?,
+            provider: parse_provider(&engine)?,
             budget_bytes: vram.map(gib_to_bytes),
         }),
         ModelCmd::Quantize {
@@ -142,11 +140,12 @@ async fn quickstart_up(
     profile: Option<String>,
 ) -> anyhow::Result<()> {
     // 1. Recommend a quant for the detected (or overridden) budget.
+    let provider = engine.provider_id().to_string();
     let rec = match client
         .call(ApiRequest::ModelRecommend(daemon_api::ModelRecommendArgs {
             repo: repo.clone(),
             revision: None,
-            engine,
+            provider: provider.clone(),
             budget_bytes: vram.map(gib_to_bytes),
         }))
         .await?
@@ -160,15 +159,12 @@ async fn quickstart_up(
         rec.repo, rec.quant, rec.fits, rec.reason
     );
 
-    // 2. Build the model ref and start the download (llama needs the recommended file).
-    let model = ModelRef::new(
-        engine,
-        ModelSource::Hf {
-            repo: repo.clone(),
-            file: rec.file.clone(),
-            revision: "main".to_string(),
-        },
-    );
+    // 2. Build the source and start the download (llama needs the recommended file).
+    let source = ModelSource::Hf {
+        repo: repo.clone(),
+        file: rec.file.clone(),
+        revision: "main".to_string(),
+    };
     if matches!(engine, ModelEngine::Llama) && rec.file.is_none() {
         anyhow::bail!(
             "no downloadable GGUF recommended for {repo}: {}",
@@ -177,7 +173,8 @@ async fn quickstart_up(
     }
     let job = match client
         .call(ApiRequest::ModelDownload {
-            model: model.clone(),
+            provider,
+            source: source.clone(),
         })
         .await?
     {
@@ -231,7 +228,7 @@ async fn quickstart_up(
     };
     let record = catalog
         .into_iter()
-        .find(|m| m.model == model)
+        .find(|m| m.model.engine == engine && m.model.source == source)
         .ok_or_else(|| anyhow::anyhow!("downloaded model not found in catalog"))?;
     println!("activate: {} ({})", record.id, record.display_name);
     render(

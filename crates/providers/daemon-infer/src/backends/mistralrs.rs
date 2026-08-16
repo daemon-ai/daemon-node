@@ -52,6 +52,8 @@ impl MistralRsBackend {
             tool_call_format: ToolCallFormat::Native,
             // Advertise the configured context window when set (the model default otherwise).
             max_context: (params.n_ctx > 0).then_some(params.n_ctx),
+            // mistral.rs advertises tools through its native tool API, not our template renderer.
+            template_tools: false,
         };
         Ok(Self {
             model,
@@ -200,8 +202,19 @@ fn build_request(req: &GenerateRequest) -> RequestBuilder {
             builder = builder.set_sampler_topp(s.top_p as f64);
         }
     }
+    // Additive penalties map directly; the multiplicative repeat penalty has no RequestBuilder
+    // setter in mistral.rs 0.8, so it is llama-engine-only (neutral defaults add nothing here).
+    if s.penalty_freq != 0.0 {
+        builder = builder.set_sampler_frequency_penalty(s.penalty_freq);
+    }
+    if s.penalty_present != 0.0 {
+        builder = builder.set_sampler_presence_penalty(s.penalty_present);
+    }
     if req.max_tokens > 0 {
         builder = builder.set_sampler_max_len(req.max_tokens as usize);
+    }
+    if !req.stop.is_empty() {
+        builder = builder.set_sampler_stop_toks(mistralrs::StopTokens::Seqs(req.stop.clone()));
     }
 
     // Grammar constraint: mistral.rs consumes the Lark dialect (llguidance). When only a GBNF

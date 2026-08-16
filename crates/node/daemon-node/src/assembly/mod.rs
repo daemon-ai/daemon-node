@@ -948,6 +948,22 @@ fn bind_model_surface(mut node_api: NodeApiImpl, a: &NodeAssembly, shared: &Shar
                 state: state.to_string(),
                 downloaded_bytes: status.downloaded_bytes,
                 total_bytes: status.total_bytes,
+                rate_bps: status.rate_bps,
+                eta_seconds: status.eta_seconds,
+                // Present on the post-catalog re-announce of a Completed job (wire v48): the
+                // emit a client's wizard auto-select keys on.
+                result_model_id: status.result_model_id.clone(),
+            });
+        }));
+        // L3 (wire v48): quantize state transitions fan onto the feed — the push that retires the
+        // client's `ModelQuantizes` polling loop.
+        let feed = shared.node_events.clone();
+        models.set_quantize_progress(Arc::new(move |status: daemon_common::QuantizeStatus| {
+            feed.emit(daemon_api::NodeEvent::QuantizeProgress {
+                id: status.id,
+                state: format!("{:?}", status.state),
+                model_id: status.model_id,
+                error: status.error,
             });
         }));
         // L3 (wire v26): the installed-model registry changed (a completed download was cataloged

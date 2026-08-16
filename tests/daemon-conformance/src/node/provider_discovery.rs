@@ -14,8 +14,9 @@ use super::harness::{
     PARTITION,
 };
 use daemon_api::{
-    CustomProvider, CustomProviderSource, ModelApi, ModelDescriptor, ProviderDescriptor,
-    ProviderKindWire, ProviderSelector,
+    CustomProvider, CustomProviderSource, InstallStrategy, ModelApi, ModelDescriptor, ProviderAuth,
+    ProviderDescriptor, ProviderKindWire, ProviderListError, ProviderListErrorKind,
+    ProviderSelector,
 };
 use daemon_host::{CloudCatalog, CredentialStore, MemCredentialStore, MemProfileStore};
 use daemon_store::{CustomProviderRecord, InMemoryStore, SessionStore};
@@ -40,22 +41,19 @@ impl CloudCatalog for RecordingCatalog {
                 display_name: "Anthropic".into(),
                 kind: ProviderKindWire::Cloud,
                 wire_selector: ProviderSelector::GenAi,
-                requires_key: true,
+                // A genai vendor gates both LIST and turns on a key (wire v48 split).
+                list_auth: ProviderAuth::ApiKey,
+                turn_auth: ProviderAuth::ApiKey,
+                install: InstallStrategy::None,
+                actions: Vec::new(),
                 supports_model_discovery: true,
                 default_base_url: None,
                 sign_in: None,
+                available: true,
+                unavailable_reason: None,
             },
-            ProviderDescriptor {
-                id: "daemon_cloud".into(),
-                display_name: "Daemon Cloud".into(),
-                kind: ProviderKindWire::DaemonCloud,
-                wire_selector: ProviderSelector::DaemonApi,
-                // Needs a key to run turns; LISTING stays keyless (asserted below).
-                requires_key: true,
-                supports_model_discovery: true,
-                default_base_url: Some("https://api.daemon.ai/api/v1/".into()),
-                sign_in: None,
-            },
+            // Turn-authed, keyless-listing (asserted below) — the canonical constructor.
+            ProviderDescriptor::daemon_cloud("https://api.daemon.ai/api/v1/"),
         ]
     }
 
@@ -63,9 +61,9 @@ impl CloudCatalog for RecordingCatalog {
         &self,
         provider_id: &str,
         key: Option<String>,
-    ) -> Vec<ModelDescriptor> {
+    ) -> Result<Vec<ModelDescriptor>, ProviderListError> {
         *self.last_key.lock().unwrap() = Some(key.clone());
-        vec![ModelDescriptor {
+        Ok(vec![ModelDescriptor {
             id: format!("{provider_id}/model-1"),
             provider: ProviderSelector::GenAi,
             display_name: None,
@@ -73,7 +71,31 @@ impl CloudCatalog for RecordingCatalog {
             input_price_micros_per_mtok: None,
             output_price_micros_per_mtok: None,
             local: false,
-        }]
+        }])
+    }
+}
+
+/// A discovery hook that always fails its listing with a classified error, so a test can assert
+/// the structured `ProviderModelsResult.error` channel (wire v48) end-to-end.
+struct FailingCatalog;
+
+#[async_trait::async_trait]
+impl CloudCatalog for FailingCatalog {
+    async fn list(&self) -> Vec<ModelDescriptor> {
+        Vec::new()
+    }
+    async fn providers(&self) -> Vec<ProviderDescriptor> {
+        Vec::new()
+    }
+    async fn provider_models(
+        &self,
+        _provider_id: &str,
+        _key: Option<String>,
+    ) -> Result<Vec<ModelDescriptor>, ProviderListError> {
+        Err(ProviderListError {
+            kind: ProviderListErrorKind::AuthRequired,
+            message: "an API key is required".into(),
+        })
     }
 }
 
@@ -95,16 +117,20 @@ impl CloudCatalog for OpenAiProbe {
     async fn providers(&self) -> Vec<ProviderDescriptor> {
         Vec::new()
     }
-    async fn provider_models(&self, _: &str, _: Option<String>) -> Vec<ModelDescriptor> {
-        Vec::new()
+    async fn provider_models(
+        &self,
+        _: &str,
+        _: Option<String>,
+    ) -> Result<Vec<ModelDescriptor>, ProviderListError> {
+        Ok(Vec::new())
     }
     async fn openai_compat_models(
         &self,
         base_url: &str,
         key: Option<String>,
-    ) -> Vec<ModelDescriptor> {
+    ) -> Result<Vec<ModelDescriptor>, ProviderListError> {
         *self.last.lock().unwrap() = Some((base_url.to_string(), key.clone()));
-        vec![ModelDescriptor {
+        Ok(vec![ModelDescriptor {
             id: "gw/model-1".into(),
             provider: ProviderSelector::DaemonApi,
             display_name: None,
@@ -112,7 +138,7 @@ impl CloudCatalog for OpenAiProbe {
             input_price_micros_per_mtok: None,
             output_price_micros_per_mtok: None,
             local: false,
-        }]
+        }])
     }
 }
 
@@ -230,12 +256,29 @@ async fn provider_models_prefers_the_transient_key() {
             None,
         )
         .await;
-    assert_eq!(models.items.len(), 1);
+    assert_eq!(models.models.len(), 1);
+    assert!(models.error.is_none(), "a served listing carries no error");
     assert_eq!(
         *last_key.lock().unwrap(),
         Some(Some("transient-xyz".into())),
         "the transient key must authenticate the LIST call"
     );
+}
+
+/// A hook listing failure surfaces as the structured `ProviderModelsResult.error` (wire v48), not
+/// as a silent empty page — the client renders a key prompt / retry from the classification.
+#[tokio::test]
+async fn provider_models_surfaces_the_structured_listing_error() {
+    let creds: Arc<dyn CredentialStore> = Arc::new(MemCredentialStore::new());
+    let node = assemble_with_catalog(Arc::new(FailingCatalog), creds);
+
+    let result = node
+        .provider_models("anthropic".into(), None, None, None)
+        .await;
+    assert!(result.models.is_empty());
+    let error = result.error.expect("the failure is structured, not silent");
+    assert_eq!(error.kind, ProviderListErrorKind::AuthRequired);
+    assert!(!error.message.is_empty());
 }
 
 #[tokio::test]
@@ -301,6 +344,7 @@ async fn projector_records_are_excluded_and_activate_rejects() {
     );
     let record = |model: &ModelRef, name: &str, arch: &str| InstalledModel {
         id: daemon_models::model_id(model),
+        provider: model.engine.provider_id().to_string(),
         model: model.clone(),
         display_name: name.into(),
         local_path: dir.join(name),
@@ -382,7 +426,11 @@ async fn projector_records_are_excluded_and_activate_rejects() {
     let offered = node
         .provider_models("llama_cpp".into(), None, None, None)
         .await;
-    let ids: Vec<&str> = offered.items.iter().map(|m| m.id.as_str()).collect();
+    assert!(
+        offered.error.is_none(),
+        "a managed engine's empty/served catalog is not an error"
+    );
+    let ids: Vec<&str> = offered.models.iter().map(|m| m.id.as_str()).collect();
     assert!(
         ids.contains(&text_id.as_str()),
         "text model offered: {ids:?}"
@@ -542,8 +590,8 @@ async fn custom_provider_models_route_to_openai_compat_credential_aware() {
     let models = node
         .provider_models("custom/gw".into(), None, None, None)
         .await;
-    assert_eq!(models.items.len(), 1);
-    assert_eq!(models.items[0].provider, ProviderSelector::DaemonApi);
+    assert_eq!(models.models.len(), 1);
+    assert_eq!(models.models[0].provider, ProviderSelector::DaemonApi);
     let (base, key) = last.lock().unwrap().clone().expect("openai_compat called");
     assert_eq!(base, "https://gw.example/v1/");
     assert_eq!(

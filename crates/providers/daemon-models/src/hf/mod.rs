@@ -9,5 +9,6 @@
 pub mod client;
 pub mod files;
 pub mod search;
+pub mod url;
 
 pub use client::HfClient;

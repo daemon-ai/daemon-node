@@ -206,20 +206,31 @@ pub enum ApiRequest {
     },
     /// [`ModelApi::model_files`].
     ModelFiles {
+        /// The managed provider whose catalog is being populated (wire v48; resolved to its
+        /// engine/format filter node-side).
+        provider: String,
         /// The `org/name` repo id.
         repo: String,
         /// The git revision to list (`None` = `main`).
         revision: Option<String>,
-        /// The engine the listed files must be loadable by.
-        engine: ModelEngine,
         /// Resume cursor: the previous page's `next` (the last served file `path`).
         #[serde(default)]
         after: Option<String>,
     },
     /// [`ModelApi::model_download`].
     ModelDownload {
-        /// The model to acquire.
-        model: ModelRef,
+        /// The managed provider whose catalog the model installs into (wire v48; resolved to its
+        /// engine node-side).
+        provider: String,
+        /// Where the model's bytes come from.
+        source: ModelSource,
+    },
+    /// [`ModelApi::model_install_from_url`] (wire v48).
+    ModelInstallFromUrl {
+        /// The managed provider whose catalog the model installs into.
+        provider: String,
+        /// The pasted Hugging Face URL (model page, `/tree/...`, or a direct `/resolve/...`).
+        url: String,
     },
     /// [`ModelApi::model_downloads`].
     ModelDownloads,
@@ -1437,6 +1448,8 @@ pub enum ApiResponse {
     ModelFiles(WirePage<ModelFile>),
     /// A started download's job handle.
     ModelDownloadStarted(DownloadId),
+    /// An install-from-URL outcome (wire v48): started, or a file choice is required.
+    ModelInstallFromUrl(InstallFromUrlOutcome),
     /// Download job statuses.
     ModelDownloads(Vec<DownloadStatus>),
     /// The installed-model catalog.
@@ -1484,8 +1497,9 @@ pub enum ApiResponse {
     /// The discoverable provider catalog (`provider_catalog`): local engines + genai vendors +
     /// Daemon Cloud.
     ProviderCatalog(Vec<ProviderDescriptor>),
-    /// A page of a provider's discoverable models (`provider_models`), descriptor-id order.
-    ProviderModels(WirePage<ModelDescriptor>),
+    /// A provider's discoverable models (`provider_models`), descriptor-id order, with an
+    /// explicit structured failure channel (wire v48).
+    ProviderModels(ProviderModelsResult),
     /// The persisted user-defined custom providers (`custom_provider_list`).
     CustomProviders(Vec<CustomProvider>),
     /// A profile distribution (profile_export).
@@ -2454,20 +2468,21 @@ mod auth_contract_tests {
     }
 
     /// The contract wire version (`daemon_common::WireVersion::CURRENT`, mirrored by
-    /// [`crate::API_WIRE_VERSION`]) is pinned to the sealed surface: v47 (the additive
-    /// `profile-spec`/`profile-info` node-seeded placeholder marker + node-side retirement — on
-    /// top of v46's `AgentsChanged` agents-catalog pointer + fast `AgentDiscover` presence reply,
-    /// v45's vhc disk-custody surface, v44's per-round det-state digest, and v43's
-    /// `VhcSwitchModule` request + `VhcSwitchOutcome` response). Distinct from the
-    /// transport-envelope [`WIRE_VERSION`] above (= 2), which these additive rungs did not touch.
-    /// Bumping the contract version is a deliberate act — this assertion is the gate.
+    /// [`crate::API_WIRE_VERSION`]) is pinned to the sealed surface: v48 (the provider-centric
+    /// model-catalog surface: provider-keyed `ModelSearch`/`ModelFiles`/`ModelDownload`/
+    /// `ModelRecommend`, `ModelInstallFromUrl`, `ProviderDescriptor` capabilities
+    /// (`list_auth`/`turn_auth`/`install`/`actions`), structured `ProviderModels` results, and
+    /// rate/eta/quantize-progress event enrichment — on top of v47's node-seeded placeholder
+    /// marker and v46's agents-catalog pointer). Distinct from the transport-envelope
+    /// [`WIRE_VERSION`] above (= 2), which these rungs did not touch. Bumping the contract
+    /// version is a deliberate act — this assertion is the gate.
     #[test]
-    fn contract_wire_version_is_v47() {
+    fn contract_wire_version_is_v48() {
         assert_eq!(
             daemon_common::WireVersion::CURRENT,
-            daemon_common::WireVersion(47)
+            daemon_common::WireVersion(48)
         );
-        assert_eq!(crate::API_WIRE_VERSION, daemon_common::WireVersion(47));
+        assert_eq!(crate::API_WIRE_VERSION, daemon_common::WireVersion(48));
     }
 
     /// The `api/<N>` feature string is formatted from the API mirror version (never hardcoded)
@@ -2622,7 +2637,7 @@ mod auth_contract_tests {
             assert_eq!(&decoded, res);
         }
 
-        // Every AuthFlowKind variant (the 4 new ones + the 2 originals).
+        // Every AuthFlowKind variant.
         for kind in [
             AuthFlowKind::MatrixSso,
             AuthFlowKind::OAuth2Pkce,
@@ -2630,6 +2645,9 @@ mod auth_contract_tests {
             AuthFlowKind::UserToken,
             AuthFlowKind::PhoneOtp,
             AuthFlowKind::QrPairing,
+            AuthFlowKind::UserPassword,
+            AuthFlowKind::AcpAuthenticate,
+            AuthFlowKind::DeviceCode,
         ] {
             let mut bytes = Vec::new();
             ciborium::into_writer(&kind, &mut bytes).expect("encode AuthFlowKind");

@@ -65,6 +65,9 @@ pub const FAMILY: &str = "oauth2";
 pub const OPENROUTER_FAMILY: &str = "provider/openrouter";
 /// The Hugging Face provider-bound family (registered only when an operator supplies a client id).
 pub const HUGGINGFACE_FAMILY: &str = "provider/huggingface";
+/// The GitHub Copilot provider-bound family — an RFC 8628 DEVICE flow (not authorization-code):
+/// served by [`DeviceFlowFactory`], advertised by the `github_copilot` provider row's `sign_in`.
+pub const GITHUB_COPILOT_FAMILY: &str = "provider/github_copilot";
 
 /// The `auth_begin` param naming the IdP's authorization endpoint URL (generic family).
 pub const PARAM_AUTHORIZATION_ENDPOINT: &str = "authorization_endpoint";
@@ -275,6 +278,49 @@ pub fn huggingface(client_id: String) -> OAuthFlowDescriptor {
             account_label: "huggingface",
         },
         params_schema: Vec::new(),
+    }
+}
+
+/// The parameterization of the RFC 8628 device-code engine — the second, poll-shaped engine next
+/// to the redirect-shaped [`OAuthFlowDescriptor`] one: the node
+/// requests a `user_code` from the vendor's device-authorization endpoint, the client shows
+/// "visit URL, enter code" ([`AuthChallenge::Message`]) and polls ([`AuthStepInput::Poll`]) while
+/// the node exchanges the parked `device_code` at the token endpoint. Device clients are public by
+/// construction (a well-known client id, no secret, no redirect).
+#[derive(Clone, Debug)]
+pub struct DeviceFlowDescriptor {
+    /// The auth family this descriptor serves (`auth_begin.family`).
+    pub family: &'static str,
+    /// A human display name for capability discovery.
+    pub display_name: &'static str,
+    /// The device-authorization endpoint (RFC 8628 §3.1) minting `device_code` + `user_code`.
+    pub device_code_endpoint: &'static str,
+    /// The token endpoint polled with the `device_code` grant (§3.4).
+    pub token_endpoint: &'static str,
+    /// The PUBLIC client id (device flows carry no secret).
+    pub client_id: &'static str,
+    /// Space-delimited scopes, when the flow requests any.
+    pub scopes: Option<&'static str>,
+    /// The fixed provider label the minted token is slotted under
+    /// ([`CredentialSlotKind::ProviderKeyForProfile`], like the OpenRouter key-mint).
+    pub account_label: &'static str,
+}
+
+/// The curated GitHub Copilot device-flow descriptor (`"provider/github_copilot"`, empty params
+/// schema). The minted GitHub OAuth token is the key genai's `github_copilot` adapter presents
+/// (it runs the Copilot token exchange internally); stored BARE under the bound profile's
+/// credential slot, exactly like a pasted key.
+pub fn github_copilot() -> DeviceFlowDescriptor {
+    DeviceFlowDescriptor {
+        family: GITHUB_COPILOT_FAMILY,
+        display_name: "GitHub Copilot",
+        device_code_endpoint: "https://github.com/login/device/code",
+        token_endpoint: "https://github.com/login/oauth/access_token",
+        // The GitHub Copilot app's well-known public device-flow client id (the one the
+        // first-party editor plugins present); device clients are public by design.
+        client_id: "Iv1.b507a08c87ecfe98",
+        scopes: Some("read:user"),
+        account_label: "github_copilot",
     }
 }
 
@@ -627,6 +673,214 @@ impl DescriptorPendingFlow {
                     slot: CredentialSlotKind::ProviderKeyForProfile,
                 })
             }
+        }
+    }
+}
+
+/// The device-code engine: a factory over a [`DeviceFlowDescriptor`] + the shared SSRF-safe
+/// egress client. `begin` mints the vendor's `device_code`/`user_code`; each client `Poll` runs
+/// (at most) one token-endpoint exchange, self-paced against the vendor's minimum interval so an
+/// eager client can never hammer the endpoint into `slow_down` bans.
+pub struct DeviceFlowFactory {
+    descriptor: Arc<DeviceFlowDescriptor>,
+    http: EgressClient,
+}
+
+impl DeviceFlowFactory {
+    /// A factory over `descriptor` with a fresh [`EgressClient`]. Fails only when the TLS backend
+    /// cannot initialize (a boot-environment defect) — surfaced, not defaulted.
+    pub fn new(descriptor: DeviceFlowDescriptor) -> Result<Self, ApiError> {
+        let http = EgressClient::new(EgressConfig {
+            user_agent: Some("daemon".to_string()),
+            timeout: Some(TOKEN_EXCHANGE_TIMEOUT),
+        })
+        .map_err(|e| ApiError::Other(format!("device auth: building egress client: {e}")))?;
+        Ok(Self {
+            descriptor: Arc::new(descriptor),
+            http,
+        })
+    }
+}
+
+#[async_trait]
+impl AuthFlowFactory for DeviceFlowFactory {
+    fn family(&self) -> &str {
+        self.descriptor.family
+    }
+
+    fn provider_info(&self) -> AuthProviderInfo {
+        AuthProviderInfo {
+            family: self.descriptor.family.to_string(),
+            flow_kind: AuthFlowKind::DeviceCode,
+            display_name: self.descriptor.display_name.to_string(),
+            // Provider-bound: the node owns every parameter.
+            params_schema: Vec::new(),
+        }
+    }
+
+    async fn begin(
+        &self,
+        _params: &BTreeMap<String, String>,
+        _redirect_uri: &str, // a device flow has no redirect; the wire field is unused
+    ) -> Result<Box<dyn PendingAuthFlow>, ApiError> {
+        let d = &self.descriptor;
+        let mut pairs: Vec<(&str, &str)> = vec![("client_id", d.client_id)];
+        if let Some(scopes) = d.scopes {
+            pairs.push(("scope", scopes));
+        }
+        // RFC 8628 §3.1; `Accept: application/json` — GitHub answers form-encoded otherwise.
+        let request = EgressRequest::post_form(d.device_code_endpoint, &pairs)
+            .header("accept", "application/json");
+        let response = self
+            .http
+            .execute(request, Redirects::None)
+            .await
+            .map_err(|e| ApiError::Other(format!("device auth: device-code request: {e}")))?;
+        let status = response.status();
+        let body = response.text().await.map_err(|e| {
+            ApiError::Other(format!("device auth: reading device-code response: {e}"))
+        })?;
+        if !status.is_success() {
+            return Err(ApiError::Other(format!(
+                "device auth: device-code endpoint returned {status}: {body}"
+            )));
+        }
+        let json: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
+            ApiError::Other(format!("device auth: device-code response not JSON: {e}"))
+        })?;
+        let field = |k: &str| -> Result<String, ApiError> {
+            json.get(k)
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .ok_or_else(|| ApiError::Other(format!("device auth: response carries no `{k}`")))
+        };
+        let device_code = field("device_code")?;
+        let user_code = field("user_code")?;
+        let verification_uri = field("verification_uri")?;
+        // §3.2: the minimum poll interval (seconds); absent = the spec default of 5.
+        let interval =
+            Duration::from_secs(json.get("interval").and_then(|v| v.as_u64()).unwrap_or(5));
+
+        Ok(Box::new(DevicePendingFlow {
+            descriptor: self.descriptor.clone(),
+            http: self.http.clone(),
+            device_code,
+            message: format!("Visit {verification_uri} and enter code {user_code}"),
+            interval: std::sync::Mutex::new(interval),
+            last_poll: std::sync::Mutex::new(None),
+        }))
+    }
+}
+
+/// A parked device flow: the secret `device_code` + the user-facing instruction, plus the poll
+/// pacing state (`interval` grows on a vendor `slow_down`).
+struct DevicePendingFlow {
+    descriptor: Arc<DeviceFlowDescriptor>,
+    http: EgressClient,
+    device_code: String,
+    message: String,
+    interval: std::sync::Mutex<Duration>,
+    last_poll: std::sync::Mutex<Option<std::time::Instant>>,
+}
+
+impl DevicePendingFlow {
+    /// The standing "visit URL, enter code" challenge re-presented on every pending poll.
+    fn challenge(&self) -> AuthChallenge {
+        AuthChallenge::Message {
+            text: self.message.clone(),
+        }
+    }
+
+    /// Whether a vendor exchange is due: rate-limits client polls to the vendor's minimum interval
+    /// (an early poll just re-presents the challenge without touching the network).
+    fn exchange_due(&self) -> bool {
+        let interval = *self.interval.lock().expect("interval lock");
+        let mut last = self.last_poll.lock().expect("last_poll lock");
+        let now = std::time::Instant::now();
+        match *last {
+            Some(at) if now.duration_since(at) < interval => false,
+            _ => {
+                *last = Some(now);
+                true
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl PendingAuthFlow for DevicePendingFlow {
+    fn initial_challenge(&self) -> AuthChallenge {
+        self.challenge()
+    }
+
+    async fn step(&self, input: AuthStepInput) -> Result<AuthStepOutcome, ApiError> {
+        if !matches!(input, AuthStepInput::Poll) {
+            return Err(ApiError::Other(
+                "device auth: this flow expects Poll steps (visit the URL, enter the code)".into(),
+            ));
+        }
+        if !self.exchange_due() {
+            return Ok(AuthStepOutcome::Challenge(self.challenge()));
+        }
+        // RFC 8628 §3.4: exchange the device code; §3.5 classifies the pending/terminal errors.
+        let d = &self.descriptor;
+        let pairs: Vec<(&str, &str)> = vec![
+            ("client_id", d.client_id),
+            ("device_code", &self.device_code),
+            ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+        ];
+        let request =
+            EgressRequest::post_form(d.token_endpoint, &pairs).header("accept", "application/json");
+        let response = self
+            .http
+            .execute(request, Redirects::None)
+            .await
+            .map_err(|e| ApiError::Other(format!("device auth: token exchange: {e}")))?;
+        let body = response
+            .text()
+            .await
+            .map_err(|e| ApiError::Other(format!("device auth: reading token response: {e}")))?;
+        let json: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|e| ApiError::Other(format!("device auth: token response not JSON: {e}")))?;
+
+        if let Some(token) = json
+            .get("access_token")
+            .and_then(|t| t.as_str())
+            .filter(|t| !t.is_empty())
+        {
+            let family = d.family;
+            let account_label = d.account_label;
+            return Ok(AuthStepOutcome::Completed(AuthOutcome {
+                // The BARE minted token rides the exact downstream path as a pasted API key.
+                credential_blob: token.to_string(),
+                credential_ref: format!("{family}/{account_label}"),
+                account_label: account_label.to_string(),
+                transport_instance: TransportId::new(format!("{family}/{account_label}")),
+                slot: CredentialSlotKind::ProviderKeyForProfile,
+            }));
+        }
+        match json.get("error").and_then(|e| e.as_str()) {
+            // Still pending: the user has not finished the browser side — re-present and re-poll.
+            Some("authorization_pending") => Ok(AuthStepOutcome::Challenge(self.challenge())),
+            // §3.5: back off — grow OUR pacing interval so subsequent polls self-throttle.
+            Some("slow_down") => {
+                let mut interval = self.interval.lock().expect("interval lock");
+                *interval += Duration::from_secs(5);
+                Ok(AuthStepOutcome::Challenge(self.challenge()))
+            }
+            Some(terminal) => {
+                let detail = json
+                    .get("error_description")
+                    .and_then(|e| e.as_str())
+                    .unwrap_or_default();
+                Err(ApiError::Other(format!(
+                    "device auth: authorization failed: {terminal} {detail}"
+                )))
+            }
+            None => Err(ApiError::Other(
+                "device auth: token response carries neither access_token nor error".into(),
+            )),
         }
     }
 }

@@ -304,6 +304,7 @@ fn classify(req: &ApiRequest) -> Coverage {
         ModelSearch { .. }
         | ModelFiles { .. }
         | ModelDownload { .. }
+        | ModelInstallFromUrl { .. }
         | ModelDownloads
         | ModelCancel { .. }
         | ModelPause { .. }

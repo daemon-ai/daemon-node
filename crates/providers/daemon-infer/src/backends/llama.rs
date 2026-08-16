@@ -32,10 +32,18 @@ use tokio_util::sync::CancellationToken;
 
 use crate::backend::{BackendChunk, BackendError, GenerateRequest, InferenceBackend};
 use crate::protocol::{Capabilities, Constraint, ModelParams, Sampling, ToolCallFormat, Usage};
+use crate::template::ChatTemplate;
 use crate::tooling;
 
 /// The output-token cap when a request leaves `max_tokens` unset (`0`).
 const DEFAULT_MAX_TOKENS: u32 = 1024;
+
+/// The generation context's logical batch size (`n_batch`), set explicitly rather than inherited
+/// from the llama.cpp default. Prefill is chunked to this size (see [`decode_span`]) — one decode
+/// call above `n_batch` trips `GGML_ASSERT(n_tokens_all <= cparams.n_batch)` in llama.cpp, which
+/// is an `abort()`, not a recoverable error: it killed the worker process mid-turn and crash-looped
+/// the supervisor. Matches the llama.cpp / llama-server default (`n_ubatch` stays 512 below it).
+const N_BATCH: u32 = 2048;
 
 /// A persistent generation context reused across [`Task::Generate`] jobs for prompt caching.
 ///
@@ -65,6 +73,64 @@ struct GenSession<'a> {
 /// The length of the longest shared leading run of `a` and `b` (the reusable KV-cache prefix).
 fn find_common_prefix<T: PartialEq>(a: &[T], b: &[T]) -> usize {
     a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
+}
+
+/// Decode `span` into sequence 0 starting at absolute KV position `pos0`, submitting at most
+/// `max_chunk` (= `n_batch`) tokens per `llama_decode` call — llama-server parity: `update_slots`
+/// never exceeds `n_batch` per decode, which keeps the llama.cpp batch-size assert unreachable
+/// for arbitrarily long prompts.
+///
+/// Logits are requested only for the very last token of the span (the sampler's seed position);
+/// every other position stays output-free. On [`DecodeError::NoKvCacheSlot`] the same window is
+/// retried with a halved chunk (llama-server's recovery for KV-cache fragmentation), down to a
+/// single token before the failure is surfaced. Cancellation is polled between chunks so a long
+/// prefill aborts with bounded latency; the CALLER owns KV-cache cleanup on any error.
+///
+/// Returns the token count of the final decode call: the sampler reads the logits row at
+/// `returned - 1`, exactly as it would for a single-batch prefill.
+fn decode_span(
+    ctx: &mut LlamaContext<'_>,
+    span: &[LlamaToken],
+    pos0: usize,
+    max_chunk: usize,
+    cancel: &CancellationToken,
+) -> Result<i32, BackendError> {
+    let max_chunk = max_chunk.max(1);
+    let mut chunk_size = max_chunk;
+    let mut off = 0usize;
+    let mut last_decoded: i32 = 0;
+    while off < span.len() {
+        if cancel.is_cancelled() {
+            return Err(BackendError::cancelled());
+        }
+        let end = (off + chunk_size).min(span.len());
+        let chunk = &span[off..end];
+        let is_span_end = end == span.len();
+        let last = chunk.len() - 1;
+        let mut batch = LlamaBatch::new(chunk.len(), 1);
+        for (i, token) in chunk.iter().enumerate() {
+            batch
+                .add(
+                    *token,
+                    (pos0 + off + i) as i32,
+                    &[0],
+                    is_span_end && i == last,
+                )
+                .map_err(|e| BackendError::transient(format!("batch add: {e}")))?;
+        }
+        match ctx.decode(&mut batch) {
+            Ok(()) => {
+                last_decoded = batch.n_tokens();
+                off = end;
+                chunk_size = max_chunk;
+            }
+            Err(DecodeError::NoKvCacheSlot) if chunk_size > 1 => {
+                chunk_size /= 2;
+            }
+            Err(e) => return Err(classify_decode(e)),
+        }
+    }
+    Ok(last_decoded)
 }
 
 /// One generation handed to the dedicated llama thread.
@@ -219,12 +285,17 @@ fn worker_thread(
         );
     }
 
+    // Compile the GGUF's chat template and probe its capabilities once — the render path uses it
+    // for every turn, and `template_tools` feeds the node's tool-advertisement gate.
+    let template = load_chat_template(&model);
+
     let capabilities = Capabilities {
         supports_native_tools: false,
         supports_streaming: true,
         // The engine emits no native tool calls; Phase 1b parses text per this format.
         tool_call_format: ToolCallFormat::HermesXml,
         max_context: Some(model.n_ctx_train()),
+        template_tools: template.as_ref().is_some_and(|t| t.caps().supports_tools),
     };
     if ready_tx.send(Ok(capabilities)).is_err() {
         return;
@@ -241,6 +312,7 @@ fn worker_thread(
                 let result = run_generation(
                     &backend,
                     &model,
+                    template.as_ref(),
                     &params,
                     &job.req,
                     &job.chunks,
@@ -274,8 +346,22 @@ fn run_embed(
 
     let mut out = Vec::with_capacity(texts.len());
     for text in texts {
+        let mut tokens = model
+            .str_to_token(text, AddBos::Always)
+            .map_err(|e| BackendError::transient(format!("tokenize: {e}")))?;
+        // Over-long inputs are clipped rather than failing the whole batch (embeddings tolerate it).
+        if tokens.len() as u32 > n_ctx {
+            tokens.truncate(n_ctx as usize);
+        }
+
+        // Mean pooling requires the whole sequence in ONE decode (chunking would pool only the
+        // final chunk), so size the batch to the input — llama-server likewise forces
+        // n_batch == n_ubatch in embeddings mode to keep the llama.cpp batch asserts unreachable.
+        let n_tokens = tokens.len().max(1) as u32;
         let mut ctx_params = LlamaContextParams::default()
             .with_n_ctx(NonZeroU32::new(n_ctx))
+            .with_n_batch(n_tokens)
+            .with_n_ubatch(n_tokens)
             .with_embeddings(true)
             .with_pooling_type(LlamaPoolingType::Mean);
         if let Some(threads) = params.n_threads {
@@ -284,14 +370,6 @@ fn run_embed(
         let mut ctx = model
             .new_context(backend, ctx_params)
             .map_err(|e| BackendError::out_of_memory(format!("create embedding context: {e}")))?;
-
-        let mut tokens = model
-            .str_to_token(text, AddBos::Always)
-            .map_err(|e| BackendError::transient(format!("tokenize: {e}")))?;
-        // Over-long inputs are clipped rather than failing the whole batch (embeddings tolerate it).
-        if tokens.len() as u32 > n_ctx {
-            tokens.truncate(n_ctx as usize);
-        }
 
         let mut batch = LlamaBatch::new(tokens.len().max(1), 1);
         for (i, token) in tokens.iter().enumerate() {
@@ -332,6 +410,7 @@ fn l2_normalize(v: &mut [f32]) {
 fn run_generation<'a>(
     backend: &LlamaBackend,
     model: &'a LlamaModel,
+    template: Option<&ChatTemplate>,
     params: &ModelParams,
     req: &GenerateRequest,
     chunks: &UnboundedSender<BackendChunk>,
@@ -342,7 +421,7 @@ fn run_generation<'a>(
         return Err(BackendError::cancelled());
     }
 
-    let prompt = render_prompt(model, req);
+    let prompt = render_prompt(model, template, req);
 
     let n_ctx = if params.n_ctx > 0 {
         params.n_ctx
@@ -364,7 +443,9 @@ fn run_generation<'a>(
 
     // (Re)create the persistent context on first use or after an invalidation.
     if session.is_none() {
-        let mut ctx_params = LlamaContextParams::default().with_n_ctx(NonZeroU32::new(n_ctx));
+        let mut ctx_params = LlamaContextParams::default()
+            .with_n_ctx(NonZeroU32::new(n_ctx))
+            .with_n_batch(N_BATCH);
         if let Some(threads) = params.n_threads {
             ctx_params = ctx_params.with_n_threads(threads as i32);
         }
@@ -415,21 +496,19 @@ fn run_generation<'a>(
         return Err(BackendError::transient(format!("kv cache trim: {e}")));
     }
 
-    // Prefill the divergent suffix, positions continuing from the reused prefix length.
+    // Prefill the divergent suffix in n_batch-sized chunks, positions continuing from the reused
+    // prefix length. Any failure (including a mid-prefill cancel) leaves a partial sequence in the
+    // KV cache, so reset it before surfacing — the next call prefills cleanly from scratch.
     let suffix = &tokens[common..];
-    let mut batch = LlamaBatch::new(suffix.len().max(1), 1);
-    let last = suffix.len().saturating_sub(1);
-    for (i, token) in suffix.iter().enumerate() {
-        batch
-            .add(*token, (common + i) as i32, &[0], i == last)
-            .map_err(|e| BackendError::transient(format!("batch add: {e}")))?;
-    }
-    if let Err(e) = session.ctx.decode(&mut batch) {
-        let failure = classify_decode(e);
-        session.ctx.clear_kv_cache();
-        session.cached_tokens.clear();
-        return Err(failure);
-    }
+    let prefill_tokens =
+        match decode_span(&mut session.ctx, suffix, common, N_BATCH as usize, cancel) {
+            Ok(n) => n,
+            Err(e) => {
+                session.ctx.clear_kv_cache();
+                session.cached_tokens.clear();
+                return Err(e);
+            }
+        };
 
     let mut sampler = build_sampler(model, &req.sampling, req.constraint.as_ref());
 
@@ -441,6 +520,11 @@ fn run_generation<'a>(
     .min(n_ctx - prompt_len);
 
     let mut decoder = encoding_rs::UTF_8.new_decoder();
+    // The logits row of the most recent decode: the prefill's final chunk first, then row 0 of
+    // each single-token generation batch.
+    let mut logits_idx = prefill_tokens - 1;
+    // One reusable single-token batch for the generation loop.
+    let mut gen_batch = LlamaBatch::new(1, 1);
     // The next free KV position after the prefilled prompt (prefix + suffix == full prompt).
     let mut n_cur = prompt_len as i32;
     let mut produced: u32 = 0;
@@ -452,15 +536,18 @@ fn run_generation<'a>(
     // text is surfaced; without tools, stream pieces live for low latency.
     let has_tools = !req.tools.is_empty();
     let mut buffered = String::new();
+    // Stop sequences: pieces route through the matcher, which holds back any tail that could
+    // still become a stop; on a full match the stop text is swallowed and generation cuts.
+    let mut stop_matcher = crate::stop::StopMatcher::new(&req.stop);
 
-    while produced < budget {
+    'generation: while produced < budget {
         if cancel.is_cancelled() {
             session.ctx.clear_kv_cache();
             session.cached_tokens.clear();
             return Err(BackendError::cancelled());
         }
 
-        let token = sampler.sample(&session.ctx, batch.n_tokens() - 1);
+        let token = sampler.sample(&session.ctx, logits_idx);
         sampler.accept(token);
         if model.is_eog_token(token) {
             break;
@@ -478,26 +565,50 @@ fn run_generation<'a>(
         }
         let _ = decoder.decode_to_string(&bytes, &mut piece, false);
         if !piece.is_empty() {
-            if has_tools {
-                buffered.push_str(&piece);
-            } else if chunks.send(BackendChunk::Text(piece)).is_err() {
-                // The consumer dropped the receiver (cancel/abort upstream); stop quietly.
-                break;
+            let (release, stop_hit) = if stop_matcher.is_active() {
+                stop_matcher.push(&piece)
+            } else {
+                (piece, false)
+            };
+            if !release.is_empty() {
+                if has_tools {
+                    buffered.push_str(&release);
+                } else if chunks.send(BackendChunk::Text(release)).is_err() {
+                    // The consumer dropped the receiver (cancel/abort upstream); stop quietly.
+                    break;
+                }
+            }
+            if stop_hit {
+                // Cut BEFORE decoding this token into the KV cache — like the EOG break above, the
+                // final token is sampled but never decoded, so it must not be recorded in
+                // `cached_tokens` (the cache/token bookkeeping would desync the next prefix match).
+                break 'generation;
             }
         }
 
         generated.push(token);
-        batch.clear();
-        batch
+        gen_batch.clear();
+        gen_batch
             .add(token, n_cur, &[0], true)
             .map_err(|e| BackendError::transient(format!("batch add: {e}")))?;
         n_cur += 1;
         produced += 1;
-        if let Err(e) = session.ctx.decode(&mut batch) {
+        if let Err(e) = session.ctx.decode(&mut gen_batch) {
             let failure = classify_decode(e);
             session.ctx.clear_kv_cache();
             session.cached_tokens.clear();
             return Err(failure);
+        }
+        logits_idx = 0;
+    }
+
+    // EOG/budget without a stop hit: release any held-back tail that never completed a stop.
+    let tail = stop_matcher.flush();
+    if !tail.is_empty() {
+        if has_tools {
+            buffered.push_str(&tail);
+        } else {
+            let _ = chunks.send(BackendChunk::Text(tail));
         }
     }
 
@@ -525,9 +636,72 @@ fn run_generation<'a>(
     })
 }
 
-/// Render the conversation into a prompt via the model's built-in chat template, falling back to a
-/// simple role-tagged concatenation when the GGUF carries no template.
-fn render_prompt(model: &LlamaModel, req: &GenerateRequest) -> String {
+/// Compile the GGUF's chat template (`tokenizer.chat_template`) and probe its capabilities.
+/// `None` when the model carries no template or it fails to compile — the render path then uses
+/// the C-API `apply_chat_template` as before.
+fn load_chat_template(model: &LlamaModel) -> Option<ChatTemplate> {
+    // Templates run from a few hundred bytes (ChatML) to tens of KiB (DeepSeek/Kimi); retry with
+    // the reported size when the first buffer is too small.
+    let source = match model.get_chat_template(64 * 1024) {
+        Ok(s) => s,
+        Err(llama_cpp_4::ChatTemplateError::BuffSizeError(needed)) => {
+            model.get_chat_template(needed).ok()?
+        }
+        Err(_) => return None,
+    };
+    // The end-of-turn token text: templates like Mistral's interleave `{{ eos_token }}` between
+    // history turns, so it must render as the real string ("" when the model defines none).
+    let eos = model
+        .token_to_str(model.token_eos(), Special::Tokenize)
+        .unwrap_or_default();
+    match ChatTemplate::new(&source, &eos) {
+        Ok(t) => {
+            tracing::info!(caps = ?t.caps(), "llama: chat template compiled");
+            Some(t)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "llama: chat template failed to compile; using C-API path");
+            None
+        }
+    }
+}
+
+/// Render the conversation into a prompt.
+///
+/// Preference order:
+/// 1. The compiled GGUF template (minijinja) — with tools passed NATIVELY when the template was
+///    trained on them (no text preamble), or the legacy preamble folded into the system prompt
+///    when tools arrived for a template without tool support (the node's "preamble" override).
+/// 2. The C-API `apply_chat_template` (role+content only; tools via preamble).
+/// 3. A plain role-tagged concatenation.
+fn render_prompt(
+    model: &LlamaModel,
+    template: Option<&ChatTemplate>,
+    req: &GenerateRequest,
+) -> String {
+    if let Some(t) = template {
+        let native_tools = t.caps().supports_tools && !req.tools.is_empty();
+        if !native_tools && !req.tools.is_empty() {
+            // Only reachable via the node's explicit "preamble" override (the auto gate never
+            // sends tools at a tool-blind template) — never a silent mis-advertisement.
+            tracing::warn!(
+                tools = req.tools.len(),
+                "llama: template has no tool support; advertising via legacy text preamble"
+            );
+        }
+        let (system, tools) = if native_tools {
+            (req.system.clone(), req.tools.as_slice())
+        } else {
+            (compose_system(req), &[][..])
+        };
+        // A render error (e.g. tool-call history through a template without tool_calls support)
+        // degrades to the C-API path rather than failing the turn.
+        match t.render(&system, &req.messages, tools) {
+            Ok(prompt) => return prompt,
+            Err(e) => tracing::warn!(error = %e, "llama: template render failed; using C-API path"),
+        }
+    }
+
     let mut messages = Vec::new();
     let system = compose_system(req);
     if !system.is_empty() {
@@ -603,14 +777,27 @@ fn build_sampler(
         None => None,
     };
 
+    // Penalties adjust logits BEFORE candidate restriction (upstream llama.cpp chain order), so a
+    // penalized token can actually fall out of the top-k/top-p nucleus. Neutral knobs add nothing.
+    let penalties = s.penalties_active().then(|| {
+        LlamaSampler::penalties(
+            s.penalty_last_n,
+            s.penalty_repeat,
+            s.penalty_freq,
+            s.penalty_present,
+        )
+    });
+
     if s.temperature <= 0.0 {
         let mut chain = Vec::new();
         chain.extend(grammar);
+        chain.extend(penalties);
         chain.push(LlamaSampler::greedy());
         return LlamaSampler::chain_simple(chain);
     }
     let mut chain = Vec::new();
     chain.extend(grammar);
+    chain.extend(penalties);
     if s.top_k > 0 {
         chain.push(LlamaSampler::top_k(s.top_k as i32));
     }

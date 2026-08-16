@@ -53,6 +53,7 @@ fn llama_worker(bin: PathBuf, model: &str, embeddings: bool) -> WorkerConfig {
         top_p: 0.95,
         top_k: 40,
         seed: 42,
+        ..Default::default()
     };
     wc.max_tokens = 64;
     wc.load_timeout = Duration::from_secs(120);

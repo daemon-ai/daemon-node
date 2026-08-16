@@ -35,7 +35,10 @@ impl CronWorker {
         match s.trim().to_lowercase().as_str() {
             "mock" => Some(Mock),
             "genai" | "openai" | "anthropic" | "gemini" | "groq" | "deep_seek" | "deepseek"
-            | "xai" | "open_router" | "openrouter" | "cohere" => Some(GenAi),
+            | "xai" | "open_router" | "openrouter" | "cohere" | "ollama" | "moonshot" | "zai"
+            | "minimax" | "fireworks" | "together" | "nebius" | "aliyun" | "vertex"
+            | "bedrock_api" | "bedrock" | "baidu" | "bigmodel" | "ollama_cloud"
+            | "github_copilot" | "aihubmix" | "mimo" | "opencode_go" => Some(GenAi),
             "llama_cpp" | "llamacpp" => Some(LlamaCpp),
             "mistral_rs" | "mistralrs" => Some(MistralRs),
             _ => None,

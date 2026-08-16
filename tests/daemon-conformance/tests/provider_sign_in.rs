@@ -6,7 +6,8 @@
 //! catalog row assertion is a `bins/daemon` binary-level test.
 
 use daemon_api::{
-    from_cbor, to_cbor, ProviderDescriptor, ProviderKindWire, ProviderSelector, ProviderSignIn,
+    from_cbor, to_cbor, InstallStrategy, ProviderAuth, ProviderDescriptor, ProviderKindWire,
+    ProviderSelector, ProviderSignIn,
 };
 use serde::Serialize;
 
@@ -17,13 +18,18 @@ fn provider_descriptor_with_sign_in_round_trips() {
         display_name: "OpenRouter".into(),
         kind: ProviderKindWire::Cloud,
         wire_selector: ProviderSelector::GenAi,
-        requires_key: true,
+        list_auth: ProviderAuth::ApiKey,
+        turn_auth: ProviderAuth::ApiKey,
+        install: InstallStrategy::None,
+        actions: Vec::new(),
         supports_model_discovery: true,
         default_base_url: None,
         sign_in: Some(ProviderSignIn {
             family: "provider/openrouter".into(),
             label: "Sign in with OpenRouter".into(),
         }),
+        available: true,
+        unavailable_reason: None,
     };
     assert_eq!(
         with,

@@ -121,7 +121,6 @@ use daemon_api::{
     ProfileInfo,
     ProfileSpec,
     ProviderDescriptor,
-    ProviderKindWire,
     ProviderSelector,
     RecordMetaArgs,
     RoomInfo,
@@ -297,19 +296,28 @@ pub trait CloudCatalog: Send + Sync {
     /// One provider's discoverable models, keyed by [`ProviderDescriptor::id`]. Credential-aware for
     /// genai vendors (the resolved `key` authenticates the LIST call); Daemon Cloud lists keyless.
     /// Local engines are served by the host from the `ModelManager` catalog, not here.
-    async fn provider_models(&self, provider_id: &str, key: Option<String>)
-        -> Vec<ModelDescriptor>;
+    /// Structured outcome (wire v48): a listing failure returns a classified
+    /// [`daemon_api::ProviderListError`] instead of masquerading as an empty catalog.
+    async fn provider_models(
+        &self,
+        provider_id: &str,
+        key: Option<String>,
+    ) -> Result<Vec<ModelDescriptor>, daemon_api::ProviderListError>;
 
     /// List an arbitrary OpenAI-compatible endpoint's models via `GET {base_url}/models`,
     /// credential-aware (`key` is sent as a bearer when present, keyless otherwise). Backs custom
     /// providers: the host resolves the stored `base_url` + credential and calls this, so the host
-    /// never links `genai`/egress. Default: empty (a catalog with no OpenAI-compatible probe wired).
+    /// never links `genai`/egress. Default: unsupported (a catalog with no OpenAI-compatible probe
+    /// wired).
     async fn openai_compat_models(
         &self,
         _base_url: &str,
         _key: Option<String>,
-    ) -> Vec<ModelDescriptor> {
-        Vec::new()
+    ) -> Result<Vec<ModelDescriptor>, daemon_api::ProviderListError> {
+        Err(daemon_api::ProviderListError {
+            kind: daemon_api::ProviderListErrorKind::Unsupported,
+            message: "this node has no OpenAI-compatible discovery probe wired".into(),
+        })
     }
 }
 

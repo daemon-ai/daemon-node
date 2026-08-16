@@ -20,6 +20,8 @@ pub mod backend;
 pub mod backends;
 pub mod grammar;
 pub mod protocol;
+pub mod stop;
+pub mod template;
 pub mod tooling;
 
 pub use backend::{BackendChunk, BackendError, GenerateRequest, InferenceBackend, StubBackend};

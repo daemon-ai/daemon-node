@@ -33,6 +33,8 @@ pub struct GenerateRequest {
     /// An optional grammar constraint bounding the output. A backend that does not support the
     /// supplied dialect ignores it (with a warning).
     pub constraint: Option<Constraint>,
+    /// Stop sequences: generation cuts (and the sequence is stripped) when one is produced.
+    pub stop: Vec<String>,
 }
 
 /// One incremental output of a generation. The terminal `Done`/usage is the [`InferenceBackend::generate`]
@@ -144,6 +146,7 @@ impl InferenceBackend for StubBackend {
             supports_streaming: false,
             tool_call_format: ToolCallFormat::Native,
             max_context: None,
+            template_tools: false,
         }
     }
 
@@ -177,6 +180,7 @@ mod tests {
             sampling: Sampling::default(),
             max_tokens: 0,
             constraint: None,
+            stop: Vec::new(),
         };
         let err = backend
             .generate(req, tx, CancellationToken::new())

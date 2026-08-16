@@ -106,7 +106,12 @@ Single-origin browser deployment: `web.addr` binds ONE plain-HTTP listener that 
 | `infer.n_ctx` | `DAEMON_INFER__N_CTX` | number | `0` |
 | `infer.n_gpu_layers` | `DAEMON_INFER__N_GPU_LAYERS` | number | `0` |
 | `infer.n_threads` | `DAEMON_INFER__N_THREADS` | optional | _(unset)_ |
+| `infer.penalty_freq` | `DAEMON_INFER__PENALTY_FREQ` | number | `0.0` |
+| `infer.penalty_last_n` | `DAEMON_INFER__PENALTY_LAST_N` | number | `64` |
+| `infer.penalty_present` | `DAEMON_INFER__PENALTY_PRESENT` | number | `0.0` |
+| `infer.penalty_repeat` | `DAEMON_INFER__PENALTY_REPEAT` | number | `1.0` |
 | `infer.restart_window_ms` | `DAEMON_INFER__RESTART_WINDOW_MS` | number | `60000` |
+| `infer.stop` | `DAEMON_INFER__STOP` | array | `[]` |
 | `infer.ttft_timeout_ms` | `DAEMON_INFER__TTFT_TIMEOUT_MS` | number | `60000` |
 | `infer.worker_bin` | `DAEMON_INFER__WORKER_BIN` | string | `daemon-infer (next to the daemon binary)` |
 | `journal_seed` | `DAEMON_JOURNAL_SEED` | optional | _(unset)_ |

@@ -238,6 +238,23 @@ encoding_rs = "0.8"
 # mistral.rs: the async, high-level local engine (Phase-1 seam; depth in Phase 2). default-features
 # off keeps the resolved tree minimal; hardware backends are opt-in via the worker's features.
 mistralrs = { version = "0.8", default-features = false }
+# HF chat-template rendering in the `daemon-infer` worker: the GGUF's Jinja template renders tools
+# the way the model was trained to see them (llama-server parity), replacing the hand-rolled text
+# preamble. `loop_controls` covers templates using {% break %}; `pycompat` supplies the Python
+# string/dict methods (`.strip()`, `.startswith()`, ...) HF templates lean on. Both crates were
+# already in the resolved tree (mistralrs renders its own templates through them).
+minijinja = { version = "2", default-features = false, features = [
+    "adjacent_loop_items",
+    "builtins",
+    "debug",
+    "loop_controls",
+    "macros",
+    "multi_template",
+    "serde",
+    "std_collections",
+    "json",
+] }
+minijinja-contrib = { version = "2", default-features = false, features = ["pycompat"] }
 # in-process mock HTTP server for provider wire tests (no live network in the suite).
 wiremock = "0.6"
 # Raw signal delivery: `daemon-processes` SIGTERMs whole background process groups (`killpg`), and

@@ -65,6 +65,7 @@ async fn llama_generates_text_on_gpu() {
         flash_attn: false,
         isq: None,
         embeddings: false,
+        mmproj: None,
     };
     let backend = backends::load(Engine::Llama, &path, &params)
         .await
@@ -91,9 +92,11 @@ async fn llama_generates_text_on_gpu() {
             top_p: 0.95,
             top_k: 40,
             seed: 42,
+            ..Default::default()
         },
         max_tokens: 64,
         constraint: None,
+        stop: Vec::new(),
     };
 
     let (tx, mut rx) = mpsc::unbounded_channel();

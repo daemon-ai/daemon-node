@@ -17,6 +17,7 @@
 
 use anyhow::Context;
 use daemon_common::PartitionId;
+use daemon_providers::ToolAdvertisement;
 use figment::providers::{Env, Format, Serialized, Toml};
 use figment::Figment;
 use serde::{Deserialize, Serialize};
@@ -278,6 +279,20 @@ pub struct LocalConfig {
     pub isq: Option<String>,
     /// The output-token cap per generation (`0` = the worker default).
     pub max_tokens: u32,
+    /// Per-model tool-advertisement policy, keyed by model id (the configured `model` string, an
+    /// `org/repo[/file]` id, or a resolved local path; `"*"` = every model). Values: `auto`
+    /// (default — the worker-reported capabilities decide), `native`, `preamble`, `off`.
+    pub tool_advertisement: std::collections::BTreeMap<String, ToolAdvertisement>,
+    /// Stop sequences applied to every local generation (cut + stripped by the worker).
+    pub stop: Vec<String>,
+    /// Repetition-penalty window (last N tokens; `0` disables penalties). Upstream-neutral default.
+    pub penalty_last_n: i32,
+    /// Multiplicative repeat penalty (`1.0` = disabled). Upstream-neutral default.
+    pub penalty_repeat: f32,
+    /// Additive frequency penalty (`0.0` = disabled).
+    pub penalty_freq: f32,
+    /// Additive presence penalty (`0.0` = disabled).
+    pub penalty_present: f32,
     /// How long to wait for `Event::Ready` after load.
     #[serde(rename = "load_timeout_ms", with = "duration_ms")]
     pub load_timeout: Duration,
@@ -304,6 +319,12 @@ impl Default for LocalConfig {
             flash_attn: false,
             isq: None,
             max_tokens: 0,
+            tool_advertisement: std::collections::BTreeMap::new(),
+            stop: Vec::new(),
+            penalty_last_n: 64,
+            penalty_repeat: 1.0,
+            penalty_freq: 0.0,
+            penalty_present: 0.0,
             load_timeout: Duration::from_secs(120),
             ttft_timeout: Duration::from_secs(60),
             inter_token_timeout: Duration::from_secs(30),

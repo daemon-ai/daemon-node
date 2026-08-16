@@ -17,6 +17,7 @@
 //! - [`hf`] — the read surface: repo [`hf::search`] (step 1) and per-repo [`hf::files`] (step 2).
 //! - [`gguf`] — GGUF filename heuristics (quant label, split shards) + a magic-byte preflight.
 //! - [`mmproj`] — vision-projector (mmproj) companion classification + pairing heuristics.
+//! - [`quant`] — the canonical quantization-family table (wire v48 quant filter/enrichment).
 //! - [`acquire`] — `hf-hub`-backed downloads with per-job progress / pause / resume / cancel.
 //! - [`resolve`] — turning a [`daemon_common::ModelRef`] into a concrete download plan per engine.
 //! - [`registry`] — the installed-model catalog (atomic JSON manifest).
@@ -36,6 +37,7 @@ pub mod hf;
 pub mod inspect;
 pub mod manager;
 pub mod mmproj;
+pub mod quant;
 pub mod quantize;
 pub mod recommend;
 pub mod registry;

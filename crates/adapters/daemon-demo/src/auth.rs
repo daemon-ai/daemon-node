@@ -136,12 +136,21 @@ fn spec_for(kind: AuthFlowKind) -> DemoFlowSpec {
             script: Script::MessagePoll,
             account_label: "demo-acp",
         },
+        // A device flow's client shape IS message + poll ("visit URL, enter code", then poll
+        // while the node exchanges the parked device code) — the MessagePoll script covers it.
+        AuthFlowKind::DeviceCode => DemoFlowSpec {
+            family: "demo-device",
+            display_name: "Demo device code (visit URL, enter code)",
+            flow_kind: AuthFlowKind::DeviceCode,
+            script: Script::MessagePoll,
+            account_label: "demo-device",
+        },
     }
 }
 
 /// The demo [`AuthFlowKind`] variants, in registration order. Kept beside the exhaustive
 /// [`spec_for`] match, which is the real coverage guarantee (a new variant fails the build there).
-const DEMO_FLOW_KINDS: [AuthFlowKind; 8] = [
+const DEMO_FLOW_KINDS: [AuthFlowKind; 9] = [
     AuthFlowKind::UserPassword,
     AuthFlowKind::MatrixSso,
     AuthFlowKind::OAuth2Pkce,
@@ -150,6 +159,7 @@ const DEMO_FLOW_KINDS: [AuthFlowKind; 8] = [
     AuthFlowKind::PhoneOtp,
     AuthFlowKind::QrPairing,
     AuthFlowKind::AcpAuthenticate,
+    AuthFlowKind::DeviceCode,
 ];
 
 /// Every demo interactive-auth factory (one per [`AuthFlowKind`]), ready to hand to the node

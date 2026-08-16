@@ -12,12 +12,12 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
 use daemon_common::{
     DownloadId, DownloadState, DownloadStatus, InstalledModel, ModelEngine, ModelFile, ModelId,
-    ModelRef, ModelSource, QuantRecommendation, SearchPage, SearchQuery,
+    ModelRef, ModelSource, QuantRecommendation, SearchHit, SearchPage, SearchQuery,
 };
 
 use crate::acquire::{Downloader, ResolvedArtifact};
@@ -27,7 +27,7 @@ use crate::hardware::HardwareProbe;
 use crate::hf::{files, search, HfClient};
 use crate::quantize::Quantizer;
 use crate::registry::{model_id, Registry};
-use crate::{gguf, mmproj, recommend, resolve};
+use crate::{gguf, mmproj, quant, recommend, resolve};
 
 /// Construction inputs for a [`ModelManager`].
 #[derive(Clone, Debug, Default)]
@@ -88,6 +88,71 @@ pub type CatalogChangedCb = Arc<dyn Fn() + Send + Sync>;
 /// the background catalog watchers spawned per download).
 type CatalogChangedSlot = Arc<std::sync::Mutex<Option<CatalogChangedCb>>>;
 
+/// How long a cached repo file listing is served WITHOUT revalidation. Past this window (and
+/// inside the TTL) the entry is served stale while one background refetch revalidates it —
+/// stale-while-revalidate, modeled on the reference app's `HFModelFilesVM` cache.
+const FILES_CACHE_FRESH: Duration = Duration::from_secs(15 * 60);
+
+/// Hard expiry: a listing older than this is never served (quant families and file sets drift
+/// slowly; a week bounds the staleness the SWR path can serve).
+const FILES_CACHE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// Cap on distinct `(engine, repo, revision)` listings retained; oldest-inserted evicted first.
+const FILES_CACHE_MAX: usize = 256;
+
+/// A stale-while-revalidate cache of repo file listings keyed `(engine, repo, revision)` — the
+/// node-side half of the quant contract: search enrichment, quant filtering, and the client's
+/// row expansion all read through it, so repeats never re-hit the Hub inside the TTL.
+#[derive(Default)]
+struct FilesCache {
+    entries: HashMap<(ModelEngine, String, String), (Instant, Vec<ModelFile>)>,
+    /// Keys with an in-flight background revalidation (stampede guard).
+    revalidating: std::collections::HashSet<(ModelEngine, String, String)>,
+}
+
+/// One cache read: the listing plus whether it is past the fresh window (serve it, but kick a
+/// background revalidation).
+struct CacheRead {
+    files: Vec<ModelFile>,
+    stale: bool,
+}
+
+impl FilesCache {
+    fn get(&self, key: &(ModelEngine, String, String)) -> Option<CacheRead> {
+        let (at, files) = self.entries.get(key)?;
+        (at.elapsed() < FILES_CACHE_TTL).then(|| CacheRead {
+            files: files.clone(),
+            stale: at.elapsed() >= FILES_CACHE_FRESH,
+        })
+    }
+
+    fn put(&mut self, key: (ModelEngine, String, String), files: Vec<ModelFile>) {
+        self.entries
+            .retain(|_, (at, _)| at.elapsed() < FILES_CACHE_TTL);
+        if self.entries.len() >= FILES_CACHE_MAX {
+            if let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (at, _))| *at)
+                .map(|(k, _)| k.clone())
+            {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.revalidating.remove(&key);
+        self.entries.insert(key, (Instant::now(), files));
+    }
+
+    /// Try to claim the (single) background revalidation slot for `key`.
+    fn claim_revalidation(&mut self, key: &(ModelEngine, String, String)) -> bool {
+        self.revalidating.insert(key.clone())
+    }
+
+    fn release_revalidation(&mut self, key: &(ModelEngine, String, String)) {
+        self.revalidating.remove(key);
+    }
+}
+
 /// The model-management facade.
 #[derive(Clone)]
 pub struct ModelManager {
@@ -98,6 +163,7 @@ pub struct ModelManager {
     active: ActiveModels,
     quantizer: Quantizer,
     catalog_changed: CatalogChangedSlot,
+    files_cache: Arc<std::sync::Mutex<FilesCache>>,
 }
 
 impl ModelManager {
@@ -111,6 +177,13 @@ impl ModelManager {
     /// assembly so registry changes (a cataloged download / a delete) fan onto the event feed.
     pub fn set_catalog_changed(&self, cb: CatalogChangedCb) {
         *self.catalog_changed.lock().unwrap() = Some(cb);
+    }
+
+    /// Wire the node-wide quantize-progress callback (wire v48 `QuantizeProgress`): the host sets
+    /// this after assembly so quantize state transitions fan onto the event feed instead of the
+    /// client polling `ModelQuantizes`.
+    pub fn set_quantize_progress(&self, cb: crate::quantize::QuantizeProgressCb) {
+        self.quantizer.set_progress(cb);
     }
 
     /// Build a manager over the shared cache + catalog.
@@ -139,6 +212,7 @@ impl ModelManager {
             active: ActiveModels::default(),
             quantizer,
             catalog_changed: Arc::new(std::sync::Mutex::new(None)),
+            files_cache: Arc::new(std::sync::Mutex::new(FilesCache::default())),
         })
     }
 
@@ -154,12 +228,127 @@ impl ModelManager {
 
     // --- Discovery (Hugging Face) -------------------------------------------------------------
 
-    /// Search repos (step 1).
-    pub async fn search(&self, query: SearchQuery) -> Result<SearchPage> {
-        search::search(&self.client, &query).await
+    /// Search repos (step 1) for `engine` (resolved from the wire query's provider by the host),
+    /// then enrich hits with canonical quant families (wire v48): repository-strategy engines
+    /// (mistral.rs) read families off the repo NAME; artifact-strategy (llama.cpp) reads the
+    /// repo file listings — cache-first (never blocking) with no filter, fetched (bounded
+    /// concurrency, SWR cache) when the query selects families. With a selection active only
+    /// matching hits are served and the page is marked `quant_filter_applied`.
+    pub async fn search(&self, engine: ModelEngine, query: SearchQuery) -> Result<SearchPage> {
+        let mut page = search::search(&self.client, engine, &query).await?;
+        self.enrich_page_quants(engine, &query, &mut page).await;
+        Ok(page)
     }
 
-    /// List a repo's loadable files for `engine` (step 2).
+    /// How many repo file listings the quant filter fetches concurrently per page.
+    const QUANT_ENRICH_CONCURRENCY: usize = 2;
+
+    /// The v48 quant enrichment/filter pass over one served page (see [`Self::search`]).
+    async fn enrich_page_quants(
+        &self,
+        engine: ModelEngine,
+        query: &SearchQuery,
+        page: &mut SearchPage,
+    ) {
+        let selected: Vec<String> = query.quants.clone().unwrap_or_default();
+        match engine {
+            // Repository strategy: the repo name IS the quant signal (method formats like
+            // GPTQ/AWQ/bnb-4bit); free to compute, always served, filterable without a fetch.
+            ModelEngine::MistralRs => {
+                for hit in &mut page.results {
+                    hit.quants = Some(quant::families_from_repo_name(&hit.repo));
+                }
+                if !selected.is_empty() {
+                    page.results.retain(|hit| {
+                        hit.quants
+                            .as_deref()
+                            .is_some_and(|fams| quant::matches_filter(fams, &selected))
+                    });
+                }
+            }
+            // Artifact strategy: families live in the repo's GGUF file listing.
+            ModelEngine::Llama => {
+                if selected.is_empty() {
+                    // No filter: enrich cache-first — the serve never blocks on the Hub. Uncached
+                    // listings are warmed by ONE detached task (bounded concurrency, claim-guarded
+                    // against repeat serves of the same page) so a follow-up serve of the query
+                    // carries families — the progressive-enrichment half of the v48 contract the
+                    // client's page-0 re-read consumes.
+                    let mut misses: Vec<String> = Vec::new();
+                    {
+                        let mut cache = self.files_cache.lock().unwrap();
+                        for hit in &mut page.results {
+                            let key = (engine, hit.repo.clone(), "main".to_string());
+                            if let Some(read) = cache.get(&key) {
+                                hit.quants = Some(quant::families_from_files(&read.files));
+                            } else if cache.claim_revalidation(&key) {
+                                misses.push(hit.repo.clone());
+                            }
+                        }
+                    }
+                    if !misses.is_empty() {
+                        let mgr = self.clone();
+                        tokio::spawn(async move {
+                            use futures::stream::{self, StreamExt};
+                            stream::iter(misses)
+                                .for_each_concurrent(Self::QUANT_ENRICH_CONCURRENCY, |repo| {
+                                    let mgr = mgr.clone();
+                                    async move {
+                                        // A successful fetch fills the SWR cache (put releases
+                                        // the claim); release manually on failure so a later
+                                        // serve can retry.
+                                        if mgr.model_files(&repo, None, engine).await.is_err() {
+                                            let key = (engine, repo, "main".to_string());
+                                            mgr.files_cache
+                                                .lock()
+                                                .unwrap()
+                                                .release_revalidation(&key);
+                                        }
+                                    }
+                                })
+                                .await;
+                        });
+                    }
+                } else {
+                    // Filter active: fetch listings (SWR cache, bounded concurrency) and serve
+                    // only matching hits. An indeterminate hit (listing fetch failed) is KEPT —
+                    // the filter must never hide models on a transient error.
+                    use futures::stream::{self, StreamExt};
+                    let hits = std::mem::take(&mut page.results);
+                    let enriched: Vec<(SearchHit, Option<Vec<String>>)> = stream::iter(hits)
+                        .map(|hit| async move {
+                            let families = self
+                                .model_files(&hit.repo, None, engine)
+                                .await
+                                .ok()
+                                .map(|files| quant::families_from_files(&files));
+                            (hit, families)
+                        })
+                        .buffered(Self::QUANT_ENRICH_CONCURRENCY)
+                        .collect()
+                        .await;
+                    page.results = enriched
+                        .into_iter()
+                        .filter_map(|(mut hit, families)| match families {
+                            Some(fams) => quant::matches_filter(&fams, &selected).then(|| {
+                                hit.quants = Some(fams);
+                                hit
+                            }),
+                            None => Some(hit), // indeterminate: keep, unenriched
+                        })
+                        .collect();
+                }
+            }
+        }
+        if !selected.is_empty() {
+            page.quant_filter_applied = true;
+        }
+    }
+
+    /// List a repo's loadable files for `engine` (step 2). Served through the SWR files cache
+    /// keyed `(engine, repo, revision)`: fresh entries return directly; stale-but-live entries
+    /// return immediately while ONE background refetch revalidates; misses fetch inline. The
+    /// same read path backs search quant enrichment, the quant filter, and row expansion.
     pub async fn model_files(
         &self,
         repo: &str,
@@ -167,7 +356,27 @@ impl ModelManager {
         engine: ModelEngine,
     ) -> Result<Vec<ModelFile>> {
         let revision = revision.unwrap_or("main");
-        files::list_files(&self.client, repo, revision, engine).await
+        let key = (engine, repo.to_string(), revision.to_string());
+        let cached = self.files_cache.lock().unwrap().get(&key);
+        if let Some(read) = cached {
+            if read.stale && self.files_cache.lock().unwrap().claim_revalidation(&key) {
+                let client = self.client.clone();
+                let cache = Arc::clone(&self.files_cache);
+                let (engine, repo, revision) = key.clone();
+                tokio::spawn(async move {
+                    let key = (engine, repo.clone(), revision.clone());
+                    match files::list_files(&client, &repo, &revision, engine).await {
+                        Ok(files) => cache.lock().unwrap().put(key, files),
+                        // A failed revalidation keeps serving the stale entry until the TTL.
+                        Err(_) => cache.lock().unwrap().release_revalidation(&key),
+                    }
+                });
+            }
+            return Ok(read.files);
+        }
+        let files = files::list_files(&self.client, repo, revision, engine).await?;
+        self.files_cache.lock().unwrap().put(key, files.clone());
+        Ok(files)
     }
 
     /// Recommend a quantization for `repo` on the detected hardware (the "tune"-like pick). For
@@ -293,9 +502,20 @@ impl ModelManager {
 
     // --- Catalog + lifecycle ------------------------------------------------------------------
 
-    /// Every installed model.
+    /// Every installed model. Legacy records (cataloged before wire v48) decode with an empty
+    /// `provider`; backfill it from the engine at read time so every served row is provider-keyed.
     pub async fn catalog(&self) -> Vec<InstalledModel> {
-        self.registry.list().await
+        self.registry
+            .list()
+            .await
+            .into_iter()
+            .map(|mut record| {
+                if record.provider.is_empty() {
+                    record.provider = record.model.engine.provider_id().to_string();
+                }
+                record
+            })
+            .collect()
     }
 
     /// Remove a model from the catalog and best-effort delete its cached artifact.
@@ -426,7 +646,13 @@ impl ModelManager {
             .artifact(id)
             .await
             .ok_or_else(|| ModelError::Download("completed job has no artifact".into()))?;
-        catalog_artifact(&self.registry, &self.catalog_changed, model, artifact).await
+        let record =
+            catalog_artifact(&self.registry, &self.catalog_changed, model, artifact).await?;
+        // wire v48: stamp the produced catalog id on the job so a client can auto-select it.
+        self.downloader
+            .set_result_model_id(id, record.id.clone())
+            .await;
+        Ok(record)
     }
 
     /// Spawn a background watcher that catalogs job `id` once it completes.
@@ -442,10 +668,17 @@ impl ModelManager {
                 match status.state {
                     DownloadState::Completed => {
                         if let Some(artifact) = downloader.artifact(id).await {
-                            if let Err(e) =
-                                catalog_artifact(&registry, &catalog_changed, model, artifact).await
+                            match catalog_artifact(&registry, &catalog_changed, model, artifact)
+                                .await
                             {
-                                tracing::warn!(error = %e, "failed to catalog completed download");
+                                // wire v48: stamp the produced catalog id on the job so a client
+                                // can auto-select the installed result.
+                                Ok(record) => {
+                                    downloader.set_result_model_id(id, record.id).await;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "failed to catalog completed download");
+                                }
                             }
                         }
                         return;
@@ -582,6 +815,7 @@ fn build_record(model: ModelRef, local_path: PathBuf, size_bytes: u64) -> Instal
     let sha256 = read_pin(&local_path);
     let mut record = InstalledModel {
         id: model_id(&model),
+        provider: model.engine.provider_id().to_string(),
         display_name: display_name(&model),
         quant: model_quant(&model),
         local_path,
@@ -785,6 +1019,7 @@ mod tests {
             let m = model("org/delete-me");
             let record = InstalledModel {
                 id: crate::registry::model_id(&m),
+                provider: m.engine.provider_id().to_string(),
                 model: m,
                 display_name: "org/delete-me".into(),
                 local_path: dir.join("delete-me.gguf"),
@@ -866,6 +1101,7 @@ mod tests {
             registry
                 .upsert(InstalledModel {
                     id: crate::registry::model_id(&m),
+                    provider: m.engine.provider_id().to_string(),
                     model: m.clone(),
                     display_name: "org/pinned".into(),
                     local_path: artifact.clone(),
@@ -960,5 +1196,58 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The SWR file-listing cache: a fresh entry hits (not stale), keys are isolated per
+    /// (engine, repo, revision), the entry cap evicts the oldest insertion, and the
+    /// revalidation claim is exclusive until released or overwritten by a put.
+    #[test]
+    fn files_cache_hits_isolates_keys_and_caps_entries() {
+        let mut cache = FilesCache::default();
+        let file = |path: &str| ModelFile {
+            path: path.to_string(),
+            ..ModelFile::default()
+        };
+        let key = |repo: &str| (ModelEngine::Llama, repo.to_string(), "main".to_string());
+
+        cache.put(key("org/a"), vec![file("a.gguf")]);
+        let read = cache.get(&key("org/a")).expect("fresh entry hits");
+        assert_eq!(read.files[0].path, "a.gguf");
+        assert!(
+            !read.stale,
+            "a just-inserted entry is inside the fresh window"
+        );
+        // Key isolation: engine and revision are part of the key.
+        assert!(cache
+            .get(&(ModelEngine::MistralRs, "org/a".into(), "main".into()))
+            .is_none());
+        assert!(cache
+            .get(&(ModelEngine::Llama, "org/a".into(), "v2".into()))
+            .is_none());
+
+        // The revalidation claim is exclusive (stampede guard) and a put releases it.
+        assert!(cache.claim_revalidation(&key("org/a")));
+        assert!(
+            !cache.claim_revalidation(&key("org/a")),
+            "second claim refused"
+        );
+        cache.put(key("org/a"), vec![file("a2.gguf")]);
+        assert!(
+            cache.claim_revalidation(&key("org/a")),
+            "put released the claim"
+        );
+        cache.release_revalidation(&key("org/a"));
+
+        // Cap: inserting past FILES_CACHE_MAX evicts the oldest ("org/a").
+        for i in 0..FILES_CACHE_MAX {
+            cache.put(key(&format!("org/fill-{i}")), vec![file("f.gguf")]);
+        }
+        assert!(cache.get(&key("org/a")).is_none(), "oldest entry evicted");
+        assert!(
+            cache
+                .get(&key(&format!("org/fill-{}", FILES_CACHE_MAX - 1)))
+                .is_some(),
+            "newest retained"
+        );
     }
 }

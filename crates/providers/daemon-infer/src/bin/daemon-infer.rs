@@ -42,6 +42,9 @@ enum InferCmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Print the compiled inference engines as one JSON line and exit — the node's boot-time
+    /// capability probe (`{"llama": bool, "mistralrs": bool}`), the same truth `Load` enforces.
+    Engines,
 }
 
 #[tokio::main]
@@ -53,9 +56,15 @@ async fn main() {
     // injected a DSN + `DAEMON_CRASH_CONSENT=1`.
     let _crash = daemon_telemetry::init_crash_reporting("infer-worker");
     let cli = <Cli as clap::Parser>::parse();
-    // A one-shot `quantize` subcommand (not part of the stdio protocol).
-    if let Some(InferCmd::Quantize { args }) = cli.cmd {
-        std::process::exit(run_quantize_cli(&args));
+    // The one-shot subcommands (not part of the stdio protocol): `quantize` shells the native
+    // quantizer, `engines` prints the compiled-capability probe line for the node.
+    match cli.cmd {
+        Some(InferCmd::Quantize { args }) => std::process::exit(run_quantize_cli(&args)),
+        Some(InferCmd::Engines) => {
+            println!("{}", backends::engines_json());
+            return;
+        }
+        None => {}
     }
 
     let selected_engine = cli.engine.as_deref().and_then(Engine::parse);
@@ -121,6 +130,7 @@ async fn main() {
                         sampling,
                         max_tokens,
                         constraint,
+                        stop,
                     } => {
                         let Some(backend) = backend.clone() else {
                             send_event(
@@ -144,6 +154,7 @@ async fn main() {
                             sampling,
                             max_tokens,
                             constraint,
+                            stop,
                         };
                         let writer = writer.clone();
                         let done_tx = done_tx.clone();

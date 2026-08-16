@@ -19,6 +19,9 @@ daemon-models = { workspace = true }
 daemon-provision = { workspace = true }
 genai = { workspace = true }
 async-trait = { workspace = true }
+# `ToolAdvertisement` derives Serialize/Deserialize so the node config's `[infer]` table parses the
+# per-model tool-advertisement policy directly into the provider type.
+serde = { workspace = true }
 serde_json = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true }

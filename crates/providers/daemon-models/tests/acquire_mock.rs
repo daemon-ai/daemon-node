@@ -63,6 +63,31 @@ fn gguf_bytes(len: usize) -> Vec<u8> {
     bytes
 }
 
+/// A throttleable [`ResolveFile`]: while the gate is closed, byte-chunk requests answer with an
+/// hour-long delay (the transfer hangs mid-flight, deterministically — no timing races), while
+/// the `bytes=0-0` metadata probe always answers instantly so the job reaches `Downloading`.
+/// Opening the gate makes chunk requests serve instantly (the resume path).
+struct ThrottledResolveFile {
+    inner: ResolveFile,
+    open: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Respond for ThrottledResolveFile {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let template = self.inner.respond(request);
+        let probe = request
+            .headers
+            .get("range")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v == "bytes=0-0");
+        if probe || self.open.load(std::sync::atomic::Ordering::Relaxed) {
+            template
+        } else {
+            template.set_delay(Duration::from_secs(3600))
+        }
+    }
+}
+
 /// Mount a repo tree listing + per-file resolve responders on `server`.
 async fn mount_repo(server: &MockServer, repo: &str, files: &[(&str, &[u8], u64)]) {
     let tree: Vec<_> = files
@@ -147,6 +172,23 @@ async fn manager_over(dir: &std::path::Path, endpoint: String) -> ModelManager {
     })
     .await
     .expect("manager")
+}
+
+/// Await a specific download state, panicking on timeout.
+async fn await_state(manager: &ModelManager, id: daemon_common::DownloadId, wanted: DownloadState) {
+    for _ in 0..200 {
+        let status = manager
+            .downloads()
+            .await
+            .into_iter()
+            .find(|s| s.id == id)
+            .expect("job status");
+        if status.state == wanted {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("download never reached {wanted:?}");
 }
 
 /// Await a terminal download state, panicking on timeout.
@@ -321,6 +363,69 @@ async fn size_mismatch_fails_the_job() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The deterministic pause/resume system test (plan Phase 7): a throttled Hub hangs the byte
+/// transfer mid-flight (gate closed), pause lands while the chunk request is in flight and the
+/// job settles `Paused` (the partial state is kept, nothing cataloged); opening the gate and
+/// resuming re-runs the transfer to `Completed` with the artifact cataloged. The live e2e
+/// journey deliberately does NOT carry pause/resume proof — this test does.
+#[tokio::test]
+async fn throttled_download_pauses_and_resumes() {
+    let server = MockServer::start().await;
+    let repo = "org/throttled";
+    let name = "Model-Q8_0.gguf";
+    let bytes = gguf_bytes(64 * 1024);
+    let tree = json!([{"type": "file", "path": name, "size": bytes.len()}]);
+    Mock::given(method("GET"))
+        .and(path(format!("/api/models/{repo}/tree/main")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(tree))
+        .mount(&server)
+        .await;
+    let gate = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    Mock::given(method("GET"))
+        .and(path(format!("/{repo}/resolve/main/{name}")))
+        .respond_with(ThrottledResolveFile {
+            inner: ResolveFile {
+                bytes: bytes.clone(),
+                commit: "0123456789abcdef0123456789abcdef01234567".into(),
+            },
+            open: gate.clone(),
+        })
+        .mount(&server)
+        .await;
+
+    let dir = temp_dir("pause");
+    let manager = manager_over(&dir, server.uri()).await;
+    let model = ModelRef::new(ModelEngine::Llama, ModelSource::hf_file(repo, name));
+    let id = manager.download(model.clone()).await.expect("download");
+
+    // The metadata probe succeeds, so the job reaches Downloading; the chunk transfer then hangs
+    // on the closed gate — pause must land while the request is IN FLIGHT.
+    await_state(&manager, id, DownloadState::Downloading).await;
+    manager.pause(id).await.expect("pause");
+    await_state(&manager, id, DownloadState::Paused).await;
+    assert!(
+        manager.catalog().await.is_empty(),
+        "a paused job must not catalog"
+    );
+
+    // Open the gate and resume: the re-run transfer completes and catalogs the artifact.
+    gate.store(true, std::sync::atomic::Ordering::Relaxed);
+    manager.resume(id).await.expect("resume");
+    assert_eq!(await_terminal(&manager, id).await, DownloadState::Completed);
+    let record = await_record(&manager, &model).await;
+    assert_eq!(record.size_bytes, bytes.len() as u64);
+    let status = manager
+        .downloads()
+        .await
+        .into_iter()
+        .find(|s| s.id == id)
+        .unwrap();
+    assert_eq!(status.files_done, 1);
+    assert!(status.error.is_none());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The post-download pairing scan links a PRE-EXISTING cataloged projector to a freshly
 /// downloaded text model (quant-compatible, recall above the local threshold) — the repo listing
 /// itself carries no projector here.
@@ -351,6 +456,7 @@ async fn pairing_scan_links_preexisting_projector_record() {
         registry
             .upsert(InstalledModel {
                 id: daemon_models::model_id(&proj_ref),
+                provider: proj_ref.engine.provider_id().to_string(),
                 model: proj_ref.clone(),
                 display_name: "mmproj-SmolVLM-256M-Instruct-Q8_0.gguf".into(),
                 local_path: proj_path.clone(),

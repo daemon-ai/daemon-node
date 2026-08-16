@@ -66,6 +66,7 @@ async fn llama_embeds_text_on_gpu() {
         flash_attn: false,
         isq: None,
         embeddings: true,
+        mmproj: None,
     };
     let backend = backends::load(Engine::Llama, &path, &params)
         .await

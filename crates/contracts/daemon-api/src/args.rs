@@ -215,12 +215,13 @@ pub struct FsWriteFromBlobArgs {
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelRecommendArgs {
+    /// The managed provider the recommendation targets (wire v48; resolved to its engine
+    /// node-side).
+    pub provider: String,
     /// The `org/name` repo id.
     pub repo: String,
     /// The git revision (`None` = `main`).
     pub revision: Option<String>,
-    /// The engine the recommendation targets.
-    pub engine: ModelEngine,
     /// An explicit memory budget in bytes (`None` = auto-detect VRAM/RAM).
     pub budget_bytes: Option<u64>,
 }
