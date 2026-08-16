@@ -16,7 +16,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
 /// An engine-agnostic generation request (the worker's decode of [`crate::protocol::Command::Generate`]).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct GenerateRequest {
     /// Correlates emitted chunks/events back to the originating request.
     pub request_id: u64,
