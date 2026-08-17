@@ -122,6 +122,7 @@ async fn run_in(
         checkpoints: None,
         tool_timeout: None,
         session_allow: &[],
+        spill: None,
     };
     let call = ToolCall {
         call_id: "c1".into(),
@@ -335,6 +336,7 @@ async fn cancel_interrupts_running_script() {
         checkpoints: None,
         tool_timeout: None,
         session_allow: &[],
+        spill: None,
     };
     let call = ToolCall {
         call_id: "c1".into(),

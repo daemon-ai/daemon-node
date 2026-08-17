@@ -931,6 +931,17 @@ impl Tool for FsTool {
         }
     }
 
+    fn spill_exempt_for(&self, call: &ToolCall) -> bool {
+        // An oversized `read` must not spill (A1): the model just read these bytes from the
+        // workspace — a spill would loop read → externalize → lcm_expand → read. Pagination
+        // (`offset`/`limit`) is its retry path; truncation keeps it bounded. Other ops spill
+        // normally, and unparseable args don't exempt (spilling is the lossless side).
+        matches!(
+            serde_json::from_str::<FsArgs>(&call.args),
+            Ok(FsArgs::Read { .. })
+        )
+    }
+
     fn parallel_scope_paths(&self, call: &ToolCall) -> Option<Vec<PathBuf>> {
         serde_json::from_str::<FsArgs>(&call.args)
             .ok()
@@ -1141,6 +1152,7 @@ mod tests {
             checkpoints: None,
             tool_timeout: None,
             session_allow: &[],
+            spill: None,
         };
         let call = ToolCall {
             call_id: "c1".into(),
@@ -1397,6 +1409,7 @@ mod tests {
             checkpoints: None,
             tool_timeout: None,
             session_allow: &[],
+            spill: None,
         };
         let call = ToolCall {
             call_id: "c1".into(),
@@ -1869,6 +1882,7 @@ mod tests {
             checkpoints: None,
             tool_timeout: None,
             session_allow: &[],
+            spill: None,
         };
         let call = ToolCall {
             call_id: "c1".into(),

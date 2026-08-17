@@ -479,6 +479,17 @@ pub trait ContextEngine: Send + Sync {
         Vec::new()
     }
 
+    /// The engine's tool-result spill store (A1), if it offers one. The §12 budget stage spills an
+    /// over-budget tool result here (leaving a recoverable notice) instead of truncating it. The
+    /// accessor lives on the context engine — not a separate injection — because the store must be
+    /// **session-scoped**: LCM is dressed per `(ProfileRef, SessionId)`, and the same instance must
+    /// serve context management, the `lcm_*` recovery tools, and spilling, or recovery would look
+    /// in the wrong bank. Default `None` = no spilling; the budget stage falls back to bounded
+    /// truncation ([`BudgetedContextEngine`] inherits this).
+    fn tool_spill(&self) -> Option<&dyn crate::spill::ToolResultSpillStore> {
+        None
+    }
+
     /// The [`CommandProvider`](crate::command::CommandProvider) view of this engine, when it also
     /// contributes operator/user commands (e.g. LCM's `/lcm`). Default `None`. Mirrors how the
     /// engine exposes tools through the §12 registry — a distinct seam from the model-facing
@@ -789,6 +800,13 @@ mod tests {
             c.push_assistant(AssistantMsg::text(format!("reply number {i} ").repeat(20)));
         }
         c
+    }
+
+    #[test]
+    fn default_engine_offers_no_spill_store() {
+        // A1: only a context engine that opts in (LCM) exposes a tool-result spill store; the
+        // default engine inherits `None`, so the §12 budget stage falls back to truncation.
+        assert!(BudgetedContextEngine::default().tool_spill().is_none());
     }
 
     #[test]

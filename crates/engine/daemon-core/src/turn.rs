@@ -66,6 +66,11 @@ pub struct TurnCx<'a> {
     /// new fingerprint) never happens through this borrow — it flows through the single-owner effect
     /// applier ([`Effect::RememberApproval`]) so the snapshot stays the sole source of truth.
     pub session_allow: &'a [CommandFingerprint],
+    /// The session's tool-result spill store (A1), when its context engine offers one
+    /// ([`ContextEngine::tool_spill`](crate::context::ContextEngine::tool_spill)): the §12 budget
+    /// stage stores an over-budget tool result here and leaves a recoverable notice instead of
+    /// truncating. `None` (the default engines, tests) = bounded truncation, exactly as before.
+    pub spill: Option<&'a dyn crate::spill::ToolResultSpillStore>,
 }
 
 impl<'a> TurnCx<'a> {
@@ -88,6 +93,7 @@ impl<'a> TurnCx<'a> {
             checkpoints: self.checkpoints,
             tool_timeout: self.tool_timeout,
             session_allow: self.session_allow,
+            spill: self.spill,
         };
         (cx, token)
     }

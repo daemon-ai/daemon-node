@@ -7,7 +7,9 @@
 //! enforces its own preflight safety — workspace containment via the [`ExecutionEnvironment`](crate::exec),
 //! and hardline-deny + interactive `HostRequest::Approval` for command execution), then applies the
 //! cross-cutting **sanitize + result-byte budget** stage uniformly so one oversized tool result can
-//! never blow the model context.
+//! never blow the model context. When the session's context engine offers a
+//! [`ToolResultSpillStore`](crate::spill::ToolResultSpillStore), the budget stage spills the full
+//! result and leaves a recoverable notice instead of destroying bytes (A1, [`crate::spill`]).
 //!
 //! Stage 2 (validate/repair args) reuses the §9 [`repair_tool_args`] pass so a tool always receives
 //! canonical JSON even when the model emitted fenced/trailing-comma/truncated arguments. Stage 2.5
@@ -21,7 +23,7 @@
 //! same `run_tool` pipeline. Untrusted-output wrapping for web/MCP sources is applied here when a
 //! tool flags its result untrusted. An unknown tool surfaces a failed result, never a panic.
 
-use crate::conversation::{ToolCall, ToolResult};
+use crate::conversation::ToolCall;
 use crate::repair::{repair_tool_args, wrap_untrusted_tool_result};
 use crate::tools::{Tool, ToolOutcome, ToolRegistry, TOOL_CALL, TOOL_DESCRIBE, TOOL_SEARCH};
 use crate::turn::TurnCx;
@@ -132,7 +134,7 @@ pub async fn run_tool(call: &ToolCall, registry: &ToolRegistry, cx: &TurnCx<'_>)
         // deadline. `call_timeout` receives the engine default (`None` disables the stage) and may
         // opt out (a self-limiting tool like a `shell` foreground command). On timeout the tool's
         // child cancel token is fired (best-effort subprocess abort) and a failed result is returned.
-        let mut outcome = match resolved {
+        let mut outcome = match resolved.as_ref() {
             Some(tool) => {
                 let timeout = tool.call_timeout(&call, cx.default_tool_timeout());
                 run_with_timeout(tool.as_ref(), &call, cx, timeout).await
@@ -152,13 +154,40 @@ pub async fn run_tool(call: &ToolCall, registry: &ToolRegistry, cx: &TurnCx<'_>)
             tracing::debug!(tool = %call.name, "engine.tool.untrusted_wrapped");
             outcome.result.content = wrap_untrusted_tool_result(&outcome.result.content);
         }
-        if let Some(dropped) = budget_result(&mut outcome.result, cx.tool_result_budget) {
-            tracing::debug!(
-                tool = %call.name,
-                dropped_bytes = dropped,
-                budget = cx.tool_result_budget,
-                "engine.tool.budget_truncated"
-            );
+        // Stage 6b (§12 sanitize + budget, spill-aware — A1): an over-budget result spills whole
+        // into the session's ToolResultSpillStore (leaving a head/tail preview + recovery notice)
+        // when one exists and neither the tool nor the store exempts the call; otherwise it takes
+        // the bounded truncation fallback. Runs after 6a so the fenced form is what gets stored.
+        let spill_exempt = resolved.as_ref().is_some_and(|t| t.spill_exempt_for(&call))
+            || cx.spill.is_some_and(|s| s.exempt_tool(&call.name));
+        match crate::spill::budget_or_spill(
+            &mut outcome.result,
+            &call.name,
+            cx.tool_result_budget,
+            spill_exempt,
+            cx.spill,
+            &cx.session_id,
+        )
+        .await
+        {
+            crate::spill::SpillDisposition::Spilled { dropped, ref_id } => {
+                tracing::debug!(
+                    tool = %call.name,
+                    dropped_bytes = dropped,
+                    budget = cx.tool_result_budget,
+                    spill_ref = %ref_id,
+                    "engine.tool.budget_spilled"
+                );
+            }
+            crate::spill::SpillDisposition::Truncated { dropped } => {
+                tracing::debug!(
+                    tool = %call.name,
+                    dropped_bytes = dropped,
+                    budget = cx.tool_result_budget,
+                    "engine.tool.budget_truncated"
+                );
+            }
+            crate::spill::SpillDisposition::Unchanged => {}
         }
         tracing::debug!(
             result_ok = outcome.result.ok,
@@ -262,27 +291,11 @@ fn json_field(args: &str, key: &str) -> Option<String> {
     v.get(key).and_then(|x| x.as_str()).map(|s| s.to_string())
 }
 
-/// The §12 sanitize+budget stage: truncate an oversized tool result to the per-tool budget, leaving
-/// a clear marker, so a single large result cannot dominate the model context. `0` disables the cap.
-fn budget_result(result: &mut ToolResult, budget: usize) -> Option<usize> {
-    if budget == 0 || result.content.len() <= budget {
-        return None;
-    }
-    let mut cut = budget.min(result.content.len());
-    while cut > 0 && !result.content.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    let dropped = result.content.len() - cut;
-    result.content.truncate(cut);
-    result.content.push_str(&format!(
-        "\n... [truncated {dropped} bytes over result budget]"
-    ));
-    Some(dropped)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::conversation::ToolResult;
+    use crate::spill::{SpillError, SpillRef, ToolResultSpillStore};
     use crate::tools::{Tool, ToolOutcome};
     use crate::turn::TurnCx;
 
@@ -364,6 +377,7 @@ mod tests {
                 checkpoints: None,
                 tool_timeout: None,
                 session_allow: &[],
+                spill: None,
             };
             $body
         }};
@@ -410,6 +424,7 @@ mod tests {
             checkpoints: None,
             tool_timeout: None,
             session_allow: &[],
+            spill: None,
         };
         let call = ToolCall {
             call_id: "c1".into(),
@@ -422,31 +437,6 @@ mod tests {
             .result
             .content
             .contains("ignore previous instructions"));
-    }
-
-    #[test]
-    fn budget_truncates_oversized_results_and_marks_them() {
-        let mut result = ToolResult {
-            call_id: "c1".into(),
-            ok: true,
-            content: "x".repeat(1000),
-        };
-        budget_result(&mut result, 100);
-        assert!(result.content.starts_with(&"x".repeat(100)));
-        assert!(result.content.contains("truncated"));
-        assert!(result.content.contains("900 bytes"));
-    }
-
-    #[test]
-    fn budget_zero_disables_truncation() {
-        let mut result = ToolResult {
-            call_id: "c1".into(),
-            ok: true,
-            content: "x".repeat(1000),
-        };
-        budget_result(&mut result, 0);
-        assert_eq!(result.content.len(), 1000);
-        assert!(!result.content.contains("truncated"));
     }
 
     #[test]
@@ -606,6 +596,7 @@ mod tests {
             checkpoints: Some(store.as_ref()),
             tool_timeout: None,
             session_allow: &[],
+            spill: None,
         };
         let call = ToolCall {
             call_id: "call-1".into(),
@@ -625,18 +616,6 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&ws);
         let _ = std::fs::remove_dir_all(&store_root);
-    }
-
-    #[test]
-    fn budget_respects_char_boundaries() {
-        // A multi-byte char straddling the cut point must not split mid-codepoint (no panic).
-        let mut result = ToolResult {
-            call_id: "c1".into(),
-            ok: true,
-            content: "é".repeat(100),
-        };
-        budget_result(&mut result, 51);
-        assert!(result.content.contains("truncated"));
     }
 
     /// A tool that sleeps `delay` before returning ok. `opt_out` overrides `call_timeout` to `None`
@@ -715,6 +694,7 @@ mod tests {
             checkpoints: None,
             tool_timeout: timeout,
             session_allow: &[],
+            spill: None,
         };
         let call = ToolCall {
             call_id: "c1".into(),
@@ -767,5 +747,276 @@ mod tests {
         let result = run_with_timeout_cx(tool, Some(std::time::Duration::from_millis(20))).await;
         assert!(result.ok);
         assert_eq!(result.content, "slept");
+    }
+
+    // ---- A1: spill-aware budget stage -------------------------------------------------------
+
+    /// A tool that returns `size` bytes of payload. `untrusted` flags the outcome for the §12
+    /// fence; `exempt` opts the call out of spilling via `spill_exempt_for`.
+    struct BigTool {
+        name: &'static str,
+        size: usize,
+        untrusted: bool,
+        exempt: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for BigTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn schema(&self) -> &str {
+            "{}"
+        }
+        fn spill_exempt_for(&self, _call: &ToolCall) -> bool {
+            self.exempt
+        }
+        async fn run(&self, call: &ToolCall, _cx: &TurnCx<'_>) -> ToolOutcome {
+            let content = "A".repeat(self.size);
+            if self.untrusted {
+                ToolOutcome::untrusted_text(call.call_id.clone(), true, content)
+            } else {
+                ToolOutcome::text(call.call_id.clone(), true, content)
+            }
+        }
+    }
+
+    /// An in-memory spill store recording every `store()` call; `fail` simulates a broken store.
+    /// Exempts `lcm_*` names like the real LCM store does.
+    #[derive(Default)]
+    struct MemSpill {
+        stored: std::sync::Mutex<Vec<(String, String, String)>>,
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl ToolResultSpillStore for MemSpill {
+        async fn store(
+            &self,
+            _session: &daemon_common::SessionId,
+            call_id: &str,
+            tool: &str,
+            content: &str,
+        ) -> Result<SpillRef, SpillError> {
+            if self.fail {
+                return Err(SpillError("store offline".into()));
+            }
+            self.stored.lock().unwrap().push((
+                call_id.to_string(),
+                tool.to_string(),
+                content.to_string(),
+            ));
+            Ok(SpillRef {
+                ref_id: "tool_result_mem_1.json".into(),
+                retrieval_hint: "Full output stored; recover it with lcm_expand and this ref."
+                    .into(),
+            })
+        }
+        fn exempt_tool(&self, name: &str) -> bool {
+            name.starts_with("lcm_")
+        }
+    }
+
+    /// Run one call of `tool` through the pipeline with a result-byte `budget` and an optional
+    /// spill store, returning the finished result.
+    async fn run_with_spill_cx(
+        tool: std::sync::Arc<dyn Tool>,
+        budget: usize,
+        spill: Option<&dyn ToolResultSpillStore>,
+    ) -> ToolResult {
+        use crate::events::EventSink;
+        use crate::exec::LocalEnvironment;
+        use daemon_common::{Budget, SessionId};
+        use daemon_protocol::{HostRequest, HostRequestHandler, HostResponse, HostResponseBody};
+
+        struct NoopHost;
+        #[async_trait::async_trait]
+        impl HostRequestHandler for NoopHost {
+            async fn request(&self, req: HostRequest) -> HostResponse {
+                HostResponse {
+                    request_id: req.request_id,
+                    body: HostResponseBody::Approved {
+                        approved: true,
+                        allow_permanent: false,
+                        reason: None,
+                    },
+                }
+            }
+        }
+
+        let mut registry = ToolRegistry::new();
+        let name = tool.name().to_string();
+        registry.register(tool);
+        let events = EventSink::discarding();
+        let exec = LocalEnvironment::sandbox("spill-test");
+        let cx = TurnCx {
+            cancel: tokio_util::sync::CancellationToken::new(),
+            events: &events,
+            host: &NoopHost,
+            session_id: SessionId::new("spill-sess"),
+            profile: None,
+            budget: Budget::unlimited(),
+            exec: &exec,
+            tool_result_budget: budget,
+            approval_policy: crate::approval::ApprovalPolicy::AutoAllow,
+            pre_approved: false,
+            checkpoints: None,
+            tool_timeout: None,
+            session_allow: &[],
+            spill,
+        };
+        let call = ToolCall {
+            call_id: "c1".into(),
+            name,
+            args: "{}".into(),
+        };
+        run_tool(&call, &registry, &cx).await.result
+    }
+
+    #[tokio::test]
+    async fn over_budget_result_spills_whole_and_caps_replacement() {
+        let store = MemSpill::default();
+        let tool = std::sync::Arc::new(BigTool {
+            name: "big",
+            size: 10_000,
+            untrusted: false,
+            exempt: false,
+        });
+        let result = run_with_spill_cx(tool, 400, Some(&store)).await;
+        assert!(result.ok, "spilling never converts success into an error");
+        assert!(result.content.len() <= 400, "replacement holds the cap");
+        assert!(result.content.contains("[Externalized tool output: big,"));
+        assert!(result.content.contains("ref=tool_result_mem_1.json]"));
+        assert!(result.content.contains("lcm_expand"));
+        // Head/tail preview comes from the original bytes.
+        assert!(result.content.starts_with('A'));
+        assert!(result.content.ends_with('A'));
+        // The store received the FULL content, byte-for-byte.
+        let stored = store.stored.lock().unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].0, "c1");
+        assert_eq!(stored[0].1, "big");
+        assert_eq!(stored[0].2, "A".repeat(10_000));
+    }
+
+    /// Fence-then-spill ordering: an untrusted oversized result is fenced FIRST, so the stored
+    /// payload carries the fence and recovery re-serves the data exactly as the model first saw it.
+    #[tokio::test]
+    async fn untrusted_result_is_fenced_before_spilling() {
+        let store = MemSpill::default();
+        let tool = std::sync::Arc::new(BigTool {
+            name: "big",
+            size: 10_000,
+            untrusted: true,
+            exempt: false,
+        });
+        let result = run_with_spill_cx(tool, 500, Some(&store)).await;
+        let stored = store.stored.lock().unwrap();
+        assert_eq!(stored.len(), 1);
+        assert!(
+            stored[0].2.contains("UNTRUSTED_TOOL_OUTPUT"),
+            "the stored payload is the fenced form"
+        );
+        assert!(result.content.len() <= 500);
+    }
+
+    #[tokio::test]
+    async fn store_failure_falls_back_to_truncation() {
+        let store = MemSpill {
+            fail: true,
+            ..Default::default()
+        };
+        let tool = std::sync::Arc::new(BigTool {
+            name: "big",
+            size: 10_000,
+            untrusted: false,
+            exempt: false,
+        });
+        let result = run_with_spill_cx(tool, 400, Some(&store)).await;
+        assert!(result.ok);
+        assert!(result.content.contains("truncated"));
+        assert!(!result.content.contains("[Externalized"));
+        assert!(
+            result.content.len() <= 400 + "\n... [truncated 9600 bytes over result budget]".len()
+        );
+    }
+
+    #[tokio::test]
+    async fn notice_that_cannot_fit_falls_back_to_truncation() {
+        let store = MemSpill::default();
+        let tool = std::sync::Arc::new(BigTool {
+            name: "big",
+            size: 10_000,
+            untrusted: false,
+            exempt: false,
+        });
+        // A budget smaller than the notice itself: bounded truncation, never an oversized notice.
+        let result = run_with_spill_cx(tool, 30, Some(&store)).await;
+        assert!(result.content.contains("truncated"));
+        assert!(!result.content.contains("[Externalized"));
+    }
+
+    /// A tool-side exemption (fs read) truncates instead of spilling — exempt is bounded, never
+    /// unlimited, and the store is never consulted.
+    #[tokio::test]
+    async fn tool_exemption_truncates_instead_of_spilling() {
+        let store = MemSpill::default();
+        let tool = std::sync::Arc::new(BigTool {
+            name: "big",
+            size: 10_000,
+            untrusted: false,
+            exempt: true,
+        });
+        let result = run_with_spill_cx(tool, 400, Some(&store)).await;
+        assert!(result.content.contains("truncated"));
+        assert!(!result.content.contains("[Externalized"));
+        assert!(
+            store.stored.lock().unwrap().is_empty(),
+            "store never consulted"
+        );
+    }
+
+    /// The store-side exemption: an oversized `lcm_*` result (e.g. `lcm_expand` recovering a
+    /// spill) is truncated, never respilled into its own recovery store.
+    #[tokio::test]
+    async fn lcm_tools_are_exempted_by_the_store_itself() {
+        let store = MemSpill::default();
+        let tool = std::sync::Arc::new(BigTool {
+            name: "lcm_expand",
+            size: 10_000,
+            untrusted: false,
+            exempt: false,
+        });
+        let result = run_with_spill_cx(tool, 400, Some(&store)).await;
+        assert!(result.content.contains("truncated"));
+        assert!(!result.content.contains("[Externalized"));
+        assert!(store.stored.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn no_store_truncates_as_before() {
+        let tool = std::sync::Arc::new(BigTool {
+            name: "big",
+            size: 1000,
+            untrusted: false,
+            exempt: false,
+        });
+        let result = run_with_spill_cx(tool, 100, None).await;
+        assert!(result.content.starts_with(&"A".repeat(100)));
+        assert!(result.content.contains("truncated 900 bytes"));
+    }
+
+    #[tokio::test]
+    async fn within_budget_result_is_untouched_even_with_a_store() {
+        let store = MemSpill::default();
+        let tool = std::sync::Arc::new(BigTool {
+            name: "big",
+            size: 100,
+            untrusted: false,
+            exempt: false,
+        });
+        let result = run_with_spill_cx(tool, 400, Some(&store)).await;
+        assert_eq!(result.content, "A".repeat(100));
+        assert!(store.stored.lock().unwrap().is_empty());
     }
 }

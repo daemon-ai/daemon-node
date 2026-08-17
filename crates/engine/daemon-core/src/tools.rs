@@ -176,6 +176,16 @@ pub trait Tool: Send + Sync {
         self.mutates()
     }
 
+    /// Whether this call's result is **exempt from spilling** (A1): the §12 budget stage never
+    /// stores it in the session's [`ToolResultSpillStore`](crate::spill::ToolResultSpillStore) —
+    /// an over-budget result stays hard-bounded by the destructive truncation marker instead
+    /// (exempt never means unlimited). The `fs` tool exempts its `read` op so an oversized read
+    /// does not loop read → spill → recover → read. Defaults to `false` (spill when a store
+    /// exists), mirroring [`mutates_for`](Tool::mutates_for)'s per-call shape.
+    fn spill_exempt_for(&self, _call: &ToolCall) -> bool {
+        false
+    }
+
     /// The §12 approval fingerprint (Cluster B) binding a parked durable approval to what the
     /// operator actually approved. The engine computes this when a call parks for a durable
     /// approval and recomputes it on the operator-approved re-run, refusing (fail-closed) if the

@@ -24,6 +24,7 @@ use crate::tokens::Tokenizer;
 use crate::tools::{ToolCx, TOOL_NAMES};
 use async_trait::async_trait;
 use daemon_common::SessionId;
+use daemon_core::spill::{SpillError, SpillRef, ToolResultSpillStore};
 use daemon_core::tools::ToolDef;
 use daemon_core::{
     CommandCx, CommandError, CommandInvocation, CommandOutput, CommandProvider,
@@ -1286,6 +1287,71 @@ impl ContextEngine for LcmContextEngine {
     /// (the operator maintenance surface, the port of `hermes-lcm`'s `command.py`).
     fn command_provider(self: Arc<Self>) -> Option<CommandProviderHandle> {
         Some(self)
+    }
+
+    /// Expose this engine's externalization store as the §12 tool-result spill store (A1) — the
+    /// SAME session-scoped side-channel `lcm_expand` recovers from, so a spilled ref always
+    /// resolves in the bank the model's recovery tools are dressed against. `None` for an
+    /// ephemeral/in-memory bank (no externalization dir): the budget stage then falls back to
+    /// bounded truncation instead of paying a store call that must fail.
+    fn tool_spill(&self) -> Option<&dyn ToolResultSpillStore> {
+        self.config
+            .externalization_dir()
+            .is_some()
+            .then_some(self as &dyn ToolResultSpillStore)
+    }
+}
+
+/// The A1 spill store over `externalize::store_payload`: an over-budget tool result is persisted
+/// to the bank's session-scoped side-channel directory exactly like an oversized ingest payload,
+/// so `lcm_expand(externalized_ref=…)` recovers it with zero new machinery. The synchronous
+/// filesystem work runs under `spawn_blocking` (the store is called from the async §12 pipeline).
+#[async_trait]
+impl ToolResultSpillStore for LcmContextEngine {
+    async fn store(
+        &self,
+        session: &SessionId,
+        call_id: &str,
+        // The payload record keys on tool_call_id; the pipeline's notice carries the tool name.
+        _tool: &str,
+        content: &str,
+    ) -> std::result::Result<SpillRef, SpillError> {
+        let Some(dir) = self.config.externalization_dir() else {
+            return Err(SpillError(
+                "no externalization directory (ephemeral bank)".to_string(),
+            ));
+        };
+        let session_id = session.as_str().to_string();
+        let call_id = call_id.to_string();
+        let body = content.to_string();
+        let reference = tokio::task::spawn_blocking(move || {
+            crate::externalize::store_payload(
+                &dir,
+                &body,
+                &crate::externalize::PayloadMeta {
+                    kind: "tool_result",
+                    field: "content",
+                    role: "tool",
+                    tool_call_id: Some(&call_id),
+                    session_id: &session_id,
+                },
+            )
+        })
+        .await
+        .map_err(|e| SpillError(format!("spill task panicked: {e}")))?
+        .map_err(|e| SpillError(format!("spill store failed: {e}")))?;
+        Ok(SpillRef {
+            retrieval_hint: format!(
+                "Full output stored; recover it with lcm_expand({{\"externalized_ref\": \"{reference}\"}})."
+            ),
+            ref_id: reference,
+        })
+    }
+
+    /// The `lcm_*` recovery tools never respill into their own store: an oversized `lcm_expand`
+    /// result truncates instead, and its own pagination/`expand_hint` machinery is the retry path.
+    fn exempt_tool(&self, name: &str) -> bool {
+        TOOL_NAMES.contains(&name)
     }
 }
 
@@ -5469,6 +5535,81 @@ mod tests {
         assert!(text.contains("backup_path: "), "{text}");
         assert!(text.contains("messages_fts_rebuilt: no"), "{text}");
         assert!(text.contains("nodes_fts_rebuilt: no"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- A1: tool-result spill store --------------------------------------------------------
+
+    /// The full A1 recovery loop: a spilled tool result round-trips through the pipeline's notice
+    /// grammar and `lcm_expand` back to its exact bytes.
+    #[tokio::test]
+    async fn spilled_tool_result_round_trips_through_lcm_expand() {
+        let (lcm, dir) = durable_engine("spill-rt", 32);
+        let store = lcm
+            .tool_spill()
+            .expect("a durable bank offers a spill store");
+        let body = "SPILLED-PAYLOAD-".repeat(2000);
+        let r = store
+            .store(&SessionId::new("s1"), "call-9", "shell", &body)
+            .await
+            .unwrap();
+        // The pipeline's notice grammar is recognized by LCM's placeholder regex, so replay/ingest
+        // machinery and `lcm_expand` both see the ref.
+        let notice = format!(
+            "[Externalized tool output: shell, {} bytes omitted; ref={}] {}",
+            body.len(),
+            r.ref_id,
+            r.retrieval_hint
+        );
+        assert_eq!(
+            crate::externalize::extract_ref(&notice).as_deref(),
+            Some(r.ref_id.as_str())
+        );
+        assert!(r.retrieval_hint.contains("lcm_expand"));
+        // `lcm_expand` pages long payloads (`max_tokens` slices + `next_content_offset`); follow
+        // the pagination to reassemble the exact original bytes.
+        let mut recovered = String::new();
+        let mut offset: u64 = 0;
+        loop {
+            let out = lcm
+                .call_tool(
+                    "lcm_expand",
+                    serde_json::json!({"externalized_ref": r.ref_id, "content_offset": offset}),
+                )
+                .await;
+            let v: Value = serde_json::from_str(&out).unwrap();
+            assert_eq!(v["source_type"], "externalized_payload");
+            assert_eq!(v["kind"], "tool_result");
+            assert_eq!(v["tool_call_id"], "call-9");
+            recovered.push_str(v["content"].as_str().unwrap());
+            if !v["has_more"].as_bool().unwrap_or(false) {
+                break;
+            }
+            offset = v["next_content_offset"].as_u64().expect("next offset");
+        }
+        assert_eq!(recovered, body, "full bytes recovered across pages");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An ephemeral (in-memory) bank has no externalization dir, so it offers no spill store —
+    /// the pipeline falls back to bounded truncation instead of a store call that must fail.
+    #[tokio::test]
+    async fn ephemeral_bank_offers_no_spill_store() {
+        let lcm = LcmContextEngine::open_in_memory(aux_with("s")).unwrap();
+        assert!(lcm.tool_spill().is_none());
+    }
+
+    /// The store exempts every `lcm_*` recovery tool from spilling (an oversized `lcm_expand`
+    /// result must not respill its own recovery) and nothing else.
+    #[tokio::test]
+    async fn lcm_recovery_tools_are_store_exempt() {
+        let (lcm, dir) = durable_engine("spill-exempt", 32);
+        let store = lcm.tool_spill().unwrap();
+        for name in crate::tools::TOOL_NAMES {
+            assert!(store.exempt_tool(name), "{name} must be exempt");
+        }
+        assert!(!store.exempt_tool("shell"));
+        assert!(!store.exempt_tool("fs"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

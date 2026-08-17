@@ -138,6 +138,7 @@ async fn mcp_discover_register_run_roundtrip() {
         checkpoints: None,
         tool_timeout: None,
         session_allow: &[],
+        spill: None,
     };
     let call = ToolCall {
         call_id: "c-echo".into(),

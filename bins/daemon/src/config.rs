@@ -1934,6 +1934,16 @@ pub fn config_reference() -> String {
          fall back to the 5-minute default tier.\n\n",
     );
     out.push_str(
+        "Tool-result budget and spilling: `engine.tool_result_budget` caps every tool result's \
+         inline bytes (`0` disables the cap). When the session's context engine offers a spill \
+         store (the default `lcm` engine with a durable `data_dir`), an over-budget result is \
+         stored whole in LCM's externalization side-channel and replaced inline by a head/tail \
+         preview plus a recovery notice — `lcm_expand` recovers the full bytes by the notice's \
+         ref. Without a store (an ephemeral/in-memory bank, or a context engine that offers \
+         none) the result is truncated in place as before. Spilling has no dedicated \
+         configuration: it is active exactly when the context engine can store payloads.\n\n",
+    );
+    out.push_str(
         "Single-origin browser deployment: `web.addr` binds ONE plain-HTTP listener that serves \
          the Qt WASM app bundle in `web.root` (point it at the installed `daemon-app` bundle \
          directory) as static files and the same authenticated WebSocket mux carrier on `/ws` — \

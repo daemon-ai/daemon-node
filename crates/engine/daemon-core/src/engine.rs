@@ -1269,6 +1269,9 @@ impl Engine {
                     .iter()
                     .map(|r| r.fingerprint.clone())
                     .collect();
+                // Owned handle to the session's context engine so the borrow the spill accessor
+                // hands out lives in this round's locals, not in `&self` (which later mutates).
+                let context_engine = self.context.clone();
                 let cx = TurnCx {
                     cancel: control.cancel_token(),
                     events,
@@ -1283,6 +1286,9 @@ impl Engine {
                     checkpoints: checkpoints.as_deref(),
                     tool_timeout,
                     session_allow: &session_allow,
+                    // A1: the session's context engine may offer a spill store for over-budget
+                    // tool results (LCM's session-scoped externalization); `None` = truncation.
+                    spill: context_engine.tool_spill(),
                 };
 
                 // Count this tool-executing round and note skill/memory tool use for the review nudges.
@@ -1803,6 +1809,9 @@ impl Engine {
         let session_id = self.snapshot.session_id.clone();
         let subsystem_profile = self.subsystem_profile.clone();
         let cancel = control.cancel_token();
+        // Owned handle to the context engine: the re-run cx's spill borrow must live in a local,
+        // not in `&self` (the loop below mutates `self.snapshot`).
+        let context_engine = self.context.clone();
         // Read-only allow-list view for the re-run cx. The durable re-run is `pre_approved` (the gate is
         // skipped), so this is not consulted here — seeded only to build a complete `TurnCx`.
         let session_allow_seed: Vec<crate::exec::CommandFingerprint> = self
@@ -1843,6 +1852,8 @@ impl Engine {
                             checkpoints: checkpoints.as_deref(),
                             tool_timeout,
                             session_allow: &session_allow_seed,
+                            // A1: the resumed re-run budgets/spills exactly like a live round.
+                            spill: context_engine.tool_spill(),
                         };
                         // Cluster B fingerprint gate: refuse to run if the command that would run now
                         // no longer matches what the operator approved (the approve-then-swap TOCTOU).

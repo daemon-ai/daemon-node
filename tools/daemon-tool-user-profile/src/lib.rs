@@ -224,6 +224,7 @@ mod tests {
             checkpoints: None,
             tool_timeout: None,
             session_allow: &[],
+            spill: None,
         };
         let call = ToolCall {
             call_id: "c1".into(),

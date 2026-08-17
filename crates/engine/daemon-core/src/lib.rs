@@ -47,6 +47,7 @@ pub mod recovery;
 pub mod repair;
 pub mod safety;
 pub mod snapshot;
+pub mod spill;
 pub mod tool_pipeline;
 pub mod tools;
 pub mod turn;

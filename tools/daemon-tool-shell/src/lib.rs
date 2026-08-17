@@ -760,6 +760,7 @@ mod tests {
             checkpoints: None,
             tool_timeout: None,
             session_allow: allow,
+            spill: None,
         };
         let call = ToolCall {
             call_id: "c1".into(),
@@ -792,6 +793,7 @@ mod tests {
             checkpoints: None,
             tool_timeout: None,
             session_allow: &[],
+            spill: None,
         };
         let call = ToolCall {
             call_id: "c1".into(),
@@ -868,6 +870,7 @@ mod tests {
             checkpoints: None,
             tool_timeout: None,
             session_allow: &[],
+            spill: None,
         };
         let call = ToolCall {
             call_id: "c1".into(),
@@ -1312,6 +1315,7 @@ mod tests {
             checkpoints: None,
             tool_timeout: None,
             session_allow: &[],
+            spill: None,
         };
         let fp = CommandFingerprint::compute(
             "exec.argv",

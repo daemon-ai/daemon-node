@@ -59,6 +59,7 @@ async fn run(tool: &dyn Tool, host: &dyn HostRequestHandler, args: &str) -> Tool
         checkpoints: None,
         tool_timeout: None,
         session_allow: &[],
+        spill: None,
     };
     let call = ToolCall {
         call_id: "c1".into(),

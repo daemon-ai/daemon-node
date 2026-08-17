@@ -688,6 +688,7 @@ mod tests {
             checkpoints: None,
             tool_timeout: None,
             session_allow: allow,
+            spill: None,
         }
     }
 
