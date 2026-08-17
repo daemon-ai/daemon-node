@@ -31,7 +31,8 @@
 //!   (no `client_id`, no `state` — PKCE binds the flow), exchange is a JSON POST to
 //!   `https://openrouter.ai/api/v1/auth/keys` with `{code, code_verifier, code_challenge_method}`
 //!   returning `{"key": "..."}`. The minted `key` is an ordinary OpenRouter API key, stored BARE
-//!   under the bound profile's credential slot ([`CredentialSlotKind::ProviderKeyForProfile`]).
+//!   under the PROVIDER-GLOBAL `provider/open_router` ref
+//!   ([`CredentialSlotKind::ProviderKeyForProfile`]; the bound profile adopts it by reference).
 //! - [`huggingface`] — a curated provider-bound family (`"provider/huggingface"`, EMPTY params
 //!   schema), gated on an operator-supplied `client_id` in node config: standard OIDC
 //!   (`https://huggingface.co/oauth/authorize` + `/oauth/token`), `inference-api` scope, `use_state`
@@ -138,10 +139,22 @@ pub enum CredentialShape {
     /// Store the raw token-response JSON as the blob under a family-derived `oauth2/<label>` ref
     /// ([`CredentialSlotKind::Derived`]); identity: explicit label → `id_token` `sub` → stable hash.
     RawTokenJson,
-    /// Store the BARE minted key (the exchange's `key_field`) under the bound profile's credential
-    /// slot ([`CredentialSlotKind::ProviderKeyForProfile`]); `account_label` is the fixed provider
+    /// Store the BARE minted key (the exchange's `key_field`) under the PROVIDER-GLOBAL ref
+    /// (`provider/<vendor>`, [`CredentialSlotKind::ProviderKeyForProfile`]) — shared across
+    /// profiles; the bound profile adopts it by reference. `account_label` is the fixed provider
     /// name. Requires a [`ExchangeStyle::JsonPost`] exchange.
     ProviderKey { account_label: &'static str },
+}
+
+/// The PROVIDER-GLOBAL credential ref a provider-key completion mints into (plan Phase 2):
+/// `provider/<canonical vendor>` via the curated [`daemon_api::vendor`] table — the SAME ref
+/// profile creation mints from the model namespace, so the sign-in lands where every profile of
+/// that vendor already reads. An uncurated family (defensive; every provider-key family is
+/// curated today) falls back to its `{family}/{account_label}` legacy shape.
+fn provider_key_ref(family: &str, account_label: &str) -> String {
+    daemon_api::vendor_for_auth_family(family)
+        .map(|v| daemon_api::provider_credential_ref(v.canonical))
+        .unwrap_or_else(|| format!("{family}/{account_label}"))
 }
 
 /// The parameterization of the one OAuth engine — one begin/complete implementation covers every
@@ -301,8 +314,9 @@ pub struct DeviceFlowDescriptor {
     pub client_id: &'static str,
     /// Space-delimited scopes, when the flow requests any.
     pub scopes: Option<&'static str>,
-    /// The fixed provider label the minted token is slotted under
-    /// ([`CredentialSlotKind::ProviderKeyForProfile`], like the OpenRouter key-mint).
+    /// The fixed provider label the completion carries; the token itself is slotted under the
+    /// PROVIDER-GLOBAL ref ([`CredentialSlotKind::ProviderKeyForProfile`], like the OpenRouter
+    /// key-mint).
     pub account_label: &'static str,
 }
 
@@ -310,7 +324,8 @@ pub struct DeviceFlowDescriptor {
 /// schema). The minted GitHub OAuth token is the key genai's `github_copilot` adapter presents —
 /// forwarded VERBATIM as the `Bearer` on the GitHub Models inference API
 /// (`https://models.github.ai/inference/`); genai performs NO `copilot_internal` token exchange.
-/// Stored BARE under the bound profile's credential slot, exactly like a pasted key. Whether a
+/// Stored BARE under the provider-global `provider/github_copilot` ref, exactly like a pasted
+/// key. Whether a
 /// device-flow token minted with only the `read:user` scope is accepted by GitHub Models remains
 /// research-gated pending a live sign-in (a PAT needs the `models: read` permission; the classic
 /// device grant may need a scope adjustment here once verified).
@@ -668,10 +683,9 @@ impl DescriptorPendingFlow {
                 let family = self.descriptor.family;
                 Ok(AuthOutcome {
                     // The BARE minted key rides the exact downstream path as a pasted API key; the
-                    // node slots it under the bound profile's credential slot (never the raw JSON).
+                    // node slots it under the PROVIDER-GLOBAL ref (never the raw JSON).
                     credential_blob: key.to_string(),
-                    // Informational default; `auth_complete` targets the bound profile slot instead.
-                    credential_ref: format!("{family}/{account_label}"),
+                    credential_ref: provider_key_ref(family, account_label),
                     account_label: (*account_label).to_string(),
                     transport_instance: TransportId::new(format!("{family}/{account_label}")),
                     slot: CredentialSlotKind::ProviderKeyForProfile,
@@ -858,7 +872,7 @@ impl PendingAuthFlow for DevicePendingFlow {
             return Ok(AuthStepOutcome::Completed(AuthOutcome {
                 // The BARE minted token rides the exact downstream path as a pasted API key.
                 credential_blob: token.to_string(),
-                credential_ref: format!("{family}/{account_label}"),
+                credential_ref: provider_key_ref(family, account_label),
                 account_label: account_label.to_string(),
                 transport_instance: TransportId::new(format!("{family}/{account_label}")),
                 slot: CredentialSlotKind::ProviderKeyForProfile,

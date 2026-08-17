@@ -78,12 +78,14 @@ pub enum CredentialSlotKind {
     /// Used by Matrix SSO and the generic operator-facing `oauth2` family.
     #[default]
     Derived,
-    /// A minted **model-provider API key**: store the BARE key under the bound profile's credential
-    /// slot (the profile id the credential broker reads), so it rides the exact same downstream
-    /// path as a pasted API key, and DO NOT attach a `BoundAccount` (a provider key is not a
-    /// transport account). Requires a bind naming the target profile — a provider key with no bind
-    /// target would be stranded where no broker reads it, so `auth_complete` rejects the no-bind
-    /// case. Used by the provider-bound OAuth families (OpenRouter, Hugging Face).
+    /// A minted **model-provider API key**: store the BARE key under the flow's PROVIDER-GLOBAL
+    /// ref (`provider/<vendor>`, plan Phase 2 — one shared credential per vendor), point the bound
+    /// profile's `credential_ref` at it (a reference, not a copy), and DO NOT attach a
+    /// `BoundAccount` (a provider key is not a transport account). It rides the exact same
+    /// downstream path as a pasted API key. Requires a bind naming the target profile — that
+    /// profile must adopt the ref for the broker's single-ref lookup to find the key, so
+    /// `auth_complete` rejects the no-bind case. Used by the provider-bound OAuth families
+    /// (OpenRouter, GitHub Copilot, Hugging Face).
     ProviderKeyForProfile,
 }
 

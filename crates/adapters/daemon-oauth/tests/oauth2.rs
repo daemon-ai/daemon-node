@@ -330,6 +330,9 @@ async fn provider_key_json_mint_stores_the_bare_key_and_slot() {
     assert_eq!(outcome.credential_blob, "sk-or-minted-test-key");
     assert_eq!(outcome.slot, CredentialSlotKind::ProviderKeyForProfile);
     assert_eq!(outcome.account_label, "openrouter");
+    // Phase 2: the mint targets the PROVIDER-GLOBAL ref (canonical vendor id via the curated
+    // table), the same ref profile creation derives from an `open_router::…` model namespace.
+    assert_eq!(outcome.credential_ref, "provider/open_router");
 
     // The JSON exchange body carried the PKCE verifier that hashes to the advertised challenge.
     let requests = server.received_requests().await.expect("recording on");

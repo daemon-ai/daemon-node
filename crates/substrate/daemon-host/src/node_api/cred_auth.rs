@@ -10,13 +10,26 @@ impl CredentialApi for NodeApiImpl {
             .credentials
             .as_ref()
             .ok_or_else(|| ApiError::Unsupported("credential management not available".into()))?;
+        // Paste-for-profile redirect (plan Phase 2): when the named string is a profile whose
+        // credential ref is a node-managed PROVIDER-GLOBAL ref (`provider/<vendor>`), the secret
+        // lands under THAT ref — the one the broker's single-ref lookup reads — not under the
+        // profile id (where nothing would ever read it). Any other target (a legacy profile-id
+        // key, an explicit operator ref like `oauth2/<label>`, a direct store row) is stored
+        // verbatim; only the node-minted namespace is redirected.
+        let key = self
+            .profile_store()
+            .ok()
+            .and_then(|profiles| profiles.get(&profile).ok().flatten())
+            .map(|spec| spec.credential_profile().to_string())
+            .filter(|r| daemon_api::is_provider_credential_ref(r))
+            .unwrap_or(profile);
         store
-            .set(&profile, &secret)
+            .set(&key, &secret)
             .map_err(|e| ApiError::Other(format!("credential set: {e}")))?;
         // Cluster F (Part B): replacing the profile's credential must invalidate leases minted
         // against the OLD material — bump the authority's lease epoch after the store write.
         if let Some(revoker) = &self.credential_revoker {
-            revoker.revoke_profile(&profile);
+            revoker.revoke_profile(&key);
         }
         Ok(())
     }
@@ -127,28 +140,40 @@ impl NodeApiImpl {
             .ok_or_else(|| ApiError::Unsupported("credential management not available".into()))?;
 
         // Slot mapping (the node decides, never the client): a provider-bound family (OpenRouter /
-        // Hugging Face) mints a MODEL-PROVIDER API key, which must ride the target profile's
-        // credential slot — the id the credential broker reads — so it flows downstream exactly like
-        // a pasted API key. It requires a bind naming the profile (a key with no bind target would be
-        // stranded where no broker reads it); no `BoundAccount` is attached (a provider key is not a
-        // transport account).
+        // GitHub Copilot / Hugging Face) mints a MODEL-PROVIDER API key stored under the
+        // PROVIDER-GLOBAL ref the family derived (`provider/<vendor>`, plan Phase 2) — one shared
+        // credential per vendor, flowing downstream exactly like a pasted key. The bind still
+        // names the target profile: its `credential_ref` is pointed at the shared ref (a
+        // reference, not a copy) so the broker's single-ref lookup finds the key even on a
+        // pre-Phase-2 profile that was still profile-id-keyed. No `BoundAccount` is attached (a
+        // provider key is not a transport account).
         if outcome.slot == crate::auth::CredentialSlotKind::ProviderKeyForProfile {
             let bind = bind.ok_or_else(|| {
                 ApiError::Other(
-                    "provider-key auth requires a bind naming the target profile: the minted key \
-                     must land in that profile's credential slot for the model broker to use it"
+                    "provider-key auth requires a bind naming the target profile: the profile \
+                     must adopt the minted key's credential ref for the model broker to use it"
                         .into(),
                 )
             })?;
             let profile = bind.profile.clone();
-            let credential_ref = profile.as_str().to_string();
+            let credential_ref = outcome.credential_ref.clone();
             store
                 .set(&credential_ref, &outcome.credential_blob)
                 .map_err(|e| ApiError::Other(format!("credential set: {e}")))?;
-            // Replacing the profile's provider key must invalidate leases minted against any prior
+            // Replacing the vendor's provider key must invalidate leases minted against any prior
             // material — bump the authority's lease epoch after the store write (as `credential_set`).
             if let Some(revoker) = &self.credential_revoker {
                 revoker.revoke_profile(&credential_ref);
+            }
+            // Point the bound profile at the shared ref. Best-effort by design: a bind naming a
+            // not-yet-created profile still lands the key (creation will mint the same ref from
+            // the vendor's model namespace).
+            let profiles = self.profile_store()?;
+            if let Ok(Some(mut spec)) = profiles.get(profile.as_str()) {
+                if spec.credential_ref.as_deref() != Some(credential_ref.as_str()) {
+                    spec.credential_ref = Some(credential_ref.clone());
+                    profiles.update(spec).map_err(profile_err)?;
+                }
             }
             return Ok(AuthCompleteResponse {
                 credential_ref,

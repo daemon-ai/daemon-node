@@ -145,7 +145,10 @@ pub struct ProfileSpec {
     #[serde(default)]
     pub memory_provider: MemoryProviderSel,
     /// The credential reference (profile/key) this engine acquires capabilities from. `None`
-    /// defaults to the profile `id`.
+    /// defaults to the profile `id`. New genai profiles get a node-minted PROVIDER-GLOBAL ref
+    /// (`provider/<vendor>`, [`crate::vendor`]) at creation so one vendor credential is shared
+    /// across profiles; refs under that prefix are node-managed (re-minted when the vendor
+    /// changes) while any other explicit ref is operator-owned and preserved verbatim.
     #[serde(default)]
     pub credential_ref: Option<String>,
     /// An optional fallback credential profile the engine fails over to when the primary credential
@@ -249,6 +252,23 @@ impl ProfileSpec {
     /// The fallback credential profile, if configured (the `Recovery::Fallback` target).
     pub fn fallback_credential_profile(&self) -> Option<&str> {
         self.fallback_credential_ref.as_deref()
+    }
+
+    /// The PROVIDER-GLOBAL credential ref this spec's vendor implies (`provider/<vendor>`,
+    /// credential plan Phase 2), derived mechanically from the namespaced model id — the vendor
+    /// namespace IS the canonical vendor id ([`crate::vendor`]). `None` when no vendor is
+    /// derivable: a non-genai provider (mock/local/daemon-api), or an un-namespaced model id
+    /// (hand-typed; the adapter is inferred at call time, so creation cannot know the vendor —
+    /// such profiles keep the profile-id-keyed default).
+    pub fn provider_scoped_credential_ref(&self) -> Option<String> {
+        if self.provider != ProviderSelector::GenAi {
+            return None;
+        }
+        let (vendor, _) = self.model.split_once("::")?;
+        if vendor.is_empty() {
+            return None;
+        }
+        Some(crate::vendor::provider_credential_ref(vendor))
     }
 
     /// Declare the transport-instance accounts bound to this profile (§5.9.4 account → profile).
@@ -933,6 +953,22 @@ impl CredentialInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_scoped_ref_derives_from_the_model_namespace() {
+        // The vendor namespace IS the canonical vendor id — no curated table consulted.
+        let spec = ProfileSpec::new("p", ProviderSelector::GenAi, "open_router::gpt-4o");
+        assert_eq!(
+            spec.provider_scoped_credential_ref().as_deref(),
+            Some("provider/open_router")
+        );
+        // Un-namespaced (adapter inferred at call time): the vendor is unknowable at creation.
+        let bare = ProfileSpec::new("p", ProviderSelector::GenAi, "gpt-4o");
+        assert_eq!(bare.provider_scoped_credential_ref(), None);
+        // Non-genai providers never scope to a vendor.
+        let mock = ProfileSpec::new("p", ProviderSelector::Mock, "open_router::gpt-4o");
+        assert_eq!(mock.provider_scoped_credential_ref(), None);
+    }
 
     #[test]
     fn custom_provider_projects_to_daemon_cloud_descriptor() {

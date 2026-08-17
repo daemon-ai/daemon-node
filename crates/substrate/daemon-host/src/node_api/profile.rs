@@ -52,6 +52,11 @@ impl ProfileApi for NodeApiImpl {
                 spec.owner = None;
                 // Ingress normalization (wire v47): only `ProfileStore::seed` mints the marker.
                 spec.seeded = false;
+                // Provider-global credential mint (plan Phase 2) — same convention as the
+                // `ProfileOps` path above; an explicit operator ref is preserved verbatim.
+                if spec.credential_ref.is_none() {
+                    spec.credential_ref = spec.provider_scoped_credential_ref();
+                }
                 let id = spec.id.clone();
                 self.profile_store()?.create(spec).map_err(profile_err)?;
                 self.record_profile(&id, daemon_common::Author::Operator, "create");
@@ -84,6 +89,17 @@ impl ProfileApi for NodeApiImpl {
                 // Force-cleared, never preserved (wire v47): an update targeting the first-boot
                 // placeholder ADOPTS it, and no update may re-mint the marker.
                 spec.seeded = false;
+                // Node-managed `provider/…` refs track the vendor (plan Phase 2) — same
+                // convention as the `ProfileOps` path above; operator refs stay verbatim.
+                if spec
+                    .credential_ref
+                    .as_deref()
+                    .is_some_and(daemon_api::is_provider_credential_ref)
+                {
+                    if let Some(re_minted) = spec.provider_scoped_credential_ref() {
+                        spec.credential_ref = Some(re_minted);
+                    }
+                }
                 let id = spec.id.clone();
                 self.profile_store()?.update(spec).map_err(profile_err)?;
                 self.record_profile(&id, daemon_common::Author::Operator, "update");
@@ -128,6 +144,12 @@ impl ProfileApi for NodeApiImpl {
         spec.created_by = Some(daemon_common::Author::Operator);
         spec.owner = None;
         spec.seeded = false;
+        // A clone is a creation: a ref-less source (pre-Phase-2 profile-id-keyed dev data, whose
+        // slot a clone could never see anyway) gets the provider-global mint; an inherited
+        // explicit or `provider/…` ref is already correct and travels as-is.
+        if spec.credential_ref.is_none() {
+            spec.credential_ref = spec.provider_scoped_credential_ref();
+        }
         store.create(spec).map_err(profile_err)?;
         self.record_profile(
             &new_id,
@@ -209,6 +231,11 @@ impl ProfileApi for NodeApiImpl {
         spec.created_by = Some(daemon_common::Author::Operator);
         spec.owner = None;
         spec.seeded = false;
+        // An import is a creation on THIS node: a ref-less distribution adopts the local
+        // provider-global credential (plan Phase 2); an explicit exported ref is kept (a name).
+        if spec.credential_ref.is_none() {
+            spec.credential_ref = spec.provider_scoped_credential_ref();
+        }
         let id = spec.id.clone();
         // The created spec is moved into the store; keep a copy for the SOUL import's
         // Foreign-engine guard below.

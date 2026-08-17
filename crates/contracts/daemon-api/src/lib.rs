@@ -53,6 +53,12 @@ pub use vhc::{
     VhcPolicyMode, VhcRunDetail, VhcRunSummary, VhcSwitchOutcome,
 };
 
+pub mod vendor;
+pub use vendor::{
+    is_provider_credential_ref, provider_credential_ref, vendor_for_auth_family, ProviderVendor,
+    PROVIDER_REF_PREFIX, PROVIDER_VENDORS,
+};
+
 pub mod profile;
 pub use daemon_common::{SkillCreator, SkillState, SkillUsage};
 pub use profile::{
@@ -1898,7 +1904,9 @@ pub trait ProfileApi: Send + Sync {
 /// surface; the node binds the real implementation.
 #[async_trait]
 pub trait CredentialApi: Send + Sync {
-    /// Store (or replace) the secret for `profile`.
+    /// Store (or replace) the secret for `profile`. The node redirects a profile-named set onto
+    /// the profile's node-managed provider-global ref (`provider/<vendor>`, [`crate::vendor`])
+    /// when it carries one, so a pasted key is shared vendor-wide exactly like a signed-in one.
     async fn credential_set(&self, _profile: String, _secret: String) -> Result<(), ApiError> {
         Err(ApiError::Unsupported("credential_set".into()))
     }

@@ -130,6 +130,12 @@ impl ProfileOps {
     /// `create` revision attributed to `author`, and emit the `ProfilesChanged` pointer. The
     /// provenance is `created_by = author` and, for an agent author, `owner = {session}` parsed from
     /// the `agent/{session}/{name}` id (operator profiles have no owner — they are node-wide).
+    ///
+    /// Credential scoping (plan Phase 2): a NEW genai profile with no explicit `credential_ref`
+    /// gets the node-minted PROVIDER-GLOBAL ref (`provider/<vendor>` from the model namespace) so
+    /// one vendor credential is shared across profiles. An explicit incoming ref is preserved
+    /// verbatim (operator-owned); pre-existing profiles are untouched — profile-id-keyed lookup
+    /// remains the fallback for them.
     pub async fn create(&self, mut spec: ProfileSpec, author: Author) -> Result<(), ApiError> {
         spec.created_by = Some(author.clone());
         spec.owner = match &author {
@@ -139,6 +145,9 @@ impl ProfileOps {
         // Ingress normalization (wire v47): `seeded` is minted only by `ProfileStore::seed` — a
         // created profile can never claim to be the first-boot placeholder.
         spec.seeded = false;
+        if spec.credential_ref.is_none() {
+            spec.credential_ref = spec.provider_scoped_credential_ref();
+        }
         self.validate(&spec).await?;
         let id = spec.id.clone();
         self.store.create(spec).map_err(profile_err)?;
@@ -160,6 +169,19 @@ impl ProfileOps {
             spec.owner = existing.owner;
         }
         spec.seeded = false;
+        // Refs under `provider/` are node-managed: a vendor change re-mints them (a provider flip
+        // in the editor must not leave the profile reading the OLD vendor's shared key). Every
+        // other state is operator-owned and preserved — `None` stays profile-id-keyed (the
+        // pre-existing-data fallback) and an explicit custom ref stays verbatim.
+        if spec
+            .credential_ref
+            .as_deref()
+            .is_some_and(daemon_api::is_provider_credential_ref)
+        {
+            if let Some(re_minted) = spec.provider_scoped_credential_ref() {
+                spec.credential_ref = Some(re_minted);
+            }
+        }
         self.validate(&spec).await?;
         let id = spec.id.clone();
         self.store.update(spec).map_err(profile_err)?;
@@ -270,6 +292,114 @@ mod tests {
         let got = store.get("agent/s1/helper").unwrap().unwrap();
         assert_eq!(got.created_by, Some(Author::Agent("profile_manage".into())));
         assert_eq!(got.owner.as_deref(), Some("s1"));
+    }
+
+    #[tokio::test]
+    async fn create_mints_the_provider_global_ref_from_the_model_namespace() {
+        let (ops, store) = ops();
+        ops.create(
+            ProfileSpec::new("alpha", ProviderSelector::GenAi, "open_router::gpt-4o"),
+            Author::Operator,
+        )
+        .await
+        .expect("create");
+        let got = store.get("alpha").unwrap().unwrap();
+        assert_eq!(
+            got.credential_ref.as_deref(),
+            Some("provider/open_router"),
+            "a new genai profile shares its vendor's provider-global credential"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_preserves_an_explicit_ref_and_skips_underivable_vendors() {
+        let (ops, store) = ops();
+        // Explicit refs are operator-owned — never overwritten by the mint.
+        let explicit = ProfileSpec {
+            credential_ref: Some("oauth2/work".into()),
+            ..ProfileSpec::new("explicit", ProviderSelector::GenAi, "open_router::gpt-4o")
+        };
+        ops.create(explicit, Author::Operator)
+            .await
+            .expect("create");
+        assert_eq!(
+            store
+                .get("explicit")
+                .unwrap()
+                .unwrap()
+                .credential_ref
+                .as_deref(),
+            Some("oauth2/work")
+        );
+        // No derivable vendor (mock provider / un-namespaced model): profile-id-keyed default.
+        ops.create(
+            ProfileSpec::new("mock", ProviderSelector::Mock, "m"),
+            Author::Operator,
+        )
+        .await
+        .expect("create mock");
+        assert_eq!(store.get("mock").unwrap().unwrap().credential_ref, None);
+        ops.create(
+            ProfileSpec::new("bare", ProviderSelector::GenAi, "gpt-4o"),
+            Author::Operator,
+        )
+        .await
+        .expect("create bare");
+        assert_eq!(store.get("bare").unwrap().unwrap().credential_ref, None);
+    }
+
+    #[tokio::test]
+    async fn update_reminting_tracks_the_vendor_only_for_node_managed_refs() {
+        let (ops, store) = ops();
+        ops.create(
+            ProfileSpec::new("alpha", ProviderSelector::GenAi, "open_router::gpt-4o"),
+            Author::Operator,
+        )
+        .await
+        .expect("create");
+        // A vendor flip re-mints the node-managed `provider/…` ref to the NEW vendor.
+        let mut flipped = store.get("alpha").unwrap().unwrap();
+        flipped.model = "anthropic::claude-sonnet-4-5".into();
+        ops.update(flipped, Author::Operator).await.expect("update");
+        assert_eq!(
+            store
+                .get("alpha")
+                .unwrap()
+                .unwrap()
+                .credential_ref
+                .as_deref(),
+            Some("provider/anthropic")
+        );
+        // A pre-existing profile with NO ref stays profile-id-keyed across updates (the
+        // pre-Phase-2 dev-data fallback) — an update never mints from None.
+        let legacy = ProfileSpec::new("legacy", ProviderSelector::GenAi, "open_router::gpt-4o");
+        store.create(legacy).expect("seed legacy directly");
+        let mut edit = store.get("legacy").unwrap().unwrap();
+        edit.model = "open_router::gpt-4o-mini".into();
+        ops.update(edit, Author::Operator)
+            .await
+            .expect("update legacy");
+        assert_eq!(store.get("legacy").unwrap().unwrap().credential_ref, None);
+        // An explicit operator ref is preserved verbatim across updates.
+        let mut explicit = store.get("alpha").unwrap().unwrap();
+        explicit.credential_ref = Some("oauth2/work".into());
+        ops.update(explicit, Author::Operator)
+            .await
+            .expect("update explicit");
+        let mut again = store.get("alpha").unwrap().unwrap();
+        again.model = "open_router::gpt-4o".into();
+        ops.update(again, Author::Operator)
+            .await
+            .expect("update again");
+        assert_eq!(
+            store
+                .get("alpha")
+                .unwrap()
+                .unwrap()
+                .credential_ref
+                .as_deref(),
+            Some("oauth2/work")
+        );
     }
 
     #[tokio::test]

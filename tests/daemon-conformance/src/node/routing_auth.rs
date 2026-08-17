@@ -1014,12 +1014,14 @@ async fn provider_openrouter_family_registered_with_empty_schema() {
     handle.shutdown().await;
 }
 
-/// CON-15 node half (the provider-key slot mapping): a provider-bound OAuth family mints a MODEL
-/// API key that must ride the BOUND PROFILE's credential slot — the id the model broker reads — so
-/// it flows downstream exactly like a pasted key, and NO `BoundAccount` is attached (a provider key
-/// is not a transport account). A `ProviderKeyForProfile` outcome with no bind is rejected (the key
-/// would be stranded where no broker reads it). Driven through the node `AuthApi` end to end: a
-/// provider-key descriptor whose JSON key-mint endpoint is a wiremock server returning `{"key":…}`.
+/// CON-15 node half (the provider-key slot mapping, Phase-2 provider-global refs): a
+/// provider-bound OAuth family mints a MODEL API key stored under the PROVIDER-GLOBAL ref
+/// (`provider/<vendor>` — one shared credential per vendor), and the BOUND profile's
+/// `credential_ref` is pointed at it (a reference, not a copy) so the model broker's single-ref
+/// lookup finds it exactly like a pasted key. NO `BoundAccount` is attached (a provider key is
+/// not a transport account). A `ProviderKeyForProfile` outcome with no bind is rejected (no
+/// profile would adopt the ref). Driven through the node `AuthApi` end to end: a provider-key
+/// descriptor whose JSON key-mint endpoint is a wiremock server returning `{"key":…}`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn provider_key_slots_under_bound_profile_and_requires_bind() {
     use daemon_api::{
@@ -1121,8 +1123,9 @@ async fn provider_key_slots_under_bound_profile_and_requires_bind() {
         p
     };
 
-    // (1) WITH a bind: the minted bare key lands under the bound profile id (the broker's slot),
-    // the response reports that ref, and NO BoundAccount is attached.
+    // (1) WITH a bind: the minted bare key lands under the PROVIDER-GLOBAL ref, the bound
+    // profile's credential_ref adopts it, the response reports that ref, and NO BoundAccount is
+    // attached.
     let begun = node
         .auth_begin(AuthBeginRequest {
             family: "provider/openrouter".into(),
@@ -1144,8 +1147,9 @@ async fn provider_key_slots_under_bound_profile_and_requires_bind() {
         .await
         .expect("auth_complete");
     assert_eq!(
-        done.credential_ref, "alpha",
-        "the node slots the provider key under the BOUND PROFILE id, not a client-named ref"
+        done.credential_ref, "provider/open_router",
+        "the node slots the provider key under the PROVIDER-GLOBAL ref (canonical vendor id), \
+         not the bound profile id and not a client-named ref"
     );
     assert_eq!(
         done.bound_profile.as_ref().map(|p| p.as_str()),
@@ -1154,10 +1158,17 @@ async fn provider_key_slots_under_bound_profile_and_requires_bind() {
 
     let listed = node.credential_list().await;
     assert!(
-        listed.iter().any(|c| c.profile == "alpha" && c.present),
-        "the minted key is stored under the profile slot (redacted): {listed:?}"
+        listed
+            .iter()
+            .any(|c| c.profile == "provider/open_router" && c.present),
+        "the minted key is stored under the provider-global ref (redacted): {listed:?}"
     );
     let alpha = profiles.get("alpha").unwrap().unwrap();
+    assert_eq!(
+        alpha.credential_ref.as_deref(),
+        Some("provider/open_router"),
+        "the bound profile adopts the shared ref (a reference, not a copy)"
+    );
     assert!(
         alpha.bound_accounts.is_empty(),
         "a provider key is NOT a transport account — no BoundAccount attach, got {:?}",

@@ -925,6 +925,10 @@ fn default_profile_spec(
         },
         context_engine,
         memory_provider,
+        // Deliberately NOT provider-global-minted (plan Phase 2): the launch seeds
+        // `DAEMON_MODEL_API_KEY` / `DAEMON_CLOUD_API_KEY` under this PROFILE-ID slot, so the
+        // placeholder must keep the profile-id-keyed default for that pairing to resolve.
+        // Operator/agent creates (ProfileOps, the wire handlers) mint `provider/<vendor>`.
         credential_ref: None,
         fallback_credential_ref: None,
         bound_accounts: Vec::new(),

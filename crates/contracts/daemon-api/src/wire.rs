@@ -491,7 +491,10 @@ pub enum ApiRequest {
     },
     /// [`CredentialApi::credential_set`].
     CredentialSet {
-        /// The profile / credential-ref to key the secret by.
+        /// The profile / credential-ref to key the secret by. When it names a profile whose
+        /// `credential_ref` is a node-managed provider-global ref (`provider/<vendor>`,
+        /// [`crate::vendor`]), the node stores the secret under THAT shared ref — a paste and an
+        /// interactive sign-in land in the same slot.
         profile: String,
         /// The secret value (provider API key / token).
         secret: String,
