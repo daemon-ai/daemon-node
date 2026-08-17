@@ -307,9 +307,13 @@ pub struct DeviceFlowDescriptor {
 }
 
 /// The curated GitHub Copilot device-flow descriptor (`"provider/github_copilot"`, empty params
-/// schema). The minted GitHub OAuth token is the key genai's `github_copilot` adapter presents
-/// (it runs the Copilot token exchange internally); stored BARE under the bound profile's
-/// credential slot, exactly like a pasted key.
+/// schema). The minted GitHub OAuth token is the key genai's `github_copilot` adapter presents —
+/// forwarded VERBATIM as the `Bearer` on the GitHub Models inference API
+/// (`https://models.github.ai/inference/`); genai performs NO `copilot_internal` token exchange.
+/// Stored BARE under the bound profile's credential slot, exactly like a pasted key. Whether a
+/// device-flow token minted with only the `read:user` scope is accepted by GitHub Models remains
+/// research-gated pending a live sign-in (a PAT needs the `models: read` permission; the classic
+/// device grant may need a scope adjustment here once verified).
 pub fn github_copilot() -> DeviceFlowDescriptor {
     DeviceFlowDescriptor {
         family: GITHUB_COPILOT_FAMILY,
