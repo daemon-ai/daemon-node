@@ -350,3 +350,94 @@ async fn provider_key_json_mint_stores_the_bare_key_and_slot() {
         "sha256(code_verifier) must equal the advertised code_challenge (the PKCE bond)"
     );
 }
+
+/// The token-set completion (Hugging Face's shape, plan Phase 4) over a wiremock endpoint: an RFC
+/// form-post exchange whose response is a real token set mints a versioned
+/// `CredentialEnvelope::OAuthTokenSet` — access + refresh + absolute expiry + the TRUSTED
+/// descriptor identity, no persisted refresh context (curated flows recover it from the live
+/// table) — under the provider-global ref. The token endpoint is injected via a param so the
+/// engine's real path runs against the mock (the real descriptor's fixed endpoint is pinned in
+/// the unit tests).
+#[tokio::test]
+async fn provider_token_set_mints_the_versioned_envelope() {
+    use daemon_common::CredentialEnvelope;
+    use daemon_oauth::{
+        CallbackParam, CredentialShape, ExchangeStyle, OAuthFlowDescriptor, Source,
+    };
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .and(body_string_contains("grant_type=authorization_code"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "access_token": "hf_oauth_access",
+            "token_type": "Bearer",
+            "refresh_token": "hf_oauth_refresh",
+            "expires_in": 28800,
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // The Hugging Face descriptor's shape, with the token endpoint pointed at the mock.
+    let descriptor = OAuthFlowDescriptor {
+        family: "provider/huggingface",
+        display_name: "Hugging Face (test)",
+        authorization_endpoint: Source::Fixed("https://huggingface.co/oauth/authorize"),
+        token_endpoint: Source::Param("token_endpoint"),
+        client_id: Some(Source::Fixed("hf-client-123")),
+        client_secret_param: None,
+        scopes: Some(Source::Fixed("inference-api")),
+        callback_param: CallbackParam::RedirectUri,
+        use_state: true,
+        exchange: ExchangeStyle::FormPost,
+        credential: CredentialShape::ProviderTokenSet {
+            account_label: "huggingface",
+        },
+        params_schema: Vec::new(),
+    };
+    let factory = DescriptorFlowFactory::new(descriptor).expect("build factory");
+    let mut params = BTreeMap::new();
+    params.insert(
+        "token_endpoint".to_string(),
+        format!("{}/token", server.uri()),
+    );
+
+    let flow = factory
+        .begin(&params, "http://127.0.0.1:7777/cb")
+        .await
+        .expect("begin");
+    let state = query_param(&redirect_url(flow.as_ref()), "state").expect("state minted");
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let outcome = complete(
+        flow.as_ref(),
+        &format!("http://127.0.0.1:7777/cb?code=hf-code&state={state}"),
+    )
+    .await
+    .expect("complete");
+
+    // Slotted like every provider credential: the provider-global ref, adopted by reference.
+    assert_eq!(outcome.slot, CredentialSlotKind::ProviderKeyForProfile);
+    assert_eq!(outcome.credential_ref, "provider/huggingface");
+    assert_eq!(outcome.account_label, "huggingface");
+
+    // The blob is the versioned envelope, not raw response JSON and not a bare token.
+    let envelope = CredentialEnvelope::parse(&outcome.credential_blob).expect("decodes");
+    let CredentialEnvelope::OAuthTokenSet(ts) = envelope else {
+        panic!("expected a token-set envelope");
+    };
+    assert_eq!(ts.access_token, "hf_oauth_access");
+    assert_eq!(ts.refresh_token.as_deref(), Some("hf_oauth_refresh"));
+    assert_eq!(ts.provider_id, "huggingface", "canonical vendor id");
+    assert_eq!(ts.method_id, "provider/huggingface", "descriptor identity");
+    let expires_at = ts.expires_at.expect("expires_in became absolute expiry");
+    assert!(
+        (before + 28_800..=before + 28_810).contains(&expires_at),
+        "expiry is now + expires_in ({expires_at})"
+    );
+    // Curated: NO persisted refresh context — the refresher recovers it from the live table.
+    assert!(ts.token_endpoint.is_none() && ts.client_id.is_none());
+}

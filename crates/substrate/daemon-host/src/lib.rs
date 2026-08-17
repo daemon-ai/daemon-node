@@ -105,8 +105,8 @@ pub use commands::{
 };
 pub use config::HostConfig;
 pub use credentials::{
-    BrokeredCredentialProvider, CredentialBroker, FenceGuard, MultiProfileStoreBroker, OwnerBroker,
-    RelayBroker,
+    BrokeredCredentialProvider, CredentialBroker, CredentialRefresher, FenceGuard,
+    MultiProfileStoreBroker, OwnerBroker, RelayBroker,
 };
 pub use credstore::{
     CredentialStore, FileCredentialStore, MemCredentialStore, PooledStoreCredentialSource,

@@ -52,6 +52,26 @@ impl FenceGuard {
     }
 }
 
+/// The lease-time credential-refresh seam (credential plan Phase 4). Implemented by the OAuth
+/// adapter (which owns descriptors + egress); the broker calls it BEFORE minting a lease so a
+/// near-expiry `OAuthTokenSet` envelope is refreshed — atomically rewritten in the store — and the
+/// freshly-minted lease carries live material. Contract:
+///
+/// - `Ok(true)`: the stored blob was REPLACED (the caller must invalidate leases minted against
+///   the old material — the broker bumps the ref's lease epoch).
+/// - `Ok(false)`: nothing to do (bare key, no envelope, not near expiry, or no store row).
+/// - `Err`: the credential is stale and could not be refreshed. Classified in the message —
+///   `refresh_failed: …` (transient: network/5xx, retryable as-is) vs `reauth_required: …`
+///   (terminal: rejected refresh grant, expired without a refresh path, undecodable envelope);
+///   the turn fails with this error through the existing turn-error path.
+///
+/// Implementations own per-credential single-flight so concurrent acquires trigger ONE refresh.
+#[async_trait]
+pub trait CredentialRefresher: Send + Sync {
+    /// Refresh the blob stored under `credential_ref` if it is a token-set envelope near expiry.
+    async fn refresh_if_stale(&self, credential_ref: &str) -> Result<bool, CredError>;
+}
+
 /// The serve-or-forward seam at one hop of the brokering chain. `acquire` mints (owner) or narrows
 /// and forwards (relay); `use_capability` resolves a `Proxied` call at the owner (relays forward).
 #[async_trait]
@@ -189,6 +209,7 @@ pub struct MultiProfileStoreBroker {
     mode: CredMode,
     ttl_ms: u64,
     authorities: Mutex<HashMap<ProfileRef, Arc<CredentialAuthority>>>,
+    refresher: Option<Arc<dyn CredentialRefresher>>,
 }
 
 impl MultiProfileStoreBroker {
@@ -214,7 +235,16 @@ impl MultiProfileStoreBroker {
             mode,
             ttl_ms,
             authorities: Mutex::new(HashMap::new()),
+            refresher: None,
         }
+    }
+
+    /// Attach the lease-time [`CredentialRefresher`]: every `acquire` first gives it the chance to
+    /// refresh a near-expiry token-set envelope, so the minted lease carries live material.
+    #[must_use]
+    pub fn with_refresher(mut self, refresher: Arc<dyn CredentialRefresher>) -> Self {
+        self.refresher = Some(refresher);
+        self
     }
 
     /// Revoke every outstanding lease for `profile` (Cluster F, Part B). If no authority has been
@@ -268,6 +298,26 @@ impl CredentialBroker for MultiProfileStoreBroker {
         profile: &ProfileRef,
         scope: &CredScope,
     ) -> Result<CapabilityLease, CredError> {
+        // Lease-time refresh (plan Phase 4): a near-expiry token-set envelope is refreshed BEFORE
+        // the lease is minted, so the secret this acquire serves is live material. A rewrite
+        // invalidates leases minted against the replaced material (epoch bump — exactly as a
+        // `CredentialSet` does); a classified refresh failure fails the acquire (and thus the
+        // turn) rather than serving a token known to be stale.
+        if let Some(refresher) = &self.refresher {
+            match refresher.refresh_if_stale(profile.as_str()).await {
+                Ok(true) => self.revoke_profile(profile),
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        trace_id = %current_trace(),
+                        profile = %profile,
+                        reason = %e,
+                        "cred.refresh_failed"
+                    );
+                    return Err(e);
+                }
+            }
+        }
         let ctx = AcquireCtx::new(requester, current_trace());
         tracing::debug!(trace_id = %current_trace(), profile = %profile, requester = ?ctx.requester, "cred.acquire");
         self.authority_for(profile).acquire(&ctx, profile, scope)
@@ -608,6 +658,148 @@ mod tests {
             .use_capability(None, &lease_b)
             .await
             .expect("beta lease unaffected by alpha revocation");
+    }
+
+    /// A stub refresher driving the broker's lease-time hook: "refreshes" by rewriting the store
+    /// row to `renewed`, or fails with a classified error.
+    struct StubRefresher {
+        store: Arc<dyn CredentialStore>,
+        renewed: Option<String>,
+        error: Option<String>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl CredentialRefresher for StubRefresher {
+        async fn refresh_if_stale(&self, credential_ref: &str) -> Result<bool, CredError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(message) = &self.error {
+                return Err(CredError::Other(message.clone()));
+            }
+            match &self.renewed {
+                Some(secret) => {
+                    self.store.set(credential_ref, secret).unwrap();
+                    Ok(true)
+                }
+                None => Ok(false),
+            }
+        }
+    }
+
+    /// The lease-time refresh hook (plan Phase 4): a rewrite invalidates leases minted against
+    /// the replaced material (epoch bump), and the acquire that triggered it serves the RENEWED
+    /// secret — never the stale one.
+    #[tokio::test]
+    async fn acquire_refreshes_stale_material_and_invalidates_old_leases() {
+        let store: Arc<dyn CredentialStore> = Arc::new(MemCredentialStore::new());
+        store.set("provider/huggingface", "stale-token").unwrap();
+        let signer = Arc::new(CapabilitySigner::generate());
+        let refresher = Arc::new(StubRefresher {
+            store: store.clone(),
+            renewed: Some("fresh-token".to_string()),
+            error: None,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let broker = MultiProfileStoreBroker::new(
+            store,
+            signer,
+            "sk-fallback",
+            ["chat"],
+            Some(1_000),
+            CredMode::Bearer,
+            60_000,
+        )
+        .with_refresher(refresher.clone());
+        let profile = ProfileRef::new("provider/huggingface");
+        let scope = CredScope::new(["provider/huggingface"], ["chat"], Some(1_000));
+
+        let lease = broker
+            .acquire(None, &profile, &scope)
+            .await
+            .expect("acquire refreshes then mints");
+        assert_eq!(
+            lease.secret.as_ref().unwrap().expose(),
+            "fresh-token",
+            "the minted lease carries the RENEWED material"
+        );
+        assert_eq!(
+            refresher.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the refresher ran once, before the lease"
+        );
+
+        // A second acquire refreshes again (the stub always rewrites) — proving the FIRST lease
+        // was invalidated by the second rewrite's epoch bump, exactly as a CredentialSet would.
+        let second = broker
+            .acquire(None, &profile, &scope)
+            .await
+            .expect("second acquire");
+        let err = broker
+            .use_capability(None, &lease)
+            .await
+            .expect_err("the pre-rewrite lease must be refused after the epoch bump");
+        assert!(matches!(err, CredError::Unavailable(_)), "got {err:?}");
+        broker
+            .use_capability(None, &second)
+            .await
+            .expect("the post-rewrite lease resolves");
+    }
+
+    /// A classified refresh failure fails the acquire (and thus the turn) — the broker never
+    /// serves a token the refresher proved stale; a `false` (nothing stale) is a clean pass-through.
+    #[tokio::test]
+    async fn refresh_failures_fail_the_acquire_and_noop_passes_through() {
+        let store: Arc<dyn CredentialStore> = Arc::new(MemCredentialStore::new());
+        store.set("alpha", "key-alpha").unwrap();
+        let signer = Arc::new(CapabilitySigner::generate());
+        let failing = Arc::new(StubRefresher {
+            store: store.clone(),
+            renewed: None,
+            error: Some("reauth_required: alpha: token endpoint rejected the grant".to_string()),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let broker = MultiProfileStoreBroker::new(
+            store.clone(),
+            signer.clone(),
+            "sk-fallback",
+            ["chat"],
+            Some(1_000),
+            CredMode::Bearer,
+            60_000,
+        )
+        .with_refresher(failing);
+        let scope = CredScope::new(["alpha"], ["chat"], Some(1_000));
+        let err = broker
+            .acquire(None, &ProfileRef::new("alpha"), &scope)
+            .await
+            .expect_err("a classified refresh failure fails the acquire");
+        assert!(
+            err.to_string().contains("reauth_required"),
+            "the classification reaches the turn error: {err}"
+        );
+
+        // `Ok(false)` (nothing stale): the acquire proceeds and serves the stored key untouched.
+        let passthrough = Arc::new(StubRefresher {
+            store: store.clone(),
+            renewed: None,
+            error: None,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let broker = MultiProfileStoreBroker::new(
+            store,
+            signer,
+            "sk-fallback",
+            ["chat"],
+            Some(1_000),
+            CredMode::Bearer,
+            60_000,
+        )
+        .with_refresher(passthrough);
+        let lease = broker
+            .acquire(None, &ProfileRef::new("alpha"), &scope)
+            .await
+            .expect("a no-op refresh never blocks the acquire");
+        assert_eq!(lease.secret.as_ref().unwrap().expose(), "key-alpha");
     }
 
     /// A profile with no stored key falls back to the configured fallback (zero-config bootstrap).

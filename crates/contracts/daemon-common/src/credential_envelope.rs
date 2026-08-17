@@ -43,6 +43,19 @@ pub struct OAuthTokenSet {
     /// Unix seconds when `access_token` expires (`None` = the vendor stated no expiry).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<u64>,
+    /// The persisted refresh context (credential plan Phase 4), split by descriptor kind:
+    /// a CURATED flow leaves these `None` — the refresher recovers token endpoint + client
+    /// identity from the live descriptor table via `method_id` (so operator config changes,
+    /// e.g. a rotated Hugging Face client id, take effect without re-auth). A DYNAMIC flow
+    /// (endpoints/client arriving as runtime params) has no table to recover from, so its
+    /// completion persists the context it VALIDATED at mint time here. Absent on a dynamic
+    /// set = explicitly non-refreshable across restart; it expires into `reauth_required`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_endpoint: Option<String>,
+    /// The refresh-grant client id paired with [`token_endpoint`](Self::token_endpoint)
+    /// (dynamic flows only; curated flows resolve it from the descriptor table).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
 }
 
 /// One decoded credential-store blob.
@@ -134,6 +147,8 @@ mod tests {
             access_token: "hf_access".into(),
             refresh_token: Some("hf_refresh".into()),
             expires_at: Some(1_900_000_000),
+            token_endpoint: None,
+            client_id: None,
         }
     }
 
@@ -171,6 +186,25 @@ mod tests {
         assert_eq!(
             CredentialEnvelope::parse(&encoded).unwrap(),
             CredentialEnvelope::OAuthTokenSet(ts)
+        );
+    }
+
+    #[test]
+    fn dynamic_refresh_context_round_trips_and_curated_sets_omit_it() {
+        // A curated set (context recovered from the descriptor table) serializes no context keys.
+        let curated = CredentialEnvelope::OAuthTokenSet(sample()).encode();
+        assert!(!curated.contains("token_endpoint"), "{curated}");
+        assert!(!curated.contains("client_id"), "{curated}");
+        // A dynamic set persists the context it validated at mint time.
+        let dynamic = OAuthTokenSet {
+            token_endpoint: Some("https://idp.example/token".into()),
+            client_id: Some("my-client".into()),
+            ..sample()
+        };
+        let encoded = CredentialEnvelope::OAuthTokenSet(dynamic.clone()).encode();
+        assert_eq!(
+            CredentialEnvelope::parse(&encoded).unwrap(),
+            CredentialEnvelope::OAuthTokenSet(dynamic)
         );
     }
 

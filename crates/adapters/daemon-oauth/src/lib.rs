@@ -36,7 +36,12 @@
 //! - [`huggingface`] — a curated provider-bound family (`"provider/huggingface"`, EMPTY params
 //!   schema), gated on an operator-supplied `client_id` in node config: standard OIDC
 //!   (`https://huggingface.co/oauth/authorize` + `/oauth/token`), `inference-api` scope, `use_state`
-//!   on, RFC form-post exchange, provider-key credential shape.
+//!   on, RFC form-post exchange, TOKEN-SET credential shape — HF's token response carries
+//!   `expires_in` (8h default) and a refresh token, so the completion mints a versioned
+//!   [`CredentialEnvelope::OAuthTokenSet`] the lease-time [`TokenSetRefresher`] keeps live.
+//!
+//! Refresh support (credential plan Phase 4) lives in [`TokenSetRefresher`]: the
+//! `daemon_host::CredentialRefresher` the broker consults before minting a lease.
 
 #![forbid(unsafe_code)]
 
@@ -53,11 +58,15 @@ use daemon_api::{
     ApiError, AuthChallenge, AuthFieldKind, AuthFlowKind, AuthParamField, AuthProviderInfo,
     AuthStepInput,
 };
+use daemon_common::{CredentialEnvelope, OAuthTokenSet};
 use daemon_egress::{EgressClient, EgressConfig, EgressRequest, Redirects};
 use daemon_host::{
     AuthFlowFactory, AuthOutcome, AuthStepOutcome, CredentialSlotKind, PendingAuthFlow,
 };
 use daemon_protocol::TransportId;
+
+mod refresh;
+pub use refresh::{RefreshEndpoint, TokenSetRefresher};
 
 /// The generic operator-facing family (`auth_begin.family`).
 pub const FAMILY: &str = "oauth2";
@@ -66,6 +75,9 @@ pub const FAMILY: &str = "oauth2";
 pub const OPENROUTER_FAMILY: &str = "provider/openrouter";
 /// The Hugging Face provider-bound family (registered only when an operator supplies a client id).
 pub const HUGGINGFACE_FAMILY: &str = "provider/huggingface";
+/// The Hugging Face token endpoint — one constant shared by the sign-in descriptor's exchange and
+/// the refresher's registration, so a minted token set refreshes where it was minted.
+const HUGGINGFACE_TOKEN_ENDPOINT: &str = "https://huggingface.co/oauth/token";
 /// The GitHub Copilot provider-bound family — an RFC 8628 DEVICE flow (not authorization-code):
 /// served by [`DeviceFlowFactory`], advertised by the `github_copilot` provider row's `sign_in`.
 pub const GITHUB_COPILOT_FAMILY: &str = "provider/github_copilot";
@@ -144,6 +156,14 @@ pub enum CredentialShape {
     /// profiles; the bound profile adopts it by reference. `account_label` is the fixed provider
     /// name. Requires a [`ExchangeStyle::JsonPost`] exchange.
     ProviderKey { account_label: &'static str },
+    /// Store a versioned [`CredentialEnvelope::OAuthTokenSet`] under the PROVIDER-GLOBAL ref —
+    /// the shape for curated RFC exchanges whose token response is a real OAuth token set
+    /// (access token + `expires_in` + optional refresh token), so the lease-time refresher can
+    /// keep it live. The envelope carries the trusted descriptor identity
+    /// (`provider_id`/`method_id`) and NO refresh context: curated descriptors recover token
+    /// endpoint + client identity from the live table, so operator config changes (a rotated
+    /// client id) take effect without re-auth. Requires [`ExchangeStyle::FormPost`].
+    ProviderTokenSet { account_label: &'static str },
 }
 
 /// The PROVIDER-GLOBAL credential ref a provider-key completion mints into (plan Phase 2):
@@ -270,8 +290,10 @@ pub fn openrouter() -> OAuthFlowDescriptor {
 
 /// The curated Hugging Face descriptor (`"provider/huggingface"`, empty params schema), gated on an
 /// operator-supplied `client_id`: standard OIDC authorization-code + PKCE with the `inference-api`
-/// scope, RFC form-post exchange, provider-key credential shape. Registered only when the operator
-/// has configured `oauth.huggingface_client_id` (so an unconfigured node never advertises it).
+/// scope, RFC form-post exchange, TOKEN-SET credential shape (HF's token endpoint answers the RFC
+/// response — `access_token` + `expires_in` (8h default) + a refresh token; `refresh_token` is in
+/// its advertised `grant_types_supported`). Registered only when the operator has configured
+/// `oauth.huggingface_client_id` (so an unconfigured node never advertises it).
 pub fn huggingface(client_id: String) -> OAuthFlowDescriptor {
     // The client id is operator config, resolved once at registration; leak it to a `'static`
     // so the descriptor's `Source::Fixed` can carry it (the process lives for the descriptor).
@@ -280,17 +302,31 @@ pub fn huggingface(client_id: String) -> OAuthFlowDescriptor {
         family: HUGGINGFACE_FAMILY,
         display_name: "Hugging Face",
         authorization_endpoint: Source::Fixed("https://huggingface.co/oauth/authorize"),
-        token_endpoint: Source::Fixed("https://huggingface.co/oauth/token"),
+        token_endpoint: Source::Fixed(HUGGINGFACE_TOKEN_ENDPOINT),
         client_id: Some(Source::Fixed(client_id)),
         client_secret_param: None,
         scopes: Some(Source::Fixed("inference-api")),
         callback_param: CallbackParam::RedirectUri,
         use_state: true,
         exchange: ExchangeStyle::FormPost,
-        credential: CredentialShape::ProviderKey {
+        // The Phase-4 defect fix: this was `ProviderKey` (a JSON key-mint shape) on a form-post
+        // exchange, which completion rejects — an HF sign-in could never complete. The RFC
+        // response is a genuine token set, so store it as one.
+        credential: CredentialShape::ProviderTokenSet {
             account_label: "huggingface",
         },
         params_schema: Vec::new(),
+    }
+}
+
+/// The refresh identity matching [`huggingface`]: registered into the [`TokenSetRefresher`]'s
+/// curated table (keyed by [`HUGGINGFACE_FAMILY`]) alongside the descriptor, so a minted HF token
+/// set refreshes against the same endpoint and client the sign-in used.
+pub fn huggingface_refresh(client_id: String) -> RefreshEndpoint {
+    RefreshEndpoint {
+        token_endpoint: HUGGINGFACE_TOKEN_ENDPOINT.to_string(),
+        client_id,
+        client_secret: None,
     }
 }
 
@@ -691,6 +727,53 @@ impl DescriptorPendingFlow {
                     slot: CredentialSlotKind::ProviderKeyForProfile,
                 })
             }
+            CredentialShape::ProviderTokenSet { account_label } => {
+                let access_token = tokens
+                    .get("access_token")
+                    .and_then(|t| t.as_str())
+                    .filter(|t| !t.is_empty())
+                    .ok_or_else(|| {
+                        ApiError::Other(
+                            "oauth2 auth: token response carries no access_token".into(),
+                        )
+                    })?;
+                let refresh_token = tokens
+                    .get("refresh_token")
+                    .and_then(|t| t.as_str())
+                    .filter(|t| !t.is_empty())
+                    .map(str::to_string);
+                // RFC 6749 §5.1 `expires_in` (seconds from now) → absolute unix expiry. Absent =
+                // the vendor stated no expiry; the set is then never proactively refreshed.
+                let expires_at = tokens
+                    .get("expires_in")
+                    .and_then(|v| v.as_u64())
+                    .map(|secs| refresh::unix_now().saturating_add(secs));
+                let family = self.descriptor.family;
+                // The trusted identity the projector/refresher key on — written by the NODE at
+                // mint time. Curated families reconcile through the vendor table; the defensive
+                // fallback (uncurated family) uses the fixed account label.
+                let provider_id = daemon_api::vendor_for_auth_family(family)
+                    .map(|v| v.canonical.to_string())
+                    .unwrap_or_else(|| (*account_label).to_string());
+                let envelope = CredentialEnvelope::OAuthTokenSet(OAuthTokenSet {
+                    provider_id,
+                    method_id: family.to_string(),
+                    access_token: access_token.to_string(),
+                    refresh_token,
+                    expires_at,
+                    // Curated: the refresher recovers endpoint + client identity from the live
+                    // descriptor table via `method_id` — deliberately NOT persisted here.
+                    token_endpoint: None,
+                    client_id: None,
+                });
+                Ok(AuthOutcome {
+                    credential_blob: envelope.encode(),
+                    credential_ref: provider_key_ref(family, account_label),
+                    account_label: (*account_label).to_string(),
+                    transport_instance: TransportId::new(format!("{family}/{account_label}")),
+                    slot: CredentialSlotKind::ProviderKeyForProfile,
+                })
+            }
         }
     }
 }
@@ -1066,6 +1149,26 @@ mod tests {
         assert_eq!(OPENROUTER_FAMILY, "provider/openrouter");
         assert!(openrouter().params_schema.is_empty());
         assert!(huggingface("x".into()).params_schema.is_empty());
+    }
+
+    #[test]
+    fn huggingface_is_a_token_set_form_post_descriptor() {
+        // The Phase-4 defect regression pin: `ProviderKey` on a form-post exchange can never
+        // complete (the completion demands a JSON key-mint), so the HF descriptor must stay a
+        // TOKEN-SET shape over its RFC form-post exchange — and its refresh wiring must target
+        // the same token endpoint the descriptor exchanges against.
+        let d = huggingface("hf-client".into());
+        assert!(matches!(d.exchange, ExchangeStyle::FormPost));
+        assert!(matches!(
+            d.credential,
+            CredentialShape::ProviderTokenSet {
+                account_label: "huggingface"
+            }
+        ));
+        let refresh = huggingface_refresh("hf-client".into());
+        assert_eq!(refresh.token_endpoint, HUGGINGFACE_TOKEN_ENDPOINT);
+        assert_eq!(refresh.client_id, "hf-client");
+        assert!(refresh.client_secret.is_none(), "HF is a public client");
     }
 
     #[test]

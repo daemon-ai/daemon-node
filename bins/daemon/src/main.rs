@@ -461,8 +461,10 @@ impl CloudCatalog for GenAiCloudCatalog {
         for (id, display_name) in discovery_vendor_ids() {
             // Interactive sign-in rides only where a node-owned auth factory registers
             // unconditionally: OpenRouter (PKCE key-mint) and GitHub Copilot (RFC 8628 device
-            // flow). Config-gated families (Hugging Face pattern) advertise nothing here until
-            // an operator supplies their client id; every other vendor is key-in-field.
+            // flow). Hugging Face's config-gated family (plan Phase 4) has NO catalog row to
+            // advertise on — genai ships no HF inference adapter; its token set serves the
+            // credential store (hub access) and is reached via the Accounts sign-in path, which
+            // lists every registered family. Every other vendor is key-in-field.
             let sign_in = match id.as_str() {
                 "open_router" => Some(ProviderSignIn {
                     family: "provider/openrouter".into(),
@@ -2449,7 +2451,28 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     // engine, uniformly across the durable, interactive, and fleet-child construction paths
     // (host-spec §6). Per-profile provisioning means a GUI `CredentialSet` on any profile reaches
     // that profile's sessions, so onboarding never depends on a launch-configured profile name.
-    let owner_broker = build_multi_profile_broker(&cfg.credential_key, credential_store.clone());
+    // The lease-time refresher (credential plan Phase 4) rides in front of every acquire: a
+    // near-expiry OAuth token-set envelope is refreshed + atomically rewritten before the lease
+    // is minted. Its curated table mirrors the registered sign-in descriptors — today Hugging
+    // Face when the operator configured a client id (dynamic sets carry their own context).
+    let refresher: Arc<dyn daemon_host::CredentialRefresher> = {
+        let mut curated = std::collections::BTreeMap::new();
+        if let Some(client_id) = cfg.oauth.huggingface_client_id.clone() {
+            curated.insert(
+                daemon_oauth::HUGGINGFACE_FAMILY.to_string(),
+                daemon_oauth::huggingface_refresh(client_id),
+            );
+        }
+        Arc::new(
+            daemon_oauth::TokenSetRefresher::new(credential_store.clone(), curated)
+                .map_err(|e| anyhow::anyhow!("building the token refresher: {e}"))?,
+        )
+    };
+    let owner_broker = build_multi_profile_broker(
+        &cfg.credential_key,
+        credential_store.clone(),
+        Some(refresher),
+    );
     let owner: Arc<dyn CredentialBroker> = owner_broker.clone();
     let cred_profile = ProfileRef::new(cfg.profile.clone());
     let credentials: CredentialBuilder = {
@@ -3915,9 +3938,10 @@ fn gateway_base_url(addr: &str) -> String {
 fn build_multi_profile_broker(
     fallback_key: &str,
     store: Arc<dyn CredentialStore>,
+    refresher: Option<Arc<dyn daemon_host::CredentialRefresher>>,
 ) -> Arc<MultiProfileStoreBroker> {
     let signer = Arc::new(CapabilitySigner::generate());
-    Arc::new(MultiProfileStoreBroker::new(
+    let mut broker = MultiProfileStoreBroker::new(
         store,
         signer,
         fallback_key,
@@ -3925,7 +3949,11 @@ fn build_multi_profile_broker(
         Some(1_000),
         CredMode::Bearer,
         60_000,
-    ))
+    );
+    if let Some(refresher) = refresher {
+        broker = broker.with_refresher(refresher);
+    }
+    Arc::new(broker)
 }
 
 /// Run as a transport server: host a completing engine unit + an authoritative store, reachable as

@@ -151,8 +151,16 @@ impl CredentialStore for MemCredentialStore {
 
 /// A file-backed credential store: a single JSON object (`profile -> secret`) at `path`.
 ///
-/// Secrets are stored in plaintext at rest for v1 (an OS-keychain / sealed-secret backend is a later
-/// refinement). The file is created with `0600` permissions on unix.
+/// ## Threat model (explicit decision, credential plan Phase 4)
+///
+/// Secrets are stored in **plaintext at rest** at `0600`. With OAuth refresh support the file now
+/// holds long-lived refresh tokens next to API keys, which raises its value to an attacker — this
+/// is accepted as a DOCUMENTED single-user MVP boundary only: any same-user process compromise
+/// reads everything in the store; the `0600` mode is the whole inter-user boundary. This is not
+/// the long-term storage design — OS-keyring backing is the filed follow-up. What this build DOES
+/// guarantee: every rewrite is **atomic** (temp file + rename in the same directory), so a crash
+/// mid-refresh can never truncate the store or tear a token set, and permissions are applied to
+/// the temp file BEFORE it becomes visible at the store path.
 pub struct FileCredentialStore {
     path: PathBuf,
     lock: RwLock<()>,
@@ -180,13 +188,17 @@ impl FileCredentialStore {
 
     fn write_map(&self, map: &BTreeMap<String, String>) -> io::Result<()> {
         let bytes = serde_json::to_vec_pretty(map).map_err(io::Error::other)?;
-        std::fs::write(&self.path, bytes)?;
+        // Atomic replace (threat-model note above): write a sibling temp file, restrict it to
+        // 0600 while it is still invisible, then rename over the store path. A crash at any point
+        // leaves either the old complete store or the new complete store — never a torn one.
+        let tmp = self.path.with_extension("tmp");
+        std::fs::write(&tmp, bytes)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600));
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
         }
-        Ok(())
+        std::fs::rename(&tmp, &self.path)
     }
 }
 

@@ -13,11 +13,16 @@ license.workspace = true
 # SSRF-safe `daemon-egress` client; no raw reqwest client is built here.
 [dependencies]
 daemon-api = { workspace = true }
+# The versioned credential envelope (`OAuthTokenSet`) the token-set completions mint and the
+# lease-time refresher rewrites.
+daemon-common = { workspace = true }
 daemon-host = { workspace = true }
 daemon-protocol = { workspace = true }
 daemon-egress = { workspace = true }
 async-trait = { workspace = true }
 serde_json = { workspace = true }
+# The refresher's per-credential single-flight lock (`tokio::sync::Mutex`).
+tokio = { workspace = true, features = ["sync"] }
 # PKCE: S256 code-challenge (sha2) over a base64url verifier/state minted from OS entropy.
 sha2 = { workspace = true }
 base64 = { workspace = true }

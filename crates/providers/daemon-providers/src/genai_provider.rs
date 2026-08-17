@@ -994,6 +994,8 @@ mod tests {
             access_token: "hf_projected".into(),
             refresh_token: Some("hf_refresh".into()),
             expires_at: None,
+            token_endpoint: None,
+            client_id: None,
         })
         .encode()
     }
