@@ -30,6 +30,7 @@ extend-exclude = [
 [default.extend-words]
 unparseable = "unparseable" # accepted variant of "unparsable"
 clonable = "clonable"       # accepted variant of "cloneable"
+rememberable = "rememberable" # able-to-be-remembered (Tool::fingerprint_rememberable, Cluster B/A2)
 flate = "flate"             # the flate2 crate (DEFLATE)
 togglable = "togglable"     # accepted variant of "toggleable"
 invokable = "invokable"     # Qt's Q_INVOKABLE macro

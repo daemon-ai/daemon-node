@@ -176,19 +176,37 @@ pub trait Tool: Send + Sync {
         self.mutates()
     }
 
-    /// The §12 exec-approval fingerprint (Cluster B) of the command this call would run — a hash of the
-    /// fully-resolved `(abs-binary, argv, env-delta, cwd, exec-surface)` tuple. The engine computes this
-    /// when a call parks for a durable approval (binding the operator's decision to the resolved
-    /// command) and recomputes it on the pre-approved re-run, refusing if the two differ (the
-    /// approve-then-swap TOCTOU gate). Defaults to `None` — a tool that does not exec (or whose
-    /// approvals need no such binding, e.g. an fs edit or `execute_code`) is unaffected and its parked
-    /// approvals run verbatim as before. `shell` overrides this.
+    /// The §12 approval fingerprint (Cluster B) binding a parked durable approval to what the
+    /// operator actually approved. The engine computes this when a call parks for a durable
+    /// approval and recomputes it on the operator-approved re-run, refusing (fail-closed) if the
+    /// two differ. Two shapes exist:
+    /// - a **resolved command** — `shell` / `execute_code` hash the fully-resolved
+    ///   `(exec-surface, abs-binary, argv, env-delta, cwd)` tuple (the approve-then-swap TOCTOU
+    ///   gate);
+    /// - a **state precondition** — the `fs` tool hashes its target's kind-tagged path state
+    ///   (absent / file bytes / symlink target / dir entries), so a file mutated while the
+    ///   approval was parked is refused instead of clobbered (A2).
+    ///
+    /// Defaults to `None`: a tool with no such binding is unaffected and its parked approvals run
+    /// verbatim as before.
     async fn resolved_fingerprint(
         &self,
         _call: &ToolCall,
         _cx: &TurnCx<'_>,
     ) -> Option<crate::exec::CommandFingerprint> {
         None
+    }
+
+    /// Whether this tool's [`resolved_fingerprint`](Tool::resolved_fingerprint) names a
+    /// re-runnable command that a verified durable `allow_permanent` may remember on the session
+    /// allow-list. Defaults to `false` — a **state-precondition** fingerprint (the `fs` tool's
+    /// path-state digest) is one-shot by construction: it binds a single parked mutation to the
+    /// exact bytes the operator approved over and must never broaden into an auto-approve (its
+    /// digest would auto-allow ANY future fs mutation gated while the file happens to hold those
+    /// bytes). `shell` and `execute_code` opt in: their fingerprints identify the exact resolved
+    /// command the operator chose to trust.
+    fn fingerprint_rememberable(&self) -> bool {
+        false
     }
 }
 

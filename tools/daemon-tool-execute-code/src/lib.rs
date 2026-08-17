@@ -307,6 +307,12 @@ impl Tool for ExecuteCodeTool {
         outcome
     }
 
+    /// An `execute_code` fingerprint names the exact resolved interpreter + code, so a verified
+    /// durable `allow_permanent` may remember it on the session allow-list.
+    fn fingerprint_rememberable(&self) -> bool {
+        true
+    }
+
     async fn resolved_fingerprint(
         &self,
         call: &ToolCall,

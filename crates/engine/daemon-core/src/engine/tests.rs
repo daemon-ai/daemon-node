@@ -2345,9 +2345,12 @@ async fn partial_rewind_does_not_fire_session_reset() {
 
 /// A tool that records whether it ran and reports a fixed [`CommandFingerprint`] — lets the
 /// approval-resolve tests drive a match / mismatch against a stored fingerprint deterministically.
+/// `rememberable` mirrors the command-tool (`shell`/`execute_code`) vs state-precondition (`fs`)
+/// split on [`Tool::fingerprint_rememberable`](crate::tools::Tool::fingerprint_rememberable).
 struct FingerprintProbeTool {
     ran: Arc<AtomicU64>,
     resolved: crate::exec::CommandFingerprint,
+    rememberable: bool,
 }
 
 #[async_trait::async_trait]
@@ -2373,6 +2376,9 @@ impl crate::tools::Tool for FingerprintProbeTool {
     ) -> Option<crate::exec::CommandFingerprint> {
         Some(self.resolved.clone())
     }
+    fn fingerprint_rememberable(&self) -> bool {
+        self.rememberable
+    }
 }
 
 /// Seed an engine with one parked approval for `fp_probe` (stored fingerprint = `stored`), an
@@ -2395,14 +2401,30 @@ async fn drive_approval_resolution_payload(
     resolved: crate::exec::CommandFingerprint,
     payload: &[u8],
 ) -> (Engine, Arc<AtomicU64>) {
-    use crate::conversation::{AssistantMsg, ToolCall, ToolResult, ToolTurn, Turn};
-
     let ran = Arc::new(AtomicU64::new(0));
-    let mut registry = ToolRegistry::new();
-    registry.register(Arc::new(FingerprintProbeTool {
+    let probe = Arc::new(FingerprintProbeTool {
         ran: ran.clone(),
         resolved,
-    }));
+        // The command-tool shape (`shell`/`execute_code`): a verified permanent allow remembers.
+        rememberable: true,
+    });
+    let engine = drive_approval_with_tool(probe, stored, payload).await;
+    (engine, ran)
+}
+
+/// The core seeding harness behind [`drive_approval_resolution_payload`], parametrized over the
+/// probe tool itself (which MUST be named `fp_probe`) — lets a test drive the resolve path with a
+/// probe whose fingerprint derives from real filesystem state (the A2 fs-shaped composition) or
+/// whose permanence predicate differs.
+async fn drive_approval_with_tool(
+    tool: Arc<dyn crate::tools::Tool>,
+    stored: Option<crate::exec::CommandFingerprint>,
+    payload: &[u8],
+) -> Engine {
+    use crate::conversation::{AssistantMsg, ToolCall, ToolResult, ToolTurn, Turn};
+
+    let mut registry = ToolRegistry::new();
+    registry.register(tool);
     let mut engine = test_engine("fp", Arc::new(TextProvider), registry);
 
     let job = JobId::new("job-fp");
@@ -2446,7 +2468,7 @@ async fn drive_approval_resolution_payload(
     engine
         .resolve_approvals(&NoopHost, &EventSink::discarding(), &TurnControl::new())
         .await;
-    (engine, ran)
+    engine
 }
 
 /// The content spliced into the `fp_probe` result slot after resolution.
@@ -2632,4 +2654,147 @@ async fn durable_allow_permanent_on_mismatch_remembers_nothing() {
         engine.snapshot.session_allow_fingerprints.is_empty(),
         "a refused command is never remembered on the allow-list",
     );
+}
+
+// --- A2: fs path-state preconditions on the durable approval path --------------------------------
+
+/// A2 permanence fail-safe: a VERIFIED approval whose tool declares its fingerprint
+/// non-rememberable (the `fs` state-precondition shape) runs once but records NOTHING — a
+/// path-state digest must never broaden into an auto-approve of future fs mutations.
+#[tokio::test]
+async fn durable_allow_permanent_state_precondition_is_single_allow() {
+    let fp = fp_at("/ws/some-file-state");
+    let ran = Arc::new(AtomicU64::new(0));
+    let probe = Arc::new(FingerprintProbeTool {
+        ran: ran.clone(),
+        resolved: fp.clone(),
+        rememberable: false,
+    });
+    let engine = drive_approval_with_tool(probe, Some(fp), b"allow_permanent").await;
+
+    assert_eq!(
+        ran.load(Ordering::SeqCst),
+        1,
+        "a verified state-precondition approval still runs once"
+    );
+    assert!(
+        engine.snapshot.session_allow_fingerprints.is_empty(),
+        "a state-precondition fingerprint is never remembered on the allow-list",
+    );
+}
+
+/// A probe shaped like the `fs` tool's A2 durable guard: its fingerprint is a kind-tagged digest
+/// of a real file's current state, recomputed at resolve time — so mutating the file between park
+/// and operator approval flips the digest.
+struct FileStateProbeTool {
+    ran: Arc<AtomicU64>,
+    target: std::path::PathBuf,
+}
+
+impl FileStateProbeTool {
+    fn state_fingerprint(target: &std::path::Path) -> crate::exec::CommandFingerprint {
+        let (kind, body): (&str, Vec<u8>) = match std::fs::read(target) {
+            Ok(bytes) => ("file", bytes),
+            Err(_) => ("absent", Vec::new()),
+        };
+        crate::exec::CommandFingerprint::compute_labeled(
+            "fs.state",
+            &[
+                ("op", b"edit"),
+                ("path", target.as_os_str().as_encoded_bytes()),
+                ("kind", kind.as_bytes()),
+                ("state", &body),
+            ],
+        )
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::tools::Tool for FileStateProbeTool {
+    fn name(&self) -> &str {
+        "fp_probe"
+    }
+    fn schema(&self) -> &str {
+        "{}"
+    }
+    async fn run(
+        &self,
+        call: &crate::conversation::ToolCall,
+        _cx: &crate::turn::TurnCx<'_>,
+    ) -> crate::tools::ToolOutcome {
+        self.ran.fetch_add(1, Ordering::SeqCst);
+        crate::tools::ToolOutcome::text(call.call_id.clone(), true, "fp_probe RAN")
+    }
+    async fn resolved_fingerprint(
+        &self,
+        _call: &crate::conversation::ToolCall,
+        _cx: &crate::turn::TurnCx<'_>,
+    ) -> Option<crate::exec::CommandFingerprint> {
+        Some(Self::state_fingerprint(&self.target))
+    }
+}
+
+fn a2_temp_file(tag: &str) -> std::path::PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::env::temp_dir().join(format!("daemon-core-a2-{tag}-{nanos}.txt"))
+}
+
+/// THE A2 durable gate, end-to-end at the engine: an fs-shaped mutation parked for approval over a
+/// file that is EXTERNALLY MUTATED while the operator decides is refused on resume — the stale
+/// mutation never runs, and the operator sees a refusal spliced into the conversation.
+#[tokio::test]
+async fn approved_fs_mutation_refused_when_file_changed_while_parked() {
+    let target = a2_temp_file("mutated");
+    std::fs::write(&target, b"what the operator approved over").unwrap();
+    // Park time: the approval is bound to the file's current state.
+    let stored = FileStateProbeTool::state_fingerprint(&target);
+    // While the approval is parked, a concurrent writer changes the file.
+    std::fs::write(&target, b"changed while a human was deciding").unwrap();
+
+    let ran = Arc::new(AtomicU64::new(0));
+    let probe = Arc::new(FileStateProbeTool {
+        ran: ran.clone(),
+        target: target.clone(),
+    });
+    let engine = drive_approval_with_tool(probe, Some(stored), b"allow").await;
+
+    assert_eq!(
+        ran.load(Ordering::SeqCst),
+        0,
+        "a stale fs mutation must NOT run after the target changed"
+    );
+    let (ok, content) = spliced_result(&engine);
+    assert!(!ok);
+    assert!(
+        content.contains("refused") && content.contains("Re-read"),
+        "refusal guides the model to re-read and retry: {content}"
+    );
+    let _ = std::fs::remove_file(&target);
+}
+
+/// The matching case: an untouched target verifies and the parked mutation runs exactly once.
+#[tokio::test]
+async fn approved_fs_mutation_runs_when_file_unchanged_while_parked() {
+    let target = a2_temp_file("unchanged");
+    std::fs::write(&target, b"stable content").unwrap();
+    let stored = FileStateProbeTool::state_fingerprint(&target);
+
+    let ran = Arc::new(AtomicU64::new(0));
+    let probe = Arc::new(FileStateProbeTool {
+        ran: ran.clone(),
+        target: target.clone(),
+    });
+    let engine = drive_approval_with_tool(probe, Some(stored), b"allow").await;
+
+    assert_eq!(
+        ran.load(Ordering::SeqCst),
+        1,
+        "an unchanged target verifies and runs"
+    );
+    let (ok, content) = spliced_result(&engine);
+    assert!(ok, "{content}");
+    let _ = std::fs::remove_file(&target);
 }

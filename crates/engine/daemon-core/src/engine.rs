@@ -1357,8 +1357,10 @@ impl Engine {
                     // re-run (`resolve_approvals`) can refuse if the resolved command later differs —
                     // the approve-then-swap TOCTOU gate. Computed here (not in the pure effect router)
                     // because it needs the tool registry + turn context. A command tool (`shell`,
-                    // `execute_code`) returns `Some` and is TOCTOU-bound; a tool that does not exec
-                    // (fs edits) returns `None` and is stored unbound (runs verbatim).
+                    // `execute_code`) returns `Some` and is TOCTOU-bound; the `fs` tool returns a
+                    // path-state digest binding the parked mutation to the exact bytes the operator
+                    // approved over (A2); a tool with no such binding returns `None` and is stored
+                    // unbound (runs verbatim).
                     for a in awaiting.iter_mut() {
                         if let Some(tool) = registry.get(&a.call.name) {
                             a.fingerprint = tool.resolved_fingerprint(&a.call, &cx).await;
@@ -1863,12 +1865,20 @@ impl Engine {
                         if verified {
                             let outcome = run_tool(&approval.call, &registry, &cx).await;
                             // Least-privilege durable "allow permanently": only a verified fingerprint
-                            // (the exact command that just ran) may be remembered. No fingerprint
-                            // (fs edits / legacy) degrades to a single allow — nothing is recorded,
-                            // so a swapped/absent command can never be auto-trusted.
+                            // (the exact command that just ran) may be remembered — and only when the
+                            // tool declares its fingerprint names a re-runnable command
+                            // (`fingerprint_rememberable`). No fingerprint (legacy) or a one-shot
+                            // state-precondition digest (fs, A2) degrades to a single allow — nothing
+                            // is recorded, so a swapped/absent command can never be auto-trusted and
+                            // an fs path-state can never broaden into an auto-approve.
                             if permanent {
                                 if let Some(fp) = &approval.fingerprint {
-                                    self.remember_session_allow(fp.clone());
+                                    let rememberable = registry
+                                        .get(&approval.call.name)
+                                        .is_some_and(|t| t.fingerprint_rememberable());
+                                    if rememberable {
+                                        self.remember_session_allow(fp.clone());
+                                    }
                                 }
                             }
                             (outcome.result.ok, outcome.result.content)
@@ -1876,8 +1886,10 @@ impl Engine {
                             (
                                 false,
                                 format!(
-                                    "refused: the resolved command no longer matches what was \
-                                     approved (request {})",
+                                    "refused: the resolved command or target state no longer \
+                                     matches what was approved (request {}) — it changed while \
+                                     the approval was pending. Re-read the target and retry with \
+                                     a fresh call.",
                                     approval.job_id
                                 ),
                             )

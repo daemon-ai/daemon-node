@@ -245,6 +245,27 @@ impl CommandFingerprint {
         CommandFingerprint(hex)
     }
 
+    /// Compute a fingerprint over an arbitrary labeled tuple for a **non-command** approval surface
+    /// (e.g. the `fs` tool's path-state precondition, A2). Same length-prefixed, label-tagged
+    /// encoding as [`Self::compute`]; the `surface` label domain-separates the tuple, and the part
+    /// count is folded in, so a labeled digest can never collide with a command digest and no two
+    /// distinct tuples share an encoding.
+    pub fn compute_labeled(surface: &str, parts: &[(&str, &[u8])]) -> Self {
+        let mut h = Sha256::new();
+        feed(&mut h, b"surface", surface.as_bytes());
+        feed(&mut h, b"partc", &(parts.len() as u64).to_le_bytes());
+        for (label, bytes) in parts {
+            feed(&mut h, b"label", label.as_bytes());
+            feed(&mut h, b"part", bytes);
+        }
+        let digest = h.finalize();
+        let mut hex = String::with_capacity(digest.len() * 2);
+        for b in digest {
+            let _ = write!(hex, "{b:02x}");
+        }
+        CommandFingerprint(hex)
+    }
+
     /// The full lowercase-hex digest.
     pub fn as_str(&self) -> &str {
         &self.0
@@ -426,6 +447,52 @@ fn is_executable_file(path: &Path) -> bool {
 mod tests {
     use super::*;
     use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn labeled_fingerprint_is_domain_separated_and_field_sensitive() {
+        let base = || {
+            CommandFingerprint::compute_labeled(
+                "fs.state",
+                &[("op", b"edit"), ("kind", b"file"), ("state", b"hello")],
+            )
+        };
+        // Same tuple -> same digest.
+        assert_eq!(base(), base());
+        // Surface, labels, part values, and part order all participate in the identity.
+        assert_ne!(
+            base(),
+            CommandFingerprint::compute_labeled(
+                "fs.other",
+                &[("op", b"edit"), ("kind", b"file"), ("state", b"hello")],
+            )
+        );
+        assert_ne!(
+            base(),
+            CommandFingerprint::compute_labeled(
+                "fs.state",
+                &[("op", b"write"), ("kind", b"file"), ("state", b"hello")],
+            )
+        );
+        assert_ne!(
+            base(),
+            CommandFingerprint::compute_labeled(
+                "fs.state",
+                &[("op", b"edit"), ("kind", b"file"), ("state", b"world")],
+            )
+        );
+        assert_ne!(
+            base(),
+            CommandFingerprint::compute_labeled(
+                "fs.state",
+                &[("kind", b"file"), ("op", b"edit"), ("state", b"hello")],
+            )
+        );
+        // A labeled digest never collides with a command digest, even over similar bytes.
+        assert_ne!(
+            base(),
+            CommandFingerprint::compute("fs.state", Path::new("edit"), &[], &[], Path::new(""))
+        );
+    }
 
     #[test]
     fn command_fingerprint_is_field_sensitive_and_deterministic() {

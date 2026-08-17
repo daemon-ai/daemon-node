@@ -36,7 +36,7 @@ pub mod read;
 pub mod search;
 
 use async_trait::async_trait;
-use daemon_core::exec::{contain, ContainedRoot};
+use daemon_core::exec::{contain, CommandFingerprint, ContainedRoot};
 use daemon_core::{
     approve_path, Effect, Gate, Tool, ToolCall, ToolConcurrency, ToolOutcome, TurnCx,
 };
@@ -193,6 +193,91 @@ struct FsDetail<'a> {
     strategy: Option<&'a str>,
 }
 
+/// The observed state of a mutating op's target path — the freshness precondition a §12 approval
+/// covers (A2). Captured before the approval gate and recompared after it (the inline recheck), and
+/// digested into the parked approval's fingerprint on the durable path, so a target mutated while a
+/// human was deciding is refused instead of clobbered. All capture I/O is fd-contained
+/// ([`ContainedRoot`]) — a symlink is digested as the LINK itself, never followed.
+#[derive(Debug, PartialEq, Eq)]
+enum PathState {
+    /// No entry at the path (the write-creates case).
+    Absent,
+    /// A regular file with exactly these bytes.
+    File(Vec<u8>),
+    /// A symlink whose raw target is this path (the link itself).
+    Symlink(PathBuf),
+    /// A directory with these (sorted) entry names.
+    Dir(Vec<String>),
+    /// The entry exists (or errored) but its state could not be captured; carries the error text.
+    /// Two captures compare equal only on the identical error, so a state that becomes readable —
+    /// or fails differently — while an approval is pending still reads as a change.
+    Other(String),
+}
+
+impl PathState {
+    /// Capture the current state of `path` under `workspace`.
+    async fn capture(workspace: &Path, path: &str) -> PathState {
+        let cr = match ContainedRoot::open(workspace) {
+            Ok(cr) => cr,
+            Err(e) => return PathState::Other(format!("open workspace: {e}")),
+        };
+        let rel = Path::new(path);
+        match cr.symlink_metadata(rel).await {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => PathState::Absent,
+            Err(e) => PathState::Other(e.to_string()),
+            Ok(meta) if meta.is_symlink => match cr.read_link(rel).await {
+                Ok(target) => PathState::Symlink(target),
+                Err(e) => PathState::Other(format!("readlink: {e}")),
+            },
+            Ok(meta) if meta.is_dir => match cr.read_dir(rel).await {
+                Ok(entries) => PathState::Dir(entries.into_iter().map(|e| e.name).collect()),
+                Err(e) => PathState::Other(format!("readdir: {e}")),
+            },
+            Ok(_) => match cr.read(rel).await {
+                Ok(bytes) => PathState::File(bytes),
+                Err(e) => PathState::Other(format!("read: {e}")),
+            },
+        }
+    }
+
+    /// A short human phrase for conflict messages.
+    fn describe(&self) -> String {
+        match self {
+            PathState::Absent => "absent".to_string(),
+            PathState::File(bytes) => format!("a {}-byte file", bytes.len()),
+            PathState::Symlink(target) => format!("a symlink to {}", target.display()),
+            PathState::Dir(entries) => format!("a directory with {} entries", entries.len()),
+            PathState::Other(e) => format!("uncapturable ({e})"),
+        }
+    }
+
+    /// Digest this state into the parked approval's fingerprint: kind-tagged, over the op, the
+    /// contained absolute path, and the state body — so ANY change to the target (appear, vanish,
+    /// content, kind) between park and operator approval flips the digest and the engine refuses
+    /// the re-run fail-closed.
+    fn fingerprint(&self, op: &str, resolved_abs: &Path) -> CommandFingerprint {
+        let (kind, body): (&str, Vec<u8>) = match self {
+            PathState::Absent => ("absent", Vec::new()),
+            PathState::File(bytes) => ("file", bytes.clone()),
+            PathState::Symlink(target) => {
+                ("symlink", target.as_os_str().as_encoded_bytes().to_vec())
+            }
+            // Entry names cannot contain NUL, so a NUL join is unambiguous.
+            PathState::Dir(entries) => ("dir", entries.join("\0").into_bytes()),
+            PathState::Other(e) => ("other", e.as_bytes().to_vec()),
+        };
+        CommandFingerprint::compute_labeled(
+            "fs.state",
+            &[
+                ("op", op.as_bytes()),
+                ("path", resolved_abs.as_os_str().as_encoded_bytes()),
+                ("kind", kind.as_bytes()),
+                ("state", &body),
+            ],
+        )
+    }
+}
+
 /// The filesystem tool.
 #[derive(Default)]
 pub struct FsTool {
@@ -253,6 +338,34 @@ impl FsTool {
                 path: Some(path.to_string()),
             }])),
         }
+    }
+
+    /// The A2 inline post-gate freshness recheck: recapture the target's state after the approval
+    /// gate returned `Proceed` and refuse to commit when it no longer matches what the operator
+    /// approved over — the gate may have blocked on a human for minutes, and committing a
+    /// pre-computed mutation over a changed target silently destroys the concurrent change.
+    /// `None` = fresh (commit); `Some(outcome)` = the typed conflict result (nothing was written).
+    async fn recheck_after_gate(
+        call: &ToolCall,
+        op: &str,
+        workspace: &Path,
+        path: &str,
+        pre: &PathState,
+    ) -> Option<ToolOutcome> {
+        let post = PathState::capture(workspace, path).await;
+        if post == *pre {
+            return None;
+        }
+        Some(ToolOutcome::text(
+            call.call_id.clone(),
+            false,
+            format!(
+                "fs {op} conflict: {path} changed while approval was pending (was {}, now {}). \
+                 The {op} was NOT applied. Re-read the target and retry with a fresh call.",
+                pre.describe(),
+                post.describe()
+            ),
+        ))
     }
 
     /// The write-deny verdict for a contained absolute path: the built-in credential/system
@@ -520,9 +633,17 @@ impl FsTool {
         if let Some(denied) = self.write_denied(&resolved) {
             return ToolOutcome::text(call.call_id.clone(), false, denied);
         }
+        // A2 freshness precondition: what the target looked like when approval was requested.
+        let pre = PathState::capture(&workspace, &path).await;
         let prompt = format!("approve write to {path} ({} bytes)", content.len());
         if let Err(out) = Self::gate(call, cx, &path, prompt).await {
             return out;
+        }
+        // The gate may have blocked on a human — refuse if the target changed meanwhile.
+        if let Some(conflict) =
+            Self::recheck_after_gate(call, "write", &workspace, &path, &pre).await
+        {
+            return conflict;
         }
         let pre_content = self.pre_content_for_lint(cx, &path).await;
         match Self::atomic_write(&workspace, &path, content.as_bytes()).await {
@@ -606,8 +727,17 @@ impl FsTool {
             preview(&old_string),
             replaced.strategy
         );
+        // A2 freshness precondition: the edit was computed from exactly `bytes` — bind the commit
+        // to them (a symlink/dir target never reaches here; the read above would have failed).
+        let pre = PathState::File(bytes);
         if let Err(out) = Self::gate(call, cx, &path, prompt).await {
             return out;
+        }
+        // The gate may have blocked on a human — refuse if the file changed meanwhile.
+        if let Some(conflict) =
+            Self::recheck_after_gate(call, "edit", &workspace, &path, &pre).await
+        {
+            return conflict;
         }
 
         let diff = unified_diff(&original, &new_content, &path);
@@ -668,9 +798,17 @@ impl FsTool {
         if let Some(denied) = self.write_denied(&resolved) {
             return ToolOutcome::text(call.call_id.clone(), false, denied);
         }
+        // A2 freshness precondition: what the operator was asked to delete.
+        let pre = PathState::capture(&workspace, &path).await;
         let prompt = format!("approve delete of {path}");
         if let Err(out) = Self::gate(call, cx, &path, prompt).await {
             return out;
+        }
+        // The gate may have blocked on a human — refuse if the target changed meanwhile.
+        if let Some(conflict) =
+            Self::recheck_after_gate(call, "delete", &workspace, &path, &pre).await
+        {
+            return conflict;
         }
         // fd-contained metadata + unlink (a symlinked component anywhere in `path` is rejected; a
         // symlinked entry is removed as the link itself, never followed out of the workspace).
@@ -797,6 +935,37 @@ impl Tool for FsTool {
         serde_json::from_str::<FsArgs>(&call.args)
             .ok()
             .map(|args| vec![scope_path(args.target_path())])
+    }
+
+    /// The A2 durable path-state precondition: a parked mutating approval is bound to a
+    /// kind-tagged digest of its target's state at park time, so the engine's resume-time verify
+    /// refuses fail-closed when the target changed while the approval was parked — the durable
+    /// analogue of the inline post-gate recheck. Non-mutating ops (and unparseable args, which the
+    /// run itself rejects) return `None` and stay unbound.
+    async fn resolved_fingerprint(
+        &self,
+        call: &ToolCall,
+        cx: &TurnCx<'_>,
+    ) -> Option<CommandFingerprint> {
+        let args: FsArgs = serde_json::from_str(&call.args).ok()?;
+        let op = match &args {
+            FsArgs::Write { .. } => "write",
+            FsArgs::Edit { .. } => "edit",
+            FsArgs::Delete { .. } => "delete",
+            _ => return None,
+        };
+        let path = args.target_path();
+        let workspace = cx.exec.cwd().to_path_buf();
+        // An uncontainable path is left unbound — the op itself refuses it before any gate.
+        let resolved = contain(&workspace, Path::new(path)).ok()?;
+        let state = PathState::capture(&workspace, path).await;
+        Some(state.fingerprint(op, &resolved))
+    }
+
+    /// An fs fingerprint is a one-shot state precondition, never a re-runnable command: the
+    /// engine must not remember it on the session allow-list (the default, made explicit).
+    fn fingerprint_rememberable(&self) -> bool {
+        false
     }
 
     async fn run(&self, call: &ToolCall, cx: &TurnCx<'_>) -> ToolOutcome {
@@ -949,10 +1118,11 @@ mod tests {
         std::env::temp_dir().join(format!("daemon-tool-fs-test-{tag}-{nanos}"))
     }
 
-    async fn run_with(
+    async fn run_with_policy(
         tool: &FsTool,
         env: &LocalEnvironment,
         host: &dyn HostRequestHandler,
+        policy: ApprovalPolicy,
         args: &str,
     ) -> ToolOutcome {
         let cancel = CancellationToken::new();
@@ -966,7 +1136,7 @@ mod tests {
             budget: Budget::unlimited(),
             exec: env,
             tool_result_budget: 0,
-            approval_policy: ApprovalPolicy::AutoAllow,
+            approval_policy: policy,
             pre_approved: false,
             checkpoints: None,
             tool_timeout: None,
@@ -978,6 +1148,15 @@ mod tests {
             args: args.into(),
         };
         tool.run(&call, &cx).await
+    }
+
+    async fn run_with(
+        tool: &FsTool,
+        env: &LocalEnvironment,
+        host: &dyn HostRequestHandler,
+        args: &str,
+    ) -> ToolOutcome {
+        run_with_policy(tool, env, host, ApprovalPolicy::AutoAllow, args).await
     }
 
     async fn run(env: &LocalEnvironment, args: &str) -> ToolOutcome {
@@ -1464,5 +1643,304 @@ mod tests {
             r.result.content
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // --- A2: post-gate freshness recheck (inline) + path-state fingerprint (durable) -------------
+
+    /// What a concurrent writer does to the target while the approval request is with the human.
+    enum Mutation {
+        Write(&'static [u8]),
+        Remove,
+    }
+
+    /// A host that mutates `target` upon receiving the approval request, then approves — the
+    /// concurrent writer racing the human-latency approval window (A2). Raw `std::fs` is the
+    /// point: the writer is OUTSIDE the tool's containment, like a real editor or another agent.
+    struct MutateOnAskHost {
+        target: PathBuf,
+        mutation: Mutation,
+    }
+    #[async_trait]
+    impl HostRequestHandler for MutateOnAskHost {
+        async fn request(&self, req: HostRequest) -> HostResponse {
+            match &self.mutation {
+                Mutation::Write(bytes) => std::fs::write(&self.target, bytes).unwrap(),
+                Mutation::Remove => std::fs::remove_file(&self.target).unwrap(),
+            }
+            HostResponse {
+                request_id: req.request_id,
+                body: HostResponseBody::Approved {
+                    approved: true,
+                    allow_permanent: false,
+                    reason: None,
+                },
+            }
+        }
+    }
+
+    /// THE A2 inline gate: a file mutated while the edit's approval was pending is refused — the
+    /// stale pre-computed edit is never committed over the concurrent change.
+    #[tokio::test]
+    async fn edit_conflicts_when_file_changes_during_approval() {
+        let root = temp_root("a2-edit");
+        let env = LocalEnvironment::new(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"hello world").unwrap();
+        let host = MutateOnAskHost {
+            target: root.join("a.txt"),
+            mutation: Mutation::Write(b"concurrent change"),
+        };
+        let r = run_with_policy(
+            &FsTool::new(),
+            &env,
+            &host,
+            ApprovalPolicy::Ask,
+            r#"{"op":"edit","path":"a.txt","old_string":"hello","new_string":"goodbye"}"#,
+        )
+        .await;
+        assert!(
+            !r.result.ok,
+            "a raced edit must refuse: {}",
+            r.result.content
+        );
+        assert!(
+            r.result.content.contains("fs edit conflict"),
+            "typed conflict result: {}",
+            r.result.content
+        );
+        assert_eq!(
+            std::fs::read(root.join("a.txt")).unwrap(),
+            b"concurrent change",
+            "the concurrent change survives; the stale edit was never committed"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A write approved as a CREATE refuses to clobber a file that appeared meanwhile.
+    #[tokio::test]
+    async fn write_conflicts_when_file_appears_during_approval() {
+        let root = temp_root("a2-write-appear");
+        let env = LocalEnvironment::new(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let host = MutateOnAskHost {
+            target: root.join("new.txt"),
+            mutation: Mutation::Write(b"racer got here first"),
+        };
+        let r = run_with_policy(
+            &FsTool::new(),
+            &env,
+            &host,
+            ApprovalPolicy::Ask,
+            r#"{"op":"write","path":"new.txt","content":"mine"}"#,
+        )
+        .await;
+        assert!(!r.result.ok, "{}", r.result.content);
+        assert!(
+            r.result.content.contains("fs write conflict")
+                && r.result.content.contains("was absent"),
+            "conflict names what changed: {}",
+            r.result.content
+        );
+        assert_eq!(
+            std::fs::read(root.join("new.txt")).unwrap(),
+            b"racer got here first"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A write approved as a REPLACE refuses when the file's content changed meanwhile.
+    #[tokio::test]
+    async fn write_conflicts_when_content_changes_during_approval() {
+        let root = temp_root("a2-write-change");
+        let env = LocalEnvironment::new(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("b.txt"), b"original").unwrap();
+        let host = MutateOnAskHost {
+            target: root.join("b.txt"),
+            mutation: Mutation::Write(b"changed under approval"),
+        };
+        let r = run_with_policy(
+            &FsTool::new(),
+            &env,
+            &host,
+            ApprovalPolicy::Ask,
+            r#"{"op":"write","path":"b.txt","content":"replacement"}"#,
+        )
+        .await;
+        assert!(!r.result.ok, "{}", r.result.content);
+        assert!(r.result.content.contains("fs write conflict"));
+        assert_eq!(
+            std::fs::read(root.join("b.txt")).unwrap(),
+            b"changed under approval"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A delete refuses when the target's content changed while the approval was pending (the
+    /// operator approved deleting WHAT THEY SAW, not whatever is there now).
+    #[tokio::test]
+    async fn delete_conflicts_when_target_changes_during_approval() {
+        let root = temp_root("a2-delete");
+        let env = LocalEnvironment::new(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("c.txt"), b"junk to delete").unwrap();
+        let host = MutateOnAskHost {
+            target: root.join("c.txt"),
+            mutation: Mutation::Write(b"suddenly precious"),
+        };
+        let r = run_with_policy(
+            &FsTool::new(),
+            &env,
+            &host,
+            ApprovalPolicy::Ask,
+            r#"{"op":"delete","path":"c.txt"}"#,
+        )
+        .await;
+        assert!(!r.result.ok, "{}", r.result.content);
+        assert!(r.result.content.contains("fs delete conflict"));
+        assert!(root.join("c.txt").exists(), "the changed file survives");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An edit refuses when the target vanished while the approval was pending.
+    #[tokio::test]
+    async fn edit_conflicts_when_file_vanishes_during_approval() {
+        let root = temp_root("a2-edit-vanish");
+        let env = LocalEnvironment::new(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("d.txt"), b"hello world").unwrap();
+        let host = MutateOnAskHost {
+            target: root.join("d.txt"),
+            mutation: Mutation::Remove,
+        };
+        let r = run_with_policy(
+            &FsTool::new(),
+            &env,
+            &host,
+            ApprovalPolicy::Ask,
+            r#"{"op":"edit","path":"d.txt","old_string":"hello","new_string":"goodbye"}"#,
+        )
+        .await;
+        assert!(!r.result.ok, "{}", r.result.content);
+        assert!(
+            r.result.content.contains("fs edit conflict") && r.result.content.contains("absent"),
+            "{}",
+            r.result.content
+        );
+        assert!(!root.join("d.txt").exists(), "the edit did not recreate it");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The recheck is not paranoid: an untouched target under the SAME ask-then-approve flow
+    /// commits exactly as before.
+    #[tokio::test]
+    async fn write_commits_when_target_unchanged_during_approval() {
+        let root = temp_root("a2-clean");
+        let env = LocalEnvironment::new(&root);
+        let r = run_with_policy(
+            &FsTool::new(),
+            &env,
+            &FixedHost(true),
+            ApprovalPolicy::Ask,
+            r#"{"op":"write","path":"e.txt","content":"clean"}"#,
+        )
+        .await;
+        assert!(r.result.ok, "{}", r.result.content);
+        assert_eq!(std::fs::read(root.join("e.txt")).unwrap(), b"clean");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The durable path-state fingerprint for `args` (the engine computes this at park/resume).
+    async fn fingerprint_of(env: &LocalEnvironment, args: &str) -> Option<CommandFingerprint> {
+        let cancel = CancellationToken::new();
+        let events = EventSink::discarding();
+        let host = FixedHost(true);
+        let cx = TurnCx {
+            cancel,
+            events: &events,
+            host: &host,
+            session_id: SessionId::new("t"),
+            profile: None,
+            budget: Budget::unlimited(),
+            exec: env,
+            tool_result_budget: 0,
+            approval_policy: ApprovalPolicy::AutoAllow,
+            pre_approved: false,
+            checkpoints: None,
+            tool_timeout: None,
+            session_allow: &[],
+        };
+        let call = ToolCall {
+            call_id: "c1".into(),
+            name: "fs".into(),
+            args: args.into(),
+        };
+        FsTool::new().resolved_fingerprint(&call, &cx).await
+    }
+
+    /// The durable precondition digest: stable while the target is unchanged, flipped by a content
+    /// change, an appear/vanish, or a kind change — and distinct per op. Non-mutating ops are
+    /// unbound (`None`).
+    #[tokio::test]
+    async fn path_state_fingerprint_tracks_target_state() {
+        let root = temp_root("a2-fp");
+        let env = LocalEnvironment::new(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let edit_args = r#"{"op":"edit","path":"f.txt","old_string":"a","new_string":"b"}"#;
+        let write_args = r#"{"op":"write","path":"f.txt","content":"x"}"#;
+
+        // Absent target: bound (a write-creates precondition), stable across recompute.
+        let absent = fingerprint_of(&env, edit_args).await.expect("bound");
+        assert_eq!(
+            fingerprint_of(&env, edit_args).await.expect("bound"),
+            absent,
+            "an unchanged (absent) state recomputes to the same digest"
+        );
+
+        // Appear: the digest flips; unchanged content is stable; a content change flips it again.
+        std::fs::write(root.join("f.txt"), b"v1").unwrap();
+        let v1 = fingerprint_of(&env, edit_args).await.expect("bound");
+        assert_ne!(v1, absent, "appear flips the digest");
+        assert_eq!(fingerprint_of(&env, edit_args).await.expect("bound"), v1);
+        std::fs::write(root.join("f.txt"), b"v2").unwrap();
+        let v2 = fingerprint_of(&env, edit_args).await.expect("bound");
+        assert_ne!(v2, v1, "a content change flips the digest");
+
+        // The op is part of the tuple: an approved edit is not an approved write.
+        let w = fingerprint_of(&env, write_args).await.expect("bound");
+        assert_ne!(w, v2, "same path+state, different op ⇒ different digest");
+
+        // A kind change (file → symlink) flips the digest even if the target content matched.
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(root.join("f.txt")).unwrap();
+            std::os::unix::fs::symlink("elsewhere", root.join("f.txt")).unwrap();
+            let sym = fingerprint_of(&env, edit_args).await.expect("bound");
+            assert_ne!(sym, v2, "a kind change flips the digest");
+        }
+
+        // Non-mutating ops carry no precondition.
+        assert!(
+            fingerprint_of(&env, r#"{"op":"read","path":"f.txt"}"#)
+                .await
+                .is_none(),
+            "reads are unbound"
+        );
+        assert!(
+            fingerprint_of(&env, r#"{"op":"grep","pattern":"x"}"#)
+                .await
+                .is_none(),
+            "grep is unbound"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An fs fingerprint is a one-shot state precondition: it must never be rememberable on the
+    /// session allow-list (a durable `allow_permanent` on an fs mutation degrades to single allow).
+    #[test]
+    fn fs_fingerprint_is_never_rememberable() {
+        assert!(!FsTool::new().fingerprint_rememberable());
     }
 }

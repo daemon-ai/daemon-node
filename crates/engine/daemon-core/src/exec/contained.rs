@@ -210,6 +210,27 @@ mod imp {
             blocking(move || this.rename_sync(&from, &to)).await
         }
 
+        /// Read the target of a contained symlink — the link ITSELF, never followed. The parent
+        /// chain is proven symlink-free (contained open), then the final component is read via
+        /// `readlinkat` from that parent fd. Errors (`EINVAL`) when `rel` is not a symlink. Used by
+        /// the `fs` tool's path-state precondition (A2) to digest a symlink's target.
+        pub async fn read_link(&self, rel: &Path) -> io::Result<PathBuf> {
+            let this = self.clone();
+            let rel = rel.to_path_buf();
+            blocking(move || this.read_link_sync(&rel)).await
+        }
+
+        /// Read a contained symlink's target (sync; see [`Self::read_link`]).
+        pub fn read_link_sync(&self, rel: &Path) -> io::Result<PathBuf> {
+            use std::os::unix::ffi::OsStringExt as _;
+            let (parent_fd, name) = self.parent_fd_and_name(rel)?;
+            let target =
+                rustix::fs::readlinkat(&parent_fd, name.as_os_str(), Vec::new()).map_err(to_io)?;
+            Ok(PathBuf::from(std::ffi::OsString::from_vec(
+                target.into_bytes(),
+            )))
+        }
+
         /// Set the unix permission bits of a contained file (opened openat2-relative, so no symlink is
         /// followed) — used to preserve an existing file's mode across the `fs` tool's atomic replace.
         pub async fn set_mode(&self, rel: &Path, mode: u32) -> io::Result<()> {
@@ -824,6 +845,13 @@ mod imp {
         pub async fn symlink_metadata(&self, rel: &Path) -> io::Result<Meta> {
             let abs = super::super::contain(&self.root_abs, rel)?;
             Ok(meta_of(&tokio::fs::symlink_metadata(&abs).await?))
+        }
+
+        /// Read a symlink's target (best-effort lexical containment on this lane; the link itself
+        /// is read, never followed). Symmetric with the unix impl.
+        pub async fn read_link(&self, rel: &Path) -> io::Result<PathBuf> {
+            let abs = super::super::contain(&self.root_abs, rel)?;
+            tokio::fs::read_link(&abs).await
         }
 
         pub fn read_sync(&self, rel: &Path) -> io::Result<Vec<u8>> {

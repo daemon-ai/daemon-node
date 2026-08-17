@@ -372,6 +372,12 @@ impl Tool for ShellTool {
         outcome
     }
 
+    /// A shell fingerprint names the exact resolved command, so a verified durable
+    /// `allow_permanent` may remember it on the session allow-list.
+    fn fingerprint_rememberable(&self) -> bool {
+        true
+    }
+
     async fn resolved_fingerprint(
         &self,
         call: &ToolCall,
