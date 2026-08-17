@@ -2798,3 +2798,422 @@ async fn approved_fs_mutation_runs_when_file_unchanged_while_parked() {
     assert!(ok, "{content}");
     let _ = std::fs::remove_file(&target);
 }
+
+// ---- B2: adversarial trajectory coverage (streaming recovery, engine-level) -----------------
+//
+// The `TrajectoryProvider` scripts real streams — mid-stream disconnects, hangs, digest
+// expectations — so the §8 recovery loop is exercised the way production providers fail, not
+// through non-streaming `chat()` shims. `assert_exhausted()` closes every test: every scripted
+// call and chunk was consumed, no unscripted call happened, no digest expectation was missed.
+
+use crate::provider::StreamEvent;
+use crate::trajectory::{TrajectoryCall, TrajectoryOutcome, TrajectoryProvider};
+
+/// The tiny deterministic recovery budget every trajectory test runs under.
+fn trajectory_config() -> Config {
+    Config {
+        model_backoff_base_ms: 1,
+        model_backoff_max_ms: 2,
+        model_max_retries: 3,
+        ..Config::default()
+    }
+}
+
+fn trajectory_engine(id: &str, provider: Arc<TrajectoryProvider>) -> Engine {
+    test_engine(id, provider, ToolRegistry::new()).with_config(trajectory_config())
+}
+
+/// A 429 carrying a server `Retry-After` retries within the budget and completes on the retry;
+/// the host saw the `RateLimit` event during the backoff.
+#[tokio::test]
+async fn trajectory_rate_limit_with_retry_after_retries_then_completes() {
+    let provider = Arc::new(TrajectoryProvider::new(vec![
+        TrajectoryCall::new(TrajectoryOutcome::Fail(Failure::RateLimit {
+            retry_after: Some(std::time::Duration::from_millis(1)),
+            message: "slow down".into(),
+        })),
+        TrajectoryCall::new(TrajectoryOutcome::streamed_text(&["reco", "vered"])),
+    ]));
+    let mut engine = trajectory_engine("traj-rl", provider.clone());
+    engine.push_user(UserMsg::new("hello"));
+    let (sink, log) = collecting();
+
+    let outcome = engine
+        .run_turn(&NoopHost, &sink, &TurnControl::new())
+        .await
+        .unwrap();
+    match outcome {
+        TurnOutcome::Completed(s) => assert_eq!(s.final_text.as_deref(), Some("recovered")),
+        _ => panic!("expected completion after the rate-limit retry"),
+    }
+    assert!(
+        log.lock()
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, AgentEvent::RateLimit { .. })),
+        "the backoff surfaced a RateLimit event"
+    );
+    provider.assert_exhausted();
+}
+
+/// Persistent auth failures rotate the credential while budget remains, then hop to the fallback
+/// profile once exhausted — and the stream completes on the fallback's credential.
+#[tokio::test]
+async fn trajectory_auth_rotates_then_falls_back_when_exhausted() {
+    let creds = Arc::new(TwoProfileCreds {
+        acquired: std::sync::Mutex::new(Vec::new()),
+    });
+    let provider = Arc::new(TrajectoryProvider::new(vec![
+        TrajectoryCall::new(TrajectoryOutcome::Fail(Failure::Auth("bad key".into()))),
+        TrajectoryCall::new(TrajectoryOutcome::Fail(Failure::Auth("still bad".into()))),
+        TrajectoryCall::new(TrajectoryOutcome::streamed_text(&["ok on fallback"])),
+    ]));
+    let mut engine = test_engine("traj-auth", provider.clone(), ToolRegistry::new())
+        .with_config(Config {
+            model_max_retries: 1,
+            model_backoff_base_ms: 1,
+            model_backoff_max_ms: 2,
+            ..Config::default()
+        })
+        .with_credentials(
+            creds.clone() as Arc<dyn crate::credentials::CredentialProvider>,
+            ProfileRef::new("primary"),
+        )
+        .with_fallback_profile(ProfileRef::new("fallback"));
+    engine.push_user(UserMsg::new("hello"));
+
+    let outcome = engine
+        .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
+        .await
+        .unwrap();
+    match outcome {
+        TurnOutcome::Completed(s) => assert_eq!(s.final_text.as_deref(), Some("ok on fallback")),
+        _ => panic!("expected completion on the fallback profile"),
+    }
+    assert_eq!(
+        creds.acquired.lock().unwrap().clone(),
+        vec![
+            "primary".to_string(),
+            "primary".to_string(),
+            "fallback".to_string()
+        ],
+        "rotate on the primary, then hop to the fallback once the budget is exhausted"
+    );
+    provider.assert_exhausted();
+}
+
+/// A streaming `ContextOverflow` compacts the conversation once and completes on the retry.
+#[tokio::test]
+async fn trajectory_context_overflow_compacts_then_retries() {
+    let provider = Arc::new(TrajectoryProvider::new(vec![
+        TrajectoryCall::new(TrajectoryOutcome::Fail(Failure::ContextOverflow(
+            "too long".into(),
+        ))),
+        TrajectoryCall::new(TrajectoryOutcome::streamed_text(&["after compact"])),
+    ]));
+    let mut engine = trajectory_engine("traj-overflow", provider.clone());
+    for i in 0..8 {
+        engine.push_user(UserMsg::new(format!("message {i} ").repeat(20)));
+    }
+    let before = engine.snapshot().conversation.turns.len();
+
+    let outcome = engine
+        .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
+        .await
+        .unwrap();
+    match outcome {
+        TurnOutcome::Completed(s) => assert_eq!(s.final_text.as_deref(), Some("after compact")),
+        _ => panic!("expected completion after compaction"),
+    }
+    assert!(
+        engine.snapshot().conversation.turns.len() < before,
+        "the conversation was compacted"
+    );
+    provider.assert_exhausted();
+}
+
+/// A mid-stream disconnect after partial deltas retries, and the DURABILITY invariant holds: the
+/// partial deltas leave no durable assistant message — only the successful retry's text lands in
+/// the conversation, exactly once.
+#[tokio::test]
+async fn trajectory_midstream_disconnect_retries_without_duplicates() {
+    let provider = Arc::new(TrajectoryProvider::new(vec![
+        TrajectoryCall::new(TrajectoryOutcome::FailAfter {
+            chunks: vec![StreamEvent::TextDelta("partial answer that dies".into())],
+            failure: Failure::TransientTransport("connection reset mid-stream".into()),
+        }),
+        TrajectoryCall::new(TrajectoryOutcome::streamed_text(&["recovered"])),
+    ]));
+    let mut engine = trajectory_engine("traj-disconnect", provider.clone());
+    engine.push_user(UserMsg::new("hello"));
+    let (sink, log) = collecting();
+
+    let outcome = engine
+        .run_turn(&NoopHost, &sink, &TurnControl::new())
+        .await
+        .unwrap();
+    match outcome {
+        TurnOutcome::Completed(s) => assert_eq!(s.final_text.as_deref(), Some("recovered")),
+        _ => panic!("expected completion after the mid-stream retry"),
+    }
+    // The partial delta was streamed live to the host (that is streaming's contract) …
+    assert!(
+        log.lock()
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TextDelta { text, .. } if text.contains("partial"))),
+        "the partial delta reached the host live"
+    );
+    // … but it must NOT be durable: exactly one assistant turn, carrying only the retry's text.
+    let assistant_texts: Vec<String> = engine
+        .snapshot()
+        .conversation
+        .turns
+        .iter()
+        .filter_map(|t| match t {
+            Turn::Assistant(a) => Some(a.text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        assistant_texts,
+        vec!["recovered".to_string()],
+        "partial deltas from the failed attempt leave no durable assistant message"
+    );
+    provider.assert_exhausted();
+}
+
+/// A retried call does not duplicate tool results: a mid-stream failure before `Done` produces no
+/// tool side effect, and the successful retry's tool call executes exactly once.
+#[tokio::test]
+async fn trajectory_retry_does_not_duplicate_tool_results() {
+    let runs = Arc::new(AtomicU64::new(0));
+    let provider = Arc::new(TrajectoryProvider::new(vec![
+        // Dies mid-stream before any Done — its (never-delivered) tool call must not run.
+        TrajectoryCall::new(TrajectoryOutcome::FailAfter {
+            chunks: vec![StreamEvent::TextDelta("about to call a tool".into())],
+            failure: Failure::TransientTransport("gone".into()),
+        }),
+        // The retry issues the tool call for real.
+        TrajectoryCall::new(TrajectoryOutcome::Chunks(vec![StreamEvent::Done(
+            ModelOutput {
+                text: String::new(),
+                tool_calls: vec![crate::conversation::ToolCall {
+                    call_id: "t1".into(),
+                    name: "counter".into(),
+                    args: "{}".into(),
+                }],
+                ..Default::default()
+            },
+        )])),
+        TrajectoryCall::new(TrajectoryOutcome::streamed_text(&["done"])),
+    ]));
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(CounterTool { runs: runs.clone() }));
+    let mut engine =
+        test_engine("traj-tool-dup", provider.clone(), registry).with_config(trajectory_config());
+    engine.push_user(UserMsg::new("hello"));
+
+    let outcome = engine
+        .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
+        .await
+        .unwrap();
+    match outcome {
+        TurnOutcome::Completed(s) => assert_eq!(s.final_text.as_deref(), Some("done")),
+        _ => panic!("expected completion"),
+    }
+    assert_eq!(
+        runs.load(Ordering::Relaxed),
+        1,
+        "the tool ran exactly once — no side effect from the failed attempt, no duplicate from the retry"
+    );
+    let tool_turns = engine
+        .snapshot()
+        .conversation
+        .turns
+        .iter()
+        .filter(|t| matches!(t, Turn::Tool(_)))
+        .count();
+    assert_eq!(tool_turns, 1, "exactly one durable tool turn");
+    provider.assert_exhausted();
+}
+
+/// A stream that never yields trips the stale-stream watchdog (a recoverable transport failure)
+/// and the retry completes — WATCHDOG recovery, distinct from cooperative cancellation below.
+#[tokio::test]
+async fn trajectory_hang_trips_watchdog_then_retries() {
+    let provider = Arc::new(TrajectoryProvider::new(vec![
+        TrajectoryCall::new(TrajectoryOutcome::Hang),
+        TrajectoryCall::new(TrajectoryOutcome::streamed_text(&["woken up"])),
+    ]));
+    let mut engine =
+        test_engine("traj-hang", provider.clone(), ToolRegistry::new()).with_config(Config {
+            model_stream_watchdog_ms: 40,
+            model_backoff_base_ms: 1,
+            model_backoff_max_ms: 2,
+            model_max_retries: 3,
+            ..Config::default()
+        });
+    engine.push_user(UserMsg::new("hello"));
+
+    let outcome = engine
+        .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
+        .await
+        .unwrap();
+    match outcome {
+        TurnOutcome::Completed(s) => {
+            assert_eq!(s.end_reason, EndReason::Completed);
+            assert_eq!(s.final_text.as_deref(), Some("woken up"));
+        }
+        _ => panic!("expected the watchdog to recover the hung stream"),
+    }
+    provider.assert_exhausted();
+}
+
+/// Deterministic MID-STREAM cancellation: the stream emits its deltas then pends forever
+/// (`HangAfter`), and the test cancels only after observing both deltas — so the cancel provably
+/// lands mid-stream. The turn ends `Interrupted` (cooperative), NOT via the watchdog, and the
+/// intentionally-cancelled final call still counts as consumed.
+#[tokio::test]
+async fn trajectory_hang_after_deltas_is_cancelled_cooperatively() {
+    let provider = Arc::new(TrajectoryProvider::new(vec![TrajectoryCall::new(
+        TrajectoryOutcome::HangAfter {
+            chunks: vec![
+                StreamEvent::TextDelta("thinking ".into()),
+                StreamEvent::TextDelta("hard".into()),
+            ],
+        },
+    )]));
+    let control = TurnControl::new();
+    let cancel = control.cancel_token();
+    let seen = Arc::new(AtomicU64::new(0));
+    let seen_in_sink = seen.clone();
+    // Cancel from the event sink the moment the second delta is observed: a synchronization
+    // point, not a sleep — the stream is provably mid-flight when the cancel fires.
+    let sink = EventSink::new(move |ev| {
+        if matches!(ev, AgentEvent::TextDelta { .. })
+            && seen_in_sink.fetch_add(1, Ordering::SeqCst) + 1 == 2
+        {
+            cancel.cancel();
+        }
+    });
+    let mut engine = test_engine("traj-cancel", provider.clone(), ToolRegistry::new())
+        // A LARGE watchdog, so only cooperative cancellation can end this stream.
+        .with_config(Config {
+            model_stream_watchdog_ms: 60_000,
+            ..trajectory_config()
+        });
+    engine.push_user(UserMsg::new("hello"));
+
+    let outcome = engine.run_turn(&NoopHost, &sink, &control).await.unwrap();
+    match outcome {
+        TurnOutcome::Completed(s) => assert_eq!(
+            s.end_reason,
+            EndReason::Interrupted,
+            "cooperative cancellation, not a watchdog recovery"
+        ),
+        _ => panic!("expected an interrupted turn"),
+    }
+    assert_eq!(seen.load(Ordering::SeqCst), 2, "both deltas were observed");
+    provider.assert_exhausted();
+}
+
+/// A `Fatal` failure aborts the turn (`Failed`) without any retry.
+#[tokio::test]
+async fn trajectory_fatal_aborts_without_retry() {
+    let provider = Arc::new(TrajectoryProvider::new(vec![TrajectoryCall::new(
+        TrajectoryOutcome::Fail(Failure::Fatal("model exploded".into())),
+    )]));
+    let mut engine = trajectory_engine("traj-fatal", provider.clone());
+    engine.push_user(UserMsg::new("hello"));
+
+    let outcome = engine
+        .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
+        .await
+        .unwrap();
+    match outcome {
+        TurnOutcome::Completed(s) => assert_eq!(s.end_reason, EndReason::Failed),
+        _ => panic!("expected a failed turn"),
+    }
+    provider.assert_exhausted();
+}
+
+/// The B1a tie-in, positive side: a scripted digest expectation computed INDEPENDENTLY (via
+/// `of_assembly` over the same inputs the engine assembles from) matches the request the engine
+/// actually dispatched — the testkit cannot satisfy the invariant by construction.
+#[tokio::test]
+async fn trajectory_digest_expectation_accepts_the_assembled_request() {
+    use crate::request_digest::{AssemblyInputs, ModelRequestDigest};
+
+    // Reconstruct the engine's assembly inputs: the conversation it will hold at call time and
+    // the composed prompt `compose()` builds from the system prompt (a single Identity slot).
+    let mut expected_conv = Conversation::new(SystemPrompt::new("test"));
+    expected_conv.push_user(UserMsg::new("hello"));
+    let mut builder = crate::context::ComposedPrompt::builder();
+    builder.push(crate::context::SlotKind::Identity, "test".to_string());
+    let composed = builder.build();
+    let injection = crate::context::TurnInjection::default();
+    let expected = ModelRequestDigest::of_assembly(&AssemblyInputs {
+        conversation: &expected_conv,
+        composed: Some(&composed),
+        injection: &injection,
+        tools: &[],
+        cache_ttl: Config::default().cache_ttl,
+    });
+
+    let provider = Arc::new(TrajectoryProvider::new(vec![TrajectoryCall::new(
+        TrajectoryOutcome::streamed_text(&["ok"]),
+    )
+    .expecting(expected)]));
+    let mut engine = trajectory_engine("traj-digest-ok", provider.clone());
+    engine.push_user(UserMsg::new("hello"));
+
+    let outcome = engine
+        .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
+        .await
+        .unwrap();
+    match outcome {
+        TurnOutcome::Completed(s) => assert_eq!(s.final_text.as_deref(), Some("ok")),
+        _ => panic!("expected completion under a matching digest expectation"),
+    }
+    provider.assert_exhausted();
+}
+
+/// The B1a tie-in, negative side: a wrong digest expectation fails the call fatally and records
+/// the violation — the engine cannot dispatch a request the expectation does not describe.
+#[tokio::test]
+async fn trajectory_digest_expectation_mismatch_fails_the_call() {
+    use crate::request_digest::{AssemblyInputs, ModelRequestDigest};
+
+    let other = Conversation::default();
+    let injection = crate::context::TurnInjection::default();
+    let wrong = ModelRequestDigest::of_assembly(&AssemblyInputs {
+        conversation: &other,
+        composed: None,
+        injection: &injection,
+        tools: &[],
+        cache_ttl: Config::default().cache_ttl,
+    });
+    let provider = Arc::new(TrajectoryProvider::new(vec![TrajectoryCall::new(
+        TrajectoryOutcome::streamed_text(&["unreachable"]),
+    )
+    .expecting(wrong)]));
+    let mut engine = trajectory_engine("traj-digest-bad", provider.clone());
+    engine.push_user(UserMsg::new("hello"));
+
+    let outcome = engine
+        .run_turn(&NoopHost, &EventSink::discarding(), &TurnControl::new())
+        .await
+        .unwrap();
+    match outcome {
+        TurnOutcome::Completed(s) => assert_eq!(s.end_reason, EndReason::Failed),
+        _ => panic!("a digest mismatch must abort the turn"),
+    }
+    assert!(
+        provider
+            .first_problem()
+            .expect("the violation was recorded")
+            .contains("digest mismatch"),
+        "assert_exhausted would fail this test"
+    );
+}

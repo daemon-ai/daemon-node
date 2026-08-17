@@ -51,6 +51,7 @@ pub mod snapshot;
 pub mod spill;
 pub mod tool_pipeline;
 pub mod tools;
+pub mod trajectory;
 pub mod turn;
 
 pub use actor::{spawn_agent_session, AgentHandle};
@@ -109,4 +110,5 @@ pub use tool_pipeline::run_tool;
 pub use tools::{
     Tool, ToolConcurrency, ToolDef, ToolOutcome, ToolProvider, ToolProviderError, ToolRegistry,
 };
+pub use trajectory::{TrajectoryCall, TrajectoryOutcome, TrajectoryProvider};
 pub use turn::{approve_command, approve_path, approve_shell_command, Effect, Gate, TurnCx};
