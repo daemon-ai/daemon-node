@@ -241,6 +241,12 @@
           strictDeps = true;
           SSL_CERT_FILE = caBundle;
           NIX_SSL_CERT_FILE = caBundle;
+          # The messaging adapters (daemon-wechat / daemon-whatsapp) opt `openssl-sys` into
+          # `vendored` mode, which compiles OpenSSL from source during the shared deps-only build —
+          # and that configure step needs `perl`, absent from the bare crane sandbox. Same fix the
+          # `daemon-browser` lane already carries; here it covers the default workspace artifacts
+          # every check (verify-codec, workspace gate) builds on.
+          nativeBuildInputs = [ pkgs.perl ];
         };
 
         # crane's deps-only builds compile against a "dummy" source tree in which every local path
@@ -337,8 +343,9 @@
             # source, which needs `perl` — absent in the crane sandbox. Adding perl lets it build
             # statically, so the shipped daemon carries no runtime `libssl.so` dependency (keeping
             # it as self-contained as the browser-free daemon, and letting the default checkPhase
-            # run the daemon's tests with the feature). The default `daemon` build never pulls
-            # openssl, so it stays on the bare commonArgs.
+            # run the daemon's tests with the feature). commonArgs now carries perl too (the
+            # messaging adapters vendored openssl into the default graph); kept explicit here so
+            # this lane stays self-describing.
             browserExtra = {
               nativeBuildInputs = [ pkgs.perl ];
             };
