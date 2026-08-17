@@ -1407,7 +1407,11 @@ impl ControlApi for NodeApiImpl {
         }
         self.load_routing_pins().await;
         // (4) drop the instance's credential (best-effort; keyed by the instance-qualified id).
-        let _ = self.credential_remove(transport.as_str().to_string()).await;
+        // Forced: the referencing transport is being removed in this same operation, so the
+        // guarded in-use rejection (wire v50) must not block its own teardown.
+        let _ = self
+            .credential_remove(transport.as_str().to_string(), true)
+            .await;
         Ok(())
     }
 

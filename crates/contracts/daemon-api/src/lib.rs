@@ -1916,8 +1916,10 @@ pub trait CredentialApi: Send + Sync {
         Vec::new()
     }
 
-    /// Remove the secret for `profile`.
-    async fn credential_remove(&self, _profile: String) -> Result<(), ApiError> {
+    /// Remove the secret for `profile`. Guarded by default (wire v50): while profiles still
+    /// reference the credential the node rejects, naming the dependents in the error; `force`
+    /// removes anyway. Node-authoritative — an app-side dependency check would race profile edits.
+    async fn credential_remove(&self, _profile: String, _force: bool) -> Result<(), ApiError> {
         Err(ApiError::Unsupported("credential_remove".into()))
     }
 

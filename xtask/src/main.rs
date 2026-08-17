@@ -4338,6 +4338,7 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
         "request-credential-remove.cbor",
         &ApiRequest::CredentialRemove {
             profile: "default".into(),
+            force: true,
         },
     )?;
     // Multi-step interactive auth (wire v31): the AuthStep op across every AuthStepInput arm, the
@@ -4669,11 +4670,20 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
         &out,
         "response-credentials.cbor",
         &ApiResponse::Credentials(vec![CredentialInfo {
-            profile: "default".into(),
+            profile: "provider/open_router".into(),
             present: true,
             hint: "\u{2026}cret".into(),
             // Wire v35: the node-overlaid human label (`None` on an un-labeled credential).
             label: Some("Personal key".into()),
+            // Wire v50 (credential plan Phase 5): the node-derived typed manager fields, every
+            // one populated so verify-codec proves the generated decoder reads them all.
+            provider: Some("open_router".into()),
+            kind: Some("oauth_token".into()),
+            scope: Some("global".into()),
+            classification: Some("provider".into()),
+            expires_at: Some(1_900_000_000),
+            refresh_status: Some("refreshable".into()),
+            used_by: vec!["default".into(), "coder".into()],
         }]),
     )?;
     write_cbor(

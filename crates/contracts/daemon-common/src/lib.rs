@@ -860,7 +860,14 @@ impl WireVersion {
     /// a cloud-credentials affordance instead of a key field. One additive enum value + its CDDL
     /// arm; strict-equal `is_compatible` still holds; clients feature-detect via the `api/49`
     /// Hello feature.
-    pub const CURRENT: Self = Self(49);
+    ///
+    /// (v50) typed credential manager (credential plan Phase 5): `credential-info` gains the
+    /// node-derived manager fields (`provider` / `kind` / `scope` / `classification` /
+    /// `expires_at` / `refresh_status` / `used_by` — all optional), and `CredentialRemove` gains
+    /// `? force` with guarded-by-default semantics (an in-use removal is rejected naming the
+    /// dependent profiles; `force` removes regardless). The app renders the node's answers — it
+    /// never re-derives provider/kind/usage locally.
+    pub const CURRENT: Self = Self(50);
 
     /// The version this build speaks (alias for [`WireVersion::CURRENT`]).
     pub fn current() -> Self {

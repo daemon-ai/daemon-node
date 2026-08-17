@@ -1140,7 +1140,29 @@ bound-account = { "transport_instance": tstr, "credential_ref": tstr }
 ; subtree-filter the profile list. Optional (pre-provenance encodings omit both).
 ; seeded (wire v47): mirrors profile-spec's node-seeded placeholder marker (read-only for clients).
 profile-info = { "id": tstr, "provider": provider-selector, "model": tstr, "is_active": bool, "bound_accounts": [* bound-account], ? "created_by": (author / null), ? "owner": (tstr / null), ? "seeded": bool }
-credential-info = { "profile": tstr, "present": bool, "hint": tstr, ? "label": (tstr / null) }
+; credential-info typed manager fields (wire v50, credential plan Phase 5) — all node-derived,
+; all optional (a pre-v50 row omits them; None = the node could not derive the fact):
+;   provider:       canonical vendor id ("open_router") from the ref shape or the stored
+;                   envelope's trusted identity
+;   kind:           stored material — "api_key" (bare secret) / "oauth_token" (token-set envelope)
+;   scope:          "global" (provider/<vendor>, shared vendor-wide) / "profile" (profile-keyed)
+;   classification: manager section — "provider" / "channel" / "agent"
+;   expires_at:     unix seconds the access token expires (token sets that stated one)
+;   refresh_status: "refreshable" / "reauth_required" (token sets only)
+;   used_by:        profiles referencing this ref — the guarded CredentialRemove dependency list
+credential-info = {
+  "profile": tstr,
+  "present": bool,
+  "hint": tstr,
+  ? "label": (tstr / null),
+  ? "provider": (tstr / null),
+  ? "kind": (tstr / null),
+  ? "scope": (tstr / null),
+  ? "classification": (tstr / null),
+  ? "expires_at": (uint64 / null),
+  ? "refresh_status": (tstr / null),
+  ? "used_by": [* tstr],
+}
 provider-selector = "mock"
                   / "genai"
                   / "daemon_api"
@@ -1555,7 +1577,9 @@ request-curator-restore = { "CuratorRestore": { ? "profile": (tstr / null), "nam
 request-curator-run = { "CuratorRun": { ? "profile": (tstr / null) } }
 request-credential-set = { "CredentialSet": { "profile": tstr, "secret": tstr } }
 request-credential-list = "CredentialList"
-request-credential-remove = { "CredentialRemove": { "profile": tstr } }
+; force (wire v50): absent/false = guarded — the node REJECTS removal of an in-use credential,
+; naming the dependent profiles in the error; true = remove regardless.
+request-credential-remove = { "CredentialRemove": { "profile": tstr, ? "force": bool } }
 request-credential-set-label = { "CredentialSetLabel": { "profile": tstr, ? "label": (tstr / null) } }
 request-model-search = { "ModelSearch": { "query": search-query } }
 request-model-files = { "ModelFiles": { "provider": tstr, "repo": tstr, "revision": (tstr / null), ? "after": (tstr / null) } }

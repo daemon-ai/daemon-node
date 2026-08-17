@@ -43,19 +43,40 @@ impl CredentialApi for NodeApiImpl {
         // rows — the credential store itself holds only the secret material.
         let labels: std::collections::HashMap<String, String> =
             self.store.credential_labels().await.into_iter().collect();
+        // The typed manager overlay (wire v50, plan Phase 5): one profile scan shared by every
+        // row — which profiles reference each ref, and which refs are bound as channel accounts.
+        let profiles = self
+            .profile_store()
+            .ok()
+            .and_then(|s| s.list().ok())
+            .unwrap_or_default();
         for info in &mut list {
             if let Some(label) = labels.get(&info.profile) {
                 info.label = Some(label.clone());
             }
+            self.enrich_credential_info(info, &profiles);
         }
         list
     }
 
-    async fn credential_remove(&self, profile: String) -> Result<(), ApiError> {
+    async fn credential_remove(&self, profile: String, force: bool) -> Result<(), ApiError> {
         let store = self
             .credentials
             .as_ref()
             .ok_or_else(|| ApiError::Unsupported("credential management not available".into()))?;
+        // The guarded mode (wire v50): removal of an in-use credential is rejected WITH the
+        // dependent list — node-authoritative, an app-side check would race profile edits. The
+        // node's own teardown paths (TransportRemove) pass `force` because the referencing
+        // resource is being removed in the same operation.
+        if !force {
+            let used_by = self.credential_used_by(&profile);
+            if !used_by.is_empty() {
+                return Err(ApiError::Other(format!(
+                    "credential in use by profile(s): {}; remove with force to delete anyway",
+                    used_by.join(", ")
+                )));
+            }
+        }
         store
             .remove(&profile)
             .map_err(|e| ApiError::Other(format!("credential remove: {e}")))?;
@@ -125,7 +146,107 @@ impl AuthApi for NodeApiImpl {
     }
 }
 
+/// Profiles referencing `credential_ref` — via `credential_ref` / profile-id keying
+/// ([`ProfileSpec::credential_profile`]), the configured fallback ref, or a bound account. One
+/// definition shared by the guarded `CredentialRemove` and the `used_by` overlay, so the error a
+/// removal returns names exactly the rows the manager displays.
+fn credential_used_by_in(credential_ref: &str, profiles: &[ProfileSpec]) -> Vec<String> {
+    profiles
+        .iter()
+        .filter(|spec| {
+            spec.credential_profile() == credential_ref
+                || spec.fallback_credential_profile() == Some(credential_ref)
+                || spec
+                    .bound_accounts
+                    .iter()
+                    .any(|a| a.credential_ref == credential_ref)
+        })
+        .map(|spec| spec.id.clone())
+        .collect()
+}
+
 impl NodeApiImpl {
+    /// The dependency list for one credential ref (a fresh profile scan — remove-time accuracy).
+    fn credential_used_by(&self, credential_ref: &str) -> Vec<String> {
+        let profiles = self
+            .profile_store()
+            .ok()
+            .and_then(|s| s.list().ok())
+            .unwrap_or_default();
+        credential_used_by_in(credential_ref, &profiles)
+    }
+
+    /// The typed manager overlay (wire v50, plan Phase 5) for one redacted row: scope and
+    /// classification from the ref shape + profile table, material kind / expiry / refresh posture
+    /// from decoding the stored envelope, `used_by` from the shared dependency scan. All
+    /// node-derived — the client renders, never re-derives.
+    fn enrich_credential_info(&self, info: &mut CredentialInfo, profiles: &[ProfileSpec]) {
+        let credential_ref = info.profile.clone();
+        info.used_by = credential_used_by_in(&credential_ref, profiles);
+        let is_provider_global = daemon_api::is_provider_credential_ref(&credential_ref);
+        info.scope = Some(
+            if is_provider_global {
+                "global"
+            } else {
+                "profile"
+            }
+            .to_string(),
+        );
+        // Section: agent-gate refs by namespace; channel refs by being bound as a transport
+        // account (or living in the operator `oauth2/` namespace); everything else is a
+        // model-provider credential (provider-global or a legacy profile-keyed key).
+        let bound_as_account = profiles.iter().any(|spec| {
+            spec.bound_accounts
+                .iter()
+                .any(|a| a.credential_ref == credential_ref)
+        });
+        info.classification = Some(
+            if credential_ref.starts_with(crate::agent_auth::AGENT_FAMILY_PREFIX) {
+                "agent"
+            } else if bound_as_account || credential_ref.starts_with("oauth2/") {
+                "channel"
+            } else {
+                "provider"
+            }
+            .to_string(),
+        );
+        if is_provider_global {
+            info.provider = credential_ref
+                .strip_prefix(daemon_api::vendor::PROVIDER_REF_PREFIX)
+                .map(str::to_string);
+        }
+        // Material facts from the stored blob. An undecodable envelope leaves `kind` unset —
+        // honest "unknown", matching the projector's fail-closed posture.
+        let Some(blob) = self
+            .credentials
+            .as_ref()
+            .and_then(|s| s.get(&credential_ref))
+        else {
+            return;
+        };
+        match daemon_common::CredentialEnvelope::parse(&blob) {
+            Ok(daemon_common::CredentialEnvelope::Key(_)) => info.kind = Some("api_key".into()),
+            Ok(daemon_common::CredentialEnvelope::OAuthTokenSet(ts)) => {
+                info.kind = Some("oauth_token".into());
+                // The envelope's provider identity is TRUSTED (node-written at mint time) and
+                // more specific than the ref shape — it wins.
+                info.provider = Some(ts.provider_id.clone());
+                info.expires_at = ts.expires_at;
+                info.refresh_status = if ts.refresh_token.is_some() {
+                    Some("refreshable".into())
+                } else if ts.expires_at.is_some() {
+                    Some("reauth_required".into())
+                } else {
+                    None // no refresh token but also no expiry: nothing to refresh, ever
+                };
+                // The store's redaction masked the envelope JSON; re-mask over the ACCESS TOKEN so
+                // the hint is honest material, not serialization tail.
+                info.hint = CredentialInfo::redacted(&credential_ref, Some(&ts.access_token)).hint;
+            }
+            Err(_) => {}
+        }
+    }
+
     /// Persist a completed flow's [`AuthOutcome`] into the credential store and honor any bind,
     /// returning the wire [`AuthCompleteResponse`]. The single credential-slot resolution path shared
     /// by `auth_step` completion and (via it) the `auth_complete` compatibility wrapper.

@@ -426,6 +426,7 @@ mod tests {
             (
                 ApiRequest::CredentialRemove {
                     profile: "p".into(),
+                    force: false,
                 },
                 Capability::CredentialWrite,
             ),

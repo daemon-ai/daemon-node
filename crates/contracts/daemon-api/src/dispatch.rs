@@ -475,8 +475,8 @@ async fn serve_auth(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse> {
             unit_or_err(api.credential_set(profile, secret).await)
         }
         ApiRequest::CredentialList => ApiResponse::Credentials(api.credential_list().await),
-        ApiRequest::CredentialRemove { profile } => {
-            unit_or_err(api.credential_remove(profile).await)
+        ApiRequest::CredentialRemove { profile, force } => {
+            unit_or_err(api.credential_remove(profile, force).await)
         }
         ApiRequest::CredentialSetLabel { profile, label } => {
             unit_or_err(api.credential_set_label(profile, label).await)

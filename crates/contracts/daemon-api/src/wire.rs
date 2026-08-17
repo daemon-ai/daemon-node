@@ -505,6 +505,11 @@ pub enum ApiRequest {
     CredentialRemove {
         /// The profile / credential-ref to clear.
         profile: String,
+        /// Remove even while profiles still reference the credential (wire v50). Default `false`:
+        /// the node REJECTS an in-use removal, naming the dependent profiles in the error — the
+        /// app confirms against the node's answer, never its own racy dependency check.
+        #[serde(default)]
+        force: bool,
     },
     /// [`CredentialApi::credential_set_label`] — set/clear a credential/account's human label
     /// (wire v35).
@@ -2471,21 +2476,20 @@ mod auth_contract_tests {
     }
 
     /// The contract wire version (`daemon_common::WireVersion::CURRENT`, mirrored by
-    /// [`crate::API_WIRE_VERSION`]) is pinned to the sealed surface: v48 (the provider-centric
-    /// model-catalog surface: provider-keyed `ModelSearch`/`ModelFiles`/`ModelDownload`/
-    /// `ModelRecommend`, `ModelInstallFromUrl`, `ProviderDescriptor` capabilities
-    /// (`list_auth`/`turn_auth`/`install`/`actions`), structured `ProviderModels` results, and
-    /// rate/eta/quantize-progress event enrichment — on top of v47's node-seeded placeholder
-    /// marker and v46's agents-catalog pointer). Distinct from the transport-envelope
+    /// [`crate::API_WIRE_VERSION`]) is pinned to the sealed surface: v50 (the credential plan's
+    /// typed manager — `credential-info` gains node-derived provider/kind/scope/classification/
+    /// expires_at/refresh_status/used_by and `CredentialRemove` gains guarded-by-default
+    /// `? force` — on top of v49's honest `cloud_credentials` provider-auth arm and v48's
+    /// provider-centric model-catalog surface). Distinct from the transport-envelope
     /// [`WIRE_VERSION`] above (= 2), which these rungs did not touch. Bumping the contract
     /// version is a deliberate act — this assertion is the gate.
     #[test]
-    fn contract_wire_version_is_v48() {
+    fn contract_wire_version_is_v50() {
         assert_eq!(
             daemon_common::WireVersion::CURRENT,
-            daemon_common::WireVersion(48)
+            daemon_common::WireVersion(50)
         );
-        assert_eq!(crate::API_WIRE_VERSION, daemon_common::WireVersion(48));
+        assert_eq!(crate::API_WIRE_VERSION, daemon_common::WireVersion(50));
     }
 
     /// The `api/<N>` feature string is formatted from the API mirror version (never hardcoded)

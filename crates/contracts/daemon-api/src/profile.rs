@@ -907,8 +907,12 @@ impl CustomProvider {
     }
 }
 
-/// A redacted view of a stored credential (the shape a GUI's "API keys" list renders). The secret
-/// itself is never returned on a read — only whether one is present and a short masked hint.
+/// A redacted view of a stored credential (the shape the app's Credentials manager renders). The
+/// secret itself is never returned on a read — only whether one is present and a short masked
+/// hint. The typed manager fields (wire v50, credential plan Phase 5) are node-derived facts:
+/// material kind and expiry come from decoding the stored envelope, scope/classification from the
+/// ref shape and the profile table, `used_by` from a node-side profile scan — the client never
+/// re-derives them.
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CredentialInfo {
@@ -916,12 +920,44 @@ pub struct CredentialInfo {
     pub profile: String,
     /// Whether a secret is stored for this profile.
     pub present: bool,
-    /// A masked hint (e.g. the last four characters), never the full secret.
+    /// A masked hint (e.g. the last four characters), never the full secret. For a token-set
+    /// envelope the hint masks the ACCESS TOKEN, not the envelope JSON.
     pub hint: String,
     /// An operator-set human label/rename for this credential/account (wire v35), overlaid by the
-    /// node from its durable store. `None` = no custom label. Backs the app's AccountsPage rename.
+    /// node from its durable store. `None` = no custom label. Backs the app's Credentials rename.
     #[serde(default)]
     pub label: Option<String>,
+    /// The canonical vendor id this credential authenticates against, when the node can derive it
+    /// (a `provider/<vendor>` ref, or a token-set envelope's TRUSTED provider identity). `None` =
+    /// underivable (a bare profile-keyed key set before Phase 2, an operator ref).
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// The stored material kind: `"api_key"` (a bare secret — pasted or sign-in-minted; the store
+    /// does not record acquisition, so the node never claims which) or `"oauth_token"` (a
+    /// versioned token-set envelope). `None` = no secret present or an undecodable envelope.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// The sharing scope the ref shape implies: `"global"` (a `provider/<vendor>` ref shared by
+    /// every profile of that vendor) or `"profile"` (keyed by a profile id / explicit ref).
+    #[serde(default)]
+    pub scope: Option<String>,
+    /// The manager section this row belongs to: `"provider"` (model-provider credentials),
+    /// `"channel"` (transport/messaging account credentials — `oauth2/…` and refs bound as
+    /// `bound_accounts`), or `"agent"` (foreign-agent gate credentials — `agent/…`; the
+    /// Credentials page filters these to the agent surface).
+    #[serde(default)]
+    pub classification: Option<String>,
+    /// Unix seconds when the stored access token expires (token sets that stated an expiry).
+    #[serde(default)]
+    pub expires_at: Option<u64>,
+    /// The refresh posture of a token set: `"refreshable"` (a refresh token + context exist) or
+    /// `"reauth_required"` (expired or expiring with no refresh path). `None` for bare keys.
+    #[serde(default)]
+    pub refresh_status: Option<String>,
+    /// Profiles referencing this credential (via `credential_ref`, profile-id keying, or a bound
+    /// account) — node-computed; the guarded `CredentialRemove` rejects while this is non-empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub used_by: Vec<String>,
 }
 
 impl CredentialInfo {
@@ -942,15 +978,30 @@ impl CredentialInfo {
                     profile,
                     present: true,
                     hint: format!("…{tail}"),
-                    label: None,
+                    ..Self::empty()
                 }
             }
             _ => Self {
                 profile,
-                present: false,
-                hint: String::new(),
-                label: None,
+                ..Self::empty()
             },
+        }
+    }
+
+    /// An absent-credential row: every typed manager field unset (the node overlays them).
+    fn empty() -> Self {
+        Self {
+            profile: String::new(),
+            present: false,
+            hint: String::new(),
+            label: None,
+            provider: None,
+            kind: None,
+            scope: None,
+            classification: None,
+            expires_at: None,
+            refresh_status: None,
+            used_by: Vec::new(),
         }
     }
 }

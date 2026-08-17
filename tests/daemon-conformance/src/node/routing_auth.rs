@@ -1199,6 +1199,157 @@ async fn provider_key_slots_under_bound_profile_and_requires_bind() {
     handle.shutdown().await;
 }
 
+/// The typed credential manager (wire v50, credential plan Phase 5): `credential_list` returns
+/// NODE-DERIVED manager facts on every row — provider / kind / scope / classification / expiry /
+/// refresh posture / `used_by` — and `credential_remove` is guarded by default: an in-use removal
+/// is rejected naming the dependent profiles, `force` removes regardless, an unused row removes
+/// without force. The app renders these answers; it never re-derives them.
+#[tokio::test]
+async fn credential_manager_lists_typed_rows_and_guards_removal() {
+    use daemon_api::{BoundAccount, CredentialApi, ProfileSpec, ProviderSelector};
+    use daemon_common::{CredentialEnvelope, OAuthTokenSet};
+    use daemon_host::{CredentialStore, MemCredentialStore, MemProfileStore, ProfileStore};
+
+    let profiles = Arc::new(MemProfileStore::new());
+    // alpha references the shared OpenRouter ref; beta is legacy profile-id-keyed AND binds a
+    // channel account whose blob lives under an operator `oauth2/` ref.
+    let mut alpha = ProfileSpec::new("alpha", ProviderSelector::GenAi, "open_router::model-a");
+    alpha.credential_ref = Some("provider/open_router".into());
+    profiles.create(alpha).expect("create alpha");
+    let mut beta = ProfileSpec::new("beta", ProviderSelector::GenAi, "model-b");
+    beta.bound_accounts
+        .push(BoundAccount::new("matrix/@bot:hs.org", "oauth2/bot"));
+    profiles.create(beta).expect("create beta");
+
+    let creds = Arc::new(MemCredentialStore::new());
+    creds
+        .set("provider/open_router", "sk-or-v1-secret")
+        .unwrap();
+    creds
+        .set(
+            "provider/huggingface",
+            &CredentialEnvelope::OAuthTokenSet(OAuthTokenSet {
+                provider_id: "huggingface".into(),
+                method_id: "provider/huggingface".into(),
+                access_token: "hf_access_material".into(),
+                refresh_token: Some("hf_refresh".into()),
+                expires_at: Some(1_900_000_000),
+                token_endpoint: None,
+                client_id: None,
+            })
+            .encode(),
+        )
+        .unwrap();
+    creds.set("beta", "sk-beta-legacy").unwrap();
+    creds.set("oauth2/bot", "{\"session\":\"blob\"}").unwrap();
+    creds.set("agent/claude/login", "sk-ant-gate").unwrap();
+
+    let AssembledNode { node, handle, .. } = assemble_node(NodeAssembly {
+        store: Arc::new(InMemoryStore::new()),
+        partition: PARTITION,
+        host_config: fast_host_config(),
+        providers: gate_providers(),
+        credentials: None,
+        profile: ProfileRef::new("alpha"),
+        engine_config: daemon_core::Config::default(),
+        journal_seed: Some([0x55; 32]),
+        nesting_depth: 0,
+        context: None,
+        context_builder: None,
+        memory: Vec::new(),
+        memory_builder: None,
+        extra_tools: Vec::new(),
+        models: None,
+        profiles: Some(profiles.clone()),
+        provider_resolver: None,
+        credential_store: Some(creds.clone()),
+        cloud_catalog: None,
+        prompt_sources: vec![],
+        revisions: None,
+        skills: None,
+        skills_resolver: None,
+        routing: None,
+        checkpoints: None,
+        auth_factories: vec![],
+        workspace_root: None,
+        blob_root: None,
+        fs: Default::default(),
+        processes: Default::default(),
+        title_aux: None,
+        reaper: Default::default(),
+        orchestrate: Default::default(),
+        foreign_gateway: None,
+        prompt: Default::default(),
+    });
+
+    let listed = node.credential_list().await;
+    let row = |r: &str| {
+        listed
+            .iter()
+            .find(|c| c.profile == r)
+            .unwrap_or_else(|| panic!("row {r} missing from {listed:?}"))
+    };
+
+    // A provider-global bare key: vendor from the ref shape, referenced by alpha.
+    let or = row("provider/open_router");
+    assert_eq!(or.provider.as_deref(), Some("open_router"));
+    assert_eq!(or.kind.as_deref(), Some("api_key"));
+    assert_eq!(or.scope.as_deref(), Some("global"));
+    assert_eq!(or.classification.as_deref(), Some("provider"));
+    assert_eq!(or.used_by, vec!["alpha".to_string()]);
+    assert!(or.refresh_status.is_none() && or.expires_at.is_none());
+
+    // A token-set envelope: material facts decoded node-side, hint re-masked over the ACCESS
+    // TOKEN (never the envelope JSON's serialization tail).
+    let hf = row("provider/huggingface");
+    assert_eq!(hf.kind.as_deref(), Some("oauth_token"));
+    assert_eq!(hf.provider.as_deref(), Some("huggingface"));
+    assert_eq!(hf.expires_at, Some(1_900_000_000));
+    assert_eq!(hf.refresh_status.as_deref(), Some("refreshable"));
+    assert_eq!(hf.hint, "\u{2026}rial", "masks the access token: {hf:?}");
+    assert!(hf.used_by.is_empty(), "no profile references it: {hf:?}");
+
+    // A legacy profile-id-keyed row: profile scope, used by that profile (id keying).
+    let legacy = row("beta");
+    assert_eq!(legacy.scope.as_deref(), Some("profile"));
+    assert_eq!(legacy.used_by, vec!["beta".to_string()]);
+
+    // A ref bound as a transport account classifies as a channel credential.
+    let bot = row("oauth2/bot");
+    assert_eq!(bot.classification.as_deref(), Some("channel"));
+    assert_eq!(bot.used_by, vec!["beta".to_string()]);
+
+    // An agent-gate ref classifies to the agent section.
+    assert_eq!(
+        row("agent/claude/login").classification.as_deref(),
+        Some("agent")
+    );
+
+    // Guarded removal: in-use is rejected NAMING the dependents; force removes; unused removes
+    // without force.
+    let err = node
+        .credential_remove("provider/open_router".into(), false)
+        .await
+        .expect_err("in-use removal must be rejected");
+    assert!(
+        err.to_string().contains("alpha"),
+        "the error names the dependent profiles: {err}"
+    );
+    assert!(
+        creds.get("provider/open_router").is_some(),
+        "rejected removal must not touch the store"
+    );
+    node.credential_remove("provider/open_router".into(), true)
+        .await
+        .expect("forced removal proceeds");
+    assert!(creds.get("provider/open_router").is_none());
+    node.credential_remove("provider/huggingface".into(), false)
+        .await
+        .expect("an unused credential removes without force");
+
+    handle.shutdown().await;
+}
+
 /// FOUNDATION (account provisioning, daemon-event-io-spec §5.9.4 — the M2 bring-up seam): the
 /// host exposes an in-process [`AccountProvisioning`] surface so a chat-transport adapter can
 /// (a) enumerate the accounts it owns across every profile, by transport *family*; (b) resolve
