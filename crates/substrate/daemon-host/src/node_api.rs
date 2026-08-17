@@ -166,7 +166,8 @@ use daemon_protocol::{
     TransportId, UserMsg,
 };
 use daemon_store::{
-    FeedbackRecord, SessionMeta, SessionRole as StoreRole, SessionStatus, SessionStore,
+    FeedbackRecord, NewSplice, SessionMeta, SessionRole as StoreRole, SessionStatus, SessionStore,
+    SpliceKind,
 };
 use daemon_telemetry::{
     current_trace, decode_entry, verify_segment, JournalPayload, Metrics, SegmentInput,
@@ -626,8 +627,8 @@ impl NodeApiImpl {
     ///   normal submit path (Observe-while-idle only folds context and drives no turn, so a
     ///   notification would otherwise sit unseen until the user next speaks);
     /// - a **durable** (activation-lifecycle) session — which `submit` must reject under the
-    ///   one-lifecycle-owner guard-rail — gets a durable pending input
-    ///   ([`SessionStore::enqueue_session_input`]) plus a wake; the incarnation drains it into the
+    ///   one-lifecycle-owner guard-rail — gets a durable inbox splice
+    ///   ([`SessionStore::append_splice`]) plus a wake; the incarnation folds it into the
     ///   conversation at hydrate and the woken turn runs with it.
     ///
     /// An **unclaimed** id (the in-memory owner map is empty after a restart) routes by durable
@@ -668,7 +669,8 @@ impl NodeApiImpl {
                 }
                 Some(_) => {}
             }
-            self.enqueue_durable_input(session, &msg).await?;
+            self.enqueue_durable_input(session, SpliceKind::StartTurn, &msg, "host-inject")
+                .await?;
             return Ok(());
         }
         // `self.submit` is the `SessionApi` trait method (Auth 4 ownership-gated). This seam is
@@ -688,27 +690,46 @@ impl NodeApiImpl {
         .await
     }
 
-    /// The shared durable pending-input rail: encode `msg`, enqueue it on the durable session's
-    /// FIFO pending-input queue ([`SessionStore::enqueue_session_input`]) + a wake. The woken
-    /// incarnation drains it into the conversation at hydrate. Used by both the host-originated
-    /// injection seam ([`Self::inject_session_msg`]) and the F4 durable-resume submit gate
+    /// The shared durable inbox rail (session-unification §4, stage 2): encode `msg`, append it
+    /// as a typed splice ([`SessionStore::append_splice`] — durable, deduped, `Idle → Ready` in
+    /// the same transaction) + a wake. The woken incarnation folds the claimed splice into the
+    /// conversation at hydrate. Used by both the host-originated injection seam
+    /// ([`Self::inject_session_msg`]) and the F4 durable-resume submit gate
     /// ([`Self::durable_resume_input`]).
+    ///
+    /// The dedupe `origin_op` is MINTED here (`op-<32 hex>`): the wire `ReqId` is a
+    /// per-connection counter (colliding across reconnects on one session) and the internal
+    /// producers carry no client op-id at all — so within this rail a retry-able end-to-end id
+    /// does not exist yet. Threading the rung-3 client `op_id` through to the splice is the
+    /// stage-5 cutover's routing work; until then the API-layer `command_dedup` table still
+    /// absorbs wire retries in front of this seam.
     async fn enqueue_durable_input(
         &self,
         session: &SessionId,
+        kind: SpliceKind,
         msg: &UserMsg,
+        origin: &str,
     ) -> Result<(), ApiError> {
         let mut payload = Vec::new();
         ciborium::into_writer(msg, &mut payload)
             .map_err(|e| ApiError::Other(format!("encode injected input: {e}")))?;
-        self.store.enqueue_session_input(session, payload).await;
+        self.store
+            .append_splice(NewSplice {
+                session_id: session.clone(),
+                kind,
+                payload,
+                origin_op: mint_op_id(),
+                origin: origin.into(),
+            })
+            .await
+            .map_err(|e| ApiError::Other(format!("append durable input: {e}")))?;
         self.store.enqueue_wake(session.clone()).await;
         Ok(())
     }
 
     /// The F4 durable-resume gate: whether a wire `Submit { StartTurn | Steer }` addressed at
-    /// `session` must ride the durable pending-input rail instead of opening a fresh live
-    /// incarnation. Returns `Some(msg)` — the [`UserMsg`] to fold into the durable transcript —
+    /// `session` must ride the durable inbox rail instead of opening a fresh live incarnation.
+    /// Returns `Some((kind, msg))` — the typed splice to fold into the durable transcript —
     /// only for a **parked-durable** session: the durable lifecycle owns it (or, when unclaimed
     /// after a restart, a durable activation row evidences it) AND it is live-but-dormant
     /// (`Active | Suspended | Ready`, never `Completed`/absent). A `Completed` durable session
@@ -719,10 +740,10 @@ impl NodeApiImpl {
         &self,
         session: &SessionId,
         command: &AgentCommand,
-    ) -> Option<UserMsg> {
-        let msg = match command {
-            AgentCommand::StartTurn { input, .. } => input.clone(),
-            AgentCommand::Steer { text, .. } => UserMsg::new(text.clone()),
+    ) -> Option<(SpliceKind, UserMsg)> {
+        let (kind, msg) = match command {
+            AgentCommand::StartTurn { input, .. } => (SpliceKind::StartTurn, input.clone()),
+            AgentCommand::Steer { text, .. } => (SpliceKind::Steer, UserMsg::new(text.clone())),
             _ => return None,
         };
         let durable = match self.owners.get(session).map(|o| *o.value()) {
@@ -736,11 +757,31 @@ impl NodeApiImpl {
         match self.store.status(session).await {
             Some(
                 SessionStatus::Active | SessionStatus::Suspended { .. } | SessionStatus::Ready,
-            ) => Some(msg),
+            ) => Some((kind, msg)),
             // Completed / absent: not parked-durable — fall through to the live path.
             _ => None,
         }
     }
+}
+
+/// Mint a fresh splice op-id: `op-<32 hex>` from 16 random bytes (mirrors `mint_session_id`). A
+/// getrandom failure is astronomically unlikely; fall back to a time-seeded id rather than
+/// panicking.
+fn mint_op_id() -> String {
+    let mut bytes = [0u8; 16];
+    if getrandom::getrandom(&mut bytes).is_err() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        bytes.copy_from_slice(&nanos.to_le_bytes());
+    }
+    let mut hex = String::with_capacity(3 + bytes.len() * 2);
+    hex.push_str("op-");
+    for b in bytes {
+        hex.push_str(&format!("{b:02x}"));
+    }
+    hex
 }
 
 mod access;

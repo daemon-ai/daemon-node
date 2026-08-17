@@ -7,12 +7,14 @@ use super::*;
 impl SessionApi for NodeApiImpl {
     async fn submit(&self, session: SessionId, command: AgentCommand) -> Result<(), ApiError> {
         // F4 durable-resume: a `StartTurn`/`Steer` at a PARKED-DURABLE session rides the durable
-        // pending-input rail (fold into the durable transcript + wake) instead of opening a
+        // inbox rail (typed splice into the durable transcript + wake) instead of opening a
         // divergent fresh live incarnation. Auth 4 is enforced before enqueuing (own-or-operator,
         // the same gate the live path uses); a settled/absent session falls through to live.
-        if let Some(msg) = self.durable_resume_input(&session, &command).await {
+        if let Some((kind, msg)) = self.durable_resume_input(&session, &command).await {
             self.require_session_access(&session, true).await?;
-            return self.enqueue_durable_input(&session, &msg).await;
+            return self
+                .enqueue_durable_input(&session, kind, &msg, "wire-submit")
+                .await;
         }
         // Guard-rail: claim the session for the live lifecycle (rejects an id already durable-managed).
         self.claim(&session, Lifecycle::Live)?;
@@ -33,9 +35,11 @@ impl SessionApi for NodeApiImpl {
         // F4 durable-resume: a parked-durable `StartTurn`/`Steer` folds into the durable transcript
         // (the origin is delivery attribution the durable session already owns) rather than opening
         // a fresh live incarnation.
-        if let Some(msg) = self.durable_resume_input(&session, &command).await {
+        if let Some((kind, msg)) = self.durable_resume_input(&session, &command).await {
             self.require_session_access(&session, true).await?;
-            return self.enqueue_durable_input(&session, &msg).await;
+            return self
+                .enqueue_durable_input(&session, kind, &msg, "wire-submit")
+                .await;
         }
         self.claim(&session, Lifecycle::Live)?;
         let auth = self.require_session_access(&session, true).await?;
@@ -115,9 +119,11 @@ impl SessionApi for NodeApiImpl {
         } = args;
         // F4 durable-resume: a parked-durable `StartTurn`/`Steer` folds into the durable transcript
         // (its engine profile is already bound durably) rather than opening a fresh live incarnation.
-        if let Some(msg) = self.durable_resume_input(&session, &command).await {
+        if let Some((kind, msg)) = self.durable_resume_input(&session, &command).await {
             self.require_session_access(&session, true).await?;
-            return self.enqueue_durable_input(&session, &msg).await;
+            return self
+                .enqueue_durable_input(&session, kind, &msg, "wire-submit")
+                .await;
         }
         self.claim(&session, Lifecycle::Live)?;
         let auth = self.require_session_access(&session, true).await?;
@@ -145,9 +151,10 @@ impl SessionApi for NodeApiImpl {
         // F4 durable-resume: if the origin resolves to a parked-durable session, a `StartTurn`/
         // `Steer` folds into the durable transcript + wakes it, rather than opening a fresh live
         // incarnation over the durable state.
-        if let Some(msg) = self.durable_resume_input(&resolved.session, &command).await {
+        if let Some((kind, msg)) = self.durable_resume_input(&resolved.session, &command).await {
             self.require_session_access(&resolved.session, true).await?;
-            self.enqueue_durable_input(&resolved.session, &msg).await?;
+            self.enqueue_durable_input(&resolved.session, kind, &msg, "wire-submit")
+                .await?;
             return Ok(resolved.session);
         }
         self.claim(&resolved.session, Lifecycle::Live)?;

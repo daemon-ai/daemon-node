@@ -4,7 +4,6 @@ CREATE INDEX cron_jobs_due ON cron_jobs (paused, next_fire_unix);
 CREATE INDEX cron_runs_job ON cron_runs (job_id, rowseq);
 CREATE INDEX feedback_outbox_pending ON feedback_outbox (delivered, created_at_ms);
 CREATE INDEX journal_seals_stream ON journal_seals (stream, id);
-CREATE INDEX pending_session_input_session ON pending_session_input (session_id, rowseq);
 CREATE INDEX room_members_room ON room_members (room_id);
 CREATE TABLE acp_catalog (
     name  TEXT PRIMARY KEY,
@@ -119,6 +118,20 @@ id      INTEGER PRIMARY KEY CHECK (id = 0),
 enabled INTEGER NOT NULL,
 addr    TEXT
 );
+CREATE TABLE inbox_splice (
+session_id     TEXT NOT NULL,
+splice_seq     INTEGER NOT NULL,
+kind           TEXT NOT NULL,
+payload        BLOB NOT NULL,
+origin_op      TEXT NOT NULL,
+origin         TEXT NOT NULL,
+received_at_ms INTEGER NOT NULL,
+claim_kind     TEXT NOT NULL DEFAULT 'pending',
+claim_fence    INTEGER,
+consumed_turn  INTEGER,
+PRIMARY KEY (session_id, splice_seq),
+UNIQUE (session_id, origin_op)
+);
 CREATE TABLE job_outbox (
     rowseq     INTEGER PRIMARY KEY AUTOINCREMENT,
     job_id     TEXT NOT NULL,
@@ -160,11 +173,6 @@ CREATE TABLE pending_approvals (
     path       TEXT,
     decision   INTEGER, fingerprint TEXT,
     UNIQUE(session_id, job_id)
-);
-CREATE TABLE pending_session_input (
-rowseq     INTEGER PRIMARY KEY AUTOINCREMENT,
-session_id TEXT NOT NULL,
-input      BLOB NOT NULL
 );
 CREATE TABLE room_members (
     room_id    TEXT NOT NULL,
@@ -230,6 +238,10 @@ CREATE TABLE session_usage (
     cache_write_tokens  INTEGER NOT NULL DEFAULT 0,
     reasoning_tokens    INTEGER NOT NULL DEFAULT 0,
     cost_micros         INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE splice_seq (
+session_id TEXT PRIMARY KEY,
+n          INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE sqlite_sequence(name,seq);
 CREATE TABLE telemetry_consent (

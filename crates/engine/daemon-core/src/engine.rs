@@ -310,6 +310,22 @@ impl Engine {
         self.snapshot.conversation.push_user(input);
     }
 
+    /// Advance the durable-inbox consumed cursor (session-unification §4.2): the host calls this
+    /// beside the `push_user`/`push_observe` that folds a claimed splice, so the snapshot this
+    /// engine eventually checkpoints records how far the inbox is captured — and the commit
+    /// transaction flips exactly that prefix to `Consumed`. Monotonic (a stale/duplicate fold
+    /// never rewinds it).
+    pub fn note_consumed_splice(&mut self, seq: u64) {
+        let cursor = &mut self.snapshot.consumed_splice_seq;
+        *cursor = (*cursor).max(seq);
+    }
+
+    /// The durable-inbox consumed cursor the snapshot currently records (see
+    /// [`note_consumed_splice`](Self::note_consumed_splice)).
+    pub fn consumed_splice_seq(&self) -> u64 {
+        self.snapshot.consumed_splice_seq
+    }
+
     /// Append an out-of-band steer marker into the conversation (hermes-style) and arm the next
     /// turn's trigger as [`TurnTrigger::Steer`]. The steer text becomes part of the model context.
     pub fn push_steer_marker(&mut self, steer: &SteerReq) {

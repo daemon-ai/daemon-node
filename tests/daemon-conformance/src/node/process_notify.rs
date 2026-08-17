@@ -175,8 +175,9 @@ async fn injected_input_reaches_a_parked_durable_session_via_the_store_seam() {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    // Hydrate (not this test) consumed the queue: nothing is left pending.
-    assert!(store.take_session_inputs(&session).await.is_empty());
+    // The folded splice was consumed by the re-park's commit transaction: nothing is left
+    // pending/claimed on the durable inbox.
+    assert!(store.splices_after(&session, 0).await.is_empty());
 
     handle.shutdown().await;
 }
@@ -210,7 +211,7 @@ async fn injected_input_into_a_settled_durable_session_is_dropped_impl() {
         .await
         .expect("inject into a settled session is a clean drop");
     assert!(
-        store.take_session_inputs(&session).await.is_empty(),
+        store.splices_after(&session, 0).await.is_empty(),
         "nothing is queued for a settled session"
     );
     assert!(

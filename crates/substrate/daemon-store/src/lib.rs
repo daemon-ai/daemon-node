@@ -548,6 +548,14 @@ pub struct Activation {
     pub unapplied: Vec<JobCompletion>,
     /// The fencing token the activation must commit under.
     pub fence: FenceToken,
+    /// The durable inbox splices this activation claimed (session-unification §4.2): every
+    /// unconsumed splice, CAS-flipped `Pending`/stale-`Claimed` → `Claimed { fence }` inside the
+    /// same load transaction. The incarnation folds them and stamps the consumed cursor onto its
+    /// commit ([`Checkpoint::consumed_splices`]); a crash before that commit leaves them
+    /// `Claimed`, reclaimable exactly once by the next (newer-fenced) activation.
+    /// `#[serde(default)]` keeps the brokered-store wire (StoreCall) compatible.
+    #[serde(default)]
+    pub splices: Vec<InboxSplice>,
 }
 
 /// A checkpoint write: the new snapshot for a session at a bumped epoch (lifecycle §5).
@@ -566,6 +574,12 @@ pub struct Checkpoint {
     /// summary + artifact refs). `None` falls back to the legacy `child:{id}` marker.
     #[serde(default)]
     pub completion_payload: Option<Vec<u8>>,
+    /// The highest inbox `splice_seq` this checkpoint's snapshot has folded (session-unification
+    /// §4.2/§5): the store flips every splice at or below it to `Consumed` inside the SAME fenced
+    /// commit transaction — consumption is never written separately. `None` = no splice statement
+    /// (legacy writers; nothing is consumed).
+    #[serde(default)]
+    pub consumed_splices: Option<u64>,
 }
 
 impl Checkpoint {
@@ -577,12 +591,20 @@ impl Checkpoint {
             epoch,
             snapshot,
             completion_payload: None,
+            consumed_splices: None,
         }
     }
 
     /// Attach a structured completion payload (used when a delegated child completes).
     pub fn with_completion_payload(mut self, payload: Option<Vec<u8>>) -> Self {
         self.completion_payload = payload;
+        self
+    }
+
+    /// Stamp the consumed-splice cursor (session-unification §4.2): every inbox splice at or
+    /// below `seq` is flipped `Consumed` inside this checkpoint's commit transaction.
+    pub fn with_consumed_splices(mut self, seq: Option<u64>) -> Self {
+        self.consumed_splices = seq;
         self
     }
 }
@@ -895,6 +917,86 @@ pub enum FaultPoint {
 /// re-executes the op and re-caches (see [`SessionStore::command_dedup_get`]).
 pub const COMMAND_DEDUP_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 
+/// The kind of a durable inbox splice (session-unification §4.1): the three durable input
+/// intents. `Observe` IS spliced (§4.3) — it mutates conversation context and must survive
+/// restart — but never triggers a model turn by itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SpliceKind {
+    /// A user message that starts (or queues) a turn.
+    StartTurn,
+    /// Mid-turn steering input.
+    Steer,
+    /// Context-only input: folds into the conversation without triggering a turn.
+    Observe,
+}
+
+/// The claim lifecycle of one inbox splice (session-unification §4.2). `Claimed` is the
+/// crash-recovery midpoint: an incarnation took the splice into a turn that has not yet reached a
+/// durable commit; a newer fence reclaims it exactly once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SpliceClaim {
+    /// Appended (and therefore acknowledged), not yet taken into a turn.
+    Pending,
+    /// Taken into a turn by the incarnation holding `fence`; reverts to claimable if that turn
+    /// never commits (a newer fence may reclaim).
+    Claimed {
+        /// The claiming activation's fence token value.
+        fence: u64,
+    },
+    /// A durable commit captured this splice's effect; replay skips it. Written only inside the
+    /// commit transaction ([`Checkpoint::consumed_splices`]), never separately.
+    Consumed {
+        /// The durable turn marker of the consuming commit (stage 3 promotes this to the
+        /// monotonic `turn_seq`; until then it records the committing epoch).
+        turn_seq: u64,
+    },
+}
+
+/// One durable inbox splice (session-unification §4.1): a typed session input that is
+/// acknowledged only after it is durable (splice-before-ack). The store sees the payload as
+/// opaque CBOR (a `UserMsg`) — the typed envelope lives in the protocol crate.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxSplice {
+    /// The session this input belongs to.
+    pub session_id: SessionId,
+    /// Store-assigned per-session monotonic sequence — never reused, never renumbered.
+    pub splice_seq: u64,
+    /// The input intent.
+    pub kind: SpliceKind,
+    /// The opaque CBOR `UserMsg` payload (typed; kind/request_id/origin preserved — the F4
+    /// bare-bytes collapse is retired).
+    pub payload: Vec<u8>,
+    /// The dedupe identity (§4.2): `UNIQUE(session_id, origin_op)` within the retention window —
+    /// a producer retry after a crash-before-ack returns the original `splice_seq`.
+    pub origin_op: String,
+    /// Producer provenance (wire client, notice worker, factory, ...).
+    pub origin: String,
+    /// Wall-clock provenance (unix millis).
+    pub received_at_ms: u64,
+    /// The claim state.
+    pub claim: SpliceClaim,
+}
+
+/// The producer-facing input to [`SessionStore::append_splice`] (everything but the
+/// store-assigned `splice_seq`/`received_at_ms`/`claim`).
+#[derive(Clone, Debug)]
+pub struct NewSplice {
+    /// The session to append to.
+    pub session_id: SessionId,
+    /// The input intent.
+    pub kind: SpliceKind,
+    /// The opaque CBOR `UserMsg` payload.
+    pub payload: Vec<u8>,
+    /// The dedupe identity (see [`InboxSplice::origin_op`]).
+    pub origin_op: String,
+    /// Producer provenance.
+    pub origin: String,
+}
+
+/// The retention window for consumed splices (session-unification §4.2): consumed rows older
+/// than this are prunable, and the append dedupe guarantee is scoped to it.
+pub const SPLICE_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+
 /// The persisted per-session execution policy (session-unification §3): written at creation,
 /// driving terminal-vs-idle at the turn boundary and role-aware failure (stage 3). NEVER inferred
 /// from the presence of one binding. The engine backend (Core vs Foreign) is an orthogonal
@@ -1014,6 +1116,47 @@ pub trait SessionStore: Send + Sync {
         None
     }
 
+    /// Append a durable inbox splice (session-unification §4.2). ONE transaction:
+    /// append-or-return-existing on `UNIQUE(session_id, origin_op)` + the `Idle → Ready` status
+    /// transition + the assigned `splice_seq` returned. The caller acknowledges the producer only
+    /// after this returns (splice-before-ack) and pairs it with
+    /// [`enqueue_wake`](Self::enqueue_wake) when the input should drive a turn. Default:
+    /// unsupported (a non-authoritative proxy store).
+    async fn append_splice(&self, _splice: NewSplice) -> Result<u64, StoreError> {
+        Err(StoreError::Common(DaemonError::Other(
+            "append_splice: not supported by this store".into(),
+        )))
+    }
+
+    /// Every unconsumed splice (`Pending`/`Claimed`) with `splice_seq > after_seq`, ordered by
+    /// sequence — the replay/projection read. Default: empty.
+    async fn splices_after(&self, _id: &SessionId, _after_seq: u64) -> Vec<InboxSplice> {
+        Vec::new()
+    }
+
+    /// Fenced claim CAS (session-unification §4.2): flip every `Pending` splice — and every
+    /// `Claimed { old }` where `old < fence.0` (the exactly-once crash reclaim) — to
+    /// `Claimed { fence }`, returning the full claimed set (including rows already claimed by
+    /// this same fence, so a re-load under one activation is idempotent), ordered by sequence.
+    /// Fails `Fenced` for a fence below the session's current lease. Default: unsupported.
+    async fn claim_splices(
+        &self,
+        _id: &SessionId,
+        _fence: FenceToken,
+    ) -> Result<Vec<InboxSplice>, StoreError> {
+        Err(StoreError::Common(DaemonError::Other(
+            "claim_splices: not supported by this store".into(),
+        )))
+    }
+
+    /// Prune `Consumed` splices received before the absolute `cutoff_ms` unix-millis instant
+    /// (retention, §4.2 — callers pass `now - SPLICE_RETENTION_MS`): the dedupe guarantee is
+    /// scoped to the retention window. Unconsumed splices are NEVER pruned. Returns the number
+    /// pruned. Default: 0.
+    async fn prune_consumed_splices(&self, _cutoff_ms: u64) -> u64 {
+        0
+    }
+
     /// Acquire/renew the activation lease for a session; returns a fresh monotonic fencing token
     /// and marks the session `Active` (lifecycle §5).
     async fn acquire_activation_lease(&self, id: &SessionId) -> Result<FenceToken, StoreError>;
@@ -1120,26 +1263,6 @@ pub trait SessionStore: Send + Sync {
     /// Used to kick a freshly-created durable child session into its first turn. Default: no-op (a
     /// non-authoritative proxy store relies on its authoritative peer's dispatcher).
     async fn enqueue_wake(&self, _id: SessionId) {}
-
-    /// Append a durable **pending input** for `id` — an opaque payload (a CBOR `UserMsg`) the host
-    /// wants folded into the session's conversation the next time it activates. This is the durable
-    /// inbound-input seam for sessions on the *activation* lifecycle (which `SessionApi::submit`
-    /// cannot reach): a background process-exit notification, a message to a delegated child (the
-    /// orchestrate tool's `send` verb), etc. The durable incarnation drains these at hydrate
-    /// ([`take_session_inputs`]); pair with [`enqueue_wake`](Self::enqueue_wake) so the wake
-    /// dispatcher runs the turn. FIFO per session. Default: no-op (a non-authoritative proxy
-    /// store).
-    ///
-    /// [`take_session_inputs`]: Self::take_session_inputs
-    async fn enqueue_session_input(&self, _id: &SessionId, _input: Vec<u8>) {}
-
-    /// Drain (return and delete) every pending input for `id`, in enqueue (FIFO) order. Called by
-    /// the durable incarnation at hydrate, before the turn runs, so a queued message lands in
-    /// exactly one incarnation. Default: empty (a store without the pending-input seam / a
-    /// non-authoritative proxy store).
-    async fn take_session_inputs(&self, _id: &SessionId) -> Vec<Vec<u8>> {
-        Vec::new()
-    }
 
     /// Compare-and-swap a DORMANT session's snapshot blob: atomically replace it with `new` only
     /// when the session is NOT `Active` and its current blob equals `expected`. The host-mediated
@@ -1754,10 +1877,12 @@ struct Inner {
     notice_outbox: VecDeque<CompletionNotice>,
     /// Per-parent monotonic counter minting the unique `{parent}/d{n}` detached child ids.
     detached_seq: HashMap<SessionId, u64>,
-    /// Per-session pending inbound inputs (opaque bytes), FIFO — the durable `send` seam drained by
-    /// the next activation's hydrate (the in-memory analogue of the SQLite `pending_session_input`
-    /// table).
-    pending_inputs: HashMap<SessionId, VecDeque<Vec<u8>>>,
+    /// Per-session durable inbox splices in sequence order (session-unification §4; the in-memory
+    /// analogue of the SQLite `inbox_splice` table). The per-session monotonic `splice_seq` mint
+    /// rides `splice_seq` below — never reused even after pruning.
+    splices: HashMap<SessionId, Vec<InboxSplice>>,
+    /// Per-session highest `splice_seq` ever assigned (survives pruning: sequences never renumber).
+    splice_seq: HashMap<SessionId, u64>,
     /// Per-session parked §12 edit-approval requests, in park order. An unanswered row keeps the
     /// session dormant; [`SessionStore::answer_approval`] stamps its decision and wakes the session.
     pending_approvals: HashMap<SessionId, Vec<ParkedApproval>>,
@@ -1859,6 +1984,49 @@ impl InMemoryStore {
     /// Arm the store to fail at a given durable boundary (acceptance test #2). `None` disarms.
     pub fn set_fault(&self, fault: Option<FaultPoint>) {
         self.inner.lock().unwrap().fault = fault;
+    }
+
+    /// The §4.2 claim CAS under the held lock: flip `Pending` and stale-`Claimed` rows to
+    /// `Claimed { fence }`, returning the full set claimed by `fence` (including rows it already
+    /// held, so a re-load under one activation is idempotent), in sequence order.
+    fn claim_splices_locked(
+        inner: &mut Inner,
+        session: &SessionId,
+        fence: FenceToken,
+    ) -> Vec<InboxSplice> {
+        let mut claimed = Vec::new();
+        if let Some(rows) = inner.splices.get_mut(session) {
+            for row in rows.iter_mut() {
+                match row.claim {
+                    SpliceClaim::Pending => {
+                        row.claim = SpliceClaim::Claimed { fence: fence.0 };
+                        claimed.push(row.clone());
+                    }
+                    SpliceClaim::Claimed { fence: old } if old < fence.0 => {
+                        row.claim = SpliceClaim::Claimed { fence: fence.0 };
+                        claimed.push(row.clone());
+                    }
+                    SpliceClaim::Claimed { fence: same } if same == fence.0 => {
+                        claimed.push(row.clone());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        claimed
+    }
+
+    /// Flip every splice at or below `up_to` to `Consumed { turn_seq }` — called only from inside
+    /// the fenced commit ops under the held lock (session-unification §4.2: consumption is written
+    /// transactionally with the snapshot, never separately).
+    fn consume_splices_locked(inner: &mut Inner, session: &SessionId, up_to: u64, turn_seq: u64) {
+        if let Some(rows) = inner.splices.get_mut(session) {
+            for row in rows.iter_mut().filter(|r| r.splice_seq <= up_to) {
+                if !matches!(row.claim, SpliceClaim::Consumed { .. }) {
+                    row.claim = SpliceClaim::Consumed { turn_seq };
+                }
+            }
+        }
     }
 
     /// Whether a fault is currently armed at `point`, clearing it (one-shot) if so.
@@ -2012,17 +2180,124 @@ impl SessionStore for InMemoryStore {
             None => {}
         }
         if let Some(input) = spec.first_input {
+            // The seeded first input rides the durable inbox (session-unification §4; stage 2
+            // migrated it off `pending_session_input`), inside the same creation transaction.
+            let seq = {
+                let s = inner.splice_seq.entry(spec.id.clone()).or_insert(0);
+                *s += 1;
+                *s
+            };
             inner
-                .pending_inputs
+                .splices
                 .entry(spec.id.clone())
                 .or_default()
-                .push_back(input);
+                .push(InboxSplice {
+                    session_id: spec.id.clone(),
+                    splice_seq: seq,
+                    kind: SpliceKind::StartTurn,
+                    payload: input,
+                    // Deterministic op id: creation is already insert-if-absent, and a retried
+                    // factory run that lost the create race dedupes here by construction.
+                    origin_op: "first-input".into(),
+                    origin: "factory".into(),
+                    received_at_ms: now_ms(),
+                    claim: SpliceClaim::Pending,
+                });
         }
         Ok(true)
     }
 
     async fn execution_policy(&self, id: &SessionId) -> Option<ExecutionPolicy> {
         self.inner.lock().unwrap().execution_policy.get(id).copied()
+    }
+
+    async fn append_splice(&self, splice: NewSplice) -> Result<u64, StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        if !inner.sessions.contains_key(&splice.session_id) {
+            return Err(StoreError::NotFound(splice.session_id.clone()));
+        }
+        // Append-or-return-existing on (session, origin_op): a producer retry after a
+        // crash-before-ack returns the original seq instead of duplicating (§4.2).
+        if let Some(existing) = inner.splices.get(&splice.session_id).and_then(|rows| {
+            rows.iter()
+                .find(|r| r.origin_op == splice.origin_op)
+                .map(|r| r.splice_seq)
+        }) {
+            return Ok(existing);
+        }
+        let seq = {
+            let s = inner
+                .splice_seq
+                .entry(splice.session_id.clone())
+                .or_insert(0);
+            *s += 1;
+            *s
+        };
+        let row = InboxSplice {
+            session_id: splice.session_id.clone(),
+            splice_seq: seq,
+            kind: splice.kind,
+            payload: splice.payload,
+            origin_op: splice.origin_op,
+            origin: splice.origin,
+            received_at_ms: now_ms(),
+            claim: SpliceClaim::Pending,
+        };
+        inner
+            .splices
+            .entry(splice.session_id.clone())
+            .or_default()
+            .push(row);
+        // Same transaction (the held lock): durable input on an Idle session makes it Ready —
+        // the §2 status rule ("Ready iff unconsumed work exists").
+        let rec = inner.sessions.get_mut(&splice.session_id).unwrap();
+        if rec.status == SessionStatus::Idle {
+            rec.status = SessionStatus::Ready;
+        }
+        Ok(seq)
+    }
+
+    async fn splices_after(&self, id: &SessionId, after_seq: u64) -> Vec<InboxSplice> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .splices
+            .get(id)
+            .map(|rows| {
+                rows.iter()
+                    .filter(|r| {
+                        r.splice_seq > after_seq && !matches!(r.claim, SpliceClaim::Consumed { .. })
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    async fn claim_splices(
+        &self,
+        id: &SessionId,
+        fence: FenceToken,
+    ) -> Result<Vec<InboxSplice>, StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        let rec = inner
+            .sessions
+            .get(id)
+            .ok_or_else(|| StoreError::NotFound(id.clone()))?;
+        Self::check_fence(rec, fence)?;
+        Ok(Self::claim_splices_locked(&mut inner, id, fence))
+    }
+
+    async fn prune_consumed_splices(&self, cutoff_ms: u64) -> u64 {
+        let mut inner = self.inner.lock().unwrap();
+        let mut pruned = 0u64;
+        for rows in inner.splices.values_mut() {
+            let before = rows.len();
+            rows.retain(|r| {
+                !(matches!(r.claim, SpliceClaim::Consumed { .. }) && r.received_at_ms < cutoff_ms)
+            });
+            pruned += (before - rows.len()) as u64;
+        }
+        pruned
     }
 
     async fn acquire_activation_lease(&self, id: &SessionId) -> Result<FenceToken, StoreError> {
@@ -2041,16 +2316,22 @@ impl SessionStore for InMemoryStore {
         id: &SessionId,
         fence: FenceToken,
     ) -> Result<Activation, StoreError> {
-        let inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
         let rec = inner
             .sessions
             .get(id)
             .ok_or_else(|| StoreError::NotFound(id.clone()))?;
+        let snapshot = rec.snapshot.clone();
         let unapplied = inner.unapplied.get(id).cloned().unwrap_or_default();
+        // Claim the durable inbox in the same load transaction (session-unification §4.2): the
+        // incarnation folds these and stamps `Checkpoint::consumed_splices`; a crash before that
+        // commit leaves them `Claimed { fence }`, reclaimable by the next (newer) fence.
+        let splices = Self::claim_splices_locked(&mut inner, id, fence);
         Ok(Activation {
-            snapshot: rec.snapshot.clone(),
+            snapshot,
             unapplied,
             fence,
+            splices,
         })
     }
 
@@ -2081,6 +2362,14 @@ impl SessionStore for InMemoryStore {
         if inner.enqueued_jobs.insert(job.job_id.clone()) {
             inner.job_outbox.push_back(job);
         }
+        if let Some(up_to) = checkpoint.consumed_splices {
+            Self::consume_splices_locked(
+                &mut inner,
+                &checkpoint.session_id,
+                up_to,
+                checkpoint.epoch.0,
+            );
+        }
 
         // Post-commit crash boundaries: the durable state is already complete and consistent;
         // these model the process/task dying after the transaction committed but before it freed.
@@ -2104,6 +2393,14 @@ impl SessionStore for InMemoryStore {
         rec.snapshot = checkpoint.snapshot;
         rec.epoch = checkpoint.epoch;
         rec.status = SessionStatus::Completed;
+        if let Some(up_to) = checkpoint.consumed_splices {
+            Self::consume_splices_locked(
+                &mut inner,
+                &checkpoint.session_id,
+                up_to,
+                checkpoint.epoch.0,
+            );
+        }
         // Stamp the terminal clock on the session's host meta (the reaper's grace timer). Same
         // transaction (the held lock); re-stamped if a resumed session completes again.
         inner
@@ -2255,26 +2552,6 @@ impl SessionStore for InMemoryStore {
         self.inner.lock().unwrap().wake_outbox.push_back(id);
     }
 
-    async fn enqueue_session_input(&self, id: &SessionId, input: Vec<u8>) {
-        self.inner
-            .lock()
-            .unwrap()
-            .pending_inputs
-            .entry(id.clone())
-            .or_default()
-            .push_back(input);
-    }
-
-    async fn take_session_inputs(&self, id: &SessionId) -> Vec<Vec<u8>> {
-        self.inner
-            .lock()
-            .unwrap()
-            .pending_inputs
-            .remove(id)
-            .map(|q| q.into_iter().collect())
-            .unwrap_or_default()
-    }
-
     async fn park_approval(
         &self,
         checkpoint: Checkpoint,
@@ -2298,6 +2575,14 @@ impl SessionStore for InMemoryStore {
         rec.epoch = checkpoint.epoch;
         if let Some(job_id) = suspend_job {
             rec.status = SessionStatus::Suspended { job_id };
+        }
+        if let Some(up_to) = checkpoint.consumed_splices {
+            Self::consume_splices_locked(
+                &mut inner,
+                &checkpoint.session_id,
+                up_to,
+                checkpoint.epoch.0,
+            );
         }
         let rows = inner
             .pending_approvals
@@ -3569,38 +3854,6 @@ mod session_meta_tests {
     async fn sqlite_cron_round_trips() {
         cron_store_behaviour(&SqliteStore::open_in_memory().unwrap()).await;
     }
-
-    /// The durable pending-input seam: enqueue is FIFO per session, take drains-and-deletes (a
-    /// second take is empty), and sessions are isolated from each other.
-    async fn pending_input_behaviour(store: &dyn SessionStore) {
-        let a = SessionId::new("in-a");
-        let b = SessionId::new("in-b");
-        assert!(store.take_session_inputs(&a).await.is_empty());
-        store.enqueue_session_input(&a, vec![1]).await;
-        store.enqueue_session_input(&a, vec![2, 2]).await;
-        store.enqueue_session_input(&b, vec![9]).await;
-        assert_eq!(
-            store.take_session_inputs(&a).await,
-            vec![vec![1], vec![2, 2]],
-            "FIFO order per session"
-        );
-        assert!(
-            store.take_session_inputs(&a).await.is_empty(),
-            "take drains: a second take is empty"
-        );
-        assert_eq!(store.take_session_inputs(&b).await, vec![vec![9]]);
-    }
-
-    #[tokio::test]
-    async fn in_memory_pending_inputs_round_trip() {
-        pending_input_behaviour(&InMemoryStore::new()).await;
-    }
-
-    #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn sqlite_pending_inputs_round_trip() {
-        pending_input_behaviour(&SqliteStore::open_in_memory().unwrap()).await;
-    }
 }
 
 #[cfg(test)]
@@ -3784,39 +4037,246 @@ mod backward_journal_tests {
 }
 
 #[cfg(test)]
-mod pending_input_tests {
-    //! The pending-input seam (the durable `send` path), proven against both backends: FIFO order,
-    //! destructive drain-once, and per-session isolation.
+mod inbox_splice_tests {
+    //! The durable typed inbox (session-unification §4), proven against both backends: the
+    //! append-or-return-existing dedupe on `(session_id, origin_op)`, the atomic `Idle → Ready`
+    //! flip, the fenced claim CAS (idempotent re-claim under one fence, exactly-once reclaim by a
+    //! newer fence, `Fenced` for a stale one), transactional consumption at the commit ops, and
+    //! retention pruning that touches only consumed rows.
 
     use super::*;
 
-    async fn pending_input_behaviour(store: &dyn SessionStore) {
-        let a = SessionId::new("s-a");
-        let b = SessionId::new("s-b");
-        // Empty until enqueued.
-        assert!(store.take_session_inputs(&a).await.is_empty());
+    const PARTITION: PartitionId = PartitionId(0);
 
-        store.enqueue_session_input(&a, b"first".to_vec()).await;
-        store.enqueue_session_input(&a, b"second".to_vec()).await;
-        store.enqueue_session_input(&b, b"other".to_vec()).await;
+    fn splice(session: &SessionId, kind: SpliceKind, payload: &[u8], op: &str) -> NewSplice {
+        NewSplice {
+            session_id: session.clone(),
+            kind,
+            payload: payload.to_vec(),
+            origin_op: op.into(),
+            origin: "test".into(),
+        }
+    }
 
-        // FIFO, scoped to the session.
-        let drained = store.take_session_inputs(&a).await;
-        assert_eq!(drained, vec![b"first".to_vec(), b"second".to_vec()]);
-        // Destructive: a second drain is empty; the sibling queue is untouched.
-        assert!(store.take_session_inputs(&a).await.is_empty());
-        assert_eq!(store.take_session_inputs(&b).await, vec![b"other".to_vec()]);
+    /// Append: NotFound on an absent session; monotonic per-session sequences; a duplicate
+    /// `origin_op` returns the ORIGINAL seq without inserting; the append flips an `Idle`
+    /// session `Ready` in the same transaction and leaves other statuses alone.
+    async fn append_dedupe_and_idle_flip(store: &dyn SessionStore) {
+        let a = SessionId::new("splice-a");
+        assert!(
+            matches!(
+                store
+                    .append_splice(splice(&a, SpliceKind::StartTurn, b"x", "op-0"))
+                    .await,
+                Err(StoreError::NotFound(_))
+            ),
+            "append to an absent session is NotFound (no orphan inbox rows)"
+        );
+
+        store
+            .create_idle(a.clone(), PARTITION, SnapshotBlob::new(vec![1]))
+            .await
+            .unwrap();
+        assert_eq!(store.status(&a).await, Some(SessionStatus::Idle));
+
+        let s1 = store
+            .append_splice(splice(&a, SpliceKind::StartTurn, b"first", "op-1"))
+            .await
+            .unwrap();
+        assert_eq!(s1, 1);
+        assert_eq!(
+            store.status(&a).await,
+            Some(SessionStatus::Ready),
+            "durable input flips Idle -> Ready atomically with the append (§2 status rule)"
+        );
+
+        // A producer retry (crash-before-ack) returns the original seq; nothing is duplicated.
+        let retry = store
+            .append_splice(splice(&a, SpliceKind::StartTurn, b"first", "op-1"))
+            .await
+            .unwrap();
+        assert_eq!(retry, s1, "duplicate origin_op returns the original seq");
+
+        let s2 = store
+            .append_splice(splice(&a, SpliceKind::Observe, b"ctx", "op-2"))
+            .await
+            .unwrap();
+        assert_eq!(s2, 2, "sequences are per-session monotonic");
+
+        let rows = store.splices_after(&a, 0).await;
+        assert_eq!(
+            rows.iter().map(|r| r.splice_seq).collect::<Vec<_>>(),
+            vec![1, 2],
+            "splices_after returns unconsumed rows in sequence order, no duplicates"
+        );
+        assert_eq!(rows[0].kind, SpliceKind::StartTurn);
+        assert_eq!(rows[0].payload, b"first");
+        assert_eq!(rows[1].kind, SpliceKind::Observe);
+
+        // Sessions are isolated.
+        let b = SessionId::new("splice-b");
+        store
+            .create_idle(b.clone(), PARTITION, SnapshotBlob::new(vec![2]))
+            .await
+            .unwrap();
+        // The same origin_op namespace on ANOTHER session dedupes independently.
+        let sb = store
+            .append_splice(splice(&b, SpliceKind::Steer, b"other", "op-1"))
+            .await
+            .unwrap();
+        assert_eq!(sb, 1, "the dedupe key is scoped per session");
+        assert_eq!(store.splices_after(&a, 0).await.len(), 2);
+        assert_eq!(store.splices_after(&b, 0).await.len(), 1);
+    }
+
+    /// Claim CAS: a claim takes every pending row under the current fence; re-claiming under the
+    /// SAME fence is idempotent (returns the held set); a STALE fence gets `Fenced`; a NEWER
+    /// fence reclaims un-consumed claims exactly once (the crash-recovery path).
+    async fn claim_cas_fencing(store: &dyn SessionStore) {
+        let id = SessionId::new("splice-claim");
+        store
+            .create_session(id.clone(), PARTITION, SnapshotBlob::new(vec![0]))
+            .await
+            .unwrap();
+        store
+            .append_splice(splice(&id, SpliceKind::StartTurn, b"one", "c-1"))
+            .await
+            .unwrap();
+        store
+            .append_splice(splice(&id, SpliceKind::Steer, b"two", "c-2"))
+            .await
+            .unwrap();
+
+        let f1 = store.acquire_activation_lease(&id).await.unwrap();
+        let claimed = store.claim_splices(&id, f1).await.unwrap();
+        assert_eq!(claimed.len(), 2);
+        assert!(claimed
+            .iter()
+            .all(|r| r.claim == SpliceClaim::Claimed { fence: f1.0 }));
+
+        // Idempotent under the same fence: a re-load sees the same set.
+        let again = store.claim_splices(&id, f1).await.unwrap();
+        assert_eq!(
+            again.iter().map(|r| r.splice_seq).collect::<Vec<_>>(),
+            claimed.iter().map(|r| r.splice_seq).collect::<Vec<_>>(),
+        );
+
+        // The next lease fences the old one out and reclaims the un-consumed rows exactly once.
+        let f2 = store.acquire_activation_lease(&id).await.unwrap();
+        assert!(
+            matches!(
+                store.claim_splices(&id, f1).await,
+                Err(StoreError::Fenced { .. })
+            ),
+            "a stale fence cannot claim"
+        );
+        let reclaimed = store.claim_splices(&id, f2).await.unwrap();
+        assert_eq!(
+            reclaimed.len(),
+            2,
+            "a newer fence reclaims the stale claims"
+        );
+        assert!(reclaimed
+            .iter()
+            .all(|r| r.claim == SpliceClaim::Claimed { fence: f2.0 }));
+    }
+
+    /// Consumption rides the commit transaction: `load_for_activation` claims in the load,
+    /// the checkpoint's `consumed_splices` cursor flips rows at/below it to `Consumed`, replay
+    /// (`splices_after`) skips them, and retention pruning deletes ONLY consumed rows.
+    async fn consume_at_commit_and_prune(store: &dyn SessionStore) {
+        let id = SessionId::new("splice-consume");
+        store
+            .create_session(id.clone(), PARTITION, SnapshotBlob::new(vec![0]))
+            .await
+            .unwrap();
+        for (i, op) in ["k-1", "k-2", "k-3"].iter().enumerate() {
+            store
+                .append_splice(splice(&id, SpliceKind::StartTurn, &[i as u8], op))
+                .await
+                .unwrap();
+        }
+
+        let fence = store.acquire_activation_lease(&id).await.unwrap();
+        let activation = store.load_for_activation(&id, fence).await.unwrap();
+        assert_eq!(
+            activation
+                .splices
+                .iter()
+                .map(|r| r.splice_seq)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "load_for_activation claims the pending inbox in the load transaction"
+        );
+
+        // The turn folded splices 1-2; the commit consumes them transactionally.
+        store
+            .mark_completed(
+                Checkpoint::new(id.clone(), Epoch(1), SnapshotBlob::new(vec![9]))
+                    .with_consumed_splices(Some(2)),
+                fence,
+            )
+            .await
+            .unwrap();
+        let rest = store.splices_after(&id, 0).await;
+        assert_eq!(
+            rest.iter().map(|r| r.splice_seq).collect::<Vec<_>>(),
+            vec![3],
+            "replay skips consumed rows; the un-folded splice survives"
+        );
+
+        // Retention: a future cutoff prunes exactly the consumed rows, never the pending one.
+        let pruned = store.prune_consumed_splices(now_ms() + 1).await;
+        assert_eq!(pruned, 2, "prune deletes only consumed rows");
+        assert_eq!(
+            store
+                .splices_after(&id, 0)
+                .await
+                .iter()
+                .map(|r| r.splice_seq)
+                .collect::<Vec<_>>(),
+            vec![3],
+            "unconsumed splices are NEVER pruned"
+        );
+        // Sequences never renumber: the next append continues past the pruned rows.
+        let next = store
+            .append_splice(splice(&id, SpliceKind::Steer, b"after-prune", "k-4"))
+            .await
+            .unwrap();
+        assert_eq!(next, 4, "splice_seq is never reused after pruning");
     }
 
     #[tokio::test]
-    async fn in_memory_pending_inputs_drain_fifo_once() {
-        pending_input_behaviour(&InMemoryStore::new()).await;
+    async fn in_memory_append_dedupe_and_idle_flip() {
+        append_dedupe_and_idle_flip(&InMemoryStore::new()).await;
     }
 
     #[cfg(feature = "sqlite")]
     #[tokio::test]
-    async fn sqlite_pending_inputs_drain_fifo_once() {
-        pending_input_behaviour(&SqliteStore::open_in_memory().unwrap()).await;
+    async fn sqlite_append_dedupe_and_idle_flip() {
+        append_dedupe_and_idle_flip(&SqliteStore::open_in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn in_memory_claim_cas_fencing() {
+        claim_cas_fencing(&InMemoryStore::new()).await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_claim_cas_fencing() {
+        claim_cas_fencing(&SqliteStore::open_in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn in_memory_consume_at_commit_and_prune() {
+        consume_at_commit_and_prune(&InMemoryStore::new()).await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_consume_at_commit_and_prune() {
+        consume_at_commit_and_prune(&SqliteStore::open_in_memory().unwrap()).await;
     }
 }
 

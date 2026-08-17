@@ -467,8 +467,8 @@ async fn unification_stage1_suite<S: FaultStore + 'static>(make: impl Fn() -> Ar
             "rolled back: no tree edge"
         );
         assert!(
-            store.take_session_inputs(&child).await.is_empty(),
-            "rolled back: no pending input"
+            store.splices_after(&child, 0).await.is_empty(),
+            "rolled back: no seeded inbox splice"
         );
 
         assert!(store
@@ -490,16 +490,16 @@ async fn unification_stage1_suite<S: FaultStore + 'static>(make: impl Fn() -> Ar
                 .as_ref(),
             Some(&parent)
         );
-        assert_eq!(
-            store.take_session_inputs(&child).await,
-            vec![b"seeded-first-input".to_vec()]
-        );
+        let seeded = store.splices_after(&child, 0).await;
+        assert_eq!(seeded.len(), 1, "the first input rides the durable inbox");
+        assert_eq!(seeded[0].kind, daemon_store::SpliceKind::StartTurn);
+        assert_eq!(seeded[0].payload, b"seeded-first-input");
 
         // Idempotent duplicate: `false` and NOTHING re-written — no duplicate tree edge, no
-        // resurrected pending input.
+        // duplicated seeded splice.
         assert!(!store.create_runnable(spec).await.expect("idempotent"));
         assert_eq!(store.children_of(&parent).await, vec![child.clone()]);
-        assert!(store.take_session_inputs(&child).await.is_empty());
+        assert_eq!(store.splices_after(&child, 0).await.len(), 1);
 
         // The child runs to terminal; its completion fulfills the parent's job (the parent wakes
         // and completes) — the factory's edge behaves exactly like `bind_delegation`.
@@ -570,6 +570,185 @@ async fn sqlite_unification_stage1() {
         .await;
 }
 
+/// Session-unification Stage 2 (spec §4, acceptance #4/#5): the durable typed inbox behaves
+/// identically on both backends across the crash/replay boundaries — a producer retry after a
+/// crash-before-ack lands the ORIGINAL splice, a claim orphaned by a crashed incarnation is
+/// reclaimed by the next fence exactly once, consumption rides the commit transaction, and input
+/// racing a turn's commit is never stranded.
+async fn unification_stage2_suite<S: FaultStore + 'static>(make: impl Fn() -> Arc<S>) {
+    use daemon_store::{Checkpoint, NewSplice, SpliceKind};
+
+    fn splice(session: &SessionId, payload: &[u8], op: &str) -> NewSplice {
+        NewSplice {
+            session_id: session.clone(),
+            kind: SpliceKind::StartTurn,
+            payload: payload.to_vec(),
+            origin_op: op.into(),
+            origin: "conformance".into(),
+        }
+    }
+
+    // (a) Crash after splice commit / before ack (acceptance #4a): the producer's retry — same
+    // `origin_op` — returns the original `splice_seq` and inserts nothing; the append that landed
+    // flipped the Idle session Ready atomically, so the input is never stranded invisible.
+    {
+        let store = make();
+        let id = SessionId::new("splice-retry");
+        let blob = Snapshot::fresh(id.clone()).encode().expect("encode");
+        store
+            .create_idle(id.clone(), PARTITION, blob)
+            .await
+            .expect("create idle");
+        let seq = store
+            .append_splice(splice(&id, b"turn please", "req-1"))
+            .await
+            .expect("append");
+        assert_eq!(store.status(&id).await, Some(SessionStatus::Ready));
+        let retried = store
+            .append_splice(splice(&id, b"turn please", "req-1"))
+            .await
+            .expect("retry append");
+        assert_eq!(retried, seq, "the retry lands on the original splice");
+        assert_eq!(store.splices_after(&id, 0).await.len(), 1);
+    }
+
+    // (b) Crash after claim (acceptance #4b): an incarnation claims the inbox in its load and
+    // dies before committing. The stale fence can no longer claim; the next activation's fence
+    // reclaims the orphaned splices exactly once; its commit consumes them; a third activation
+    // sees an empty inbox.
+    {
+        let store = make();
+        let id = SessionId::new("splice-reclaim");
+        seed(&*store, &id).await;
+        store
+            .append_splice(splice(&id, b"orphaned work", "req-2"))
+            .await
+            .expect("append");
+
+        // First incarnation: claims in the load, then "crashes" (no commit ever happens).
+        let f1 = store.acquire_activation_lease(&id).await.expect("lease 1");
+        let crashed = store.load_for_activation(&id, f1).await.expect("load 1");
+        assert_eq!(crashed.splices.len(), 1, "the load claims the inbox");
+
+        // Recovery: the next fence reclaims the orphan; the stale fence is locked out.
+        let f2 = store.acquire_activation_lease(&id).await.expect("lease 2");
+        assert!(
+            matches!(
+                store.claim_splices(&id, f1).await,
+                Err(StoreError::Fenced { .. })
+            ),
+            "the crashed incarnation's fence must not reclaim"
+        );
+        let recovered = store.load_for_activation(&id, f2).await.expect("load 2");
+        assert_eq!(
+            recovered.splices.len(),
+            1,
+            "the newer fence reclaims the orphaned splice exactly once"
+        );
+
+        // The recovered incarnation folds and commits: consumption rides the same transaction.
+        let folded = Snapshot::fresh(id.clone()).encode().expect("encode");
+        store
+            .mark_completed(
+                Checkpoint::new(id.clone(), daemon_common::Epoch(1), folded)
+                    .with_consumed_splices(Some(recovered.splices[0].splice_seq)),
+                f2,
+            )
+            .await
+            .expect("commit");
+        let f3 = store.acquire_activation_lease(&id).await.expect("lease 3");
+        let after = store.load_for_activation(&id, f3).await.expect("load 3");
+        assert!(
+            after.splices.is_empty(),
+            "a consumed splice is never redelivered"
+        );
+    }
+
+    // (c) Input racing the commit (acceptance #5): a splice appended AFTER the incarnation's load
+    // but BEFORE its commit is untouched by that commit's consumption cursor — it stays pending
+    // and the next activation claims it. Nothing raced-in is ever silently consumed or stranded.
+    {
+        let store = make();
+        let id = SessionId::new("splice-race");
+        seed(&*store, &id).await;
+        store
+            .append_splice(splice(&id, b"in the turn", "req-3"))
+            .await
+            .expect("append pre-load");
+        let fence = store.acquire_activation_lease(&id).await.expect("lease");
+        let activation = store.load_for_activation(&id, fence).await.expect("load");
+        let claimed_seq = activation.splices[0].splice_seq;
+
+        // Mid-turn: new input races in (a wire submit / an operator send).
+        let raced_seq = store
+            .append_splice(splice(&id, b"raced in mid-turn", "req-4"))
+            .await
+            .expect("append mid-turn");
+        assert!(raced_seq > claimed_seq);
+
+        // The commit consumes only what the turn folded (the claimed prefix).
+        let folded = Snapshot::fresh(id.clone()).encode().expect("encode");
+        store
+            .mark_completed(
+                Checkpoint::new(id.clone(), daemon_common::Epoch(1), folded)
+                    .with_consumed_splices(Some(claimed_seq)),
+                fence,
+            )
+            .await
+            .expect("commit");
+        let remaining = store.splices_after(&id, 0).await;
+        assert_eq!(
+            remaining.iter().map(|s| s.splice_seq).collect::<Vec<_>>(),
+            vec![raced_seq],
+            "the raced-in splice survives the commit, unconsumed"
+        );
+        let f2 = store.acquire_activation_lease(&id).await.expect("lease 2");
+        let next = store.load_for_activation(&id, f2).await.expect("load 2");
+        assert_eq!(
+            next.splices
+                .iter()
+                .map(|s| s.splice_seq)
+                .collect::<Vec<_>>(),
+            vec![raced_seq],
+            "the next activation claims exactly the raced-in input"
+        );
+    }
+
+    // (d) End-to-end through the real activation loop: a spliced input on a Ready session is
+    // folded by the woken incarnation and consumed by its terminal commit — the inbox is empty
+    // afterwards and the session completed (the fold happened exactly once, inside the substrate).
+    {
+        let store = make();
+        let mgr = manager(store.clone());
+        let id = SessionId::new("splice-end-to-end");
+        seed(&*store, &id).await;
+        store
+            .append_splice(splice(&id, b"delegated task", "req-5"))
+            .await
+            .expect("append");
+        mgr.wake(id.clone()).await.expect("wake");
+        // The delegating test engine suspends on a job after its first activation; drive the
+        // job + resume through the workers (the same path the resident dispatchers run).
+        mgr.recover().await.expect("recover");
+        assert_completed(&*store, &id).await;
+        assert!(
+            store.splices_after(&id, 0).await.is_empty(),
+            "the terminal commit consumed the folded splice"
+        );
+    }
+}
+
+#[tokio::test]
+async fn in_memory_unification_stage2() {
+    unification_stage2_suite(|| Arc::new(InMemoryStore::new())).await;
+}
+
+#[tokio::test]
+async fn sqlite_unification_stage2() {
+    unification_stage2_suite(|| Arc::new(SqliteStore::open_in_memory().expect("open sqlite")))
+        .await;
+}
+
 /// Session-unification §6 regression: a concurrent wake of a BUSY session must not bump the fence
 /// past the in-flight incarnation. The in-process slot is reserved before the lease is acquired,
 /// so a busy session's wake returns satisfied without touching the lease; under the old
@@ -594,6 +773,7 @@ async fn concurrent_wake_does_not_self_fence() {
             &mut self,
             snapshot: daemon_activation::SnapshotBlob,
             _unapplied: Vec<JobCompletion>,
+            _splices: Vec<daemon_store::InboxSplice>,
         ) -> Result<(), EngineError> {
             self.snapshot = Some(snapshot);
             Ok(())

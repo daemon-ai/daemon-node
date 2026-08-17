@@ -576,11 +576,27 @@ impl Tool for OrchestrateTool {
                 if store.status(&child).await.is_none() {
                     return Self::err(call, format!("send failed: unknown child {target}"));
                 }
-                // Queue on the durable pending-input seam, then wake: the child's next incarnation
-                // drains the message into its conversation before the turn runs.
-                store
-                    .enqueue_session_input(&child, UserMsg::new(message).encode())
+                // Append on the durable inbox (session-unification §4), then wake: the child's
+                // next incarnation folds the claimed splice into its conversation before the
+                // turn runs. The op-id is minted per invocation (nanos + call_id): provider tool
+                // call ids are NOT guaranteed unique across turns, and swallowing a distinct
+                // message as a false duplicate is worse than the pre-splice rail's no-dedupe.
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                let append = store
+                    .append_splice(daemon_store::NewSplice {
+                        session_id: child.clone(),
+                        kind: daemon_store::SpliceKind::Steer,
+                        payload: UserMsg::new(message).encode(),
+                        origin_op: format!("send-{}-{nanos}", call.call_id),
+                        origin: format!("orchestrate-send:{}", cx.session_id),
+                    })
                     .await;
+                if let Err(e) = append {
+                    return Self::err(call, format!("send failed: {e}"));
+                }
                 store.enqueue_wake(child).await;
                 Self::ok(call, format!("sent:{target}"), Vec::new())
             }

@@ -453,7 +453,7 @@ async fn notice_to_a_settled_parent_is_cleanly_dropped_impl() {
         Some(daemon_store::SessionStatus::Completed)
     ));
     assert!(
-        store.take_session_inputs(&parent).await.is_empty(),
+        store.splices_after(&parent, 0).await.is_empty(),
         "a settled parent queues nothing off a detached notice"
     );
 

@@ -234,12 +234,19 @@ async fn operator_assign_wakes_a_parked_durable_child_impl() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
-    // The operator-ish input reaches the parked child durably (pending input, FIFO): this is the
+    // The operator-ish input reaches the parked child durably (an inbox splice): this is the
     // store half of `inject_session_input` — the seam a first-class operator durable-steer op
     // would ride (recorded follow-up).
     store
-        .enqueue_session_input(&child, UserMsg::new("OPERATOR-WAKE-PING").encode())
-        .await;
+        .append_splice(daemon_store::NewSplice {
+            session_id: child.clone(),
+            kind: daemon_store::SpliceKind::Steer,
+            payload: UserMsg::new("OPERATOR-WAKE-PING").encode(),
+            origin_op: "operator-wake-ping".into(),
+            origin: "test-operator".into(),
+        })
+        .await
+        .expect("append the operator splice");
 
     // The operator wakes the parked child through the wire `Assign` op; the woken hydrate drains
     // the pending input into the conversation. Generous deadline + a measured re-nudge cadence:

@@ -114,6 +114,13 @@ pub struct Snapshot {
     /// snapshots decodable.
     #[serde(default)]
     pub composed_model: String,
+    /// The highest durable-inbox `splice_seq` this snapshot's conversation has folded
+    /// (session-unification §4.2, the consumed cursor): hydrate replays only claimed splices
+    /// ABOVE it, and the commit that persists this snapshot flips everything at/below it to
+    /// `Consumed` in the same transaction. `0` = nothing folded. `#[serde(default)]` keeps
+    /// pre-existing snapshots decodable.
+    #[serde(default)]
+    pub consumed_splice_seq: u64,
 }
 
 /// A gated tool call parked for a durable human-in-the-loop decision (§12). Persisted on the
@@ -156,6 +163,7 @@ impl Snapshot {
             writer_version: String::new(),
             composed_prompt: None,
             composed_model: String::new(),
+            consumed_splice_seq: 0,
         }
     }
 

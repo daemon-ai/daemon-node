@@ -17,7 +17,8 @@
 use async_trait::async_trait;
 use daemon_common::{DaemonError, Epoch, FenceToken, PartitionId, SessionId};
 use daemon_store::{
-    Checkpoint, JobCommand, JobCompletion, ParkedApproval, SessionStatus, SessionStore, StoreError,
+    Checkpoint, InboxSplice, JobCommand, JobCompletion, ParkedApproval, SessionStatus,
+    SessionStore, StoreError,
 };
 use daemon_telemetry::{current_trace, ingress_trace, with_trace};
 use dashmap::DashMap;
@@ -63,12 +64,16 @@ pub enum EngineError {
 /// durable job/completion types, never §17 messages directly.
 #[async_trait]
 pub trait Incarnation: Send {
-    /// Reconstruct from the last snapshot and apply unapplied completions idempotently *before*
-    /// running new work (lifecycle §3.1, invariant #2).
+    /// Reconstruct from the last snapshot, apply unapplied completions idempotently, and fold the
+    /// claimed durable-inbox splices (session-unification §4.2; already CAS-claimed under this
+    /// activation's fence by `load_for_activation`) — all *before* running new work (lifecycle
+    /// §3.1, invariant #2). Splices at or below the snapshot's consumed cursor were captured by an
+    /// earlier commit and must be skipped, never re-folded.
     async fn hydrate(
         &mut self,
         snapshot: SnapshotBlob,
         unapplied: Vec<JobCompletion>,
+        splices: Vec<InboxSplice>,
     ) -> Result<(), EngineError>;
 
     /// Process available work, returning whether the engine completed or suspended.
@@ -79,6 +84,14 @@ pub trait Incarnation: Send {
 
     /// The current incarnation epoch (post-bump at suspension).
     fn epoch(&self) -> Epoch;
+
+    /// The highest durable-inbox `splice_seq` this incarnation's snapshot has folded, stamped onto
+    /// every commit ([`Checkpoint::consumed_splices`]) so the store flips exactly that prefix to
+    /// `Consumed` inside the commit transaction (§4.2: consumption is never written separately).
+    /// `None` = this incarnation makes no splice statement (nothing is consumed).
+    fn consumed_splices(&self) -> Option<u64> {
+        None
+    }
 
     /// The structured completion payload to record when this incarnation reaches `Step::Completed`
     /// (daemon-content-transfer-spec.md Phase 2a: a CBOR `DelegationResult` capturing the child's
@@ -201,15 +214,21 @@ impl ManagerInner {
                 trace_id = %current_trace(),
                 session = %id,
                 unapplied_jobs = activation.unapplied.len(),
+                splices = activation.splices.len(),
                 "activation.hydrate"
             );
             let mut inc = self.factory.create();
-            inc.hydrate(activation.snapshot, activation.unapplied)
-                .await?;
+            inc.hydrate(
+                activation.snapshot,
+                activation.unapplied,
+                activation.splices,
+            )
+            .await?;
             match inc.run().await? {
                 Step::Suspended { job } => {
                     let snapshot = inc.checkpoint()?;
-                    let checkpoint = Checkpoint::new(id.clone(), inc.epoch(), snapshot);
+                    let checkpoint = Checkpoint::new(id.clone(), inc.epoch(), snapshot)
+                        .with_consumed_splices(inc.consumed_splices());
                     tracing::info!(
                         trace_id = %current_trace(),
                         session = %id,
@@ -227,7 +246,8 @@ impl ManagerInner {
                     // in one transaction, but enqueue *no* runnable job — the session stays dormant until
                     // an operator `answer_approval` wakes it (recovery re-park dedupes on the unique row).
                     let snapshot = inc.checkpoint()?;
-                    let checkpoint = Checkpoint::new(id.clone(), inc.epoch(), snapshot);
+                    let checkpoint = Checkpoint::new(id.clone(), inc.epoch(), snapshot)
+                        .with_consumed_splices(inc.consumed_splices());
                     tracing::info!(
                         trace_id = %current_trace(),
                         session = %id,
@@ -245,7 +265,8 @@ impl ManagerInner {
                     // A delegated child carries its structured result (DelegationResult: summary +
                     // artifact refs) on the completion payload; the incarnation captured it at terminal.
                     let checkpoint = Checkpoint::new(id.clone(), inc.epoch(), snapshot)
-                        .with_completion_payload(inc.completion_payload());
+                        .with_completion_payload(inc.completion_payload())
+                        .with_consumed_splices(inc.consumed_splices());
                     tracing::info!(
                         trace_id = %current_trace(),
                         session = %id,

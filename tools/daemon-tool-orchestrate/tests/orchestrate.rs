@@ -317,11 +317,15 @@ async fn send_queues_input_and_wakes_an_owned_child() {
     assert!(out.result.ok, "{}", out.result.content);
     assert_eq!(out.result.content, "sent:parent/c1");
 
-    // The message landed on the durable pending-input queue (a CBOR UserMsg)...
+    // The message landed on the durable inbox as a pending Steer splice (a CBOR UserMsg)...
     let child = SessionId::new("parent/c1");
-    let queued = store.take_session_inputs(&child).await;
+    let queued = store.splices_after(&child, 0).await;
     assert_eq!(queued.len(), 1);
-    assert_eq!(UserMsg::decode(&queued[0]).text, "also check the docs");
+    assert_eq!(queued[0].kind, daemon_store::SpliceKind::Steer);
+    assert_eq!(
+        UserMsg::decode(&queued[0].payload).text,
+        "also check the docs"
+    );
     // ...and a wake was enqueued so the next dispatch activates the child.
     assert_eq!(store.dequeue_wake().await, Some(child));
 }
@@ -343,7 +347,7 @@ async fn send_rejects_targets_outside_the_callers_subtree() {
     assert!(out.result.content.contains("not a child"));
     assert!(
         store
-            .take_session_inputs(&SessionId::new("other/c1"))
+            .splices_after(&SessionId::new("other/c1"), 0)
             .await
             .is_empty(),
         "nothing may be queued on a foreign session"

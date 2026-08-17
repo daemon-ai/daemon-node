@@ -130,6 +130,7 @@ impl Incarnation for DispatchingIncarnation {
         &mut self,
         snapshot: SnapshotBlob,
         unapplied: Vec<daemon_store::JobCompletion>,
+        splices: Vec<daemon_store::InboxSplice>,
     ) -> Result<(), EngineError> {
         let foreign = self.foreign.clone();
         let mut inner: Box<dyn Incarnation> = match Self::resolve_foreign(&foreign, &snapshot).await
@@ -144,7 +145,7 @@ impl Incarnation for DispatchingIncarnation {
             )),
             None => self.core.create(),
         };
-        inner.hydrate(snapshot, unapplied).await?;
+        inner.hydrate(snapshot, unapplied, splices).await?;
         self.inner = Some(inner);
         Ok(())
     }
@@ -171,6 +172,10 @@ impl Incarnation for DispatchingIncarnation {
     fn completion_payload(&self) -> Option<Vec<u8>> {
         self.inner.as_ref().and_then(|i| i.completion_payload())
     }
+
+    fn consumed_splices(&self) -> Option<u64> {
+        self.inner.as_ref().and_then(|i| i.consumed_splices())
+    }
 }
 
 /// A durable incarnation that runs a delegated child as its bound `Foreign{agent}` backend: spawn
@@ -189,8 +194,12 @@ pub(crate) struct ForeignIncarnation {
     materials: crate::fleet::foreign_live::SpawnMaterials,
     /// The spawned foreign backend, materialized at hydrate.
     session: Option<Arc<dyn AgentSession>>,
-    /// The durable pending inputs drained at hydrate (the delegated task + any queued `send`s).
+    /// The claimed durable-inbox splices folded at hydrate (the delegated task + any queued
+    /// `send`s), decoded as `UserMsg`s.
     inputs: Vec<UserMsg>,
+    /// The highest folded `splice_seq` (session-unification §4.2): stamped onto the terminal
+    /// commit so the store flips the folded prefix `Consumed` in the same transaction.
+    consumed_splices: Option<u64>,
     /// The structured completion payload captured at terminal (a CBOR `DelegationResult`).
     completion_payload: Option<Vec<u8>>,
 }
@@ -214,6 +223,7 @@ impl ForeignIncarnation {
             materials,
             session: None,
             inputs: Vec::new(),
+            consumed_splices: None,
             completion_payload: None,
         }
     }
@@ -253,6 +263,7 @@ impl Incarnation for ForeignIncarnation {
         &mut self,
         _snapshot: SnapshotBlob,
         _unapplied: Vec<daemon_store::JobCompletion>,
+        splices: Vec<daemon_store::InboxSplice>,
     ) -> Result<(), EngineError> {
         // The agent answers its own blocking §17 requests (ACP permission prompts) against an
         // auto-allow host: a durable child runs headless with no operator to prompt.
@@ -270,15 +281,15 @@ impl Incarnation for ForeignIncarnation {
         )
         .await
         .map_err(|e| EngineError::Other(format!("spawn foreign session `{}`: {e}", self.agent)))?;
-        // Drain the durable pending inputs (the delegated task seeded by the job worker, plus any
-        // `send`s queued while dehydrated) into this activation's turn queue; each decodes as a
-        // `UserMsg` (bare text falls back).
-        self.inputs = self
-            .store
-            .take_session_inputs(&self.session_id)
-            .await
+        // Fold the claimed durable-inbox splices (the delegated task seeded by the job worker's
+        // `create_runnable`, plus any `send`s queued while dehydrated) into this activation's turn
+        // queue; each payload decodes as a `UserMsg` (bare text falls back). The folded high-water
+        // mark rides the terminal commit ([`Incarnation::consumed_splices`]) so the store flips
+        // exactly that prefix `Consumed` — replacing the old destructive drain.
+        self.consumed_splices = splices.iter().map(|s| s.splice_seq).max();
+        self.inputs = splices
             .iter()
-            .map(|raw| UserMsg::decode(raw))
+            .map(|s| UserMsg::decode(&s.payload))
             .collect();
         self.session = Some(session);
         Ok(())
@@ -353,6 +364,10 @@ impl Incarnation for ForeignIncarnation {
 
     fn completion_payload(&self) -> Option<Vec<u8>> {
         self.completion_payload.clone()
+    }
+
+    fn consumed_splices(&self) -> Option<u64> {
+        self.consumed_splices
     }
 }
 

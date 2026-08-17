@@ -385,6 +385,7 @@ impl Incarnation for CoreIncarnation {
         &mut self,
         snapshot: SnapshotBlob,
         unapplied: Vec<JobCompletion>,
+        splices: Vec<daemon_store::InboxSplice>,
     ) -> Result<(), EngineError> {
         if snapshot.is_empty() {
             return Err(EngineError::Other(
@@ -454,17 +455,29 @@ impl Incarnation for CoreIncarnation {
             })
             .collect();
         engine.apply_completions(completions);
-        // Durable inbound-input seam: drain any host-enqueued pending inputs (a background
-        // process-exit notification, a message to a delegated child — the durable `send` path) into
-        // the conversation as user messages before the turn runs. This is how content reaches an
-        // activation-lifecycle session that `SessionApi::submit` cannot drive (the
-        // one-lifecycle-owner guard-rail); the enqueuer pairs it with `enqueue_wake` so this hydrate
-        // happens. Each payload decodes as a CBOR `UserMsg` (bare text falls back) so the message
-        // lands in exactly this incarnation's turn.
-        if let Some(store) = self.journal.as_ref().map(|cfg| &cfg.store) {
-            for raw in store.take_session_inputs(&session_id).await {
-                engine.push_user(daemon_protocol::UserMsg::decode(&raw));
+        // Durable inbox seam (session-unification §4): fold the claimed splices — a background
+        // process-exit notification, a message to a delegated child (the durable `send` path), a
+        // seeded first input, an F4 durable-resume turn — into the conversation before the turn
+        // runs. The splices were CAS-claimed under this activation's fence inside the load
+        // transaction (replacing the old destructive `take_session_inputs` drain); rows at or
+        // below the snapshot's consumed cursor were captured by an earlier commit and are
+        // skipped. Each payload decodes as a CBOR `UserMsg` (bare text falls back); an `Observe`
+        // splice folds context-only (`push_observe` — it never opens a turn by itself). The
+        // engine's cursor advances with each fold, so the commit that persists this snapshot
+        // flips exactly the folded prefix to `Consumed` in the same transaction.
+        let cursor = engine.consumed_splice_seq();
+        for splice in splices {
+            if splice.splice_seq <= cursor {
+                continue;
             }
+            let msg = daemon_protocol::UserMsg::decode(&splice.payload);
+            match splice.kind {
+                daemon_store::SpliceKind::Observe => engine.push_observe(msg),
+                daemon_store::SpliceKind::StartTurn | daemon_store::SpliceKind::Steer => {
+                    engine.push_user(msg)
+                }
+            }
+            engine.note_consumed_splice(splice.splice_seq);
         }
         // I15: a cron-fired session carries `SessionMeta::scheduled_job` (read above). Arm the next
         // turn's trigger as `TurnTrigger::Scheduled { job }` so the fired turn reports its scheduled
@@ -648,6 +661,15 @@ impl Incarnation for CoreIncarnation {
     fn completion_payload(&self) -> Option<Vec<u8>> {
         self.completion_payload.clone()
     }
+
+    fn consumed_splices(&self) -> Option<u64> {
+        // The engine's snapshot cursor (advanced at hydrate as claimed splices folded): the store
+        // flips exactly that prefix `Consumed` in the same transaction that persists the snapshot.
+        self.engine
+            .as_ref()
+            .map(|e| e.consumed_splice_seq())
+            .filter(|seq| *seq > 0)
+    }
 }
 
 /// The substrate-path host handler: resolves a delegation to the deterministic durable `JobId` the
@@ -800,14 +822,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&cas);
     }
 
-    /// The durable inbound-input seam: pending inputs enqueued on the store
-    /// (`enqueue_session_input`) are drained at hydrate — decoded as `UserMsg`s and appended to the
-    /// conversation in FIFO order, before the turn runs — and the store side is emptied (a second
-    /// hydrate sees nothing). A non-CBOR payload folds as bare text rather than failing the
-    /// activation (`UserMsg::decode` fallback).
+    /// The durable inbox seam (session-unification §4): claimed splices are folded at hydrate —
+    /// decoded as `UserMsg`s and appended to the conversation in sequence order, before the turn
+    /// runs — the checkpointed snapshot records the consumed cursor, and a re-hydrate FROM that
+    /// checkpoint skips the already-folded prefix (nothing folds twice). A non-CBOR payload folds
+    /// as bare text rather than failing the activation (`UserMsg::decode` fallback), and an
+    /// `Observe` splice folds context-only.
     #[tokio::test]
-    async fn hydrate_drains_pending_session_inputs_into_conversation() {
-        use daemon_store::{InMemoryStore, SessionStore};
+    async fn hydrate_folds_claimed_splices_into_conversation() {
+        use daemon_store::{InMemoryStore, NewSplice, SessionStore, SpliceKind};
 
         let store: Arc<dyn SessionStore> = Arc::new(InMemoryStore::new());
         let session = SessionId::new("notify-target");
@@ -825,15 +848,33 @@ mod tests {
             ciborium::into_writer(&daemon_protocol::UserMsg::new(text), &mut buf).unwrap();
             buf
         };
+        let splice = |kind: SpliceKind, payload: Vec<u8>, op: &str| NewSplice {
+            session_id: session.clone(),
+            kind,
+            payload,
+            origin_op: op.into(),
+            origin: "test".into(),
+        };
         store
-            .enqueue_session_input(&session, encode("[proc done] first"))
-            .await;
+            .append_splice(splice(
+                SpliceKind::StartTurn,
+                encode("[proc done] first"),
+                "n-1",
+            ))
+            .await
+            .unwrap();
         store
-            .enqueue_session_input(&session, b"not-cbor".to_vec())
-            .await;
+            .append_splice(splice(SpliceKind::Steer, b"not-cbor".to_vec(), "n-2"))
+            .await
+            .unwrap();
         store
-            .enqueue_session_input(&session, encode("[proc done] second"))
-            .await;
+            .append_splice(splice(
+                SpliceKind::Observe,
+                encode("[proc done] second"),
+                "n-3",
+            ))
+            .await
+            .unwrap();
 
         let profile = EngineProfile::new(
             Arc::new(|| Arc::new(MockProvider::completing("ok")) as Arc<dyn Provider>),
@@ -843,12 +884,22 @@ mod tests {
         let factory = CoreEngineFactory::from_profile(profile)
             .with_journal(store.clone(), Arc::new(TraceSigner::generate()));
         let mut inc = factory.create();
-        let blob = store.peek_snapshot(&session).await.unwrap();
-        inc.hydrate(blob, Vec::new()).await.unwrap();
+        let fence = store.acquire_activation_lease(&session).await.unwrap();
+        let activation = store.load_for_activation(&session, fence).await.unwrap();
+        assert_eq!(activation.splices.len(), 3, "the load claims the inbox");
+        inc.hydrate(
+            activation.snapshot,
+            activation.unapplied,
+            activation.splices,
+        )
+        .await
+        .unwrap();
 
-        // The checkpointed conversation carries all three inputs, in enqueue order (the bare-text
-        // payload folds through the decode fallback rather than being dropped).
-        let snap = Snapshot::decode(&inc.checkpoint().unwrap()).unwrap();
+        // The checkpointed conversation carries all three inputs, in sequence order (the bare-text
+        // payload folds through the decode fallback rather than being dropped; the Observe folds
+        // context-only into the same conversation), and the consumed cursor is stamped.
+        let checkpoint_blob = inc.checkpoint().unwrap();
+        let snap = Snapshot::decode(&checkpoint_blob).unwrap();
         let users: Vec<String> = snap
             .conversation
             .turns
@@ -866,8 +917,30 @@ mod tests {
                 "[proc done] second".to_string()
             ]
         );
-        // Drained: a second hydrate sees no pending inputs.
-        assert!(store.take_session_inputs(&session).await.is_empty());
+        assert_eq!(
+            snap.consumed_splice_seq, 3,
+            "the snapshot records the folded high-water mark"
+        );
+        assert_eq!(
+            inc.consumed_splices(),
+            Some(3),
+            "the incarnation stamps the cursor onto its commit"
+        );
+
+        // A re-hydrate FROM the checkpoint with the same claimed set (a crash between fold and
+        // commit re-claims under a newer fence) skips the already-captured prefix.
+        let fence2 = store.acquire_activation_lease(&session).await.unwrap();
+        let again = store.load_for_activation(&session, fence2).await.unwrap();
+        let mut inc2 = factory.create();
+        inc2.hydrate(checkpoint_blob, again.unapplied, again.splices)
+            .await
+            .unwrap();
+        let snap2 = Snapshot::decode(&inc2.checkpoint().unwrap()).unwrap();
+        assert_eq!(
+            snap2.conversation.turns.len(),
+            snap.conversation.turns.len(),
+            "splices at/below the snapshot cursor never re-fold"
+        );
     }
 
     /// The suspension payload's declared lifetime is surfaced onto the durable `JobCommand`:
@@ -900,85 +973,74 @@ mod tests {
         );
     }
 
-    /// Pending inputs queued while the session was dehydrated (the durable `send` seam) are drained
-    /// FIFO at hydrate and folded into the conversation — and the drain is destructive, so a second
-    /// hydrate sees nothing.
+    /// Splices queued while the session was dehydrated (the durable `send` seam) fold exactly
+    /// once: the commit that persists the folded snapshot consumes them in the same transaction,
+    /// so the NEXT activation's load claims nothing and the conversation gains no duplicates.
     #[tokio::test]
-    async fn hydrate_drains_pending_inputs_into_conversation() {
+    async fn commit_consumes_folded_splices_exactly_once() {
+        use daemon_store::{Checkpoint, NewSplice, SpliceKind};
+
         let store: Arc<dyn SessionStore> = Arc::new(daemon_store::InMemoryStore::new());
         let session = SessionId::new("dormant");
         store
-            .enqueue_session_input(
-                &session,
-                daemon_protocol::UserMsg::new("first ping").encode(),
+            .create_session(
+                session.clone(),
+                daemon_common::PartitionId::DEFAULT,
+                daemon_core::Snapshot::fresh(session.clone())
+                    .encode()
+                    .unwrap(),
             )
-            .await;
-        store
-            .enqueue_session_input(&session, b"bare text follow-up".to_vec())
-            .await;
+            .await
+            .unwrap();
+        for (text, op) in [("first ping", "s-1"), ("bare follow-up", "s-2")] {
+            store
+                .append_splice(NewSplice {
+                    session_id: session.clone(),
+                    kind: SpliceKind::Steer,
+                    payload: daemon_protocol::UserMsg::new(text).encode(),
+                    origin_op: op.into(),
+                    origin: "test".into(),
+                })
+                .await
+                .unwrap();
+        }
 
         let profile = EngineProfile::new(
             Arc::new(|| Arc::new(MockProvider::completing("done")) as Arc<dyn Provider>),
             Arc::new(ToolRegistry::new()),
             SystemPrompt::new("test"),
         );
-        let mut inc = CoreIncarnation {
-            profile,
-            engine: None,
-            journal: Some(JournalConfig {
-                store: store.clone(),
-                signer: Arc::new(TraceSigner::generate()),
-            }),
-            background: None,
-            resolver: None,
-            content: None,
-            cron_profile: None,
-            completion_payload: None,
-        };
-        let blob = daemon_core::Snapshot::fresh(session.clone())
-            .encode()
+        let factory = CoreEngineFactory::from_profile(profile)
+            .with_journal(store.clone(), Arc::new(TraceSigner::generate()));
+        let mut inc = factory.create();
+        let fence = store.acquire_activation_lease(&session).await.unwrap();
+        let activation = store.load_for_activation(&session, fence).await.unwrap();
+        inc.hydrate(
+            activation.snapshot,
+            activation.unapplied,
+            activation.splices,
+        )
+        .await
+        .unwrap();
+        let folded = Snapshot::decode(&inc.checkpoint().unwrap()).unwrap();
+        assert_eq!(folded.consumed_splice_seq, 2);
+
+        // Commit the folded snapshot with the cursor: consumption rides the same transaction.
+        store
+            .mark_completed(
+                Checkpoint::new(session.clone(), inc.epoch(), inc.checkpoint().unwrap())
+                    .with_consumed_splices(inc.consumed_splices()),
+                fence,
+            )
+            .await
             .unwrap();
-        inc.hydrate(blob.clone(), Vec::new()).await.unwrap();
 
-        let turns = &inc.engine.as_ref().unwrap().snapshot().conversation.turns;
-        let texts: Vec<&str> = turns
-            .iter()
-            .filter_map(|t| match t {
-                daemon_core::Turn::User(msg) => Some(msg.text.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            texts,
-            ["first ping", "bare text follow-up"],
-            "both queued inputs fold into the conversation, FIFO"
-        );
-
-        // Destructive drain: a re-hydrate finds an empty queue.
-        let mut again = CoreIncarnation {
-            profile: EngineProfile::new(
-                Arc::new(|| Arc::new(MockProvider::completing("done")) as Arc<dyn Provider>),
-                Arc::new(ToolRegistry::new()),
-                SystemPrompt::new("test"),
-            ),
-            engine: None,
-            journal: Some(JournalConfig {
-                store: store.clone(),
-                signer: Arc::new(TraceSigner::generate()),
-            }),
-            background: None,
-            resolver: None,
-            content: None,
-            cron_profile: None,
-            completion_payload: None,
-        };
-        again.hydrate(blob, Vec::new()).await.unwrap();
-        let turns = &again.engine.as_ref().unwrap().snapshot().conversation.turns;
+        // The next activation claims nothing — the folded splices are consumed, not re-deliverable.
+        let fence2 = store.acquire_activation_lease(&session).await.unwrap();
+        let again = store.load_for_activation(&session, fence2).await.unwrap();
         assert!(
-            turns
-                .iter()
-                .all(|t| !matches!(t, daemon_core::Turn::User(_))),
-            "the queue drains exactly once"
+            again.splices.is_empty(),
+            "consumed splices never re-claim: the fold happened exactly once"
         );
     }
 }

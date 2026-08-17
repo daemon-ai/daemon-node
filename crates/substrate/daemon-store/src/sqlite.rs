@@ -16,12 +16,12 @@
 
 use crate::{
     AcpEntry, Activation, ChatRoute, Checkpoint, ChildLifetime, CommittedRoot, CompletionNotice,
-    CustomProviderRecord, ExecutionPolicy, FaultPoint, FeedbackRecord, JobCommand, JobCompletion,
-    JournalEntry, JournalPage, JournalSeal, ParkedApproval, Room, RoomMember, RunnableEdge,
-    RunnableSession, SessionMeta, SessionRole, SessionSearchHit, SessionStatus, SessionStore,
-    StoreError, StoreStats, StoredCronJob, StoredCronRun, StoredCronSuggestion,
-    StoredSavedPresence, TraceEntry, TraceSegment, TransportPref, COMMAND_DEDUP_TTL_MS,
-    CRON_RUN_RETENTION,
+    CustomProviderRecord, ExecutionPolicy, FaultPoint, FeedbackRecord, InboxSplice, JobCommand,
+    JobCompletion, JournalEntry, JournalPage, JournalSeal, NewSplice, ParkedApproval, Room,
+    RoomMember, RunnableEdge, RunnableSession, SessionMeta, SessionRole, SessionSearchHit,
+    SessionStatus, SessionStore, SpliceClaim, SpliceKind, StoreError, StoreStats, StoredCronJob,
+    StoredCronRun, StoredCronSuggestion, StoredSavedPresence, TraceEntry, TraceSegment,
+    TransportPref, COMMAND_DEDUP_TTL_MS, CRON_RUN_RETENTION,
 };
 use async_trait::async_trait;
 use daemon_common::{
@@ -463,8 +463,96 @@ static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
         // NULL on legacy rows (policy then falls back to edge inspection). The new 'idle' value of
         // `status_kind` needs no DDL (TEXT column, no CHECK constraint).
         M::up("ALTER TABLE session_record ADD COLUMN execution_policy TEXT;"),
+        // M19 (session-unification §4): the typed durable inbox. `splice_seq` is per-session
+        // monotonic, minted from the dedicated `splice_seq` counter table (mirroring
+        // `detached_seq`) so a sequence is NEVER reused or renumbered even after retention prunes
+        // a fully-consumed inbox — a reused seq at/below a snapshot's consumed cursor would be
+        // silently skipped at hydrate. `UNIQUE (session_id, origin_op)` is the append dedupe key
+        // (append-or-return-existing); the claim state is `claim_kind`
+        // ('pending' | 'claimed' | 'consumed') with `claim_fence` carrying the claiming
+        // activation's fence and `consumed_turn` the consuming commit's turn marker. Existing
+        // `pending_session_input` rows migrate in (kind 'steer' — the rail they rode folded into
+        // the conversation at hydrate, exactly Steer's contract) with deterministic minted
+        // op-ids, and the legacy table is dropped: the F4 bare-bytes rail is retired.
+        M::up(
+            "CREATE TABLE inbox_splice (\n\
+                 session_id     TEXT NOT NULL,\n\
+                 splice_seq     INTEGER NOT NULL,\n\
+                 kind           TEXT NOT NULL,\n\
+                 payload        BLOB NOT NULL,\n\
+                 origin_op      TEXT NOT NULL,\n\
+                 origin         TEXT NOT NULL,\n\
+                 received_at_ms INTEGER NOT NULL,\n\
+                 claim_kind     TEXT NOT NULL DEFAULT 'pending',\n\
+                 claim_fence    INTEGER,\n\
+                 consumed_turn  INTEGER,\n\
+                 PRIMARY KEY (session_id, splice_seq),\n\
+                 UNIQUE (session_id, origin_op)\n\
+             );\n\
+             CREATE TABLE splice_seq (\n\
+                 session_id TEXT PRIMARY KEY,\n\
+                 n          INTEGER NOT NULL DEFAULT 0\n\
+             );\n\
+             INSERT INTO inbox_splice \
+                 (session_id, splice_seq, kind, payload, origin_op, origin, received_at_ms)\n\
+             SELECT session_id,\n\
+                    ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY rowseq),\n\
+                    'steer', input, 'legacy-pending-' || rowseq, 'pending-input-migration',\n\
+                    CAST(strftime('%s', 'now') AS INTEGER) * 1000\n\
+             FROM pending_session_input;\n\
+             INSERT INTO splice_seq (session_id, n)\n\
+             SELECT session_id, MAX(splice_seq) FROM inbox_splice GROUP BY session_id;\n\
+             DROP TABLE pending_session_input;",
+        ),
     ])
 });
+
+fn splice_kind_to_str(kind: SpliceKind) -> &'static str {
+    match kind {
+        SpliceKind::StartTurn => "start_turn",
+        SpliceKind::Steer => "steer",
+        SpliceKind::Observe => "observe",
+    }
+}
+
+fn splice_kind_from_str(s: &str) -> Option<SpliceKind> {
+    match s {
+        "start_turn" => Some(SpliceKind::StartTurn),
+        "steer" => Some(SpliceKind::Steer),
+        "observe" => Some(SpliceKind::Observe),
+        _ => None,
+    }
+}
+
+/// Map an `inbox_splice` row to an [`InboxSplice`] (column order: session_id, splice_seq, kind,
+/// payload, origin_op, origin, received_at_ms, claim_kind, claim_fence, consumed_turn — matches
+/// every inbox_splice SELECT). An unknown kind string maps to `Steer` (fold-into-conversation is
+/// the safe reading of any input).
+fn splice_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<InboxSplice> {
+    let claim = match row.get::<_, String>(7)?.as_str() {
+        "claimed" => SpliceClaim::Claimed {
+            fence: row.get::<_, i64>(8)? as u64,
+        },
+        "consumed" => SpliceClaim::Consumed {
+            turn_seq: row.get::<_, i64>(9)? as u64,
+        },
+        _ => SpliceClaim::Pending,
+    };
+    Ok(InboxSplice {
+        session_id: SessionId::new(row.get::<_, String>(0)?),
+        splice_seq: row.get::<_, i64>(1)? as u64,
+        kind: splice_kind_from_str(&row.get::<_, String>(2)?).unwrap_or(SpliceKind::Steer),
+        payload: row.get::<_, Vec<u8>>(3)?,
+        origin_op: row.get::<_, String>(4)?,
+        origin: row.get::<_, String>(5)?,
+        received_at_ms: row.get::<_, i64>(6)? as u64,
+        claim,
+    })
+}
+
+/// Every `inbox_splice` SELECT's column list (kept in one place so `splice_from_row` stays true).
+const SPLICE_COLUMNS: &str = "session_id, splice_seq, kind, payload, origin_op, origin, \
+                              received_at_ms, claim_kind, claim_fence, consumed_turn";
 
 fn role_to_str(role: SessionRole) -> &'static str {
     match role {
@@ -715,6 +803,98 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// The §4.2 claim CAS: flip `pending` and stale-`claimed` rows to `claimed { fence }` and
+    /// return the full set held by `fence` (including rows it already held, so a re-load under
+    /// one activation is idempotent), in sequence order. Runs inside the caller's transaction.
+    fn claim_splices_conn(
+        conn: &Connection,
+        id: &SessionId,
+        fence: FenceToken,
+    ) -> Result<Vec<InboxSplice>, StoreError> {
+        conn.execute(
+            "UPDATE inbox_splice SET claim_kind = 'claimed', claim_fence = ?2 \
+             WHERE session_id = ?1 \
+               AND (claim_kind = 'pending' \
+                    OR (claim_kind = 'claimed' AND claim_fence < ?2))",
+            params![id.as_str(), fence.0 as i64],
+        )
+        .map_err(sql_err)?;
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {SPLICE_COLUMNS} FROM inbox_splice \
+                 WHERE session_id = ?1 AND claim_kind = 'claimed' AND claim_fence = ?2 \
+                 ORDER BY splice_seq",
+            ))
+            .map_err(sql_err)?;
+        let rows = stmt
+            .query_map(params![id.as_str(), fence.0 as i64], splice_from_row)
+            .map_err(sql_err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(sql_err)?;
+        Ok(rows)
+    }
+
+    /// Flip every splice at or below `up_to` to `consumed` — called only from inside the fenced
+    /// commit transactions (session-unification §4.2: consumption is written transactionally with
+    /// the snapshot, never separately). `turn_seq` records the committing epoch until stage 3
+    /// promotes it to the monotonic turn counter.
+    fn consume_splices_conn(
+        conn: &Connection,
+        id: &SessionId,
+        up_to: u64,
+        turn_seq: u64,
+    ) -> Result<(), StoreError> {
+        conn.execute(
+            "UPDATE inbox_splice \
+             SET claim_kind = 'consumed', claim_fence = NULL, consumed_turn = ?3 \
+             WHERE session_id = ?1 AND splice_seq <= ?2 AND claim_kind != 'consumed'",
+            params![id.as_str(), up_to as i64, turn_seq as i64],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
+    /// Insert one splice row inside the caller's transaction, minting the next per-session
+    /// `splice_seq` from the dedicated counter table (never reused, even after pruning).
+    fn insert_splice_conn(
+        conn: &Connection,
+        id: &SessionId,
+        kind: SpliceKind,
+        payload: &[u8],
+        origin_op: &str,
+        origin: &str,
+    ) -> Result<u64, StoreError> {
+        conn.execute(
+            "INSERT INTO splice_seq (session_id, n) VALUES (?1, 1) \
+             ON CONFLICT(session_id) DO UPDATE SET n = n + 1",
+            params![id.as_str()],
+        )
+        .map_err(sql_err)?;
+        let seq: i64 = conn
+            .query_row(
+                "SELECT n FROM splice_seq WHERE session_id = ?1",
+                params![id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(sql_err)?;
+        conn.execute(
+            "INSERT INTO inbox_splice \
+             (session_id, splice_seq, kind, payload, origin_op, origin, received_at_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                id.as_str(),
+                seq,
+                splice_kind_to_str(kind),
+                payload,
+                origin_op,
+                origin,
+                crate::now_ms() as i64,
+            ],
+        )
+        .map_err(sql_err)?;
+        Ok(seq as u64)
+    }
+
     /// Read a session's current fence, or `NotFound`.
     fn fence_of(conn: &Connection, id: &SessionId) -> Result<FenceToken, StoreError> {
         conn.query_row(
@@ -827,11 +1007,18 @@ impl SessionStore for SqliteStore {
             None => {}
         }
         if let Some(input) = &spec.first_input {
-            tx.execute(
-                "INSERT INTO pending_session_input (session_id, input) VALUES (?1, ?2)",
-                params![spec.id.as_str(), input],
-            )
-            .map_err(sql_err)?;
+            // The seeded first input rides the durable inbox (session-unification §4; stage 2
+            // migrated it off `pending_session_input`), inside the same creation transaction.
+            // Deterministic op id: creation is insert-if-absent, so a retried factory run that
+            // lost the create race never reaches this insert twice.
+            Self::insert_splice_conn(
+                &tx,
+                &spec.id,
+                SpliceKind::StartTurn,
+                input,
+                "first-input",
+                "factory",
+            )?;
         }
         tx.commit().map_err(sql_err)?;
         Ok(true)
@@ -852,6 +1039,99 @@ impl SessionStore for SqliteStore {
         .and_then(policy_from_str)
     }
 
+    async fn append_splice(&self, splice: NewSplice) -> Result<u64, StoreError> {
+        // ONE transaction (session-unification §4.2): dedupe lookup + insert + the Idle → Ready
+        // status flip land together; the wire ack follows the commit (splice-before-ack).
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(sql_err)?;
+        let exists: Option<i64> = tx
+            .query_row(
+                "SELECT 1 FROM session_record WHERE session_id = ?1",
+                params![splice.session_id.as_str()],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(sql_err)?;
+        if exists.is_none() {
+            return Err(StoreError::NotFound(splice.session_id.clone()));
+        }
+        // Append-or-return-existing on UNIQUE(session_id, origin_op): a producer retry after a
+        // crash-before-ack returns the original seq instead of duplicating.
+        if let Some(existing) = tx
+            .query_row(
+                "SELECT splice_seq FROM inbox_splice WHERE session_id = ?1 AND origin_op = ?2",
+                params![splice.session_id.as_str(), splice.origin_op],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(sql_err)?
+        {
+            return Ok(existing as u64);
+        }
+        let seq = Self::insert_splice_conn(
+            &tx,
+            &splice.session_id,
+            splice.kind,
+            &splice.payload,
+            &splice.origin_op,
+            &splice.origin,
+        )?;
+        // Same transaction: durable input on an Idle session makes it Ready — the §2 status rule
+        // ("Ready iff unconsumed work exists").
+        tx.execute(
+            "UPDATE session_record SET status_kind = 'ready' \
+             WHERE session_id = ?1 AND status_kind = 'idle'",
+            params![splice.session_id.as_str()],
+        )
+        .map_err(sql_err)?;
+        tx.commit().map_err(sql_err)?;
+        Ok(seq)
+    }
+
+    async fn splices_after(&self, id: &SessionId, after_seq: u64) -> Vec<InboxSplice> {
+        let conn = self.conn.lock().unwrap();
+        let Ok(mut stmt) = conn.prepare(&format!(
+            "SELECT {SPLICE_COLUMNS} FROM inbox_splice \
+             WHERE session_id = ?1 AND splice_seq > ?2 AND claim_kind != 'consumed' \
+             ORDER BY splice_seq",
+        )) else {
+            return Vec::new();
+        };
+        stmt.query_map(params![id.as_str(), after_seq as i64], splice_from_row)
+            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+            .unwrap_or_default()
+    }
+
+    async fn claim_splices(
+        &self,
+        id: &SessionId,
+        fence: FenceToken,
+    ) -> Result<Vec<InboxSplice>, StoreError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(sql_err)?;
+        let current = Self::fence_of(&tx, id)?;
+        if fence < current {
+            return Err(StoreError::Fenced {
+                have: fence.0,
+                current: current.0,
+            });
+        }
+        let claimed = Self::claim_splices_conn(&tx, id, fence)?;
+        tx.commit().map_err(sql_err)?;
+        Ok(claimed)
+    }
+
+    async fn prune_consumed_splices(&self, cutoff_ms: u64) -> u64 {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM inbox_splice \
+             WHERE claim_kind = 'consumed' AND received_at_ms < ?1",
+            params![cutoff_ms as i64],
+        )
+        .map(|n| n as u64)
+        .unwrap_or(0)
+    }
+
     async fn acquire_activation_lease(&self, id: &SessionId) -> Result<FenceToken, StoreError> {
         let conn = self.conn.lock().unwrap();
         let current = Self::fence_of(&conn, id)?;
@@ -869,8 +1149,9 @@ impl SessionStore for SqliteStore {
         id: &SessionId,
         fence: FenceToken,
     ) -> Result<Activation, StoreError> {
-        let conn = self.conn.lock().unwrap();
-        let snapshot = conn
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(sql_err)?;
+        let snapshot = tx
             .query_row(
                 "SELECT snapshot FROM session_record WHERE session_id = ?1",
                 params![id.as_str()],
@@ -881,29 +1162,39 @@ impl SessionStore for SqliteStore {
             .map(SnapshotBlob::new)
             .ok_or_else(|| StoreError::NotFound(id.clone()))?;
 
-        let mut stmt = conn
-            .prepare(
-                "SELECT epoch, job_id, payload FROM completion_inbox \
-                 WHERE session_id = ?1 ORDER BY rowseq",
-            )
-            .map_err(sql_err)?;
-        let unapplied = stmt
-            .query_map(params![id.as_str()], |row| {
-                Ok(JobCompletion {
-                    session_id: id.clone(),
-                    epoch: Epoch(row.get::<_, i64>(0)? as u64),
-                    job_id: JobId::new(row.get::<_, String>(1)?),
-                    payload: row.get::<_, Vec<u8>>(2)?,
+        let unapplied = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT epoch, job_id, payload FROM completion_inbox \
+                     WHERE session_id = ?1 ORDER BY rowseq",
+                )
+                .map_err(sql_err)?;
+            let rows = stmt
+                .query_map(params![id.as_str()], |row| {
+                    Ok(JobCompletion {
+                        session_id: id.clone(),
+                        epoch: Epoch(row.get::<_, i64>(0)? as u64),
+                        job_id: JobId::new(row.get::<_, String>(1)?),
+                        payload: row.get::<_, Vec<u8>>(2)?,
+                    })
                 })
-            })
-            .map_err(sql_err)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(sql_err)?;
+                .map_err(sql_err)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(sql_err)?;
+            rows
+        };
+
+        // Claim the durable inbox in the same load transaction (session-unification §4.2): the
+        // incarnation folds these and stamps `Checkpoint::consumed_splices`; a crash before that
+        // commit leaves them `claimed`, reclaimable exactly once by the next (newer) fence.
+        let splices = Self::claim_splices_conn(&tx, id, fence)?;
+        tx.commit().map_err(sql_err)?;
 
         Ok(Activation {
             snapshot,
             unapplied,
             fence,
+            splices,
         })
     }
 
@@ -942,6 +1233,11 @@ impl SessionStore for SqliteStore {
                 ],
             )
             .map_err(sql_err)?;
+            // Consume the splices this commit's snapshot captured, in the SAME transaction
+            // (session-unification §4.2: consumption is never written separately).
+            if let Some(up_to) = checkpoint.consumed_splices {
+                Self::consume_splices_conn(&tx, &checkpoint.session_id, up_to, checkpoint.epoch.0)?;
+            }
             // Dedupe re-enqueues from idempotent re-activation (mirrors `enqueued_jobs`).
             let fresh = tx
                 .execute(
@@ -997,6 +1293,10 @@ impl SessionStore for SqliteStore {
             ],
         )
         .map_err(sql_err)?;
+        // Consume the splices this terminal snapshot captured, in the SAME transaction (§4.2).
+        if let Some(up_to) = checkpoint.consumed_splices {
+            Self::consume_splices_conn(&tx, &checkpoint.session_id, up_to, checkpoint.epoch.0)?;
+        }
         // Stamp the terminal clock on the session's host meta (the reaper's grace timer), in the
         // same transaction. The upsert supplies an empty overlay so a row created here still reads
         // back through `session_meta` (which extracts `overlay` as non-NULL bytes).
@@ -1245,38 +1545,6 @@ impl SessionStore for SqliteStore {
         );
     }
 
-    async fn enqueue_session_input(&self, id: &SessionId, input: Vec<u8>) {
-        let conn = self.conn.lock().unwrap();
-        let _ = conn.execute(
-            "INSERT INTO pending_session_input (session_id, input) VALUES (?1, ?2)",
-            params![id.as_str(), input],
-        );
-    }
-
-    async fn take_session_inputs(&self, id: &SessionId) -> Vec<Vec<u8>> {
-        // Drain-and-delete in one transaction so a concurrent enqueue is never half-consumed.
-        let mut conn = self.conn.lock().unwrap();
-        let Ok(tx) = conn.transaction() else {
-            return Vec::new();
-        };
-        let inputs = {
-            let Ok(mut stmt) = tx.prepare(
-                "SELECT input FROM pending_session_input WHERE session_id = ?1 ORDER BY rowseq",
-            ) else {
-                return Vec::new();
-            };
-            stmt.query_map(params![id.as_str()], |row| row.get::<_, Vec<u8>>(0))
-                .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
-                .unwrap_or_default()
-        };
-        let _ = tx.execute(
-            "DELETE FROM pending_session_input WHERE session_id = ?1",
-            params![id.as_str()],
-        );
-        let _ = tx.commit();
-        inputs
-    }
-
     async fn park_approval(
         &self,
         checkpoint: Checkpoint,
@@ -1309,6 +1577,10 @@ impl SessionStore for SqliteStore {
                 ],
             )
             .map_err(sql_err)?;
+        }
+        // Consume the splices this parked snapshot captured, in the SAME transaction (§4.2).
+        if let Some(up_to) = checkpoint.consumed_splices {
+            Self::consume_splices_conn(&tx, &checkpoint.session_id, up_to, checkpoint.epoch.0)?;
         }
         for approval in &approvals {
             // Dedupe a re-parked row on deterministic recovery (UNIQUE(session_id, job_id)).
@@ -2964,8 +3236,9 @@ mod tests {
     /// `credential_labels` account-management tables, the wire-v37 `saved_presences` +
     /// `saved_presence_active` tables, the `custom_providers` table, the wire-v38
     /// `transport_prefs.settings` account-settings column, and the rung-3 (api/39)
-    /// `command_dedup` op-id idempotency table, the wire-v41 `crash_consent` toggle, and the
-    /// session-unification `session_record.execution_policy` column).
+    /// `command_dedup` op-id idempotency table, the wire-v41 `crash_consent` toggle, the
+    /// session-unification `session_record.execution_policy` column, and the session-unification
+    /// §4 durable inbox (`inbox_splice` + `splice_seq`, retiring `pending_session_input`)).
     #[test]
     fn migration_ladder_valid_and_applied() {
         assert!(MIGRATIONS.validate().is_ok());
@@ -2976,7 +3249,85 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 18, "fresh DB is stamped to the latest migration");
+        assert_eq!(version, 19, "fresh DB is stamped to the latest migration");
+    }
+
+    /// The M19 data migration: legacy `pending_session_input` rows land in `inbox_splice` as
+    /// pending `steer` splices (FIFO order preserved as ascending `splice_seq`, per session),
+    /// the `splice_seq` counter is seeded past them, and the legacy table is gone.
+    #[test]
+    fn m19_migrates_legacy_pending_inputs() {
+        // Build a database at M18 (one migration short), seed legacy rows, then finish the ladder.
+        let mut conn = Connection::open_in_memory().expect("open");
+        let ladder = &MIGRATIONS;
+        ladder
+            .to_version(&mut conn, 18)
+            .expect("ladder to M18 (user_version 18)");
+        conn.execute_batch(
+            "INSERT INTO pending_session_input (session_id, input) VALUES
+                 ('legacy/a', x'01'), ('legacy/b', x'09'), ('legacy/a', x'02');",
+        )
+        .expect("seed legacy rows");
+        ladder.to_latest(&mut conn).expect("finish the ladder");
+
+        let rows: Vec<(String, i64, String, Vec<u8>, String)> = conn
+            .prepare(
+                "SELECT session_id, splice_seq, kind, payload, claim_kind \
+                 FROM inbox_splice ORDER BY session_id, splice_seq",
+            )
+            .unwrap()
+            .query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "legacy/a".into(),
+                    1,
+                    "steer".into(),
+                    vec![0x01],
+                    "pending".into()
+                ),
+                (
+                    "legacy/a".into(),
+                    2,
+                    "steer".into(),
+                    vec![0x02],
+                    "pending".into()
+                ),
+                (
+                    "legacy/b".into(),
+                    1,
+                    "steer".into(),
+                    vec![0x09],
+                    "pending".into()
+                ),
+            ],
+            "legacy inputs become pending steer splices, FIFO order preserved per session"
+        );
+        let seeded: i64 = conn
+            .query_row(
+                "SELECT n FROM splice_seq WHERE session_id = 'legacy/a'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            seeded, 2,
+            "the seq counter is seeded past the migrated rows"
+        );
+        let legacy_table: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'pending_session_input'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_table, 0, "the legacy table is dropped");
     }
 
     /// `custom_provider_set`/`list`/`remove` round-trip identically on both the SQLite and in-memory
