@@ -64,9 +64,9 @@ use daemon_models::{ActiveModels, ManagerConfig, ModelManager};
 use daemon_node::{assemble, AssembledNode, NodeAssembly, ProviderResolver};
 use daemon_protocol::{IsolationPolicy, TransportId};
 use daemon_providers::{
-    discovery_vendor_ids, genai_listed_models, genai_models_for_id_classified, vendor_keyless,
-    GenAiEmbedder, GenAiProvider, LocalEmbedder, SwitchableLocalProvider, VendorListing,
-    WorkerConfig, DAEMON_CLOUD_BASE,
+    discovery_vendor_ids, genai_listed_models, genai_models_for_id_classified,
+    vendor_cloud_credentials, vendor_keyless, GenAiEmbedder, GenAiProvider, LocalEmbedder,
+    SwitchableLocalProvider, VendorListing, WorkerConfig, DAEMON_CLOUD_BASE,
 };
 use daemon_provision::CutChannel;
 use daemon_pytool_client::{PyToolConfig, PyToolProvider};
@@ -474,9 +474,14 @@ impl CloudCatalog for GenAiCloudCatalog {
                 }),
                 _ => None,
             };
-            // A keyless vendor (Ollama — a local server genai names no key env for) lists and
-            // runs turns without any credential; every other genai vendor gates both on a key.
-            let auth = if vendor_keyless(&id) {
+            // Honest auth-mode labels (plan Phase 3): a cloud-credential vendor (Bedrock SigV4 /
+            // Vertex) authenticates from EXTERNAL cloud credentials — checked FIRST, because
+            // SigV4's missing key env would otherwise misread as keyless. A keyless vendor
+            // (Ollama — a local server genai names no key env for) lists and runs turns without
+            // any credential; every other genai vendor gates both on a key.
+            let auth = if vendor_cloud_credentials(&id) {
+                daemon_api::ProviderAuth::CloudCredentials
+            } else if vendor_keyless(&id) {
                 daemon_api::ProviderAuth::None
             } else {
                 daemon_api::ProviderAuth::ApiKey
@@ -4399,6 +4404,17 @@ mod tests {
         assert_eq!(ollama.list_auth, daemon_api::ProviderAuth::None);
         assert_eq!(ollama.turn_auth, daemon_api::ProviderAuth::None);
         assert_eq!(ollama.wire_selector, ProviderSelector::GenAi);
+
+        // Honest cloud-credential labels (plan Phase 3, wire v49): Bedrock SigV4 (the ambient AWS
+        // chain — NOT keyless despite naming no key env) and Vertex (operator-obtained GCP
+        // bearer) advertise CloudCredentials; the bearer-key Bedrock entry stays an API key.
+        let sigv4 = providers.iter().find(|p| p.id == "bedrock_sigv4").unwrap();
+        assert_eq!(sigv4.list_auth, daemon_api::ProviderAuth::CloudCredentials);
+        assert_eq!(sigv4.turn_auth, daemon_api::ProviderAuth::CloudCredentials);
+        let vertex = providers.iter().find(|p| p.id == "vertex").unwrap();
+        assert_eq!(vertex.turn_auth, daemon_api::ProviderAuth::CloudCredentials);
+        let bedrock_api = providers.iter().find(|p| p.id == "bedrock_api").unwrap();
+        assert_eq!(bedrock_api.turn_auth, daemon_api::ProviderAuth::ApiKey);
     }
 
     /// The boot probe's verdict annotates the local engine rows (wire v48 additive): an engine the

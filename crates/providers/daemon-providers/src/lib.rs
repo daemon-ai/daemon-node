@@ -23,8 +23,9 @@ mod local;
 
 pub use genai_provider::{
     discovery_vendor_ids, genai_listed_models, genai_models_for, genai_models_for_id,
-    genai_models_for_id_classified, genai_models_for_result, vendor_keyless, GenAiEmbedder,
-    GenAiProvider, VendorListing, DAEMON_CLOUD_BASE, DISCOVERY_ADAPTERS,
+    genai_models_for_id_classified, genai_models_for_result, project_auth,
+    vendor_cloud_credentials, vendor_keyless, GenAiEmbedder, GenAiProvider, VendorListing,
+    DAEMON_CLOUD_BASE, DISCOVERY_ADAPTERS,
 };
 pub use local::{
     probe_worker_engines, EngineProbe, LocalEmbedder, LocalInferenceState, LocalInferenceStatus,

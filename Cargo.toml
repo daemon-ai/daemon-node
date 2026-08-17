@@ -179,7 +179,12 @@ tokio-rustls = "0.26"
 rusqlite_migration = "=2.3.0"
 # real networked providers (isolated to the `daemon-providers` crate): genai gives one native-protocol
 # client over OpenAI/Anthropic/Gemini/… so we don't hand-roll wire/SSE/JSON. Default TLS is rustls.
-genai = "0.6"
+# Pinned to the published 0.7 beta (crates.io-verified; the compatibility spike of plan Phase 3):
+# an exact pin because betas may break between releases. It brings the BedrockSigv4/Vertex auth
+# surface; AuthData still has no headers-overlay variant, so the token-set projector emits Key.
+# bedrock-sigv4 turns on the true SigV4 Bedrock adapter (AuthData::None resolves the ambient AWS
+# credential chain on it); deny-gated on its aws-config/aws-credential-types/aws-sigv4 delta.
+genai = { version = "=0.7.0-beta.18", features = ["bedrock-sigv4"] }
 # still used by the in-process mock HTTP server in the provider wire tests.
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 # URL construction/parsing for the OAuth2 PKCE auth-flow factory (`daemon-oauth`): authorization-URL

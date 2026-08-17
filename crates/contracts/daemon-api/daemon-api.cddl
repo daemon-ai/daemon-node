@@ -19,7 +19,7 @@ kv-pair = [k: tstr, v: tstr]
 ; cap) - the fix that lets arbitrary file sizes round-trip. Fixed 32-byte hashes stay arrays
 ; (`content-hash`, below) since they are small and `ContentHash([u8; 32])` serializes as a sequence.
 byte-array = bstr
-wire_version = uint                 ; daemon-common WireVersion (current = 48)
+wire_version = uint                 ; daemon-common WireVersion (current = 49)
 
 ; ----- uniform wire pagination (wire v25) -----
 ; Every list op that can exceed the client codec's fixed 64-element array buffers is paginated
@@ -1154,7 +1154,9 @@ provider-sign-in = { "family": tstr, "label": tstr }
 ; catalog is populated (install strategy), and the node-owned catalog-management action list the
 ; UI renders verbatim (empty for enumerated providers; a user-registered custom endpoint
 ; advertises exactly remove_provider — its registration is wire-removable).
-provider-auth = "none" / "api_key"
+; cloud_credentials (plan Phase 3): external cloud auth (AWS chain / GCP bearer), not a vendor
+; API key — the client must not render a vendor-key affordance for it.
+provider-auth = "none" / "api_key" / "cloud_credentials"
 install-strategy = "none" / "artifact" / "repository"
 provider-action = "search" / "install" / "remove" / "activate" / "requantize" / "add_from_url" / "remove_provider"
 ; v48 additive: `available` (absent = true) + `unavailable_reason` — the boot-time worker engine

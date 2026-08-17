@@ -586,6 +586,11 @@ pub enum ProviderAuth {
     None,
     /// An API key (pasted into a field or stored via a credential ref).
     ApiKey,
+    /// External CLOUD credentials, not a vendor API key (credential plan Phase 3): the ambient
+    /// AWS credential chain (Bedrock SigV4) or an operator-obtained GCP bearer (Vertex — genai
+    /// does no ADC). The credential store holds nothing for these; the UI must not render a
+    /// vendor-API-key affordance.
+    CloudCredentials,
 }
 
 /// How a managed provider's catalog is populated (wire v48). `None` for enumerated providers

@@ -5,7 +5,7 @@
 
 use crate::{classify_genai_error, finalize_output, RawToolCall};
 use async_trait::async_trait;
-use daemon_common::{Pricing, UsageDelta};
+use daemon_common::{CredentialEnvelope, OAuthTokenSet, Pricing, UsageDelta};
 use daemon_core::provider::CacheTtl;
 use daemon_core::{
     Capabilities, EmbeddingProvider, Failure, ModelOutput, Provider, Request, RequestImage,
@@ -209,13 +209,14 @@ fn prompt_cache_key(req: &Request) -> String {
 /// profile's `base_url` overrides it for a self-hosted gateway.
 pub const DAEMON_CLOUD_BASE: &str = "https://api.daemon.ai/api/v1/";
 
-/// The genai cloud vendors the node enumerates for provider + model discovery. genai 0.6.5 exposes
-/// no public enumeration of [`AdapterKind`], so this is the curated set the picker offers — every
+/// The genai cloud vendors the node enumerates for provider + model discovery. genai exposes no
+/// public enumeration of [`AdapterKind`], so this is the curated set the picker offers — every
 /// distinct vendor genai ships, EXCEPT `OpenAIResp` (a protocol variant of the OpenAI vendor: same
-/// endpoint + key, not a second provider) and `BedrockSigv4` (an auth variant of `BedrockApi`).
-/// Each is queried for models only when a credential resolves (a transient/stored key, or its env
-/// var), so a no-key node makes no network calls for it; Ollama is the one keyless entry (a local
-/// server — genai names no key env for it).
+/// endpoint + key, not a second provider). Each is queried for models only when a credential
+/// resolves (a transient/stored key, or its env var), so a no-key node makes no network calls for
+/// it; Ollama is the one keyless entry (a local server — genai names no key env for it), and
+/// `BedrockSigv4` authenticates from the ambient AWS credential chain (see
+/// [`vendor_cloud_credentials`]) with a curated (offline) model listing.
 ///
 /// ORDER IS THE WIRE ORDER clients render (after Daemon Cloud + the local engines): estimated
 /// popularity, OpenRouter first as the aggregator default.
@@ -238,6 +239,7 @@ pub const DISCOVERY_ADAPTERS: &[AdapterKind] = &[
     AdapterKind::Aliyun,
     AdapterKind::Vertex,
     AdapterKind::BedrockApi,
+    AdapterKind::BedrockSigv4,
     AdapterKind::Baidu,
     AdapterKind::BigModel,
     AdapterKind::OllamaCloud,
@@ -247,15 +249,34 @@ pub const DISCOVERY_ADAPTERS: &[AdapterKind] = &[
     AdapterKind::OpenCodeGo,
 ];
 
-/// Whether a discovery vendor lists + runs turns WITHOUT any credential. Exactly the adapters genai
-/// names no key env for — today only Ollama (a local server on `:11434`). The picker renders these
-/// keyless (no key field, no API badge) and the classified listing proceeds straight to the call.
+/// Whether a discovery vendor lists + runs turns WITHOUT any credential. The adapters genai names
+/// no key env for, MINUS the cloud-credential vendors (which are credential-less only in the
+/// key-field sense — [`vendor_cloud_credentials`] must be consulted FIRST): today only Ollama (a
+/// local server on `:11434`). The picker renders these keyless (no key field, no API badge) and
+/// the classified listing proceeds straight to the call.
 #[must_use]
 pub fn vendor_keyless(vendor_id: &str) -> bool {
-    DISCOVERY_ADAPTERS
-        .iter()
-        .find(|a| a.as_lower_str() == vendor_id)
-        .is_some_and(|a| a.default_key_env_name().is_none())
+    !vendor_cloud_credentials(vendor_id)
+        && DISCOVERY_ADAPTERS
+            .iter()
+            .find(|a| a.as_lower_str() == vendor_id)
+            .is_some_and(|a| a.default_key_env_name().is_none())
+}
+
+/// Whether a discovery vendor authenticates from EXTERNAL cloud credentials rather than a vendor
+/// API key (credential plan Phase 3 — the honest auth-mode label; nothing is held in the
+/// credential store for these):
+///
+/// - `bedrock_sigv4`: SigV4 over the ambient AWS credential chain (env/profile/SSO/IMDS), genai's
+///   `bedrock-sigv4` feature. KNOWN CAVEAT (availability, not disclosure): genai caches resolved
+///   AWS credentials per process, so expired STS/SSO/AssumeRole credentials keep failing until the
+///   node restarts.
+/// - `vertex`: genai does NOT do ADC — the "key" is a short-lived GCP OAuth bearer the operator
+///   obtains outside the node (`gcloud auth print-access-token`) and supplies via the key
+///   field/env. Labeled cloud-credentials so the UI never presents it as a vendor API key.
+#[must_use]
+pub fn vendor_cloud_credentials(vendor_id: &str) -> bool {
+    matches!(vendor_id, "bedrock_sigv4" | "vertex")
 }
 
 /// Live model ids for a single genai `adapter`, credential-aware: when `key` is `Some`, the LIST
@@ -279,12 +300,12 @@ pub async fn genai_models_for_result(
 ) -> Result<Vec<String>, String> {
     let client = Client::default();
     // `AuthData` converts into a genai `ProviderConfig { endpoint: None, auth: Some(..) }`; `()`
-    // resolves the adapter's default endpoint + env key.
+    // resolves the adapter's default endpoint + env key. A stored secret is projected through the
+    // trusted [`project_auth`] seam, so an envelope-stored token set lists exactly like a key.
     let listed = match key {
         Some(k) => {
-            client
-                .all_model_names(adapter, AuthData::from_single(k.to_string()))
-                .await
+            let auth = project_auth(k).map_err(|e| e.to_string())?;
+            client.all_model_names(adapter, auth).await
         }
         None => client.all_model_names(adapter, ()).await,
     };
@@ -340,7 +361,8 @@ fn vendor_display_name(adapter: AdapterKind) -> String {
         AdapterKind::Cohere => "Cohere",
         AdapterKind::Aliyun => "Alibaba Cloud (Qwen)",
         AdapterKind::Vertex => "Google Vertex AI",
-        AdapterKind::BedrockApi => "AWS Bedrock",
+        AdapterKind::BedrockApi => "AWS Bedrock (API key)",
+        AdapterKind::BedrockSigv4 => "AWS Bedrock (IAM)",
         AdapterKind::Baidu => "Baidu (ERNIE)",
         AdapterKind::BigModel => "Zhipu BigModel",
         AdapterKind::OllamaCloud => "Ollama Cloud",
@@ -514,12 +536,40 @@ impl EmbeddingProvider for GenAiEmbedder {
     }
 }
 
-/// Build the per-call [`ServiceTarget`]: `genai`'s resolved default for the model, with the auth key
-/// (the lease secret) and any endpoint override applied. When `adapter` is `None` the genai adapter
-/// is *inferred* from the model name (namespace or prefix; see [`AdapterKind::from_model`]); a
-/// `Some` forces it. Free (not a method) so the streaming task can resolve without borrowing the
-/// provider. When `auth` is `None`, genai resolves the adapter's `default_key_env_name()` from the
-/// environment as the fallback credential.
+/// The TRUSTED projector (credential plan Phase 3): decode one stored credential blob
+/// ([`CredentialEnvelope`]) and decide how it authenticates a genai request. The projector — never
+/// the blob — owns request policy: a token set carries material + descriptor identity only, and
+/// THIS table maps that identity onto genai's [`AuthData`]. Every seam that hands a stored secret
+/// to genai routes through here (chat + stream + embed via [`resolve_target`], model listing via
+/// [`genai_models_for_result`]), so all four call paths honor envelopes uniformly. An unreadable
+/// magic-marked blob is an [`Failure::Auth`] — fail closed, never forward raw JSON as a bearer.
+pub fn project_auth(secret: &str) -> Result<AuthData, Failure> {
+    match CredentialEnvelope::parse(secret) {
+        Ok(CredentialEnvelope::Key(k)) => Ok(AuthData::from_single(k)),
+        Ok(CredentialEnvelope::OAuthTokenSet(ts)) => Ok(project_token_set(&ts)),
+        Err(e) => Err(Failure::Auth(format!("stored credential: {e}"))),
+    }
+}
+
+/// Map a decoded token set onto [`AuthData`] by its TRUSTED method id. Every curated method today
+/// presents the access token as the adapter's standard bearer key (genai's per-adapter auth
+/// formatting applies downstream); a future method needing extra headers adds a match arm here —
+/// policy lives in this table, never in the stored blob. `AuthData` (beta.18, verified) has no
+/// headers-overlay variant, so a bearer-plus-headers method would map onto an operation-aware
+/// `RequestOverride` at that point.
+fn project_token_set(ts: &OAuthTokenSet) -> AuthData {
+    // All curated provider methods today: plain bearer from the access token. (A method-id match
+    // materializes here the first time a method's policy diverges.)
+    AuthData::from_single(ts.access_token.clone())
+}
+
+/// Build the per-call [`ServiceTarget`]: `genai`'s resolved default for the model, with the auth
+/// (the lease secret, projected through [`project_auth`]) and any endpoint override applied. When
+/// `adapter` is `None` the genai adapter is *inferred* from the model name (namespace or prefix;
+/// see [`AdapterKind::from_model`]); a `Some` forces it. Free (not a method) so the streaming task
+/// can resolve without borrowing the provider. When `auth` is `None`, genai resolves the adapter's
+/// default auth — `default_key_env_name()` from the environment, or the ambient cloud credential
+/// chain on `BedrockSigv4` (`AuthData::None` at request time).
 async fn resolve_target(
     client: &Client,
     adapter: Option<AdapterKind>,
@@ -538,7 +588,7 @@ async fn resolve_target(
         .await
         .map_err(|e| Failure::Provider(format!("resolve target: {e}")))?;
     if let Some(key) = auth {
-        target.auth = AuthData::from_single(key.to_string());
+        target.auth = project_auth(key)?;
     }
     if let Some(base) = endpoint {
         target.endpoint = Endpoint::from_owned(base.to_string());
@@ -936,6 +986,73 @@ impl Provider for GenAiProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn token_set_envelope() -> String {
+        CredentialEnvelope::OAuthTokenSet(OAuthTokenSet {
+            provider_id: "huggingface".into(),
+            method_id: "provider/huggingface".into(),
+            access_token: "hf_projected".into(),
+            refresh_token: Some("hf_refresh".into()),
+            expires_at: None,
+        })
+        .encode()
+    }
+
+    /// The trusted projector, per envelope kind: a bare key passes verbatim, a token set projects
+    /// its ACCESS TOKEN as the bearer (policy from the projector, none from the blob), and a
+    /// magic-marked blob this build cannot decode fails CLOSED as an auth failure (never forwarded
+    /// raw). The listing path (`genai_models_for_result`) consumes the same function, so this
+    /// covers list alongside the resolve_target callers.
+    #[test]
+    fn project_auth_covers_every_envelope_kind() {
+        assert!(matches!(
+            project_auth("sk-bare").unwrap(),
+            AuthData::Key(k) if k == "sk-bare"
+        ));
+        assert!(matches!(
+            project_auth(&token_set_envelope()).unwrap(),
+            AuthData::Key(k) if k == "hf_projected"
+        ));
+        let future = r#"{"daemon_credential":99,"kind":"oauth_token_set","provider_id":"p","method_id":"m","access_token":"a"}"#;
+        assert!(matches!(project_auth(future), Err(Failure::Auth(_))));
+    }
+
+    /// The chat/stream/embed seam: `resolve_target` (the one target builder all three call) hands
+    /// genai the PROJECTED auth for an envelope secret — and surfaces the projector's closed-fail
+    /// for an unreadable one.
+    #[tokio::test]
+    async fn resolve_target_projects_envelope_auth() {
+        let client = Client::default();
+        let target = resolve_target(
+            &client,
+            None,
+            "open_router::openai/gpt-4o",
+            None,
+            Some(&token_set_envelope()),
+        )
+        .await
+        .expect("resolve");
+        assert!(matches!(target.auth, AuthData::Key(k) if k == "hf_projected"));
+
+        let bad = r#"{"daemon_credential":2,"kind":"oauth_token_set","provider_id":"p","method_id":"m","access_token":"a"}"#;
+        let err = resolve_target(&client, None, "open_router::openai/gpt-4o", None, Some(bad))
+            .await
+            .expect_err("unsupported envelope fails closed");
+        assert!(matches!(err, Failure::Auth(_)), "got {err:?}");
+    }
+
+    /// The honest auth-mode split (plan Phase 3): Bedrock SigV4 is discovered, classified as
+    /// cloud-credentials (NOT keyless, despite naming no key env), and Ollama stays the one
+    /// keyless vendor. Vertex is cloud-credentials too (operator-obtained GCP bearer).
+    #[test]
+    fn cloud_credential_vendors_are_not_keyless() {
+        assert!(DISCOVERY_ADAPTERS.contains(&AdapterKind::BedrockSigv4));
+        assert!(vendor_cloud_credentials("bedrock_sigv4"));
+        assert!(vendor_cloud_credentials("vertex"));
+        assert!(!vendor_keyless("bedrock_sigv4"));
+        assert!(!vendor_cloud_credentials("open_router"));
+        assert!(vendor_keyless("ollama"));
+    }
 
     #[test]
     fn known_max_output_resolves_by_prefix_most_specific_first() {

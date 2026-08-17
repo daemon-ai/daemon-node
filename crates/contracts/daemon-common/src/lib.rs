@@ -14,6 +14,15 @@
 // the --lib pass still guards production. `EnvPolicy::apply` itself carries a scoped production anchor.
 #![cfg_attr(test, allow(clippy::disallowed_methods, clippy::disallowed_types))]
 
+/// The versioned credential-store envelope (credential plan Phase 3): bare keys stay bare, OAuth
+/// token sets ride a magic-discriminated JSON envelope carrying material + descriptor identity —
+/// never request policy.
+pub mod credential_envelope;
+pub use credential_envelope::{
+    CredentialEnvelope, EnvelopeError, OAuthTokenSet, CREDENTIAL_ENVELOPE_MAGIC,
+    CREDENTIAL_ENVELOPE_VERSION,
+};
+
 /// The shared cursored-ring primitive (`CursoredRing`/`CursoredItem`) backing the daemon's live
 /// streams (merged log, node-event feed, fs-watch). Pure + sync.
 pub mod cursored;
@@ -844,7 +853,14 @@ impl WireVersion {
     ///   `? result_model_id`; `installed-model` gains `provider`; `DownloadProgress` gains
     ///   `? rate_bps`/`? eta_seconds`; new `QuantizeProgress` node event (retires the client
     ///   quantize poll).
-    pub const CURRENT: Self = Self(48);
+    ///
+    /// (v49) additive provider auth-mode label (credential plan Phase 3): `provider-auth` gains
+    /// the `cloud_credentials` arm — external cloud credentials (the ambient AWS chain on Bedrock
+    /// SigV4; an operator-obtained GCP bearer on Vertex), NOT a vendor API key, so clients render
+    /// a cloud-credentials affordance instead of a key field. One additive enum value + its CDDL
+    /// arm; strict-equal `is_compatible` still holds; clients feature-detect via the `api/49`
+    /// Hello feature.
+    pub const CURRENT: Self = Self(49);
 
     /// The version this build speaks (alias for [`WireVersion::CURRENT`]).
     pub fn current() -> Self {
