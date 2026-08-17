@@ -45,6 +45,7 @@ pub mod profile;
 pub mod provider;
 pub mod recovery;
 pub mod repair;
+pub mod request_digest;
 pub mod safety;
 pub mod snapshot;
 pub mod spill;
@@ -101,6 +102,7 @@ pub use repair::{
     repair_tool_args, repair_tool_call, repair_tool_name, sanitize_tool_error, scrub_content,
     wrap_untrusted_tool_result, ArgRepair, NameRepairError, ScrubChunk, StreamingThinkScrubber,
 };
+pub use request_digest::{AssemblyInputs, ModelRequestDigest};
 pub use safety::{check_url, check_url_resolved, check_url_resolved_with, CheckedUrl, UrlReject};
 pub use snapshot::{PendingApproval, ProcHandle, References, Snapshot, ToolBinding};
 pub use tool_pipeline::run_tool;

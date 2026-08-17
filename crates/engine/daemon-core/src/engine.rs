@@ -639,6 +639,34 @@ impl Engine {
         self.turn_injection.apply_to_last_user(&mut req);
         req.cache_ttl = self.config.cache_ttl;
         crate::provider::mark_cache_breakpoints(&mut req);
+        // B1a request-consistency digest: the assembled request must agree with an independent
+        // fold over the assembly inputs (conversation + composed prompt + injection + tools +
+        // cache TTL). Computed HERE, before `call_model` attaches the lease secret, so the digest
+        // is secret-free by exclusion. Mismatch: hard assert in debug/test lanes, error-level
+        // trace in release — never abort a user turn over it.
+        let assembled = crate::request_digest::ModelRequestDigest::of_request(&req);
+        let expected = crate::request_digest::ModelRequestDigest::of_assembly(
+            &crate::request_digest::AssemblyInputs {
+                conversation: &self.snapshot.conversation,
+                composed: self.composed.as_ref(),
+                injection: &self.turn_injection,
+                tools,
+                cache_ttl: self.config.cache_ttl,
+            },
+        );
+        if assembled != expected {
+            tracing::error!(
+                session = %self.snapshot.session_id,
+                profile = %self.profile,
+                assembled = %assembled,
+                expected = %expected,
+                "engine.request_digest.mismatch: assembled request is not a pure function of the assembly inputs"
+            );
+            debug_assert_eq!(
+                assembled, expected,
+                "B1a: assembled request disagrees with its assembly inputs"
+            );
+        }
         req
     }
 
