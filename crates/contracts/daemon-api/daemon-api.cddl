@@ -1571,8 +1571,9 @@ request-model-resume = { "ModelResume": { "id": download-id } }
 request-model-catalog = "ModelCatalog"
 request-model-delete = { "ModelDelete": { "id": model-id } }
 request-model-activate = { "ModelActivate": { "id": model-id, "profile": (tstr / null) } }
-; v48: provider-keyed (was engine-keyed).
-model-recommend-args = { "repo": tstr, "revision": (tstr / null), "provider": tstr, "budget_bytes": (uint64 / null) }
+; v48: provider-keyed (was engine-keyed). Key order mirrors the Rust struct declaration
+; (serde emits fields in that order and the generated zcbor decoder is order-sensitive).
+model-recommend-args = { "provider": tstr, "repo": tstr, "revision": (tstr / null), "budget_bytes": (uint64 / null) }
 request-model-recommend = { "ModelRecommend": model-recommend-args }
 model-quantize-args = { "repo": tstr, "revision": (tstr / null), "target_quant": tstr, "source_file": (tstr / null) }
 request-model-quantize = { "ModelQuantize": model-quantize-args }
