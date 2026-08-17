@@ -233,8 +233,11 @@ everything through activation + attachments. The Foreign actor rail is untouched
   `TransientTransport` without routing status/body through `classify_api_error` (the
   `HttpError`/`WebModelCall` arms classify properly). Extract the embedded status/body and route
   it through the classifier.
-- Empty-assembly gate: a user-triggered turn that assembles zero messages fails before the wire —
-  a malformed request is a bug surfaced, never a provider call.
+- Empty-assembly gate: a turn that assembles zero messages fails before the wire — a malformed
+  request is a bug surfaced, never a provider call. The gate lives at the networked-provider
+  boundary (`daemon-providers`, as `Failure::InvalidRequest`), NOT in the engine: scripted/mock
+  providers legitimately drive blank-session turns (the conformance harness's orchestrators), and
+  the property being protected is the wire.
 
 ## 10. Acceptance (the track's binding gates)
 

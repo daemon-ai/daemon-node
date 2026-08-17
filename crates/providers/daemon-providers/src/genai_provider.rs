@@ -3,7 +3,7 @@
 
 //! The [`Provider`] adapter over the [`genai`] multi-provider client.
 
-use crate::{classify_genai_error, finalize_output, RawToolCall};
+use crate::{classify_genai_error, empty_assembly_gate, finalize_output, RawToolCall};
 use async_trait::async_trait;
 use daemon_common::{CredentialEnvelope, OAuthTokenSet, Pricing, UsageDelta};
 use daemon_core::provider::CacheTtl;
@@ -876,6 +876,7 @@ impl Provider for GenAiProvider {
     }
 
     async fn chat(&self, req: Request) -> Result<ModelOutput, Failure> {
+        empty_assembly_gate(&req)?;
         let target = resolve_target(
             &self.client,
             self.adapter,
@@ -901,6 +902,9 @@ impl Provider for GenAiProvider {
     }
 
     fn stream(&self, req: Request) -> BoxStream<'_, Result<StreamEvent, Failure>> {
+        if let Err(f) = empty_assembly_gate(&req) {
+            return Box::pin(futures::stream::once(async move { Err(f) }));
+        }
         let client = self.client.clone();
         let adapter = self.adapter;
         let model = self.model.clone();

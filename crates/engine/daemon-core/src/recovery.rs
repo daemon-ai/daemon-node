@@ -171,7 +171,10 @@ pub fn classify_api_error(
             } else if mentions_content_policy(&lower) {
                 Failure::ContentPolicy(snippet(body))
             } else {
-                Failure::FormatError(snippet(body))
+                // A plain 4xx reject is deterministic: the provider parsed the request and refused
+                // it, so retrying the identical payload cannot succeed (Abort, not the FormatError
+                // bounded retry — which stays reserved for malformed *responses*).
+                Failure::InvalidRequest(snippet(body))
             }
         }
         408 | 409 | 425 => Failure::TransientTransport(snippet(body)),
@@ -540,7 +543,11 @@ mod tests {
         ));
         assert!(matches!(
             classify_api_error(400, no_hdr, "bad json"),
-            Failure::FormatError(_)
+            Failure::InvalidRequest(_)
+        ));
+        assert!(matches!(
+            classify_api_error(422, no_hdr, "messages: at least one message is required"),
+            Failure::InvalidRequest(_)
         ));
         assert!(matches!(
             classify_api_error(503, no_hdr, ""),

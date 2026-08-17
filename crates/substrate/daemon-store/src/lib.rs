@@ -34,7 +34,7 @@ mod sqlite;
 #[cfg(feature = "sqlite")]
 pub use sqlite::SqliteStore;
 
-/// The durable status of a session record (lifecycle §5).
+/// The durable status of a session record (lifecycle §5; session-unification §2).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SessionStatus {
     /// A live incarnation is (or was) running; recoverable from the last snapshot.
@@ -48,6 +48,12 @@ pub enum SessionStatus {
     Ready,
     /// The session reached a terminal state.
     Completed,
+    /// The session exists but has no runnable work (session-unification §2): a blank interactive
+    /// creation, or (stage 3) a committed interactive turn with an empty inbox. NEVER selected by
+    /// the recovery scanner and never woken — the status rule is `Ready` iff unconsumed work
+    /// exists, `Idle` iff none does. Every transition that creates work flips `Idle -> Ready` in
+    /// the same transaction that records the work.
+    Idle,
 }
 
 /// One durable session row (lifecycle §5).
@@ -643,6 +649,11 @@ pub enum StoreError {
     /// The session does not exist.
     #[error("session not found: {0}")]
     NotFound(SessionId),
+    /// A creation op found the session already present (session-unification §3): creation is
+    /// insert-if-absent, never a silent state reset (`INSERT OR REPLACE` recreated the scanner
+    /// race by resetting epoch/status/fence under a concurrent incarnation).
+    #[error("session already exists: {0}")]
+    AlreadyExists(SessionId),
     /// A test-injected crash boundary fired.
     #[error("injected fault at {0:?}")]
     Fault(FaultPoint),
@@ -682,6 +693,9 @@ impl From<&StoreError> for StoreErrorWire {
                 current: *current,
             },
             StoreError::NotFound(id) => StoreErrorWire::NotFound(id.clone()),
+            StoreError::AlreadyExists(id) => {
+                StoreErrorWire::Other(format!("session already exists: {id}"))
+            }
             StoreError::Fault(point) => StoreErrorWire::Fault(format!("{point:?}")),
             StoreError::Common(inner) => StoreErrorWire::Other(inner.to_string()),
         }
@@ -868,6 +882,11 @@ pub enum FaultPoint {
     AfterJobOutbox,
     /// Crash after the completion is durably inserted but before the wake is published.
     BeforeWakePublish,
+    /// Crash inside [`SessionStore::create_runnable`] mid-construction — after the session row,
+    /// before the meta/edge/input bind. The commit is one transaction, so the observable outcome
+    /// must be NOTHING persisted (session-unification §3: a scan racing construction sees either
+    /// nothing runnable or the complete session).
+    MidRunnableConstruction,
 }
 
 /// Rung 3 (api/39): the time-to-live of a `command_dedup` row — 24h. The retry window that
@@ -876,16 +895,124 @@ pub enum FaultPoint {
 /// re-executes the op and re-caches (see [`SessionStore::command_dedup_get`]).
 pub const COMMAND_DEDUP_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 
+/// The persisted per-session execution policy (session-unification §3): written at creation,
+/// driving terminal-vs-idle at the turn boundary and role-aware failure (stage 3). NEVER inferred
+/// from the presence of one binding. The engine backend (Core vs Foreign) is an orthogonal
+/// dimension — a foreign child may itself be joining or detached — so backend kind is NOT a
+/// policy value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExecutionPolicy {
+    /// A user-driven conversation: turns commit back to `Idle`/`Ready`, never terminal; a failed
+    /// turn stays retryable (retry = a new user action).
+    InteractiveRoot,
+    /// A delegated child whose terminal completion fulfills its parent's job (wakes the suspended
+    /// parent) — success or failure.
+    JoiningChild,
+    /// A detached child whose terminal completion delivers a notice to its parent (no parent job).
+    DetachedChild,
+    /// An attached, non-joining background child (skill/memory review): self-closes terminal.
+    BackgroundChild,
+    /// A one-shot scheduled run: terminal at its first turn boundary, closing the cron run.
+    CronRun,
+}
+
+/// The durable edge a seeded child is created with, committed atomically inside
+/// [`SessionStore::create_runnable`] so a recovery scan firing mid-construction can never run a
+/// child whose parent linkage is missing (session-unification §3).
+#[derive(Clone, Debug)]
+pub enum RunnableEdge {
+    /// A joining delegation: the child's terminal completion fulfills this parent job
+    /// (see [`SessionStore::bind_delegation`]).
+    Delegation(JobCommand),
+    /// A detached child: terminal completion pushes a [`CompletionNotice`] to `parent`
+    /// (see [`SessionStore::bind_completion_notice`]).
+    CompletionNotice {
+        /// The parent session the notice is delivered to.
+        parent: SessionId,
+        /// The parent's spawning tool call, for chip-link provenance (wire v29).
+        call_id: Option<String>,
+    },
+    /// An attached, non-joining background edge: tree-visible, self-closing
+    /// (see [`SessionStore::record_child_edge`]).
+    ChildEdge {
+        /// The parent session the child appears under.
+        parent: SessionId,
+        /// The tree projection's `work` label.
+        work_label: String,
+    },
+}
+
+/// Everything a seeded producer publishes for a runnable session, committed in ONE transaction by
+/// [`SessionStore::create_runnable`] with the `Ready` status landing only as part of that commit
+/// (session-unification §3). A scan firing at any point during construction therefore sees either
+/// nothing runnable or the complete session.
+#[derive(Clone, Debug)]
+pub struct RunnableSession {
+    /// Stable logical identity.
+    pub id: SessionId,
+    /// Owning partition.
+    pub partition: PartitionId,
+    /// The seeded initial snapshot (opaque CBOR).
+    pub snapshot: SnapshotBlob,
+    /// The persisted execution policy (stage 3 consumes it at the turn boundary).
+    pub policy: ExecutionPolicy,
+    /// Host-level meta to stamp at creation (owner/role/parent/profile/…), if any.
+    pub meta: Option<SessionMeta>,
+    /// The durable parent edge, if this is a child (joining / detached / background).
+    pub edge: Option<RunnableEdge>,
+    /// A first pending input (an opaque CBOR `UserMsg`) for engines that drain the
+    /// pending-input seam at hydrate (today: the Foreign-child task; stage 2 migrates this to
+    /// the typed inbox).
+    pub first_input: Option<Vec<u8>>,
+}
+
 /// The durable session store — the sole authority for activation state (lifecycle §4–§5).
 #[async_trait]
 pub trait SessionStore: Send + Sync {
-    /// Create a fresh session row in `Ready` state with an initial snapshot.
+    /// Create a fresh session row in `Ready` state with an initial snapshot. Insert-if-absent:
+    /// an existing row is NEVER reset (that was the `INSERT OR REPLACE` clobber);
+    /// [`StoreError::AlreadyExists`] surfaces a duplicate create.
     async fn create_session(
         &self,
         id: SessionId,
         partition: PartitionId,
         snapshot: SnapshotBlob,
     ) -> Result<(), StoreError>;
+
+    /// Create a blank interactive session in `Idle` state (session-unification §2/§3): a durable
+    /// row + [`ExecutionPolicy::InteractiveRoot`], NEVER scanner work (the scanner selects only
+    /// `Ready`/`Active`). Replaces the `session_create` path's `Ready` write — the incident's
+    /// root cause was a non-runnable blank presented as activation work. Insert-if-absent
+    /// ([`StoreError::AlreadyExists`] on a duplicate). Default: unsupported (a non-authoritative
+    /// proxy store never creates sessions).
+    async fn create_idle(
+        &self,
+        _id: SessionId,
+        _partition: PartitionId,
+        _snapshot: SnapshotBlob,
+    ) -> Result<(), StoreError> {
+        Err(StoreError::Common(DaemonError::Other(
+            "create_idle: not supported by this store".into(),
+        )))
+    }
+
+    /// The seeded-producer factory (session-unification §3): snapshot + meta + parent edge +
+    /// first pending input + execution policy committed in ONE transaction, with the `Ready`
+    /// status landing only as part of that commit — a recovery scan racing construction sees
+    /// either nothing runnable or the complete session. Returns `true` if the session was
+    /// created, `false` if it already existed (nothing written — the caller's idempotent
+    /// re-bind/re-wake path applies). Default: unsupported (a non-authoritative proxy store).
+    async fn create_runnable(&self, _spec: RunnableSession) -> Result<bool, StoreError> {
+        Err(StoreError::Common(DaemonError::Other(
+            "create_runnable: not supported by this store".into(),
+        )))
+    }
+
+    /// The persisted [`ExecutionPolicy`] stamped at creation (`None` for legacy rows and stores
+    /// without the seam — stage 3 falls back to edge inspection for those). Default: `None`.
+    async fn execution_policy(&self, _id: &SessionId) -> Option<ExecutionPolicy> {
+        None
+    }
 
     /// Acquire/renew the activation lease for a session; returns a fresh monotonic fencing token
     /// and marks the session `Active` (lifecycle §5).
@@ -1648,6 +1775,9 @@ struct Inner {
     /// Per-session host-level metadata: bound profile + opaque overlay blob (the in-memory analogue
     /// of the SQLite `session_meta` table).
     session_meta: HashMap<SessionId, SessionMeta>,
+    /// The persisted per-session execution policy, stamped at creation (session-unification §3;
+    /// the in-memory analogue of the SQLite `session_record.execution_policy` column).
+    execution_policy: HashMap<SessionId, ExecutionPolicy>,
     /// Durable chat→session routing pins, keyed by canonical origin key (§5.9; the in-memory analogue
     /// of the SQLite `chat_routes` table).
     chat_routes: HashMap<String, ChatRoute>,
@@ -1750,6 +1880,32 @@ impl InMemoryStore {
         Ok(())
     }
 
+    /// Insert a fresh session row under the held lock — insert-if-absent (session-unification §3):
+    /// an existing row is never reset; a duplicate create surfaces [`StoreError::AlreadyExists`].
+    fn insert_fresh(
+        inner: &mut Inner,
+        id: SessionId,
+        partition: PartitionId,
+        snapshot: SnapshotBlob,
+        status: SessionStatus,
+    ) -> Result<(), StoreError> {
+        if inner.sessions.contains_key(&id) {
+            return Err(StoreError::AlreadyExists(id));
+        }
+        inner.sessions.insert(
+            id.clone(),
+            SessionRecord {
+                session_id: id,
+                partition,
+                epoch: Epoch::ZERO,
+                status,
+                snapshot,
+                fence: FenceToken::ZERO,
+            },
+        );
+        Ok(())
+    }
+
     /// Apply a completion under the held lock: idempotent per `(session, epoch, job)`, push it onto
     /// the parent's unapplied queue and mark the parent `Ready`. Returns `true` if it was fresh (the
     /// caller then publishes the wake). The parent must exist. Shared by the explicit
@@ -1780,18 +1936,93 @@ impl SessionStore for InMemoryStore {
         snapshot: SnapshotBlob,
     ) -> Result<(), StoreError> {
         let mut inner = self.inner.lock().unwrap();
-        inner.sessions.insert(
+        Self::insert_fresh(&mut inner, id, partition, snapshot, SessionStatus::Ready)
+    }
+
+    async fn create_idle(
+        &self,
+        id: SessionId,
+        partition: PartitionId,
+        snapshot: SnapshotBlob,
+    ) -> Result<(), StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        Self::insert_fresh(
+            &mut inner,
             id.clone(),
-            SessionRecord {
-                session_id: id,
-                partition,
-                epoch: Epoch::ZERO,
-                status: SessionStatus::Ready,
-                snapshot,
-                fence: FenceToken::ZERO,
-            },
-        );
+            partition,
+            snapshot,
+            SessionStatus::Idle,
+        )?;
+        inner
+            .execution_policy
+            .insert(id, ExecutionPolicy::InteractiveRoot);
         Ok(())
+    }
+
+    async fn create_runnable(&self, spec: RunnableSession) -> Result<bool, StoreError> {
+        // One lock hold = one transaction: row + policy + meta + edge + first input land together,
+        // so a scan interleaving construction sees either nothing runnable or the complete session.
+        let mut inner = self.inner.lock().unwrap();
+        if inner.sessions.contains_key(&spec.id) {
+            return Ok(false);
+        }
+        // The construction-boundary crash: the SQLite backend rolls its transaction back; the
+        // in-memory model faults before mutating, observing the same all-or-nothing contract.
+        Self::take_fault(&mut inner, FaultPoint::MidRunnableConstruction)?;
+        Self::insert_fresh(
+            &mut inner,
+            spec.id.clone(),
+            spec.partition,
+            spec.snapshot,
+            SessionStatus::Ready,
+        )?;
+        inner.execution_policy.insert(spec.id.clone(), spec.policy);
+        if let Some(meta) = spec.meta {
+            inner.session_meta.insert(spec.id.clone(), meta);
+        }
+        // Each arm mirrors its standalone bind op exactly (`bind_delegation` /
+        // `bind_completion_notice` / `record_child_edge`): dedupe the child-index row and keep
+        // first-writer-wins on the notice edge — a spawn-time bind (which carries the call_id)
+        // may already have run before the factory materializes the child.
+        match spec.edge {
+            Some(RunnableEdge::Delegation(job)) => {
+                let siblings = inner.child_index.entry(job.session_id.clone()).or_default();
+                if !siblings.contains(&spec.id) {
+                    siblings.push(spec.id.clone());
+                }
+                inner.delegations.insert(spec.id.clone(), job);
+            }
+            Some(RunnableEdge::CompletionNotice { parent, call_id }) => {
+                let siblings = inner.child_index.entry(parent.clone()).or_default();
+                if !siblings.contains(&spec.id) {
+                    siblings.push(spec.id.clone());
+                }
+                inner
+                    .completion_notices
+                    .entry(spec.id.clone())
+                    .or_insert((parent, call_id));
+            }
+            Some(RunnableEdge::ChildEdge { parent, work_label }) => {
+                let siblings = inner.child_index.entry(parent).or_default();
+                if !siblings.contains(&spec.id) {
+                    siblings.push(spec.id.clone());
+                }
+                inner.background_edges.insert(spec.id.clone(), work_label);
+            }
+            None => {}
+        }
+        if let Some(input) = spec.first_input {
+            inner
+                .pending_inputs
+                .entry(spec.id.clone())
+                .or_default()
+                .push_back(input);
+        }
+        Ok(true)
+    }
+
+    async fn execution_policy(&self, id: &SessionId) -> Option<ExecutionPolicy> {
+        self.inner.lock().unwrap().execution_policy.get(id).copied()
     }
 
     async fn acquire_activation_lease(&self, id: &SessionId) -> Result<FenceToken, StoreError> {

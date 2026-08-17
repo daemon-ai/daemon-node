@@ -136,11 +136,55 @@ struct ManagerInner {
     store: Arc<dyn SessionStore>,
     factory: Arc<dyn EngineFactory>,
     partition: PartitionId,
-    /// The active-only directory: currently running sessions. Returns to baseline after passivation
-    /// (invariant #8) — this is what the churn acceptance test asserts.
-    directory: DashMap<SessionId, ()>,
+    /// The active-only directory: currently running sessions, each holding its reservation
+    /// generation. Returns to baseline after passivation (invariant #8) — this is what the churn
+    /// acceptance test asserts. Reservation is an atomic insert-if-vacant acquired BEFORE the
+    /// lease (session-unification §6): the old lease-then-check order let concurrent wakes bump
+    /// the fence past an in-flight incarnation of the same session (self-fencing).
+    directory: DashMap<SessionId, u64>,
+    /// Monotonic reservation-generation mint, so a guard's release can never remove a newer
+    /// incarnation's reservation (the double-remove hazard on racing exits).
+    generations: std::sync::atomic::AtomicU64,
     /// Tracks live activation tasks so their memory is released on completion (invariant #8).
     tracker: TaskTracker,
+}
+
+/// An owned directory reservation (session-unification §6): acquired before the activation lease,
+/// released on EVERY exit path — lease failure, spawn failure, cancellation, panic, shutdown —
+/// by `Drop`, and generation-checked so it never removes a newer incarnation's reservation.
+struct SlotGuard {
+    inner: Arc<ManagerInner>,
+    id: SessionId,
+    generation: u64,
+}
+
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        self.inner
+            .directory
+            .remove_if(&self.id, |_, gen| *gen == self.generation);
+    }
+}
+
+impl ManagerInner {
+    /// Atomically reserve the session's slot (insert-if-vacant). `None` = a live incarnation
+    /// already holds it in this process.
+    fn try_reserve(self: &Arc<Self>, id: &SessionId) -> Option<SlotGuard> {
+        let generation = self
+            .generations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        match self.directory.entry(id.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(_) => None,
+            dashmap::mapref::entry::Entry::Vacant(v) => {
+                v.insert(generation);
+                Some(SlotGuard {
+                    inner: self.clone(),
+                    id: id.clone(),
+                    generation,
+                })
+            }
+        }
+    }
 }
 
 impl ManagerInner {
@@ -239,6 +283,7 @@ impl ActivationManager {
                 factory,
                 partition,
                 directory: DashMap::new(),
+                generations: std::sync::atomic::AtomicU64::new(0),
                 tracker: TaskTracker::new(),
             }),
         }
@@ -249,19 +294,30 @@ impl ActivationManager {
         self.inner.directory.len()
     }
 
-    /// Acquire a fresh lease and activate `id`, guarding against re-entry and completed sessions.
-    /// This is the convenience wake path; the store remains authoritative (invariant #1).
+    /// Acquire a fresh lease and activate `id`, guarding against re-entry, completed sessions,
+    /// and idle (no-runnable-work) sessions. This is the convenience wake path; the store remains
+    /// authoritative (invariant #1).
+    ///
+    /// Ordering (session-unification §6): the in-process slot is reserved BEFORE the lease is
+    /// acquired. The old lease-then-check order meant every concurrent wake of a busy session
+    /// bumped the fence — self-fencing the in-flight incarnation's eventual commit.
     pub async fn wake(&self, id: SessionId) -> Result<(), SubErr> {
         match self.inner.store.status(&id).await {
-            Some(SessionStatus::Completed) | None => return Ok(()),
+            // `Idle` = exists, no runnable work (never scanner/wake work); the splice/completion
+            // that creates work flips it `Ready` in the same transaction.
+            Some(SessionStatus::Completed) | Some(SessionStatus::Idle) | None => return Ok(()),
             _ => {}
         }
+        // A live incarnation already holds the slot: wake's contract ("ensure it is progressing")
+        // is satisfied without touching the lease.
+        let Some(slot) = self.inner.try_reserve(&id) else {
+            return Ok(());
+        };
         let fence = self.inner.store.acquire_activation_lease(&id).await?;
-        match self.activate(id, fence).await {
-            // A concurrent incarnation is already driving this session, so wake's contract ("ensure
-            // it is progressing") is satisfied: an in-process `Busy` guard, or a superseding lease
-            // that fenced our incarnation (e.g. the resident recovery scanner won the lease race).
-            Err(SubErr::Busy(_)) | Err(SubErr::Store(StoreError::Fenced { .. })) => Ok(()),
+        match self.run_reserved(id, fence, slot).await {
+            // A superseding lease fenced our incarnation mid-run (e.g. a cross-process writer):
+            // the winner is driving the session, so the wake is satisfied.
+            Err(SubErr::Store(StoreError::Fenced { .. })) => Ok(()),
             other => other,
         }
     }
@@ -336,9 +392,16 @@ impl ActivationManager {
     }
 }
 
-#[async_trait]
-impl ActivationSubstrate for ActivationManager {
-    async fn activate(&self, id: SessionId, fence: FenceToken) -> Result<(), SubErr> {
+impl ActivationManager {
+    /// Run one activation cycle under an already-held slot reservation: spawn the tracked task
+    /// with the guard moved into it, so the slot is released on every exit path — completion,
+    /// error, cancellation, or panic (the guard's `Drop`; invariant #8).
+    async fn run_reserved(
+        &self,
+        id: SessionId,
+        fence: FenceToken,
+        slot: SlotGuard,
+    ) -> Result<(), SubErr> {
         let trace = ingress_trace(Some(current_trace()));
         tracing::debug!(
             trace_id = %trace,
@@ -346,28 +409,33 @@ impl ActivationSubstrate for ActivationManager {
             fence = fence.0,
             "activation.wake"
         );
-        // Single-activation guard for this process (invariant #6). Cluster-wide single-activation is
-        // enforced durably by the fence: a stale incarnation cannot commit (invariant #5).
-        if self.inner.directory.contains_key(&id) {
-            return Err(SubErr::Busy(id));
-        }
-        self.inner.directory.insert(id.clone(), ());
-
         let inner = self.inner.clone();
-        let task_id = id.clone();
         let handle = self.inner.tracker.spawn(with_trace(trace, async move {
-            let result = inner.run_cycle(&task_id, fence).await;
-            // Passivate: drop the directory entry so memory returns to baseline (invariant #8).
-            inner.directory.remove(&task_id);
+            let result = inner.run_cycle(&slot.id, fence).await;
+            // Passivate: the guard drops here, releasing the directory entry so memory returns to
+            // baseline (invariant #8). Generation-checked, so a racing newer reservation survives.
+            drop(slot);
             result
         }));
         match handle.await {
             Ok(result) => result,
-            Err(join_err) => {
-                self.inner.directory.remove(&id);
-                Err(SubErr::Join(join_err.to_string()))
-            }
+            Err(join_err) => Err(SubErr::Join(join_err.to_string())),
         }
+    }
+}
+
+#[async_trait]
+impl ActivationSubstrate for ActivationManager {
+    async fn activate(&self, id: SessionId, fence: FenceToken) -> Result<(), SubErr> {
+        // Single-activation guard for this process (invariant #6): atomic insert-if-vacant, so two
+        // racing activations can never both pass a check-then-insert. Cluster-wide
+        // single-activation is enforced durably by the fence: a stale incarnation cannot commit
+        // (invariant #5). NOTE: callers of this seam bring their own fence (acquired elsewhere);
+        // the reserve-before-lease ordering lives in [`ActivationManager::wake`].
+        let Some(slot) = self.inner.try_reserve(&id) else {
+            return Err(SubErr::Busy(id));
+        };
+        self.run_reserved(id, fence, slot).await
     }
 
     async fn passivate(&self, id: &SessionId) {

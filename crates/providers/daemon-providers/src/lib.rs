@@ -117,6 +117,23 @@ fn snippet(body: &str) -> String {
     }
 }
 
+/// The empty-assembly gate (session-unification §9): a request with zero messages is OUR bug (a
+/// turn ran on an un-seeded conversation), and every cloud API deterministically 400s an empty
+/// `messages` array — which the recovery loop then retried during the incident. Refuse locally,
+/// before the wire, as the same non-retryable [`Failure::InvalidRequest`] a provider 400 maps to.
+/// Deliberately at the networked-provider boundary, NOT in the engine: scripted/mock providers
+/// (the conformance harness's orchestrators) legitimately drive blank-session turns.
+pub(crate) fn empty_assembly_gate(req: &daemon_core::Request) -> Result<(), Failure> {
+    if req.messages.is_empty() {
+        return Err(Failure::InvalidRequest(
+            "empty request assembly: refusing the provider call (a turn ran on a conversation \
+             with no messages — a seeding/creation bug upstream)"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Map a [`genai::Error`] into the §8 [`Failure`] taxonomy.
 ///
 /// HTTP errors (the common, recoverable case) carry status/headers/body, which we route through the
@@ -132,7 +149,21 @@ pub(crate) fn classify_genai_error(err: genai::Error) -> Failure {
         E::StreamParse { .. } | E::InvalidJsonResponseElement { .. } => {
             Failure::FormatError(format!("genai decode: {err}"))
         }
-        E::WebStream { .. } => Failure::TransientTransport(format!("genai stream: {err}")),
+        // A streaming-path failure. genai's stream layer checks the HTTP status BEFORE streaming
+        // and, on a non-2xx, boxes a `genai::Error::HttpError { status, body, .. }` into
+        // `WebStream.error` — so an HTTP reject on the streaming path (the incident's 400) carries
+        // its status here and MUST route through `classify_api_error` like every other HTTP error
+        // (session-unification §9), not blanket-retry as transport. Only a genuinely mid-stream
+        // transport failure (reset, hung stream) stays `TransientTransport`.
+        E::WebStream { cause, error, .. } => match error.downcast::<genai::Error>() {
+            Ok(inner) => match *inner {
+                E::HttpError { status, body, .. } => {
+                    classify_api_error(status.as_u16(), |_| None, &body)
+                }
+                other => Failure::TransientTransport(format!("genai stream: {other}")),
+            },
+            Err(_) => Failure::TransientTransport(format!("genai stream: {cause}")),
+        },
         E::ChatResponse { body, .. } => Failure::Provider(snippet(&body.to_string())),
         other => Failure::Provider(other.to_string()),
     }
@@ -161,5 +192,87 @@ fn classify_webc(err: genai::webc::Error) -> Failure {
         }
         W::Reqwest(e) => Failure::TransientTransport(format!("transport: {e}")),
         other => Failure::Provider(other.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    type BoxErr = Box<dyn std::error::Error + Send + Sync>;
+
+    fn model_iden() -> genai::ModelIden {
+        genai::ModelIden::new(genai::adapter::AdapterKind::OpenAI, "test-model")
+    }
+
+    fn web_stream(error: BoxErr) -> genai::Error {
+        genai::Error::WebStream {
+            model_iden: model_iden(),
+            cause: "stream open failed".into(),
+            error,
+        }
+    }
+
+    /// §9 regression (the incident's masked classification): an HTTP reject on the *streaming*
+    /// path boxes a `genai::Error::HttpError` inside `WebStream` — its status MUST route through
+    /// `classify_api_error` exactly like the non-streaming path, not blanket-retry as transport.
+    #[test]
+    fn web_stream_http_reject_routes_through_status_classification() {
+        let http_400 = genai::Error::HttpError {
+            status: reqwest::StatusCode::BAD_REQUEST,
+            canonical_reason: "Bad Request".into(),
+            body: r#"{"error":{"message":"messages: at least one message is required"}}"#.into(),
+        };
+        assert!(
+            matches!(
+                classify_genai_error(web_stream(Box::new(http_400))),
+                Failure::InvalidRequest(_)
+            ),
+            "a streamed 400 must abort as InvalidRequest, not retry as transport"
+        );
+
+        let http_429 = genai::Error::HttpError {
+            status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+            canonical_reason: "Too Many Requests".into(),
+            body: "rate limited".into(),
+        };
+        assert!(matches!(
+            classify_genai_error(web_stream(Box::new(http_429))),
+            Failure::RateLimit { .. }
+        ));
+    }
+
+    /// A genuinely mid-stream transport failure (no boxed HTTP status) stays retryable transport.
+    #[test]
+    fn web_stream_transport_failure_stays_transient() {
+        let io: BoxErr = Box::new(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "reset",
+        ));
+        assert!(matches!(
+            classify_genai_error(web_stream(io)),
+            Failure::TransientTransport(_)
+        ));
+    }
+
+    /// §9: zero assembled messages never reaches the wire — refused locally as the same
+    /// non-retryable failure a provider 400 maps to.
+    #[test]
+    fn empty_assembly_refused_before_the_wire() {
+        let empty = daemon_core::Request::default();
+        assert!(matches!(
+            empty_assembly_gate(&empty),
+            Err(Failure::InvalidRequest(_))
+        ));
+
+        let seeded = daemon_core::Request {
+            messages: vec![daemon_core::RequestMsg {
+                role: "user".into(),
+                content: "hello".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(empty_assembly_gate(&seeded).is_ok());
     }
 }

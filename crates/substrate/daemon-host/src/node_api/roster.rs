@@ -370,6 +370,9 @@ fn map_state(status: SessionStatus) -> SessionState {
         },
         SessionStatus::Ready => SessionState::Ready,
         SessionStatus::Completed => SessionState::Completed,
+        // The durable "exists, no runnable work" state projects onto the wire's quiescent state —
+        // no CDDL change (an explicit `idle` wire state is a deliberate follow-up wire decision).
+        SessionStatus::Idle => SessionState::Ready,
     }
 }
 

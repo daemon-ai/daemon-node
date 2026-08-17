@@ -339,6 +339,13 @@ pub enum Failure {
     /// The provider returned a malformed/unparseable response — retry once to re-elicit.
     #[error("format error: {0}")]
     FormatError(String),
+    /// The provider deterministically rejected the request as malformed (a plain HTTP 400/422 that
+    /// is neither a context overflow nor a content-policy trip). Retrying the same request cannot
+    /// succeed — the bug is ours, not transient — so recovery is Abort, never a retry loop
+    /// (session-unification §9: the incident's blank-session activation retried an
+    /// empty-messages 400 four times).
+    #[error("invalid request: {0}")]
+    InvalidRequest(String),
     /// A transient transport error (timeout, reset, hung stream) — retry with backoff.
     #[error("transient transport: {0}")]
     TransientTransport(String),
@@ -385,6 +392,8 @@ impl Failure {
             // Billing/content-policy can't clear on the same profile: hop to the fallback profile.
             Failure::Billing(_) | Failure::ContentPolicy(_) => Recovery::Fallback,
             Failure::ContextOverflow(_) | Failure::PayloadTooLarge(_) => Recovery::Compact,
+            // A deterministic 4xx reject: the identical request cannot succeed on retry.
+            Failure::InvalidRequest(_) => Recovery::Abort,
             Failure::Provider(_) | Failure::Other(_) | Failure::Fatal(_) | Failure::Cancelled => {
                 Recovery::Abort
             }

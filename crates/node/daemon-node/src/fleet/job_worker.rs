@@ -288,31 +288,19 @@ impl JobWorker for FleetJobWorker {
                     engine.push_user(daemon_protocol::UserMsg::new(input.task.clone()));
                     engine.snapshot().encode().map_err(ServiceError::new)?
                 };
-                self.store
-                    .create_session(child.clone(), self.partition, blob)
-                    .await
-                    .map_err(ServiceError::new)?;
-                // The foreign child has no Core-seeded first turn, so its task rides the durable
-                // pending-input seam the `ForeignIncarnation` drains at hydrate.
-                if is_foreign {
-                    self.store
-                        .enqueue_session_input(
-                            &child,
-                            daemon_protocol::UserMsg::new(input.task.clone()).encode(),
-                        )
-                        .await;
-                }
-                // Stamp the hierarchy edge so the child is excluded from the `TopLevel` roster and
-                // reached only by walking the tree: it is a non-`Primary` child of the delegating
-                // session. Read-modify-write preserves any bound profile/overlay; the role is
-                // derived from the job's declared `ChildLifetime` (managed vs ephemeral subagent).
+                // The child's host meta, stamped atomically with the row below. The hierarchy edge
+                // excludes it from the `TopLevel` roster (a non-`Primary` child of the delegating
+                // session); the role derives from the job's declared `ChildLifetime` (managed vs
+                // ephemeral subagent). Auth 4: a delegated child INHERITS the delegating (parent)
+                // session's owner — the worker runs in a background service task with no request
+                // principal, so ownership can only flow down the tree; legacy/unowned parents
+                // leave the child unowned too.
+                let child_role = job.lifetime.role();
+                // Read-modify-write: a spawn-time path (the orchestrate tool) may have stamped
+                // meta on the pre-minted child id before this materialize pass — preserve it.
                 let mut meta = self.store.session_meta(&child).await.unwrap_or_default();
                 meta.parent = Some(job.session_id.clone());
-                let child_role = job.lifetime.role();
                 meta.role = Some(child_role);
-                // Auth 4: a delegated child INHERITS the delegating (parent) session's owner — the
-                // worker runs in a background service task with no request principal, so ownership
-                // can only flow down the tree. Legacy/unowned parents leave the child unowned too.
                 meta.owner = self
                     .store
                     .session_meta(&job.session_id)
@@ -337,32 +325,60 @@ impl JobWorker for FleetJobWorker {
                 if meta.title.is_none() && !child_title.is_empty() {
                     meta.title = Some(child_title);
                 }
+                // Atomic runnable publication (session-unification §3): row + policy + meta + the
+                // parent edge + the Foreign child's first input land in ONE transaction with
+                // `Ready` — a recovery scan firing mid-construction can no longer run a child with
+                // a missing input (a blank first turn) or an unbound parent edge (an unnotified
+                // parent). A DETACHED child binds a completion-notice edge (terminal completion
+                // delivers a notice — the parent never suspended); a joining delegation binds the
+                // parent job (terminal completion fulfills it and wakes the suspended parent).
+                // The Foreign child has no Core-seeded first turn, so its task rides the durable
+                // pending-input seam the `ForeignIncarnation` drains at hydrate.
+                let edge = if input.detached {
+                    daemon_store::RunnableEdge::CompletionNotice {
+                        parent: job.session_id.clone(),
+                        call_id: None,
+                    }
+                } else {
+                    daemon_store::RunnableEdge::Delegation(job.clone())
+                };
                 self.store
-                    .set_session_meta(&child, meta)
+                    .create_runnable(daemon_store::RunnableSession {
+                        id: child.clone(),
+                        partition: self.partition,
+                        snapshot: blob,
+                        policy: if input.detached {
+                            daemon_store::ExecutionPolicy::DetachedChild
+                        } else {
+                            daemon_store::ExecutionPolicy::JoiningChild
+                        },
+                        meta: Some(meta),
+                        edge: Some(edge),
+                        first_input: is_foreign
+                            .then(|| daemon_protocol::UserMsg::new(input.task.clone()).encode()),
+                    })
                     .await
                     .map_err(ServiceError::new)?;
                 // Real topology change: push the spawn delta so a live `tree_subscribe` shows the new
                 // subagent row promptly (the conformance "push before poll" guarantee).
                 self.emit_spawn(&job.session_id, &child, map_store_role(child_role))
                     .await;
-            }
-            // Durable tree edge (idempotent). A DETACHED child binds a completion-notice edge: its
-            // terminal completion delivers a notice to the parent (a fresh reactive turn), NOT a job
-            // completion — the parent never suspended. A joining delegation binds the parent job, so
-            // the child's terminal completion fulfills it and wakes the suspended parent.
-            if input.detached {
-                // An idempotent re-bind: the spawn-time bind (orchestrate tool) already stamped
-                // the spawning call_id on the edge; this materialize-path bind never overwrites
-                // it (first-writer-wins), so `None` here is safe.
-                self.store
-                    .bind_completion_notice(&child, &job.session_id, None)
-                    .await
-                    .map_err(ServiceError::new)?;
             } else {
-                self.store
-                    .bind_delegation(child.clone(), job.clone())
-                    .await
-                    .map_err(ServiceError::new)?;
+                // The child already existed (a recovery-re-processed job): re-assert the durable
+                // tree edge idempotently — the factory transaction above only runs for a fresh
+                // child. The materialize-path completion-notice re-bind never overwrites a
+                // spawn-time call_id (first-writer-wins), so `None` here is safe.
+                if input.detached {
+                    self.store
+                        .bind_completion_notice(&child, &job.session_id, None)
+                        .await
+                        .map_err(ServiceError::new)?;
+                } else {
+                    self.store
+                        .bind_delegation(child.clone(), job.clone())
+                        .await
+                        .map_err(ServiceError::new)?;
+                }
             }
             // Kick the child into its first turn via the shared wake dispatcher.
             self.store.enqueue_wake(child).await;

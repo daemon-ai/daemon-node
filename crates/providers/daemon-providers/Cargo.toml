@@ -34,6 +34,9 @@ tokio = { workspace = true }
 daemon-infer = { workspace = true }
 daemon-core = { workspace = true }
 futures = { workspace = true }
+# Constructing `genai::Error::HttpError { status: reqwest::StatusCode, … }` in the §8/§9
+# classification regressions (already in the graph via genai — test-only, no new weight).
+reqwest = { workspace = true }
 
 [lints]
 workspace = true

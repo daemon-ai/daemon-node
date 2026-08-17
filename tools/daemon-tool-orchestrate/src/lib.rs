@@ -362,6 +362,8 @@ impl OrchestrateTool {
             Some(daemon_store::SessionStatus::Suspended { .. }) => "suspended",
             Some(daemon_store::SessionStatus::Ready) => "ready",
             Some(daemon_store::SessionStatus::Completed) => "completed",
+            // Durable "exists, no runnable work" — a child parked between turns reads as idle.
+            Some(daemon_store::SessionStatus::Idle) => "idle",
             None => "unknown",
         };
         let meta = store.session_meta(child).await.unwrap_or_default();

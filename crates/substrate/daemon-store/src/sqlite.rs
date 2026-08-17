@@ -16,11 +16,12 @@
 
 use crate::{
     AcpEntry, Activation, ChatRoute, Checkpoint, ChildLifetime, CommittedRoot, CompletionNotice,
-    CustomProviderRecord, FaultPoint, FeedbackRecord, JobCommand, JobCompletion, JournalEntry,
-    JournalPage, JournalSeal, ParkedApproval, Room, RoomMember, SessionMeta, SessionRole,
-    SessionSearchHit, SessionStatus, SessionStore, StoreError, StoreStats, StoredCronJob,
-    StoredCronRun, StoredCronSuggestion, StoredSavedPresence, TraceEntry, TraceSegment,
-    TransportPref, COMMAND_DEDUP_TTL_MS, CRON_RUN_RETENTION,
+    CustomProviderRecord, ExecutionPolicy, FaultPoint, FeedbackRecord, JobCommand, JobCompletion,
+    JournalEntry, JournalPage, JournalSeal, ParkedApproval, Room, RoomMember, RunnableEdge,
+    RunnableSession, SessionMeta, SessionRole, SessionSearchHit, SessionStatus, SessionStore,
+    StoreError, StoreStats, StoredCronJob, StoredCronRun, StoredCronSuggestion,
+    StoredSavedPresence, TraceEntry, TraceSegment, TransportPref, COMMAND_DEDUP_TTL_MS,
+    CRON_RUN_RETENTION,
 };
 use async_trait::async_trait;
 use daemon_common::{
@@ -457,6 +458,11 @@ static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
                  enabled INTEGER NOT NULL\n\
              );",
         ),
+        // M18 (session-unification §3): the persisted per-session execution policy, stamped at
+        // creation by `create_idle`/`create_runnable` and consumed at the turn boundary (stage 3).
+        // NULL on legacy rows (policy then falls back to edge inspection). The new 'idle' value of
+        // `status_kind` needs no DDL (TEXT column, no CHECK constraint).
+        M::up("ALTER TABLE session_record ADD COLUMN execution_policy TEXT;"),
     ])
 });
 
@@ -543,7 +549,29 @@ fn status_from_row(kind: &str, job: Option<String>) -> SessionStatus {
             job_id: JobId::new(job.unwrap_or_default()),
         },
         "ready" => SessionStatus::Ready,
+        "idle" => SessionStatus::Idle,
         _ => SessionStatus::Completed,
+    }
+}
+
+fn policy_to_str(policy: ExecutionPolicy) -> &'static str {
+    match policy {
+        ExecutionPolicy::InteractiveRoot => "interactive_root",
+        ExecutionPolicy::JoiningChild => "joining_child",
+        ExecutionPolicy::DetachedChild => "detached_child",
+        ExecutionPolicy::BackgroundChild => "background_child",
+        ExecutionPolicy::CronRun => "cron_run",
+    }
+}
+
+fn policy_from_str(s: &str) -> Option<ExecutionPolicy> {
+    match s {
+        "interactive_root" => Some(ExecutionPolicy::InteractiveRoot),
+        "joining_child" => Some(ExecutionPolicy::JoiningChild),
+        "detached_child" => Some(ExecutionPolicy::DetachedChild),
+        "background_child" => Some(ExecutionPolicy::BackgroundChild),
+        "cron_run" => Some(ExecutionPolicy::CronRun),
+        _ => None,
     }
 }
 
@@ -616,6 +644,77 @@ impl SqliteStore {
         .flatten()
     }
 
+    /// Insert a fresh session row — insert-if-absent (session-unification §3): an existing row is
+    /// never reset (the old `INSERT OR REPLACE` recreated the scanner race by resetting
+    /// epoch/status/fence under a concurrent incarnation); a duplicate create surfaces
+    /// [`StoreError::AlreadyExists`].
+    fn insert_fresh(
+        conn: &Connection,
+        id: &SessionId,
+        partition: PartitionId,
+        snapshot: &SnapshotBlob,
+        status_kind: &str,
+        policy: Option<ExecutionPolicy>,
+    ) -> Result<(), StoreError> {
+        let inserted = conn
+            .execute(
+                "INSERT OR IGNORE INTO session_record \
+                 (session_id, partition, epoch, status_kind, status_job, snapshot, fence, execution_policy) \
+                 VALUES (?1, ?2, 0, ?3, NULL, ?4, 0, ?5)",
+                params![
+                    id.as_str(),
+                    partition.0 as i64,
+                    status_kind,
+                    snapshot.as_bytes(),
+                    policy.map(policy_to_str),
+                ],
+            )
+            .map_err(sql_err)?;
+        if inserted == 0 {
+            return Err(StoreError::AlreadyExists(id.clone()));
+        }
+        Ok(())
+    }
+
+    /// Upsert a session's host meta row (the `set_session_meta` statement, reusable inside a
+    /// creation transaction so meta lands atomically with the session row).
+    fn upsert_meta(
+        conn: &Connection,
+        id: &SessionId,
+        meta: &SessionMeta,
+    ) -> Result<(), StoreError> {
+        let bound = meta.bound_profile.as_ref().map(|p| p.as_str());
+        let role = meta.role.map(role_to_str);
+        let parent = meta.parent.as_ref().map(|p| p.as_str());
+        let last_activity = meta.last_activity_ms.map(|v| v as i64);
+        let scheduled_job = meta.scheduled_job.as_ref().map(|j| j.as_str());
+        conn.execute(
+            "INSERT INTO session_meta (session_id, bound_profile, overlay, title, last_activity_ms, role, parent, pinned, archived, scheduled_job, activation_epoch, owner, terminal_ms, inline_profile) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
+             ON CONFLICT(session_id) DO UPDATE SET bound_profile = ?2, overlay = ?3, title = ?4, \
+             last_activity_ms = ?5, role = ?6, parent = ?7, pinned = ?8, archived = ?9, scheduled_job = ?10, \
+             activation_epoch = ?11, owner = ?12, terminal_ms = ?13, inline_profile = ?14",
+            params![
+                id.as_str(),
+                bound,
+                meta.overlay,
+                meta.title,
+                last_activity,
+                role,
+                parent,
+                meta.pinned as i64,
+                meta.archived as i64,
+                scheduled_job,
+                meta.activation_epoch as i64,
+                meta.owner,
+                meta.terminal_ms.map(|v| v as i64),
+                meta.inline_profile,
+            ],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
     /// Read a session's current fence, or `NotFound`.
     fn fence_of(conn: &Connection, id: &SessionId) -> Result<FenceToken, StoreError> {
         conn.query_row(
@@ -639,14 +738,118 @@ impl SessionStore for SqliteStore {
         snapshot: SnapshotBlob,
     ) -> Result<(), StoreError> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT OR REPLACE INTO session_record \
-             (session_id, partition, epoch, status_kind, status_job, snapshot, fence) \
-             VALUES (?1, ?2, 0, 'ready', NULL, ?3, 0)",
-            params![id.as_str(), partition.0 as i64, snapshot.as_bytes()],
+        Self::insert_fresh(&conn, &id, partition, &snapshot, "ready", None)
+    }
+
+    async fn create_idle(
+        &self,
+        id: SessionId,
+        partition: PartitionId,
+        snapshot: SnapshotBlob,
+    ) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        Self::insert_fresh(
+            &conn,
+            &id,
+            partition,
+            &snapshot,
+            "idle",
+            Some(ExecutionPolicy::InteractiveRoot),
+        )
+    }
+
+    async fn create_runnable(&self, spec: RunnableSession) -> Result<bool, StoreError> {
+        // ONE transaction: row + policy + meta + edge + first input land together (the 'ready'
+        // status is part of the same commit), so a recovery scan racing construction sees either
+        // nothing runnable or the complete session (session-unification §3).
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(sql_err)?;
+        let exists: Option<i64> = tx
+            .query_row(
+                "SELECT 1 FROM session_record WHERE session_id = ?1",
+                params![spec.id.as_str()],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(sql_err)?;
+        if exists.is_some() {
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT INTO session_record \
+             (session_id, partition, epoch, status_kind, status_job, snapshot, fence, execution_policy) \
+             VALUES (?1, ?2, 0, 'ready', NULL, ?3, 0, ?4)",
+            params![
+                spec.id.as_str(),
+                spec.partition.0 as i64,
+                spec.snapshot.as_bytes(),
+                policy_to_str(spec.policy),
+            ],
         )
         .map_err(sql_err)?;
-        Ok(())
+        // The construction-boundary crash: erroring out here drops `tx` un-committed, so the
+        // session row above genuinely rolls back — proving the all-or-nothing contract.
+        self.take_fault(FaultPoint::MidRunnableConstruction)?;
+        if let Some(meta) = &spec.meta {
+            Self::upsert_meta(&tx, &spec.id, meta)?;
+        }
+        match &spec.edge {
+            Some(RunnableEdge::Delegation(job)) => {
+                tx.execute(
+                    "INSERT OR IGNORE INTO delegations \
+                     (child, parent_session, parent_epoch, job_id, payload) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        spec.id.as_str(),
+                        job.session_id.as_str(),
+                        job.epoch.0 as i64,
+                        job.job_id.as_str(),
+                        job.payload,
+                    ],
+                )
+                .map_err(sql_err)?;
+            }
+            Some(RunnableEdge::CompletionNotice { parent, call_id }) => {
+                tx.execute(
+                    "INSERT OR IGNORE INTO completion_notices (child, parent_session, call_id) \
+                     VALUES (?1, ?2, ?3)",
+                    params![spec.id.as_str(), parent.as_str(), call_id],
+                )
+                .map_err(sql_err)?;
+            }
+            Some(RunnableEdge::ChildEdge { parent, work_label }) => {
+                tx.execute(
+                    "INSERT OR IGNORE INTO background_edges (child, parent_session, work_label) \
+                     VALUES (?1, ?2, ?3)",
+                    params![spec.id.as_str(), parent.as_str(), work_label],
+                )
+                .map_err(sql_err)?;
+            }
+            None => {}
+        }
+        if let Some(input) = &spec.first_input {
+            tx.execute(
+                "INSERT INTO pending_session_input (session_id, input) VALUES (?1, ?2)",
+                params![spec.id.as_str(), input],
+            )
+            .map_err(sql_err)?;
+        }
+        tx.commit().map_err(sql_err)?;
+        Ok(true)
+    }
+
+    async fn execution_policy(&self, id: &SessionId) -> Option<ExecutionPolicy> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT execution_policy FROM session_record WHERE session_id = ?1",
+            params![id.as_str()],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .flatten()
+        .as_deref()
+        .and_then(policy_from_str)
     }
 
     async fn acquire_activation_lease(&self, id: &SessionId) -> Result<FenceToken, StoreError> {
@@ -710,24 +913,23 @@ impl SessionStore for SqliteStore {
         job: JobCommand,
         fence: FenceToken,
     ) -> Result<(), StoreError> {
-        // Fence first: a stale incarnation must not commit (lifecycle §5).
+        // Atomic commit: the fence check and the writes share ONE transaction under one lock hold
+        // (session-unification §6) — the old separate check-then-write lock scopes left a gap a
+        // concurrent `acquire_activation_lease` could interleave into, letting a freshly-fenced
+        // incarnation commit anyway.
         {
-            let conn = self.conn.lock().unwrap();
-            let current = Self::fence_of(&conn, &checkpoint.session_id)?;
+            let mut conn = self.conn.lock().unwrap();
+            let tx = conn.transaction().map_err(sql_err)?;
+            // Fence first: a stale incarnation must not commit (lifecycle §5).
+            let current = Self::fence_of(&tx, &checkpoint.session_id)?;
             if fence < current {
                 return Err(StoreError::Fenced {
                     have: fence.0,
                     current: current.0,
                 });
             }
-        }
-        // Boundary: abort the whole transaction before anything is written.
-        self.take_fault(FaultPoint::BeforeSnapshot)?;
-
-        // Atomic commit: snapshot, epoch, status, and job-outbox enqueue land together.
-        {
-            let mut conn = self.conn.lock().unwrap();
-            let tx = conn.transaction().map_err(sql_err)?;
+            // Boundary: abort the whole transaction before anything is written.
+            self.take_fault(FaultPoint::BeforeSnapshot)?;
             tx.execute(
                 "UPDATE session_record \
                  SET snapshot = ?2, epoch = ?3, status_kind = 'suspended', status_job = ?4 \
@@ -1081,21 +1283,19 @@ impl SessionStore for SqliteStore {
         approvals: Vec<ParkedApproval>,
         fence: FenceToken,
     ) -> Result<(), StoreError> {
-        {
-            let conn = self.conn.lock().unwrap();
-            let current = Self::fence_of(&conn, &checkpoint.session_id)?;
-            if fence < current {
-                return Err(StoreError::Fenced {
-                    have: fence.0,
-                    current: current.0,
-                });
-            }
-        }
-        self.take_fault(FaultPoint::BeforeSnapshot)?;
-        // Atomic commit: snapshot + epoch + Suspended status + parked rows land together. No job is
-        // enqueued — the session stays dormant until an operator decision wakes it.
+        // Atomic commit: fence check + snapshot + epoch + Suspended status + parked rows share ONE
+        // transaction under one lock hold (session-unification §6; see `checkpoint_and_enqueue`).
+        // No job is enqueued — the session stays dormant until an operator decision wakes it.
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction().map_err(sql_err)?;
+        let current = Self::fence_of(&tx, &checkpoint.session_id)?;
+        if fence < current {
+            return Err(StoreError::Fenced {
+                have: fence.0,
+                current: current.0,
+            });
+        }
+        self.take_fault(FaultPoint::BeforeSnapshot)?;
         if let Some(first) = approvals.first() {
             tx.execute(
                 "UPDATE session_record \
@@ -2764,7 +2964,8 @@ mod tests {
     /// `credential_labels` account-management tables, the wire-v37 `saved_presences` +
     /// `saved_presence_active` tables, the `custom_providers` table, the wire-v38
     /// `transport_prefs.settings` account-settings column, and the rung-3 (api/39)
-    /// `command_dedup` op-id idempotency table, and the wire-v41 `crash_consent` toggle).
+    /// `command_dedup` op-id idempotency table, the wire-v41 `crash_consent` toggle, and the
+    /// session-unification `session_record.execution_policy` column).
     #[test]
     fn migration_ladder_valid_and_applied() {
         assert!(MIGRATIONS.validate().is_ok());
@@ -2775,7 +2976,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 17, "fresh DB is stamped to the latest migration");
+        assert_eq!(version, 18, "fresh DB is stamped to the latest migration");
     }
 
     /// `custom_provider_set`/`list`/`remove` round-trip identically on both the SQLite and in-memory

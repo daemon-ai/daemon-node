@@ -272,6 +272,78 @@ async fn session_surface_runs_an_interactive_turn_to_finished_impl() {
     handle.shutdown().await;
 }
 
+/// THE INCIDENT PIN (session-unification §2): a GUI `SessionCreate` publishes a blank, un-run
+/// interactive session as durable `Idle` — never scanner work. Under the old `Ready` write, the
+/// resident recovery scanner activated the blank row concurrently with the GUI's first live turn,
+/// and the failed blank activation's terminal commit clobbered the conversation. Here the resident
+/// scanner gets dozens of real ticks over the blank row (10ms cadence): it must stay `Idle`,
+/// un-activated, and the first live turn on the same id must then run to `TurnFinished`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blank_session_create_is_idle_and_survives_recovery_scans() {
+    as_system(blank_session_create_is_idle_and_survives_recovery_scans_impl()).await;
+}
+async fn blank_session_create_is_idle_and_survives_recovery_scans_impl() {
+    use daemon_api::{Outbound, SessionApi};
+    use daemon_common::ReqId;
+    use daemon_protocol::{AgentCommand, AgentEvent, UserMsg};
+
+    let store: Arc<dyn SessionStore> = Arc::new(InMemoryStore::new());
+    let AssembledNode { node, handle, .. } =
+        assemble_over(store.clone(), 0, [0x77; 32], fast_host_config());
+
+    let session = node
+        .session_create(Some(SessionId::new("incident-blank")), None)
+        .await
+        .expect("session_create");
+    assert_eq!(
+        store.status(&session).await,
+        Some(daemon_store::SessionStatus::Idle),
+        "a blank created session is durably Idle, not Ready"
+    );
+
+    // ~30 scanner ticks over the blank row.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        store.status(&session).await,
+        Some(daemon_store::SessionStatus::Idle),
+        "the recovery scanner must never activate a blank Idle session"
+    );
+
+    // The incident's other rail: the first LIVE turn on the same id runs cleanly.
+    node.submit(
+        session.clone(),
+        AgentCommand::StartTurn {
+            input: UserMsg::new("hello"),
+            request_id: ReqId(1),
+        },
+    )
+    .await
+    .expect("submit StartTurn");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut finished = false;
+    while Instant::now() < deadline {
+        let drained = node.poll(session.clone(), 0).await.expect("poll");
+        if drained
+            .iter()
+            .any(|o| matches!(o, Outbound::Event(AgentEvent::TurnFinished { .. })))
+        {
+            finished = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(finished, "the first live turn never reached TurnFinished");
+
+    // No blank activation committed a terminal snapshot underneath the live turn.
+    assert_eq!(
+        store.status(&session).await,
+        Some(daemon_store::SessionStatus::Idle),
+        "the durable row must remain Idle — no failed blank activation ever committed"
+    );
+
+    handle.shutdown().await;
+}
+
 /// THE PHASE 0 GUI-READINESS DEMO GATE: over a single Unix socket, a scripted client walks the
 /// whole GUI bring-up flow end to end — set an Anthropic key, create + select a
 /// `claude-opus-4-8` profile, list discoverable models, confirm the current model, then open an

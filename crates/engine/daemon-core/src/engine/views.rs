@@ -200,6 +200,7 @@ pub(super) fn failure_kind(failure: &Failure) -> &'static str {
         Failure::PayloadTooLarge(_) => "payload_too_large",
         Failure::ContentPolicy(_) => "content_policy",
         Failure::FormatError(_) => "format_error",
+        Failure::InvalidRequest(_) => "invalid_request",
         Failure::TransientTransport(_) => "transient_transport",
         Failure::ProviderOverloaded(_) => "provider_overloaded",
         Failure::Fatal(_) => "fatal",

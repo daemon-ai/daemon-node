@@ -68,15 +68,24 @@ impl SessionApi for NodeApiImpl {
                 .and_then(|s| s.active().ok().flatten())
                 .map(ProfileRef::new),
         };
-        // Create-if-absent durable row with the engine's initial snapshot (the `assign` body).
+        // Create-if-absent durable row with the engine's initial snapshot — in `Idle`, NOT `Ready`
+        // (session-unification §2/§3): a blank un-run session is not scanner work. The old `Ready`
+        // write was the incident's root cause — the recovery scanner activated the blank row while
+        // the GUI's first live turn ran the same session, and the failed blank activation's
+        // terminal snapshot clobbered the conversation. A concurrent duplicate create is benign
+        // (`AlreadyExists` = the row is there, which is all this path needs).
         if self.store.status(&session).await.is_none() {
             let blob = Snapshot::fresh(session.clone())
                 .encode()
                 .map_err(|e| ApiError::Other(format!("encode initial snapshot: {e}")))?;
-            self.store
-                .create_session(session.clone(), self.partition, blob)
+            match self
+                .store
+                .create_idle(session.clone(), self.partition, blob)
                 .await
-                .map_err(|e| ApiError::Other(format!("create session: {e}")))?;
+            {
+                Ok(()) | Err(daemon_store::StoreError::AlreadyExists(_)) => {}
+                Err(e) => return Err(ApiError::Other(format!("create session: {e}"))),
+            }
         }
         // Bind `bound_profile` + stamp the owner on the durable host meta (read-modify-write, so a
         // pre-existing overlay/title is preserved and a re-create never clobbers an existing binding).

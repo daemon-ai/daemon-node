@@ -291,10 +291,18 @@ fn assemble_core_approval(store: Arc<dyn SessionStore>) -> AssembledNode {
 /// `ParkingHandler` path, NOT the durable `ApprovalsPending` inbox), the turn resumes, and it
 /// completes. This is the live counterpart to the durable `answer_approval` cycle and the
 /// surfacing daemon-app's DaemonTurnEngine relies on.
-async fn live_approval_park_then_respond(store: Arc<dyn SessionStore>, allow: bool) {
-    as_system(live_approval_park_then_respond_impl(store, allow)).await;
+/// `session` must be unique per test: the default exec sandbox is keyed by session id
+/// (`/tmp/daemon-ws-{session}`), so concurrent tests sharing an id share `approved.txt` — one
+/// test's approved write then trips another's pending-approval freshness gate (a real TOCTOU
+/// conflict, but of the harness's making).
+async fn live_approval_park_then_respond(store: Arc<dyn SessionStore>, session: &str, allow: bool) {
+    as_system(live_approval_park_then_respond_impl(store, session, allow)).await;
 }
-async fn live_approval_park_then_respond_impl(store: Arc<dyn SessionStore>, allow: bool) {
+async fn live_approval_park_then_respond_impl(
+    store: Arc<dyn SessionStore>,
+    session: &str,
+    allow: bool,
+) {
     use daemon_api::{Outbound, SessionApi};
     use daemon_common::ReqId;
     use daemon_protocol::{
@@ -303,7 +311,7 @@ async fn live_approval_park_then_respond_impl(store: Arc<dyn SessionStore>, allo
     };
 
     let AssembledNode { node, handle, .. } = assemble_core_approval(store);
-    let session = SessionId::new("live-approval-1");
+    let session = SessionId::new(session);
 
     node.submit(
         session.clone(),
@@ -411,13 +419,15 @@ async fn live_approval_park_then_respond_impl(store: Arc<dyn SessionStore>, allo
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_approval_park_allow_resumes_in_memory() {
-    live_approval_park_then_respond(Arc::new(InMemoryStore::new()), true).await;
+    live_approval_park_then_respond(Arc::new(InMemoryStore::new()), "live-approval-mem", true)
+        .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_approval_park_allow_resumes_sqlite() {
     live_approval_park_then_respond(
         Arc::new(SqliteStore::open_in_memory().expect("open sqlite store")),
+        "live-approval-sqlite",
         true,
     )
     .await;
@@ -425,5 +435,6 @@ async fn live_approval_park_allow_resumes_sqlite() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_approval_park_deny_resumes_in_memory() {
-    live_approval_park_then_respond(Arc::new(InMemoryStore::new()), false).await;
+    live_approval_park_then_respond(Arc::new(InMemoryStore::new()), "live-approval-deny", false)
+        .await;
 }

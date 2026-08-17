@@ -257,36 +257,47 @@ impl CronWorker {
             let Ok(blob) = engine.snapshot().encode() else {
                 return;
             };
+            // The meta stamped atomically with the row: the cron origin + bound profile +
+            // isolation role. `scheduled_job` tells the incarnation to set
+            // `TurnTrigger::Scheduled`; the `EphemeralSubagent` role keeps the cron run out of
+            // the top-level roster (it is a transient, isolated session). Auth 4: the spawned
+            // session is owned by the job's creator (captured at `cron_create` from the request
+            // principal); `None` on legacy/system jobs. Phase 2 shaping: the run's
+            // model/provider/toolset/workdir persists as a `SessionOverlay` so the durable
+            // factory applies it at hydrate (see `engine_incarnation::hydrate`) — the constrained
+            // cron profile is the base; the overlay narrows/overrides it (G3-safe).
+            let mut meta = daemon_store::SessionMeta {
+                scheduled_job: Some(daemon_common::JobId::from(job.id.as_str())),
+                role: Some(daemon_store::SessionRole::EphemeralSubagent),
+                owner: job.owner.clone(),
+                ..Default::default()
+            };
+            if let Some(target) = &spec.target {
+                meta.bound_profile = Some(ProfileRef::new(target));
+            }
+            let overlay = Self::overlay_from_spec(spec);
+            if !overlay.is_empty() {
+                meta.overlay = daemon_host::encode_overlay(&overlay);
+            }
+            // Atomic runnable publication (session-unification §3): row + policy + meta land in
+            // ONE transaction with `Ready` — a recovery scan firing mid-construction can no longer
+            // run the session without its cron identity/overlay.
             if self
                 .store
-                .create_session(session.clone(), self.partition, blob)
+                .create_runnable(daemon_store::RunnableSession {
+                    id: session.clone(),
+                    partition: self.partition,
+                    snapshot: blob,
+                    policy: daemon_store::ExecutionPolicy::CronRun,
+                    meta: Some(meta),
+                    edge: None,
+                    first_input: None,
+                })
                 .await
                 .is_err()
             {
                 return;
             }
-            // Stamp the cron origin + bound profile + isolation role. `scheduled_job` tells the
-            // incarnation to set `TurnTrigger::Scheduled`; the `EphemeralSubagent` role keeps the
-            // cron run out of the top-level roster (it is a transient, isolated session).
-            let mut meta = self.store.session_meta(&session).await.unwrap_or_default();
-            meta.scheduled_job = Some(daemon_common::JobId::from(job.id.as_str()));
-            meta.role = Some(daemon_store::SessionRole::EphemeralSubagent);
-            // Auth 4: the spawned cron session is owned by the job's creator (captured at
-            // `cron_create` from the request principal), so a scheduled run is visible to (and
-            // controllable by) the user who scheduled it. `None` on legacy/system jobs.
-            meta.owner = job.owner.clone();
-            if let Some(target) = &spec.target {
-                meta.bound_profile = Some(ProfileRef::new(target));
-            }
-            // Phase 2 shaping: persist the run's model/provider/toolset/workdir as a `SessionOverlay`
-            // so the durable factory applies it when hydrating this cron session (see
-            // `engine_incarnation::hydrate`). The constrained cron profile is the base; the overlay
-            // narrows/overrides it (the resolver path is G3-safe — it never wires `cron`/`orchestrate`).
-            let overlay = Self::overlay_from_spec(spec);
-            if !overlay.is_empty() {
-                meta.overlay = daemon_host::encode_overlay(&overlay);
-            }
-            let _ = self.store.set_session_meta(&session, meta).await;
         }
         let _ = self
             .store

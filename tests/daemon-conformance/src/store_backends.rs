@@ -350,6 +350,313 @@ async fn sqlite_child_edge() {
     .await;
 }
 
+/// Session-unification Stage 1 (spec §3, §5): identical containment semantics on both backends —
+/// a blank interactive session is durably inert (`Idle`), creation never resurrects an existing
+/// row, and the seeded factory (`create_runnable`) is atomic, idempotent, and crash-safe at the
+/// construction boundary.
+async fn unification_stage1_suite<S: FaultStore + 'static>(make: impl Fn() -> Arc<S>) {
+    use daemon_store::{ExecutionPolicy, RunnableEdge, RunnableSession, SessionMeta, SessionRole};
+
+    // (a) The incident pin: `create_idle` publishes a blank interactive session as `Idle` —
+    // invisible to the recovery scan and inert to wakes — so no blank zero-epoch activation can
+    // ever race the interactive rail (was: `create_session` published it 'ready'; the scanner ran
+    // a blank turn whose failed commit became the authoritative snapshot).
+    {
+        let store = make();
+        let mgr = manager(store.clone());
+        let id = SessionId::new("blank-interactive");
+        let blob = Snapshot::fresh(id.clone()).encode().expect("encode");
+        store
+            .create_idle(id.clone(), PARTITION, blob)
+            .await
+            .expect("create idle");
+        assert_eq!(store.status(&id).await, Some(SessionStatus::Idle));
+        assert_eq!(
+            store.execution_policy(&id).await,
+            Some(ExecutionPolicy::InteractiveRoot)
+        );
+        assert!(
+            store
+                .scan_resumable(PARTITION)
+                .await
+                .expect("scan")
+                .is_empty(),
+            "Idle must be invisible to the recovery scan"
+        );
+        // Even a stray durable wake hint must not run a turn on it.
+        store.enqueue_wake(id.clone()).await;
+        mgr.recover().await.expect("recover");
+        assert_eq!(
+            store.status(&id).await,
+            Some(SessionStatus::Idle),
+            "recovery must never run a turn on an Idle session"
+        );
+        assert_eq!(mgr.active_count(), 0);
+    }
+
+    // (b) Creation is insert-if-absent: a duplicate create surfaces `AlreadyExists` and resets
+    // NOTHING (was: `INSERT OR REPLACE` silently resurrected the row at a blank epoch 0).
+    {
+        let store = make();
+        let mgr = manager(store.clone());
+        let id = SessionId::new("no-resurrect");
+        seed(&*store, &id).await;
+        mgr.wake(id.clone()).await.expect("wake");
+        mgr.recover().await.expect("recover");
+        assert_completed(&*store, &id).await;
+        let blob = Snapshot::fresh(id.clone()).encode().expect("encode");
+        assert!(matches!(
+            store
+                .create_session(id.clone(), PARTITION, blob.clone())
+                .await,
+            Err(StoreError::AlreadyExists(_))
+        ));
+        assert!(matches!(
+            store.create_idle(id.clone(), PARTITION, blob).await,
+            Err(StoreError::AlreadyExists(_))
+        ));
+        assert_completed(&*store, &id).await;
+    }
+
+    // (c) The seeded factory: the construction-boundary crash rolls back to NOTHING; the retry
+    // commits session + policy + meta + delegation edge + first input as one unit; a duplicate is
+    // a no-op `false`; and the child's terminal completion fulfills the parent's job exactly like
+    // a standalone `bind_delegation`.
+    {
+        let store = make();
+        let mgr = manager(store.clone());
+        let parent = SessionId::new("factory-parent");
+        seed(&*store, &parent).await;
+        mgr.wake(parent.clone()).await.expect("wake parent");
+        let job = store
+            .dequeue_job()
+            .await
+            .expect("the parent's delegated job");
+        assert!(matches!(
+            store.status(&parent).await,
+            Some(SessionStatus::Suspended { .. })
+        ));
+
+        let child = SessionId::new("factory-parent/c1");
+        let spec = RunnableSession {
+            id: child.clone(),
+            partition: PARTITION,
+            snapshot: Snapshot::fresh(child.clone()).encode().expect("encode"),
+            policy: ExecutionPolicy::JoiningChild,
+            meta: Some(SessionMeta {
+                parent: Some(parent.clone()),
+                role: Some(SessionRole::ManagedChild),
+                ..Default::default()
+            }),
+            edge: Some(RunnableEdge::Delegation(job)),
+            first_input: Some(b"seeded-first-input".to_vec()),
+        };
+
+        store.arm(Some(FaultPoint::MidRunnableConstruction));
+        assert!(matches!(
+            store.create_runnable(spec.clone()).await,
+            Err(StoreError::Fault(_))
+        ));
+        assert_eq!(
+            store.status(&child).await,
+            None,
+            "rolled back: no session row"
+        );
+        assert!(
+            store.children_of(&parent).await.is_empty(),
+            "rolled back: no tree edge"
+        );
+        assert!(
+            store.take_session_inputs(&child).await.is_empty(),
+            "rolled back: no pending input"
+        );
+
+        assert!(store
+            .create_runnable(spec.clone())
+            .await
+            .expect("create runnable"));
+        assert_eq!(store.status(&child).await, Some(SessionStatus::Ready));
+        assert_eq!(
+            store.execution_policy(&child).await,
+            Some(ExecutionPolicy::JoiningChild)
+        );
+        assert_eq!(store.children_of(&parent).await, vec![child.clone()]);
+        assert_eq!(
+            store
+                .session_meta(&child)
+                .await
+                .expect("meta stamped")
+                .parent
+                .as_ref(),
+            Some(&parent)
+        );
+        assert_eq!(
+            store.take_session_inputs(&child).await,
+            vec![b"seeded-first-input".to_vec()]
+        );
+
+        // Idempotent duplicate: `false` and NOTHING re-written — no duplicate tree edge, no
+        // resurrected pending input.
+        assert!(!store.create_runnable(spec).await.expect("idempotent"));
+        assert_eq!(store.children_of(&parent).await, vec![child.clone()]);
+        assert!(store.take_session_inputs(&child).await.is_empty());
+
+        // The child runs to terminal; its completion fulfills the parent's job (the parent wakes
+        // and completes) — the factory's edge behaves exactly like `bind_delegation`.
+        mgr.recover().await.expect("recover");
+        assert_completed(&*store, &child).await;
+        assert_completed(&*store, &parent).await;
+    }
+
+    // (d) A detached child's notice edge: the spawn-time `bind_completion_notice` (which carries
+    // the tool-call provenance) may land BEFORE the factory materializes the child — the factory
+    // must dedupe the tree row and keep first-writer-wins on the recorded `call_id`.
+    {
+        let store = make();
+        let mgr = manager(store.clone());
+        let parent = SessionId::new("notice-parent");
+        seed(&*store, &parent).await;
+        let child = SessionId::new("notice-parent/d1");
+        store
+            .bind_completion_notice(&child, &parent, Some("call-7".into()))
+            .await
+            .expect("spawn-time bind");
+        assert!(store
+            .create_runnable(RunnableSession {
+                id: child.clone(),
+                partition: PARTITION,
+                snapshot: Snapshot::fresh(child.clone()).encode().expect("encode"),
+                policy: ExecutionPolicy::DetachedChild,
+                meta: None,
+                edge: Some(RunnableEdge::CompletionNotice {
+                    parent: parent.clone(),
+                    call_id: None,
+                }),
+                first_input: None,
+            })
+            .await
+            .expect("create runnable"));
+        assert_eq!(
+            store.children_of(&parent).await,
+            vec![child.clone()],
+            "the factory edge dedupes against the spawn-time bind"
+        );
+
+        mgr.wake(child.clone()).await.expect("wake child");
+        mgr.recover().await.expect("recover");
+        assert_completed(&*store, &child).await;
+        let notice = store
+            .dequeue_completion_notice()
+            .await
+            .expect("terminal notice");
+        assert_eq!(notice.parent, parent);
+        assert_eq!(notice.child, child);
+        assert_eq!(
+            notice.call_id.as_deref(),
+            Some("call-7"),
+            "the spawn-time call_id survives the factory's None (first-writer-wins)"
+        );
+    }
+}
+
+#[tokio::test]
+async fn in_memory_unification_stage1() {
+    unification_stage1_suite(|| Arc::new(InMemoryStore::new())).await;
+}
+
+#[tokio::test]
+async fn sqlite_unification_stage1() {
+    unification_stage1_suite(|| Arc::new(SqliteStore::open_in_memory().expect("open sqlite")))
+        .await;
+}
+
+/// Session-unification §6 regression: a concurrent wake of a BUSY session must not bump the fence
+/// past the in-flight incarnation. The in-process slot is reserved before the lease is acquired,
+/// so a busy session's wake returns satisfied without touching the lease; under the old
+/// lease-then-check order every such wake self-fenced the running incarnation's eventual commit
+/// (this test then fails: the commit is Fenced and the session never completes).
+#[tokio::test]
+async fn concurrent_wake_does_not_self_fence() {
+    use daemon_activation::{EngineError, EngineFactory, Incarnation, Step};
+    use daemon_common::Epoch;
+    use tokio::sync::Notify;
+
+    /// An engine that parks mid-run until released, so the test can interleave wakes while the
+    /// incarnation verifiably holds the slot.
+    struct GateEngine {
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+        snapshot: Option<daemon_activation::SnapshotBlob>,
+    }
+    #[async_trait::async_trait]
+    impl Incarnation for GateEngine {
+        async fn hydrate(
+            &mut self,
+            snapshot: daemon_activation::SnapshotBlob,
+            _unapplied: Vec<JobCompletion>,
+        ) -> Result<(), EngineError> {
+            self.snapshot = Some(snapshot);
+            Ok(())
+        }
+        async fn run(&mut self) -> Result<Step, EngineError> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(Step::Completed)
+        }
+        fn checkpoint(&self) -> Result<daemon_activation::SnapshotBlob, EngineError> {
+            Ok(self.snapshot.clone().expect("hydrated"))
+        }
+        fn epoch(&self) -> Epoch {
+            Epoch::ZERO
+        }
+    }
+    struct GateFactory {
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+    impl EngineFactory for GateFactory {
+        fn create(&self) -> Box<dyn Incarnation> {
+            Box::new(GateEngine {
+                entered: self.entered.clone(),
+                release: self.release.clone(),
+                snapshot: None,
+            })
+        }
+    }
+
+    let store = Arc::new(InMemoryStore::new());
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let mgr = ActivationManager::new(
+        store.clone(),
+        Arc::new(GateFactory {
+            entered: entered.clone(),
+            release: release.clone(),
+        }),
+        PARTITION,
+    );
+    let id = SessionId::new("busy-no-self-fence");
+    seed(&*store, &id).await;
+
+    let first = {
+        let mgr = mgr.clone();
+        let id = id.clone();
+        tokio::spawn(async move { mgr.wake(id).await })
+    };
+    entered.notified().await; // the incarnation is mid-run, holding the slot
+
+    for _ in 0..8 {
+        mgr.wake(id.clone()).await.expect("busy wake is satisfied");
+    }
+
+    release.notify_one();
+    first
+        .await
+        .expect("join")
+        .expect("the in-flight incarnation's commit must not be fenced by busy wakes");
+    assert_completed(&*store, &id).await;
+}
+
 /// N1: the durable feedback outbox + node-owned telemetry consent behave identically on both
 /// backends — enqueue -> pending (oldest first) -> mark_delivered removes from pending, enqueue is
 /// idempotent by id, and consent defaults OFF then round-trips through get/set.

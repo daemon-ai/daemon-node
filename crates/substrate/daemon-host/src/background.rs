@@ -158,25 +158,38 @@ impl BackgroundSpawner {
         snapshot.conversation = conversation;
         let blob = snapshot.encode().ok()?;
 
-        self.store
-            .create_session(child.clone(), self.partition, blob)
-            .await
-            .ok()?;
-        // The non-joining edge: tree-visible for audit, but no bound job — `mark_completed` finds no
-        // delegation and never wakes the parent (self-close). Contrast `bind_delegation`.
-        self.store
-            .record_child_edge(parent.clone(), child.clone(), spec.kind.clone())
-            .await
-            .ok()?;
-        // Auth 4: an attached background child INHERITS the parent's owner (the spawn runs off the
-        // engine/activation path with no request principal — ownership flows down the tree). Stamped
-        // on a fresh meta row; a legacy/unowned parent leaves the child unowned.
+        // Atomic runnable publication (session-unification §3): row + policy + the non-joining
+        // edge (tree-visible, no bound job — `mark_completed` finds no delegation and never wakes
+        // the parent) + owner meta land in ONE transaction, `Ready` included — a recovery scan
+        // firing mid-construction can no longer run an edge-less child. Auth 4: the child INHERITS
+        // the parent's owner (the spawn runs off the engine/activation path with no request
+        // principal — ownership flows down the tree); a legacy/unowned parent leaves it unowned.
         let owner = self.store.session_meta(parent).await.and_then(|m| m.owner);
-        if owner.is_some() {
-            let mut meta = self.store.session_meta(&child).await.unwrap_or_default();
-            meta.owner = owner;
-            let _ = self.store.set_session_meta(&child, meta).await;
-        }
+        let meta = match owner {
+            Some(owner) => {
+                // Read-modify-write parity with the pre-factory path: preserve any meta already
+                // stamped on the child id.
+                let mut meta = self.store.session_meta(&child).await.unwrap_or_default();
+                meta.owner = Some(owner);
+                Some(meta)
+            }
+            None => None,
+        };
+        self.store
+            .create_runnable(daemon_store::RunnableSession {
+                id: child.clone(),
+                partition: self.partition,
+                snapshot: blob,
+                policy: daemon_store::ExecutionPolicy::BackgroundChild,
+                meta,
+                edge: Some(daemon_store::RunnableEdge::ChildEdge {
+                    parent: parent.clone(),
+                    work_label: spec.kind.clone(),
+                }),
+                first_input: None,
+            })
+            .await
+            .ok()?;
         self.store.enqueue_wake(child.clone()).await;
         Some(child)
     }
