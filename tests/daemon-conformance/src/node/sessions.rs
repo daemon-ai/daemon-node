@@ -334,12 +334,25 @@ async fn blank_session_create_is_idle_and_survives_recovery_scans_impl() {
     }
     assert!(finished, "the first live turn never reached TurnFinished");
 
-    // No blank activation committed a terminal snapshot underneath the live turn.
-    assert_eq!(
-        store.status(&session).await,
-        Some(daemon_store::SessionStatus::Idle),
-        "the durable row must remain Idle — no failed blank activation ever committed"
-    );
+    // No blank activation committed a terminal snapshot underneath the live turn. TurnFinished
+    // streams through the hub BEFORE the turn-commit transaction lands, so give the commit a
+    // moment to settle Active -> Idle; any terminal status is the incident regressing.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match store.status(&session).await {
+            Some(daemon_store::SessionStatus::Idle) => break,
+            Some(daemon_store::SessionStatus::Active)
+            | Some(daemon_store::SessionStatus::Ready)
+                if Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            other => panic!(
+                "the durable row must settle Idle — no failed blank activation ever \
+                 committed (got {other:?})"
+            ),
+        }
+    }
 
     handle.shutdown().await;
 }

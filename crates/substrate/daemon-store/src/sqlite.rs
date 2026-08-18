@@ -2056,7 +2056,10 @@ impl SessionStore for SqliteStore {
         let mut stmt = conn
             .prepare(
                 "SELECT session_id FROM session_record \
-                 WHERE partition = ?1 AND status_kind IN ('ready', 'active')",
+                 WHERE partition = ?1 AND (status_kind IN ('ready', 'active') \
+                    OR (status_kind = 'suspended' AND EXISTS ( \
+                        SELECT 1 FROM completion_inbox ci \
+                        WHERE ci.session_id = session_record.session_id)))",
             )
             .map_err(sql_err)?;
         let ids = stmt

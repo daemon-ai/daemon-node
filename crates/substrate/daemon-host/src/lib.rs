@@ -300,7 +300,8 @@ impl Host {
         factory: Arc<dyn EngineFactory>,
         config: HostConfig,
     ) -> Self {
-        let manager = ActivationManager::new(store.clone(), factory, config.partition);
+        let manager =
+            ActivationManager::with_linger(store.clone(), factory, config.partition, config.linger);
         Self {
             store,
             manager,

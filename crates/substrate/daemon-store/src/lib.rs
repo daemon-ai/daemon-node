@@ -1454,8 +1454,13 @@ pub trait SessionStore: Send + Sync {
         Vec::new()
     }
 
-    /// Scan for sessions in a resumable (`Ready`/`Active`) state for the recovery scanner
-    /// (lifecycle §5; invariant #7).
+    /// Scan for sessions with resumable work for the recovery scanner (lifecycle §5;
+    /// invariant #7): `Ready`/`Active`, plus `Suspended` sessions holding an unapplied
+    /// completion. The last case is the safety net for an absorbed completion wake — a wake that
+    /// raced the suspending cycle's slot release is a lost HINT, and a `Suspended` session is
+    /// reachable by no other rail (never `Ready`, so a status-only scan would strand it forever).
+    /// A `Suspended` session with NO recorded completion stays un-scanned (still waiting on its
+    /// job), as does a blank `Idle` one (the §2 incident pin).
     async fn scan_resumable(&self, partition: PartitionId) -> Result<Vec<SessionId>, StoreError>;
 
     /// Pop the next pending durable job, if any (job-outbox dispatcher / worker side).
@@ -2931,7 +2936,12 @@ impl SessionStore for InMemoryStore {
             .values()
             .filter(|r| {
                 r.partition == partition
-                    && matches!(r.status, SessionStatus::Ready | SessionStatus::Active)
+                    && (matches!(r.status, SessionStatus::Ready | SessionStatus::Active)
+                        || (matches!(r.status, SessionStatus::Suspended { .. })
+                            && inner
+                                .unapplied
+                                .get(&r.session_id)
+                                .is_some_and(|c| !c.is_empty())))
             })
             .map(|r| r.session_id.clone())
             .collect())

@@ -338,6 +338,7 @@ impl EngineFactory for CoreEngineFactory {
             fold_only: false,
             ctx: None,
             turn_seal: None,
+            hydrated_key: None,
         })
     }
 }
@@ -384,6 +385,25 @@ pub struct CoreIncarnation {
     /// post-turn journaling and handed to the manager via [`Incarnation::take_turn_seal`] for the
     /// `commit_turn` transaction.
     turn_seal: Option<daemon_store::TurnSeal>,
+    /// The session-meta inputs that drove this incarnation's profile resolution at its last
+    /// hydrate (commit-then-linger §8): a re-hydrate reuses the resident engine ONLY while these
+    /// are unchanged, so a mid-linger rebind / overlay switch / cron stamp rebuilds under the new
+    /// resolution at the very next turn — the same boundary the live actor applies pending
+    /// switches at. `None` until first hydrated.
+    hydrated_key: Option<ProfileKey>,
+}
+
+/// See [`CoreIncarnation::hydrated_key`]: (bound profile, inline spec, overlay, cron stamp).
+type ProfileKey = (Option<ProfileRef>, Vec<u8>, Vec<u8>, Option<JobId>);
+
+/// The [`ProfileKey`] slice of a session's durable meta.
+fn profile_inputs(meta: &daemon_store::SessionMeta) -> ProfileKey {
+    (
+        meta.bound_profile.clone(),
+        meta.inline_profile.clone(),
+        meta.overlay.clone(),
+        meta.scheduled_job.clone(),
+    )
 }
 
 fn map_failure(failure: Failure) -> EngineError {
@@ -402,18 +422,34 @@ fn lifetime_from_payload(payload: &[u8]) -> daemon_store::ChildLifetime {
 }
 
 impl CoreIncarnation {
+    /// This session's durable host meta (the profile binding + overlay + cron stamp), read once
+    /// per hydrate. Defaults (no binding, no overlay) when no journal store is wired — the same
+    /// no-resolution outcome the pre-linger per-call reads produced.
+    async fn load_meta(&self, session: &SessionId) -> daemon_store::SessionMeta {
+        match self.journal.as_ref().map(|cfg| &cfg.store) {
+            Some(store) => store.session_meta(session).await.unwrap_or_default(),
+            None => Default::default(),
+        }
+    }
+
     /// Re-resolve `session`'s effective [`EngineProfile`] from its host-level metadata (the bound
     /// profile plus the persisted overlay) via the injected resolver. Returns `None` when no
-    /// resolver/journal store is wired or no profile binding is recorded, so the caller then falls
-    /// back to the factory's default profile. This is the durable half of the one resolution path
-    /// shared with the live surface, so a durable session honors its own profile and restored
-    /// session override.
-    async fn resolve_session_profile(&self, session: &SessionId) -> Option<EngineProfile> {
+    /// resolver is wired or no profile binding is recorded, so the caller then falls back to the
+    /// factory's default profile. This is the durable half of the one resolution path shared with
+    /// the live surface, so a durable session honors its own profile and restored session override.
+    fn resolve_session_profile(
+        &self,
+        session: &SessionId,
+        meta: &daemon_store::SessionMeta,
+    ) -> Option<EngineProfile> {
         let resolver = self.resolver.as_ref()?;
-        let store = self.journal.as_ref().map(|cfg| &cfg.store)?;
-        let meta = store.session_meta(session).await.unwrap_or_default();
         let overlay = decode_overlay(&meta.overlay);
-        resolver(session, meta.bound_profile, &meta.inline_profile, &overlay)
+        resolver(
+            session,
+            meta.bound_profile.clone(),
+            &meta.inline_profile,
+            &overlay,
+        )
     }
 
     /// Capture this (child) session's `outbox/` into the content store as a structured
@@ -487,69 +523,99 @@ impl Incarnation for CoreIncarnation {
         splices: Vec<daemon_store::InboxSplice>,
         ctx: TurnCtx,
     ) -> Result<(), EngineError> {
-        if snapshot.is_empty() {
-            return Err(EngineError::Other(
-                "core incarnation hydrated from an empty snapshot".into(),
-            ));
-        }
         self.ctx = Some(ctx);
-        let snap = Snapshot::decode(&snapshot)?;
-        let session_id = snap.session_id.clone();
-        // I15: read the cron origin once — it drives both the profile selection here (a cron-fired
-        // session runs under the constrained cron profile) and the `TurnTrigger::Scheduled` arming
-        // below, so we avoid a second `session_meta` round-trip.
-        let scheduled_job = if let Some(store) = self.journal.as_ref().map(|cfg| &cfg.store) {
-            store
-                .session_meta(&session_id)
-                .await
-                .and_then(|m| m.scheduled_job)
-        } else {
-            None
-        };
-        // A background child (§4.3) hydrates under its constrained review profile (skills-only /
-        // memory-only tools + bounded budget + nudges off), not the parent's full profile. A
-        // cron-fired session (I15/G3) hydrates under the constrained cron profile (no `cron`/
-        // `orchestrate` tools) so it cannot self-schedule. Otherwise, when a per-session resolver +
-        // journal store are wired, re-resolve this session's profile from its persisted bound profile
-        // + overlay (unified resolution: a durable session honors its own model/tools/approval
-        // override). Falls back to the factory's fixed profile when no binding is recorded (e.g.
-        // delegated orchestrator children).
-        let profile = if let Some(bg_profile) = self
-            .background
-            .as_ref()
-            .and_then(|bg| bg.profile_for(&snap.session_id))
-        {
-            bg_profile
-        } else if scheduled_job.is_some() {
-            // I15/G3 + Phase 2 shaping: a cron-fired session resolves its bound profile overlaid with
-            // the run's persisted `SessionOverlay` (model/provider/tool-allowlist/workdir) through the
-            // SAME unified resolver the live/durable paths use. That resolver is G3-safe **by
-            // construction** — it builds the session tool registry from fs+shell+node-extras+skills and
-            // never wires the `cron`/`orchestrate` tools — so honoring the overlay cannot let a
-            // scheduled run self-schedule or self-delegate. Falls back to the explicitly-constrained
-            // `cron_profile` (then the factory default) when no resolver/binding is wired.
-            if let Some(resolved) = self.resolve_session_profile(&snap.session_id).await {
-                resolved
-            } else if let Some(cron_profile) = &self.cron_profile {
-                cron_profile.clone()
-            } else {
-                self.profile.clone()
+        // Commit-then-linger fast path (§8): a resident engine from this incarnation's OWN
+        // committed turn is reused — the manager guarantees `snapshot` is byte-identical to the
+        // blob that commit persisted, so decode + profile resolution + rebuild are skipped and
+        // the new work folds straight into the resident conversation. The reuse is gated on the
+        // profile inputs (`hydrated_key`): a mid-linger rebind / overlay switch / cron stamp
+        // rebuilds under the new resolution at this very turn.
+        let resident_engine = self.engine.take();
+        let decoded = match &resident_engine {
+            Some(_) => None,
+            None => {
+                if snapshot.is_empty() {
+                    return Err(EngineError::Other(
+                        "core incarnation hydrated from an empty snapshot".into(),
+                    ));
+                }
+                Some(Snapshot::decode(&snapshot)?)
             }
-        } else if let Some(resolved) = self.resolve_session_profile(&snap.session_id).await {
-            resolved
-        } else if matches!(
-            self.ctx.and_then(|c| c.policy),
-            Some(daemon_store::ExecutionPolicy::InteractiveRoot)
-        ) && self.interactive_profile.is_some()
-        {
-            // Stage-5 cutover parity: an interactive-root wire session with no bound-profile
-            // resolution hydrates under the SAME session profile the live builder used, not the
-            // factory's fixed (orchestrator) fallback.
-            self.interactive_profile.clone().expect("checked above")
-        } else {
-            self.profile.clone()
         };
-        let mut engine = profile.from_snapshot(snap);
+        let session_id = match (&resident_engine, &decoded) {
+            (Some(engine), _) => engine.snapshot().session_id.clone(),
+            (None, Some(snap)) => snap.session_id.clone(),
+            (None, None) => unreachable!("decoded above"),
+        };
+        // I15 + §8: ONE meta read per hydrate — it drives the cron `TurnTrigger::Scheduled`
+        // arming, the profile selection (a cron-fired session runs under the constrained cron
+        // profile), and the resident-reuse key.
+        let meta = self.load_meta(&session_id).await;
+        let key = profile_inputs(&meta);
+        let scheduled_job = meta.scheduled_job.clone();
+        let mut engine = match resident_engine {
+            Some(engine) if self.hydrated_key.as_ref() == Some(&key) => engine,
+            _ => {
+                // Fresh build — or an invalidated resident (changed profile inputs), rebuilt from
+                // the passed snapshot (byte-identical to the resident state, per the manager).
+                let snap = match decoded {
+                    Some(snap) => snap,
+                    None => {
+                        if snapshot.is_empty() {
+                            return Err(EngineError::Other(
+                                "core incarnation hydrated from an empty snapshot".into(),
+                            ));
+                        }
+                        Snapshot::decode(&snapshot)?
+                    }
+                };
+                // A background child (§4.3) hydrates under its constrained review profile (skills-only /
+                // memory-only tools + bounded budget + nudges off), not the parent's full profile. A
+                // cron-fired session (I15/G3) hydrates under the constrained cron profile (no `cron`/
+                // `orchestrate` tools) so it cannot self-schedule. Otherwise, when a per-session resolver +
+                // journal store are wired, re-resolve this session's profile from its persisted bound profile
+                // + overlay (unified resolution: a durable session honors its own model/tools/approval
+                // override). Falls back to the factory's fixed profile when no binding is recorded (e.g.
+                // delegated orchestrator children).
+                let profile = if let Some(bg_profile) = self
+                    .background
+                    .as_ref()
+                    .and_then(|bg| bg.profile_for(&session_id))
+                {
+                    bg_profile
+                } else if scheduled_job.is_some() {
+                    // I15/G3 + Phase 2 shaping: a cron-fired session resolves its bound profile overlaid with
+                    // the run's persisted `SessionOverlay` (model/provider/tool-allowlist/workdir) through the
+                    // SAME unified resolver the live/durable paths use. That resolver is G3-safe **by
+                    // construction** — it builds the session tool registry from fs+shell+node-extras+skills and
+                    // never wires the `cron`/`orchestrate` tools — so honoring the overlay cannot let a
+                    // scheduled run self-schedule or self-delegate. Falls back to the explicitly-constrained
+                    // `cron_profile` (then the factory default) when no resolver/binding is wired.
+                    if let Some(resolved) = self.resolve_session_profile(&session_id, &meta) {
+                        resolved
+                    } else if let Some(cron_profile) = &self.cron_profile {
+                        cron_profile.clone()
+                    } else {
+                        self.profile.clone()
+                    }
+                } else if let Some(resolved) = self.resolve_session_profile(&session_id, &meta) {
+                    resolved
+                } else if matches!(
+                    self.ctx.and_then(|c| c.policy),
+                    Some(daemon_store::ExecutionPolicy::InteractiveRoot)
+                ) && self.interactive_profile.is_some()
+                {
+                    // Stage-5 cutover parity: an interactive-root wire session with no bound-profile
+                    // resolution hydrates under the SAME session profile the live builder used, not the
+                    // factory's fixed (orchestrator) fallback.
+                    self.interactive_profile.clone().expect("checked above")
+                } else {
+                    self.profile.clone()
+                };
+                profile.from_snapshot(snap)
+            }
+        };
+        self.hydrated_key = Some(key);
         // Node-side: materialize any artifacts the completed children returned into this (parent)
         // session's `inbox/` before the engine folds the completions (the engine sees only the
         // summary text; the files land on disk). Best-effort; no-op without content transfer.
@@ -1012,6 +1078,7 @@ mod tests {
             fold_only: false,
             ctx: None,
             turn_seal: None,
+            hydrated_key: None,
         }
     }
 

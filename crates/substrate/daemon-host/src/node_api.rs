@@ -888,12 +888,14 @@ impl NodeApiImpl {
                 // Commit-boundary consistency: the engine publishes `TurnFinished` and frees the
                 // hub slot BEFORE the activation manager persists the checkpoint (`commit_turn`),
                 // so an idle-path read raced against that window would serve the pre-turn
-                // snapshot. `Active` marks exactly that in-flight cycle — wait it out (bounded)
-                // before peeking, mirroring the live actor's read-your-turn snapshot semantics.
+                // snapshot. `Active` marks exactly that in-flight cycle, and `Ready` marks queued
+                // work (e.g. a boundary-drained Observe splice) whose commit is imminent — wait
+                // both out (bounded) before peeking, mirroring the live actor's read-your-turn
+                // snapshot semantics.
                 let settle = std::time::Instant::now() + std::time::Duration::from_secs(10);
                 while matches!(
                     self.store.status(session).await,
-                    Some(SessionStatus::Active)
+                    Some(SessionStatus::Active | SessionStatus::Ready)
                 ) && std::time::Instant::now() < settle
                 {
                     // A turn may have started between `request_snapshot` and here: queue on it.

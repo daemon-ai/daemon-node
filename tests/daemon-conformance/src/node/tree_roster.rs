@@ -512,10 +512,20 @@ async fn tree_pages_beyond_the_wire_bound() {
                 break;
             }
         }
-        assert!(
-            Instant::now() < deadline,
-            "the assigned parents never all completed"
-        );
+        if Instant::now() >= deadline {
+            // Diagnose the stall: dump every non-completed parent's wire state.
+            let mut stuck = Vec::new();
+            if let ApiResponse::Sessions(list) = client.call(ApiRequest::Sessions).await.unwrap() {
+                for p in &parents {
+                    match list.iter().find(|i| i.session == *p) {
+                        Some(i) if i.state == SessionState::Completed => {}
+                        Some(i) => stuck.push(format!("{p}={:?}", i.state)),
+                        None => stuck.push(format!("{p}=<missing>")),
+                    }
+                }
+            }
+            panic!("the assigned parents never all completed; stuck: {stuck:?}");
+        }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 

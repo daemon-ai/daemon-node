@@ -91,6 +91,12 @@ pub trait Incarnation: Send {
     /// activation's fence by `load_for_activation`) — all *before* running new work (lifecycle
     /// §3.1, invariant #2). Splices at or below the snapshot's consumed cursor were captured by an
     /// earlier commit and must be skipped, never re-folded.
+    ///
+    /// Commit-then-linger (§8): the manager may hydrate the SAME instance again after its own
+    /// non-terminal turn commit, guaranteeing `snapshot` is byte-identical to the blob that commit
+    /// persisted (a diverged store discards the instance instead). An implementation may therefore
+    /// keep its engine resident across hydrates and fold the new work in place; rebuilding from
+    /// `snapshot` is always a correct fallback.
     async fn hydrate(
         &mut self,
         snapshot: SnapshotBlob,
@@ -191,6 +197,18 @@ struct ManagerInner {
     generations: std::sync::atomic::AtomicU64,
     /// Tracks live activation tasks so their memory is released on completion (invariant #8).
     tracker: TaskTracker,
+    /// Commit-then-linger residency (session-unification §8): after a non-terminal turn commit
+    /// the incarnation stays hydrated this long awaiting the next wake (no rehydrate cost per
+    /// message); the timeout only passivates the ALREADY-COMMITTED incarnation — no commit is
+    /// ever owed at passivation. `None` disables lingering (every commit passivates immediately).
+    linger: Option<std::time::Duration>,
+    /// The lingering incarnations' wake mailboxes: a wake that finds the slot occupied hands the
+    /// hint to the lingerer here instead of dropping it (the sole in-process wake seam a resident
+    /// incarnation has — durable wakes stay authoritative via the store + recovery scanner).
+    lingers: DashMap<SessionId, Arc<tokio::sync::Notify>>,
+    /// Cancelled at shutdown so lingering incarnations exit immediately instead of holding the
+    /// task tracker open for a full idle timeout.
+    shutdown: tokio_util::sync::CancellationToken,
 }
 
 /// An owned directory reservation (session-unification §6): acquired before the activation lease,
@@ -231,123 +249,240 @@ impl ManagerInner {
     }
 }
 
+/// One turn's outcome inside an activation cycle: the non-terminal `commit_turn` result paired
+/// with the committed snapshot blob (the linger decision reads the status; the blob guards
+/// resident-engine reuse), or `None` for the terminal/suspension/park commits that end the cycle
+/// unconditionally.
+type TurnResult = Result<Option<(daemon_store::TurnCommit, SnapshotBlob)>, SubErr>;
+
 impl ManagerInner {
-    async fn run_cycle(&self, id: &SessionId, fence: FenceToken) -> Result<(), SubErr> {
+    /// Drive one activation cycle (session-unification §8): a loop of fenced
+    /// load→hydrate→run→commit turns on one slot reservation, with a fresh lease per follow-on
+    /// turn so splices are never claimed under a stale fence.
+    ///
+    /// Reporting discipline: the first turn's outcome goes to `first_done` — but ONLY when the
+    /// cycle decides to keep running (resident drain / linger), where releasing the caller early
+    /// is safe because the resident incarnation itself claims any wake absorbed against its held
+    /// slot. On every EXIT path the sender is left untouched and the result is returned, so the
+    /// caller reports it strictly AFTER the slot drops — a wake dispatched right behind this
+    /// cycle's end must find the slot free, or its work would strand `Ready` until a scanner pass.
+    async fn run_cycle(
+        &self,
+        id: &SessionId,
+        first_fence: FenceToken,
+        first_done: &mut Option<tokio::sync::oneshot::Sender<Result<(), SubErr>>>,
+    ) -> Result<(), SubErr> {
         let span = tracing::info_span!(
             "activation.run_cycle",
             trace_id = %current_trace(),
             session = %id,
-            fence = fence.0
+            fence = first_fence.0
         );
         async {
-            let activation = self.store.load_for_activation(id, fence).await?;
-            tracing::debug!(
-                trace_id = %current_trace(),
-                session = %id,
-                unapplied_jobs = activation.unapplied.len(),
-                splices = activation.splices.len(),
-                "activation.hydrate"
-            );
             let mut inc = self.factory.create();
-            let ctx = TurnCtx {
-                policy: activation.policy,
-                turn_seq: activation.turn_seq,
-                fence,
-            };
-            // The completion keys this load delivered: the incarnation folds them at hydrate, so
-            // a non-terminal turn commit deletes exactly these rows (`applied_completions`) —
-            // otherwise the folded completions would count as pending work forever and
-            // `commit_turn`'s Idle-iff-no-work rule would livelock the session on Ready+self-wake.
-            let applied_completions: Vec<_> = activation
-                .unapplied
-                .iter()
-                .map(|c| (c.epoch, c.job_id.clone()))
-                .collect();
-            inc.hydrate(
-                activation.snapshot,
-                activation.unapplied,
-                activation.splices,
-                ctx,
-            )
-            .await?;
-            match inc.run().await? {
-                Step::Suspended { job } => {
-                    let snapshot = inc.checkpoint()?;
-                    let checkpoint = Checkpoint::new(id.clone(), inc.epoch(), snapshot)
-                        .with_consumed_splices(inc.consumed_splices());
-                    tracing::info!(
-                        trace_id = %current_trace(),
-                        session = %id,
-                        epoch = inc.epoch().0,
-                        step = "Suspended",
-                        job_id = %job.job_id,
-                        "activation.commit"
-                    );
-                    self.store
-                        .checkpoint_and_enqueue(checkpoint, job, fence)
-                        .await?;
+            let mut fence = first_fence;
+            // The blob the incarnation's last commit persisted: an incarnation may keep its engine
+            // resident across iterations ONLY while the stored snapshot is byte-identical to it —
+            // any divergence (e.g. a rewind CAS landed while lingering) discards the resident
+            // incarnation, because the store is the authority.
+            let mut last_committed: Option<SnapshotBlob> = None;
+            loop {
+                // Terminal/suspension/park commits (`None`) and errors passivate unconditionally.
+                let Some((commit, snapshot)) = self
+                    .run_turn(id, fence, &mut inc, last_committed.take())
+                    .await?
+                else {
+                    return Ok(());
+                };
+                let Some(linger) = self.linger else {
+                    return Ok(());
+                };
+                match commit.status {
+                    // Work already queued (the commit enqueued its own self-wake, which a later
+                    // dispatch absorbs benignly): release the caller and drain it on the resident
+                    // engine now.
+                    SessionStatus::Ready => {
+                        if let Some(tx) = first_done.take() {
+                            let _ = tx.send(Ok(()));
+                        }
+                    }
+                    // Nothing queued: release the caller and linger hydrated awaiting the next
+                    // wake. Timeout / shutdown passivates the already-committed incarnation — no
+                    // commit is owed.
+                    SessionStatus::Idle => {
+                        if let Some(tx) = first_done.take() {
+                            let _ = tx.send(Ok(()));
+                        }
+                        if !self.linger_wait(id, linger).await {
+                            return Ok(());
+                        }
+                        // Only claimable work re-enters the loop; a spurious notify with nothing
+                        // queued would otherwise open a BLANK turn (the incident shape stage 1
+                        // buried).
+                        if !matches!(self.store.status(id).await, Some(SessionStatus::Ready)) {
+                            return Ok(());
+                        }
+                    }
+                    _ => return Ok(()),
                 }
-                Step::ParkApproval { approvals } => {
-                    // §12 HITL park: checkpoint the suspended snapshot + record the parked approval rows
-                    // in one transaction, but enqueue *no* runnable job — the session stays dormant until
-                    // an operator `answer_approval` wakes it (recovery re-park dedupes on the unique row).
-                    let snapshot = inc.checkpoint()?;
-                    let checkpoint = Checkpoint::new(id.clone(), inc.epoch(), snapshot)
-                        .with_consumed_splices(inc.consumed_splices());
-                    tracing::info!(
-                        trace_id = %current_trace(),
-                        session = %id,
-                        epoch = inc.epoch().0,
-                        step = "ParkApproval",
-                        approvals = approvals.len(),
-                        "activation.commit"
-                    );
-                    self.store
-                        .park_approval(checkpoint, approvals, fence)
-                        .await?;
-                }
-                Step::TurnCommitted => {
-                    // The non-terminal turn boundary (session-unification §5): commit the
-                    // snapshot + turn_seq + consumed splices + the turn's journal seal + the
-                    // Idle/Ready selection in ONE fenced transaction. The incarnation then
-                    // passivates; a raced-in splice re-wakes via the commit's own self-wake.
-                    let snapshot = inc.checkpoint()?;
-                    let checkpoint = Checkpoint::new(id.clone(), inc.epoch(), snapshot)
-                        .with_consumed_splices(inc.consumed_splices())
-                        .with_applied_completions(applied_completions);
-                    let seal = inc.take_turn_seal();
-                    let commit = self.store.commit_turn(checkpoint, seal, fence).await?;
-                    tracing::info!(
-                        trace_id = %current_trace(),
-                        session = %id,
-                        epoch = inc.epoch().0,
-                        step = "TurnCommitted",
-                        turn_seq = commit.turn_seq,
-                        status = ?commit.status,
-                        "activation.commit"
-                    );
-                }
-                Step::Completed => {
-                    let snapshot = inc.checkpoint()?;
-                    // A delegated child carries its structured result (DelegationResult: summary +
-                    // artifact refs) on the completion payload; the incarnation captured it at terminal.
-                    let checkpoint = Checkpoint::new(id.clone(), inc.epoch(), snapshot)
-                        .with_completion_payload(inc.completion_payload())
-                        .with_consumed_splices(inc.consumed_splices());
-                    tracing::info!(
-                        trace_id = %current_trace(),
-                        session = %id,
-                        epoch = inc.epoch().0,
-                        step = "Completed",
-                        "activation.commit"
-                    );
-                    self.store.mark_completed(checkpoint, fence).await?;
-                }
+                last_committed = Some(snapshot);
+                // A fresh lease per follow-on turn: the next load claims splices under the LATEST
+                // fence — exactly what a fresh wake would hold — so a lingering incarnation can
+                // never claim work under a superseded fence.
+                fence = self.store.acquire_activation_lease(id).await?;
             }
-            Ok(())
         }
         .instrument(span)
         .await
+    }
+
+    /// One fenced load→hydrate→run→commit turn. Returns the non-terminal turn commit (the caller
+    /// decides whether to linger on its status), `None` after a terminal/suspension/park commit.
+    async fn run_turn(
+        &self,
+        id: &SessionId,
+        fence: FenceToken,
+        inc: &mut Box<dyn Incarnation>,
+        last_committed: Option<SnapshotBlob>,
+    ) -> TurnResult {
+        let activation = self.store.load_for_activation(id, fence).await?;
+        // §8 resident-reuse guard: the incarnation may only keep its engine when the stored
+        // snapshot is exactly the blob its own commit persisted.
+        if let Some(committed) = last_committed {
+            if committed != activation.snapshot {
+                *inc = self.factory.create();
+            }
+        }
+        tracing::debug!(
+            trace_id = %current_trace(),
+            session = %id,
+            unapplied_jobs = activation.unapplied.len(),
+            splices = activation.splices.len(),
+            "activation.hydrate"
+        );
+        let ctx = TurnCtx {
+            policy: activation.policy,
+            turn_seq: activation.turn_seq,
+            fence,
+        };
+        // The completion keys this load delivered: the incarnation folds them at hydrate, so
+        // a non-terminal turn commit deletes exactly these rows (`applied_completions`) —
+        // otherwise the folded completions would count as pending work forever and
+        // `commit_turn`'s Idle-iff-no-work rule would livelock the session on Ready+self-wake.
+        let applied_completions: Vec<_> = activation
+            .unapplied
+            .iter()
+            .map(|c| (c.epoch, c.job_id.clone()))
+            .collect();
+        inc.hydrate(
+            activation.snapshot,
+            activation.unapplied,
+            activation.splices,
+            ctx,
+        )
+        .await?;
+        match inc.run().await? {
+            Step::Suspended { job } => {
+                let snapshot = inc.checkpoint()?;
+                let checkpoint = Checkpoint::new(id.clone(), inc.epoch(), snapshot)
+                    .with_consumed_splices(inc.consumed_splices());
+                tracing::info!(
+                    trace_id = %current_trace(),
+                    session = %id,
+                    epoch = inc.epoch().0,
+                    step = "Suspended",
+                    job_id = %job.job_id,
+                    "activation.commit"
+                );
+                self.store
+                    .checkpoint_and_enqueue(checkpoint, job, fence)
+                    .await?;
+                Ok(None)
+            }
+            Step::ParkApproval { approvals } => {
+                // §12 HITL park: checkpoint the suspended snapshot + record the parked approval rows
+                // in one transaction, but enqueue *no* runnable job — the session stays dormant until
+                // an operator `answer_approval` wakes it (recovery re-park dedupes on the unique row).
+                let snapshot = inc.checkpoint()?;
+                let checkpoint = Checkpoint::new(id.clone(), inc.epoch(), snapshot)
+                    .with_consumed_splices(inc.consumed_splices());
+                tracing::info!(
+                    trace_id = %current_trace(),
+                    session = %id,
+                    epoch = inc.epoch().0,
+                    step = "ParkApproval",
+                    approvals = approvals.len(),
+                    "activation.commit"
+                );
+                self.store
+                    .park_approval(checkpoint, approvals, fence)
+                    .await?;
+                Ok(None)
+            }
+            Step::TurnCommitted => {
+                // The non-terminal turn boundary (session-unification §5): commit the
+                // snapshot + turn_seq + consumed splices + the turn's journal seal + the
+                // Idle/Ready selection in ONE fenced transaction — IMMEDIATELY, before any
+                // lingering (commit first, then linger: crash-of-resident loses nothing).
+                let snapshot = inc.checkpoint()?;
+                let committed = snapshot.clone();
+                let checkpoint = Checkpoint::new(id.clone(), inc.epoch(), snapshot)
+                    .with_consumed_splices(inc.consumed_splices())
+                    .with_applied_completions(applied_completions);
+                let seal = inc.take_turn_seal();
+                let commit = self.store.commit_turn(checkpoint, seal, fence).await?;
+                tracing::info!(
+                    trace_id = %current_trace(),
+                    session = %id,
+                    epoch = inc.epoch().0,
+                    step = "TurnCommitted",
+                    turn_seq = commit.turn_seq,
+                    status = ?commit.status,
+                    "activation.commit"
+                );
+                Ok(Some((commit, committed)))
+            }
+            Step::Completed => {
+                let snapshot = inc.checkpoint()?;
+                // A delegated child carries its structured result (DelegationResult: summary +
+                // artifact refs) on the completion payload; the incarnation captured it at terminal.
+                let checkpoint = Checkpoint::new(id.clone(), inc.epoch(), snapshot)
+                    .with_completion_payload(inc.completion_payload())
+                    .with_consumed_splices(inc.consumed_splices());
+                tracing::info!(
+                    trace_id = %current_trace(),
+                    session = %id,
+                    epoch = inc.epoch().0,
+                    step = "Completed",
+                    "activation.commit"
+                );
+                self.store.mark_completed(checkpoint, fence).await?;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Park this cycle between turns (commit-then-linger §8): register the session's wake mailbox,
+    /// then wait for a handed-off wake, the idle `timeout`, or shutdown. Returns `true` when a wake
+    /// arrived (the caller re-checks the store before running — the store stays authoritative).
+    /// A wake absorbed in the unregister→slot-release window is recovered by the scanner, the same
+    /// safety net every absorbed wake already rides.
+    async fn linger_wait(&self, id: &SessionId, timeout: std::time::Duration) -> bool {
+        let notify = Arc::new(tokio::sync::Notify::new());
+        self.lingers.insert(id.clone(), notify.clone());
+        // A splice that landed between the commit and this registration already flipped `Ready`
+        // (its wake found the slot occupied with no mailbox yet): don't wait on it.
+        let woke = if matches!(self.store.status(id).await, Some(SessionStatus::Ready)) {
+            true
+        } else {
+            tokio::select! {
+                _ = notify.notified() => true,
+                _ = tokio::time::sleep(timeout) => false,
+                _ = self.shutdown.cancelled() => false,
+            }
+        };
+        self.lingers.remove(id);
+        woke
     }
 }
 
@@ -360,10 +495,24 @@ pub struct ActivationManager {
 
 impl ActivationManager {
     /// Construct a manager over a shared store and engine factory, owning `partition`.
+    /// Lingering is disabled: every commit passivates immediately (the pre-§8 behavior).
     pub fn new(
         store: Arc<dyn SessionStore>,
         factory: Arc<dyn EngineFactory>,
         partition: PartitionId,
+    ) -> Self {
+        Self::with_linger(store, factory, partition, None)
+    }
+
+    /// As [`Self::new`], with commit-then-linger residency (session-unification §8): after a
+    /// non-terminal turn commit the incarnation stays hydrated for up to `linger` awaiting the
+    /// next wake (no rehydrate cost per message); the timeout only passivates the
+    /// already-committed incarnation. `None` disables lingering.
+    pub fn with_linger(
+        store: Arc<dyn SessionStore>,
+        factory: Arc<dyn EngineFactory>,
+        partition: PartitionId,
+        linger: Option<std::time::Duration>,
     ) -> Self {
         Self {
             inner: Arc::new(ManagerInner {
@@ -373,6 +522,9 @@ impl ActivationManager {
                 directory: DashMap::new(),
                 generations: std::sync::atomic::AtomicU64::new(0),
                 tracker: TaskTracker::new(),
+                linger,
+                lingers: DashMap::new(),
+                shutdown: tokio_util::sync::CancellationToken::new(),
             }),
         }
     }
@@ -397,8 +549,12 @@ impl ActivationManager {
             _ => {}
         }
         // A live incarnation already holds the slot: wake's contract ("ensure it is progressing")
-        // is satisfied without touching the lease.
+        // is satisfied without touching the lease. If that incarnation is LINGERING between turns
+        // (§8), hand it the hint so it drains the new work on its resident engine.
         let Some(slot) = self.inner.try_reserve(&id) else {
+            if let Some(mailbox) = self.inner.lingers.get(&id) {
+                mailbox.notify_one();
+            }
             return Ok(());
         };
         let fence = self.inner.store.acquire_activation_lease(&id).await?;
@@ -473,8 +629,10 @@ impl ActivationManager {
         Ok(())
     }
 
-    /// Gracefully close the task tracker and wait for in-flight activations to drain.
+    /// Gracefully close the task tracker and wait for in-flight activations to drain. Lingering
+    /// incarnations are released immediately (they owe no commit — §8 commits before lingering).
     pub async fn shutdown(&self) {
+        self.inner.shutdown.cancel();
         self.inner.tracker.close();
         self.inner.tracker.wait().await;
     }
@@ -484,6 +642,10 @@ impl ActivationManager {
     /// Run one activation cycle under an already-held slot reservation: spawn the tracked task
     /// with the guard moved into it, so the slot is released on every exit path — completion,
     /// error, cancellation, or panic (the guard's `Drop`; invariant #8).
+    ///
+    /// The caller awaits only the FIRST turn's outcome (reported through a oneshot), not the
+    /// task's completion: a lingering cycle (§8) may hold its slot long after the first commit,
+    /// and awaiting it would stall the wake dispatcher for the whole linger window.
     async fn run_reserved(
         &self,
         id: SessionId,
@@ -498,16 +660,48 @@ impl ActivationManager {
             "activation.wake"
         );
         let inner = self.inner.clone();
-        let handle = self.inner.tracker.spawn(with_trace(trace, async move {
-            let result = inner.run_cycle(&slot.id, fence).await;
+        let (first_done, first_result) = tokio::sync::oneshot::channel();
+        self.inner.tracker.spawn(with_trace(trace, async move {
+            let mut first_done = Some(first_done);
+            let result = inner.run_cycle(&slot.id, fence, &mut first_done).await;
             // Passivate: the guard drops here, releasing the directory entry so memory returns to
             // baseline (invariant #8). Generation-checked, so a racing newer reservation survives.
+            // The caller is released strictly AFTER the drop (unless a linger continuation
+            // already released it), so a wake dispatched behind this result finds the slot free.
             drop(slot);
-            result
+            match first_done.take() {
+                Some(tx) => {
+                    let _ = tx.send(result);
+                }
+                // The cycle already released its caller (it continued past its first commit):
+                // report follow-on failures to the log instead. A fence loss is benign — a newer
+                // lease owns the session; the durable state is already committed either way and
+                // the scanner re-drives `Ready`.
+                None => match result {
+                    Ok(()) => {}
+                    Err(SubErr::Store(StoreError::Fenced { .. })) => {
+                        tracing::debug!(
+                            trace_id = %current_trace(),
+                            "linger turn fenced; a newer activation owns the session"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            trace_id = %current_trace(),
+                            error = %e,
+                            "linger turn failed; passivating"
+                        );
+                    }
+                },
+            }
         }));
-        match handle.await {
+        match first_result.await {
             Ok(result) => result,
-            Err(join_err) => Err(SubErr::Join(join_err.to_string())),
+            // The sender dropped without reporting: the cycle task panicked before its first
+            // commit (a completed first turn always sends after releasing the slot).
+            Err(_) => Err(SubErr::Join(format!(
+                "activation cycle for {id} aborted before its first turn commit"
+            ))),
         }
     }
 }

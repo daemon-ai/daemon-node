@@ -1340,6 +1340,230 @@ async fn concurrent_wake_does_not_self_fence() {
     assert_completed(&*store, &id).await;
 }
 
+/// Session-unification §8 regression: commit-then-linger runs consecutive turns on ONE resident
+/// incarnation. After a non-terminal `commit_turn` the incarnation holds its slot awaiting the
+/// next wake — the second turn hydrates the SAME instance (no factory re-create), each turn was
+/// committed at its boundary (the store showed `Idle` before the second input existed), and the
+/// first wake's caller was released at the first commit rather than being held for the linger
+/// window. Shutdown passivates the lingering incarnation promptly (cancellation, not timeout).
+#[tokio::test]
+async fn commit_then_linger_runs_consecutive_turns_on_one_incarnation() {
+    use daemon_activation::{EngineError, EngineFactory, Incarnation, Step};
+    use daemon_common::Epoch;
+    use daemon_store::{NewSplice, SpliceKind};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    /// A minimal turn-committing engine: every hydrate+run consumes the delivered splices and
+    /// commits a turn, counting hydrates so residency is observable.
+    struct LingerEngine {
+        hydrates: Arc<AtomicUsize>,
+        consumed: Option<u64>,
+        snapshot: Option<daemon_activation::SnapshotBlob>,
+    }
+    #[async_trait::async_trait]
+    impl Incarnation for LingerEngine {
+        async fn hydrate(
+            &mut self,
+            snapshot: daemon_activation::SnapshotBlob,
+            _unapplied: Vec<JobCompletion>,
+            splices: Vec<daemon_store::InboxSplice>,
+            _ctx: daemon_activation::TurnCtx,
+        ) -> Result<(), EngineError> {
+            self.hydrates.fetch_add(1, Ordering::SeqCst);
+            self.snapshot = Some(snapshot);
+            self.consumed = splices.last().map(|s| s.splice_seq).or(self.consumed);
+            Ok(())
+        }
+        async fn run(&mut self) -> Result<Step, EngineError> {
+            Ok(Step::TurnCommitted)
+        }
+        fn checkpoint(&self) -> Result<daemon_activation::SnapshotBlob, EngineError> {
+            Ok(self.snapshot.clone().expect("hydrated"))
+        }
+        fn epoch(&self) -> Epoch {
+            Epoch::ZERO
+        }
+        fn consumed_splices(&self) -> Option<u64> {
+            self.consumed
+        }
+    }
+    struct LingerFactory {
+        created: Arc<AtomicUsize>,
+        hydrates: Arc<AtomicUsize>,
+    }
+    impl EngineFactory for LingerFactory {
+        fn create(&self) -> Box<dyn Incarnation> {
+            self.created.fetch_add(1, Ordering::SeqCst);
+            Box::new(LingerEngine {
+                hydrates: self.hydrates.clone(),
+                consumed: None,
+                snapshot: None,
+            })
+        }
+    }
+
+    fn start_turn(session: &SessionId, op: &str) -> NewSplice {
+        NewSplice {
+            session_id: session.clone(),
+            kind: SpliceKind::StartTurn,
+            payload: b"input".to_vec(),
+            origin_op: op.into(),
+            origin: "conformance".into(),
+        }
+    }
+    /// Poll until the session settles `Idle` (its turn committed) within the bound.
+    async fn settle_idle(store: &InMemoryStore, id: &SessionId) {
+        for _ in 0..200 {
+            if store.status(id).await == Some(SessionStatus::Idle) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("session {id} never settled Idle");
+    }
+
+    let store = Arc::new(InMemoryStore::new());
+    let created = Arc::new(AtomicUsize::new(0));
+    let hydrates = Arc::new(AtomicUsize::new(0));
+    let mgr = ActivationManager::with_linger(
+        store.clone(),
+        Arc::new(LingerFactory {
+            created: created.clone(),
+            hydrates: hydrates.clone(),
+        }),
+        PARTITION,
+        Some(Duration::from_secs(30)),
+    );
+    let id = SessionId::new("linger-two-turns");
+    let blob = Snapshot::fresh(id.clone()).encode().expect("encode");
+    store
+        .create_idle(id.clone(), PARTITION, blob)
+        .await
+        .expect("create idle");
+
+    // Turn one: the wake returns at the first commit (not after the linger window)...
+    store
+        .append_splice(start_turn(&id, "turn-1"))
+        .await
+        .expect("append turn one");
+    mgr.wake(id.clone()).await.expect("wake turn one");
+    settle_idle(&store, &id).await;
+    // ...and the committed incarnation lingers, holding its slot.
+    assert_eq!(mgr.active_count(), 1, "the incarnation lingers post-commit");
+    assert_eq!(created.load(Ordering::SeqCst), 1);
+    assert_eq!(hydrates.load(Ordering::SeqCst), 1);
+
+    // Turn two rides the SAME residency: the wake hands the hint to the lingering incarnation.
+    store
+        .append_splice(start_turn(&id, "turn-2"))
+        .await
+        .expect("append turn two");
+    mgr.wake(id.clone()).await.expect("wake turn two");
+    settle_idle(&store, &id).await;
+    assert_eq!(
+        created.load(Ordering::SeqCst),
+        1,
+        "turn two must reuse the resident incarnation, not re-create"
+    );
+    assert_eq!(
+        hydrates.load(Ordering::SeqCst),
+        2,
+        "turn two hydrates the same instance"
+    );
+    assert_eq!(mgr.active_count(), 1, "still resident after turn two");
+
+    // Shutdown cancels the linger promptly; the slot is released (invariant #8).
+    mgr.shutdown().await;
+    assert_eq!(mgr.active_count(), 0, "shutdown passivates the lingerer");
+}
+
+/// Session-unification §8: the idle timeout passivates the ALREADY-COMMITTED lingering
+/// incarnation — the slot returns to baseline without any further input, and the next turn
+/// re-activates through the normal wake path (a fresh incarnation).
+#[tokio::test]
+async fn linger_timeout_passivates_committed_incarnation() {
+    use daemon_activation::{EngineError, EngineFactory, Incarnation, Step};
+    use daemon_common::Epoch;
+    use daemon_store::{NewSplice, SpliceKind};
+    use std::time::Duration;
+
+    struct OneTurnEngine {
+        consumed: Option<u64>,
+        snapshot: Option<daemon_activation::SnapshotBlob>,
+    }
+    #[async_trait::async_trait]
+    impl Incarnation for OneTurnEngine {
+        async fn hydrate(
+            &mut self,
+            snapshot: daemon_activation::SnapshotBlob,
+            _unapplied: Vec<JobCompletion>,
+            splices: Vec<daemon_store::InboxSplice>,
+            _ctx: daemon_activation::TurnCtx,
+        ) -> Result<(), EngineError> {
+            self.snapshot = Some(snapshot);
+            self.consumed = splices.last().map(|s| s.splice_seq);
+            Ok(())
+        }
+        async fn run(&mut self) -> Result<Step, EngineError> {
+            Ok(Step::TurnCommitted)
+        }
+        fn checkpoint(&self) -> Result<daemon_activation::SnapshotBlob, EngineError> {
+            Ok(self.snapshot.clone().expect("hydrated"))
+        }
+        fn epoch(&self) -> Epoch {
+            Epoch::ZERO
+        }
+        fn consumed_splices(&self) -> Option<u64> {
+            self.consumed
+        }
+    }
+    struct OneTurnFactory;
+    impl EngineFactory for OneTurnFactory {
+        fn create(&self) -> Box<dyn Incarnation> {
+            Box::new(OneTurnEngine {
+                consumed: None,
+                snapshot: None,
+            })
+        }
+    }
+
+    let store = Arc::new(InMemoryStore::new());
+    let mgr = ActivationManager::with_linger(
+        store.clone(),
+        Arc::new(OneTurnFactory),
+        PARTITION,
+        Some(Duration::from_millis(50)),
+    );
+    let id = SessionId::new("linger-timeout");
+    let blob = Snapshot::fresh(id.clone()).encode().expect("encode");
+    store
+        .create_idle(id.clone(), PARTITION, blob)
+        .await
+        .expect("create idle");
+    store
+        .append_splice(NewSplice {
+            session_id: id.clone(),
+            kind: SpliceKind::StartTurn,
+            payload: b"input".to_vec(),
+            origin_op: "turn-1".into(),
+            origin: "conformance".into(),
+        })
+        .await
+        .expect("append");
+    mgr.wake(id.clone()).await.expect("wake");
+    assert_eq!(store.status(&id).await, Some(SessionStatus::Idle));
+
+    // The already-committed incarnation passivates on the idle timeout — no input required.
+    for _ in 0..200 {
+        if mgr.active_count() == 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the lingering incarnation never passivated on the idle timeout");
+}
+
 /// N1: the durable feedback outbox + node-owned telemetry consent behave identically on both
 /// backends — enqueue -> pending (oldest first) -> mark_delivered removes from pending, enqueue is
 /// idempotent by id, and consent defaults OFF then round-trips through get/set.

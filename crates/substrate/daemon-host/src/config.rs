@@ -31,6 +31,11 @@ pub struct HostConfig {
     /// ACP agents are NOT isolated by this knob: the ACP transport owns process creation without
     /// an env-scrubbing hook (a documented deferral).
     pub agent_state_root: Option<PathBuf>,
+    /// Commit-then-linger residency (session-unification §8): how long a durable incarnation
+    /// stays hydrated after a non-terminal turn commit awaiting the next wake (no rehydrate cost
+    /// per message). The timeout only passivates the ALREADY-COMMITTED incarnation — no commit is
+    /// owed at passivation. `None` disables lingering (every commit passivates immediately).
+    pub linger: Option<Duration>,
 }
 
 impl Default for HostConfig {
@@ -43,6 +48,7 @@ impl Default for HostConfig {
             backoff: Backoff::default(),
             meltdown: MeltdownPolicy::default(),
             agent_state_root: None,
+            linger: Some(Duration::from_secs(30)),
         }
     }
 }
