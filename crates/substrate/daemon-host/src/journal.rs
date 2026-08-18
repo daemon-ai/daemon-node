@@ -81,6 +81,13 @@ pub struct JournalSink {
     prior: Mutex<MerkleRoot>,
     /// Monotonic per-segment sequence number, reset on each seal.
     seq: AtomicU64,
+    /// Deferred-seal mode (session-unification §5): [`seal`](Self::seal) computes and signs the
+    /// root but does NOT commit it — the pending [`TurnSeal`] is taken by the incarnation and
+    /// written inside the `commit_turn` transaction, so the root lands atomically with the
+    /// snapshot it covers.
+    defer_seal: bool,
+    /// The computed-but-uncommitted seal, when `defer_seal` fired.
+    pending_seal: Mutex<Option<daemon_store::TurnSeal>>,
 }
 
 impl JournalSink {
@@ -111,6 +118,8 @@ impl JournalSink {
             segment: AtomicU64::new(start_segment),
             prior: Mutex::new(prior),
             seq: AtomicU64::new(0),
+            defer_seal: false,
+            pending_seal: Mutex::new(None),
         }
     }
 
@@ -133,6 +142,48 @@ impl JournalSink {
                 .unwrap_or(GENESIS_ROOT)
         };
         Self::with_segment(store, signer, stream, Some(fence), epoch, prior)
+    }
+
+    /// Open a journal for one durable TURN (session-unification §5): segment = the session's
+    /// in-flight `turn_seq`, chained onto the prior turn's sealed root, fenced by the activation
+    /// lease on EVERY append. A resumed suspension re-opens the same (still-open) segment, so the
+    /// per-segment `seq` continues past the entries already appended — never colliding with (and
+    /// silently dropping under) the idempotent `(stream, segment, seq)` key. `defer_seal` puts
+    /// [`seal`](Self::seal) in deferred mode: the signed root is stashed as a [`TurnSeal`] for the
+    /// `commit_turn` transaction instead of being committed directly.
+    pub async fn for_turn(
+        store: Arc<dyn SessionStore>,
+        signer: Arc<TraceSigner>,
+        stream: JournalStreamId,
+        fence: FenceToken,
+        turn_seq: u64,
+        defer_seal: bool,
+    ) -> Self {
+        let prior = if turn_seq == 0 {
+            GENESIS_ROOT
+        } else {
+            store
+                .load_trace_segment(&stream, turn_seq - 1)
+                .await
+                .and_then(|seg| seg.committed.map(|c| c.root))
+                .unwrap_or(GENESIS_ROOT)
+        };
+        let next_seq = store
+            .load_trace_segment(&stream, turn_seq)
+            .await
+            .and_then(|seg| seg.entries.iter().map(|e| e.seq).max())
+            .map(|max| max + 1)
+            .unwrap_or(0);
+        let mut sink = Self::with_segment(store, signer, stream, Some(fence), turn_seq, prior);
+        sink.seq = AtomicU64::new(next_seq);
+        sink.defer_seal = defer_seal;
+        sink
+    }
+
+    /// Take the deferred [`TurnSeal`] computed by a deferred-mode [`seal`](Self::seal), if any —
+    /// the incarnation hands it to the manager for the `commit_turn` transaction.
+    pub fn take_pending_seal(&self) -> Option<daemon_store::TurnSeal> {
+        self.pending_seal.lock().unwrap().take()
     }
 
     /// The current open segment.
@@ -178,6 +229,7 @@ impl JournalSink {
                     bytes,
                     content_hash,
                 },
+                self.fence,
             )
             .await
     }
@@ -239,6 +291,7 @@ impl JournalSink {
                     bytes,
                     content_hash,
                 },
+                self.fence,
             )
             .await
     }
@@ -304,6 +357,28 @@ impl JournalSink {
         };
         let root = segment_root(&input).expect("recompute segment root from durable entries");
         let signature = self.signer.sign_root(&root);
+        if self.defer_seal {
+            // Deferred mode (session-unification §5): the signed root rides the `commit_turn`
+            // transaction instead of a separate commit, so the seal lands atomically with the
+            // snapshot it covers. The segment does NOT advance — this turn owns exactly one
+            // segment, and a repeated seal within the activation (e.g. the coalescer seals on
+            // both the error record and the turn boundary) simply recomputes the root over
+            // everything appended so far; the LAST recompute wins with the same segment id.
+            *self.pending_seal.lock().unwrap() = Some(daemon_store::TurnSeal {
+                segment,
+                root,
+                signature,
+            });
+            tracing::info!(
+                trace_id = %current_trace(),
+                stream = %self.stream,
+                segment,
+                entry_count = entries.len(),
+                deferred = true,
+                "journal.seal"
+            );
+            return Ok(root);
+        }
         self.store
             .commit_trace_segment(&self.stream, segment, root, signature, self.fence)
             .await?;
@@ -312,6 +387,7 @@ impl JournalSink {
             stream = %self.stream,
             segment,
             entry_count = entries.len(),
+            deferred = false,
             "journal.seal"
         );
         // Advance the chain: next turn is the next segment, chained onto this root.

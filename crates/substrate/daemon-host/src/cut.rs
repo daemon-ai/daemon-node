@@ -33,7 +33,7 @@ use daemon_core::{CredentialBuilder, CredentialProvider, EmbeddedCredentialPool}
 use daemon_provision::{ChildGuard, CutChannel, CutReader, CutWriter, Placement};
 use daemon_store::{
     Activation, Checkpoint, JobCommand, JobCompletion, JournalPage, SessionStatus, SessionStore,
-    StoreError, StoreErrorWire, StoreStats, TraceEntry, TraceSegment,
+    StoreError, StoreErrorWire, StoreStats, TraceEntry, TraceSegment, TurnCommit, TurnSeal,
 };
 use daemon_supervision::{
     Ack, EndReason, EventStream, FailureClass, FailureView, ManageCommand, ManageEvent,
@@ -190,6 +190,16 @@ pub enum StoreCall {
         /// The committing fence.
         fence: FenceToken,
     },
+    /// [`SessionStore::commit_turn`] — the non-terminal durable turn boundary
+    /// (session-unification §5).
+    CommitTurn {
+        /// The turn's checkpoint (snapshot + consumed-splice cursor).
+        checkpoint: Checkpoint,
+        /// The turn's journal segment seal, when the session journals.
+        seal: Option<TurnSeal>,
+        /// The committing fence.
+        fence: FenceToken,
+    },
     /// [`SessionStore::record_completion_and_wake`].
     RecordCompletionAndWake {
         /// The completion to record.
@@ -220,6 +230,11 @@ pub enum StoreCall {
         segment: u64,
         /// The opaque entry.
         entry: TraceEntry,
+        /// The appending fence (`Some` on the durable path — session-unification §5: the fence
+        /// rides every append; `None` for non-durable streams). `#[serde(default)]` keeps the
+        /// frame decodable across the cut during a rolling upgrade.
+        #[serde(default)]
+        fence: Option<FenceToken>,
     },
     /// [`SessionStore::commit_trace_segment`] — seal a segment with its signed root.
     CommitTraceSegment {
@@ -285,6 +300,8 @@ pub enum StoreReplyBody {
     MaybeSegment(Option<TraceSegment>),
     /// A `load_journal` reply.
     Journal(JournalPage),
+    /// A `commit_turn` reply.
+    TurnCommit(Result<TurnCommit, StoreErrorWire>),
 }
 
 /// The on-wire envelope: every cut frame rides with the sender's task-local [`TraceId`] so the
@@ -340,6 +357,7 @@ fn store_call_kind(call: &StoreCall) -> &'static str {
         StoreCall::LoadForActivation { .. } => "LoadForActivation",
         StoreCall::CheckpointAndEnqueue { .. } => "CheckpointAndEnqueue",
         StoreCall::MarkCompleted { .. } => "MarkCompleted",
+        StoreCall::CommitTurn { .. } => "CommitTurn",
         StoreCall::RecordCompletionAndWake { .. } => "RecordCompletionAndWake",
         StoreCall::ScanResumable { .. } => "ScanResumable",
         StoreCall::DequeueJob => "DequeueJob",
@@ -403,6 +421,16 @@ async fn serve_store_call(store: &dyn SessionStore, call: StoreCall) -> StoreRep
                 .await
                 .map_err(|e| StoreErrorWire::from(&e)),
         ),
+        StoreCall::CommitTurn {
+            checkpoint,
+            seal,
+            fence,
+        } => StoreReplyBody::TurnCommit(
+            store
+                .commit_turn(checkpoint, seal, fence)
+                .await
+                .map_err(|e| StoreErrorWire::from(&e)),
+        ),
         StoreCall::RecordCompletionAndWake { completion } => StoreReplyBody::Unit(
             store
                 .record_completion_and_wake(&completion)
@@ -423,9 +451,10 @@ async fn serve_store_call(store: &dyn SessionStore, call: StoreCall) -> StoreRep
             stream,
             segment,
             entry,
+            fence,
         } => StoreReplyBody::Unit(
             store
-                .append_trace(&stream, segment, entry)
+                .append_trace(&stream, segment, entry, fence)
                 .await
                 .map_err(|e| StoreErrorWire::from(&e)),
         ),
@@ -594,6 +623,25 @@ impl SessionStore for RemoteStoreClient {
         }
     }
 
+    async fn commit_turn(
+        &self,
+        checkpoint: Checkpoint,
+        seal: Option<TurnSeal>,
+        fence: FenceToken,
+    ) -> Result<TurnCommit, StoreError> {
+        match self
+            .call(StoreCall::CommitTurn {
+                checkpoint,
+                seal,
+                fence,
+            })
+            .await
+        {
+            StoreReplyBody::TurnCommit(r) => r.map_err(StoreErrorWire::into_store_error),
+            _ => unexpected_reply(),
+        }
+    }
+
     async fn record_completion_and_wake(&self, c: &JobCompletion) -> Result<(), StoreError> {
         match self
             .call(StoreCall::RecordCompletionAndWake {
@@ -646,12 +694,14 @@ impl SessionStore for RemoteStoreClient {
         stream: &JournalStreamId,
         segment: u64,
         entry: TraceEntry,
+        fence: Option<FenceToken>,
     ) -> Result<(), StoreError> {
         match self
             .call(StoreCall::AppendTrace {
                 stream: stream.clone(),
                 segment,
                 entry,
+                fence,
             })
             .await
         {

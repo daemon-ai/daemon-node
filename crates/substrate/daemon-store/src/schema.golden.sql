@@ -228,7 +228,7 @@ CREATE TABLE session_record (
     status_job  TEXT,
     snapshot    BLOB NOT NULL,
     fence       INTEGER NOT NULL
-, execution_policy TEXT);
+, execution_policy TEXT, turn_seq INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE session_usage (
     session_id          TEXT PRIMARY KEY,
     input_tokens        INTEGER NOT NULL,

@@ -193,10 +193,11 @@ async fn cross_epoch_chain() {
     );
 }
 
-/// A stale incarnation cannot seal a segment root: the commit is fenced exactly as a checkpoint
-/// would be (reuses acceptance tests #4/#6, now for the trace root).
+/// A stale incarnation cannot write the journal at all (session-unification §5): the fence rides
+/// EVERY append — not just the seal — so a superseded incarnation can neither inject entries into
+/// the winning turn's segment nor commit its root (reuses acceptance tests #4/#6 for the trace).
 #[tokio::test]
-async fn stale_fence_cannot_seal() {
+async fn stale_fence_cannot_append_or_seal() {
     let store = Arc::new(InMemoryStore::new());
     let id = SessionId::new("journal-fenced");
     seed(&store, &id).await;
@@ -216,15 +217,20 @@ async fn stale_fence_cannot_seal() {
     )
     .await;
     for ev in turn_events() {
-        // Appends are not fenced (the open log), but the seal is.
-        sink.record(&ev).await.unwrap();
+        let r = sink.record(&ev).await;
+        assert!(
+            matches!(r, Err(StoreError::Fenced { .. })),
+            "a stale incarnation must not append into the segment, got {r:?}"
+        );
     }
     let r = sink.seal().await;
     assert!(
         matches!(r, Err(StoreError::Fenced { .. })),
         "a stale incarnation must not seal a segment root, got {r:?}"
     );
-    // No root was committed.
-    let seg = store.load_trace_segment(&stream, 0).await.unwrap();
-    assert!(seg.committed.is_none());
+    // Nothing landed: no entries and no root.
+    assert!(
+        store.load_trace_segment(&stream, 0).await.is_none(),
+        "the stale incarnation wrote nothing"
+    );
 }

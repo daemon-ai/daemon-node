@@ -71,6 +71,10 @@ pub struct SessionRecord {
     pub snapshot: SnapshotBlob,
     /// The current (highest) fencing token granted for this session.
     pub fence: FenceToken,
+    /// The number of durably committed turns (session-unification §5). The in-flight turn's
+    /// identity — and its journal segment index — is this value; `commit_turn` (or a terminal
+    /// `mark_completed`) increments it. Orthogonal to `epoch`, which fences suspensions.
+    pub turn_seq: u64,
 }
 
 /// Host-level per-session metadata kept beside the snapshot: which profile the session resolves its
@@ -556,6 +560,18 @@ pub struct Activation {
     /// `#[serde(default)]` keeps the brokered-store wire (StoreCall) compatible.
     #[serde(default)]
     pub splices: Vec<InboxSplice>,
+    /// The persisted [`ExecutionPolicy`] stamped at creation (session-unification §3), read in the
+    /// SAME load transaction so the incarnation's turn-boundary decision (terminal vs a
+    /// non-terminal turn commit) can never race a policy it didn't run under. `None` on legacy
+    /// rows — the incarnation then keeps today's terminal semantics.
+    #[serde(default)]
+    pub policy: Option<ExecutionPolicy>,
+    /// The in-flight turn's identity (session-unification §5): the session's committed-turn count
+    /// at load time, which is also the journal segment index this activation appends into. A
+    /// resumed suspension re-loads the same value (the turn is still in flight), so its appends
+    /// continue the same open segment.
+    #[serde(default)]
+    pub turn_seq: u64,
 }
 
 /// A checkpoint write: the new snapshot for a session at a bumped epoch (lifecycle §5).
@@ -580,6 +596,15 @@ pub struct Checkpoint {
     /// (legacy writers; nothing is consumed).
     #[serde(default)]
     pub consumed_splices: Option<u64>,
+    /// The completion-inbox rows this checkpoint's snapshot has APPLIED (the `(epoch, job)` keys
+    /// the activation load delivered as `Activation::unapplied` and the engine folded): the store
+    /// deletes exactly these rows inside the SAME commit transaction (session-unification §5 —
+    /// the completion sibling of `consumed_splices`). Without this, `commit_turn`'s Idle-iff-no-
+    /// work rule would see the already-folded completions as forever-pending work and livelock the
+    /// session on `Ready` + self-wake. A completion that raced in AFTER the load is not listed,
+    /// stays durable, and correctly forces `Ready`.
+    #[serde(default)]
+    pub applied_completions: Vec<(Epoch, JobId)>,
 }
 
 impl Checkpoint {
@@ -592,6 +617,7 @@ impl Checkpoint {
             snapshot,
             completion_payload: None,
             consumed_splices: None,
+            applied_completions: Vec::new(),
         }
     }
 
@@ -607,6 +633,43 @@ impl Checkpoint {
         self.consumed_splices = seq;
         self
     }
+
+    /// Stamp the applied completion keys (the `Activation::unapplied` rows this snapshot folded):
+    /// the store deletes exactly these completion-inbox rows inside this checkpoint's commit
+    /// transaction, so an applied completion never counts as pending work again.
+    pub fn with_applied_completions(mut self, keys: Vec<(Epoch, JobId)>) -> Self {
+        self.applied_completions = keys;
+        self
+    }
+}
+
+/// The journal-root seal a [`commit_turn`](SessionStore::commit_turn) writes inside its own
+/// transaction (session-unification §5 item 3): the committed turn's segment — identified by the
+/// session's `turn_seq` — sealed to a signed Merkle root. Computed by the incarnation's journal
+/// sink over the already-durable entry rows; the store only persists the root row, atomically with
+/// the snapshot and splice consumption. `None` on a commit for a session that isn't journaling.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnSeal {
+    /// The segment being sealed. MUST equal the session's in-flight `turn_seq` (the value the
+    /// activation loaded); a mismatch is an incarnation bug and fails the commit.
+    pub segment: u64,
+    /// The recomputed Merkle root over the segment's entries.
+    pub root: MerkleRoot,
+    /// The ed25519 signature over the root.
+    pub signature: Vec<u8>,
+}
+
+/// What a fenced [`commit_turn`](SessionStore::commit_turn) decided (session-unification §5): the
+/// committed turn's identity and the durable status the session landed in — `Idle` iff no
+/// unconsumed work (pending splices / unapplied completions) remained inside the commit
+/// transaction, else `Ready` (with a self-wake enqueued so raced-in input is never stranded).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnCommit {
+    /// The committed turn's identity (= its journal segment index; the session's `turn_seq` was
+    /// advanced past it in the same transaction).
+    pub turn_seq: u64,
+    /// The post-commit durable status: [`SessionStatus::Idle`] or [`SessionStatus::Ready`].
+    pub status: SessionStatus,
 }
 
 /// A durable parked edit-approval request (§12 HITL): a gated tool action (an fs edit, a dangerous
@@ -1184,6 +1247,31 @@ pub trait SessionStore: Send + Sync {
         checkpoint: Checkpoint,
         fence: FenceToken,
     ) -> Result<(), StoreError>;
+
+    /// The durable turn boundary (session-unification §5), fenced, in ONE transaction:
+    ///
+    /// 1. the snapshot blob, advancing the session's monotonic `turn_seq` past the committed turn;
+    /// 2. the consumed-splice cursor ([`Checkpoint::consumed_splices`]) — every folded splice
+    ///    flips `Consumed { turn_seq }` with the committed turn's identity;
+    /// 3. the turn's journal segment root (`seal`), promoted atomically with the state it covers;
+    /// 4. the next status: `Idle` iff no unconsumed work (pending splices / unapplied completions)
+    ///    remains, else `Ready` **with a self-wake enqueued** — input that raced in mid-turn is
+    ///    never stranded on an `Idle` session.
+    ///
+    /// The non-terminal sibling of [`mark_completed`](Self::mark_completed): the persisted
+    /// [`ExecutionPolicy`] decides which of the two a turn ends in (`Step::TurnCommitted` vs
+    /// `Step::Completed` at the activation layer). Default: unsupported (a non-authoritative
+    /// proxy store).
+    async fn commit_turn(
+        &self,
+        _checkpoint: Checkpoint,
+        _seal: Option<TurnSeal>,
+        _fence: FenceToken,
+    ) -> Result<TurnCommit, StoreError> {
+        Err(StoreError::Common(DaemonError::Other(
+            "commit_turn: not supported by this store".into(),
+        )))
+    }
 
     /// Record a completion durably and enqueue a `Wake` (one transaction). Idempotent per
     /// `(session, epoch, job)` (lifecycle §5; invariants #2, #3).
@@ -1763,12 +1851,16 @@ pub trait SessionStore: Send + Sync {
     // Default impls report "unsupported" / empty so a non-authoritative store (the brokered child
     // proxy) need not implement them; an authoritative backend overrides them.
 
-    /// Append one entry to the open `(stream, segment)` segment. Idempotent per `seq`.
+    /// Append one entry to the open `(stream, segment)` segment. Idempotent per `seq`. `fence` is
+    /// `Some` on the durable path (session-unification §5: the fence rides EVERY append, so a
+    /// stale incarnation can neither append into nor seal the winning segment — the seal CAS alone
+    /// is insufficient) and `None` for non-durable streams.
     async fn append_trace(
         &self,
         _stream: &JournalStreamId,
         _segment: u64,
         _entry: TraceEntry,
+        _fence: Option<FenceToken>,
     ) -> Result<(), StoreError> {
         Err(StoreError::Common(DaemonError::Other(
             "verifiable journal not supported by this store".into(),
@@ -2069,6 +2161,7 @@ impl InMemoryStore {
                 status,
                 snapshot,
                 fence: FenceToken::ZERO,
+                turn_seq: 0,
             },
         );
         Ok(())
@@ -2322,7 +2415,9 @@ impl SessionStore for InMemoryStore {
             .get(id)
             .ok_or_else(|| StoreError::NotFound(id.clone()))?;
         let snapshot = rec.snapshot.clone();
+        let turn_seq = rec.turn_seq;
         let unapplied = inner.unapplied.get(id).cloned().unwrap_or_default();
+        let policy = inner.execution_policy.get(id).cloned();
         // Claim the durable inbox in the same load transaction (session-unification §4.2): the
         // incarnation folds these and stamps `Checkpoint::consumed_splices`; a crash before that
         // commit leaves them `Claimed { fence }`, reclaimable by the next (newer) fence.
@@ -2332,6 +2427,8 @@ impl SessionStore for InMemoryStore {
             unapplied,
             fence,
             splices,
+            policy,
+            turn_seq,
         })
     }
 
@@ -2363,12 +2460,14 @@ impl SessionStore for InMemoryStore {
             inner.job_outbox.push_back(job);
         }
         if let Some(up_to) = checkpoint.consumed_splices {
-            Self::consume_splices_locked(
-                &mut inner,
-                &checkpoint.session_id,
-                up_to,
-                checkpoint.epoch.0,
-            );
+            // The turn is still in flight (a suspension, not a boundary): stamp the in-flight
+            // turn's identity, without advancing it.
+            let turn = inner
+                .sessions
+                .get(&checkpoint.session_id)
+                .map(|r| r.turn_seq)
+                .unwrap_or(0);
+            Self::consume_splices_locked(&mut inner, &checkpoint.session_id, up_to, turn);
         }
 
         // Post-commit crash boundaries: the durable state is already complete and consistent;
@@ -2393,13 +2492,12 @@ impl SessionStore for InMemoryStore {
         rec.snapshot = checkpoint.snapshot;
         rec.epoch = checkpoint.epoch;
         rec.status = SessionStatus::Completed;
+        // A terminal commit IS this turn's boundary (session-unification §5 item 5): the turn
+        // commits under its identity and the counter advances past it, exactly like `commit_turn`.
+        let committed_turn = rec.turn_seq;
+        rec.turn_seq += 1;
         if let Some(up_to) = checkpoint.consumed_splices {
-            Self::consume_splices_locked(
-                &mut inner,
-                &checkpoint.session_id,
-                up_to,
-                checkpoint.epoch.0,
-            );
+            Self::consume_splices_locked(&mut inner, &checkpoint.session_id, up_to, committed_turn);
         }
         // Stamp the terminal clock on the session's host meta (the reaper's grace timer). Same
         // transaction (the held lock); re-stamped if a resumed session completes again.
@@ -2450,6 +2548,98 @@ impl SessionStore for InMemoryStore {
             }
         }
         Ok(())
+    }
+
+    async fn commit_turn(
+        &self,
+        checkpoint: Checkpoint,
+        seal: Option<TurnSeal>,
+        fence: FenceToken,
+    ) -> Result<TurnCommit, StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        {
+            let rec = inner
+                .sessions
+                .get(&checkpoint.session_id)
+                .ok_or_else(|| StoreError::NotFound(checkpoint.session_id.clone()))?;
+            Self::check_fence(rec, fence)?;
+            if let Some(seal) = &seal {
+                if seal.segment != rec.turn_seq {
+                    return Err(StoreError::Common(DaemonError::Other(format!(
+                        "commit_turn: seal segment {} != in-flight turn {} (incarnation bug)",
+                        seal.segment, rec.turn_seq
+                    ))));
+                }
+            }
+        }
+        // Boundary: abort the whole transaction before anything is written.
+        Self::take_fault(&mut inner, FaultPoint::BeforeSnapshot)?;
+
+        // Atomic commit (session-unification §5): snapshot + turn_seq + consumed splices +
+        // journal-root seal + next status land together under the held lock.
+        let rec = inner.sessions.get_mut(&checkpoint.session_id).unwrap();
+        let committed_turn = rec.turn_seq;
+        rec.snapshot = checkpoint.snapshot;
+        rec.epoch = checkpoint.epoch;
+        rec.turn_seq += 1;
+        if let Some(up_to) = checkpoint.consumed_splices {
+            Self::consume_splices_locked(&mut inner, &checkpoint.session_id, up_to, committed_turn);
+        }
+        // Consume the completions this turn's snapshot folded (the load-delivered `unapplied`
+        // set): delete exactly those rows, so an applied completion never re-counts as pending
+        // work. A completion that raced in after the load survives and forces `Ready` below.
+        if !checkpoint.applied_completions.is_empty() {
+            if let Some(rows) = inner.unapplied.get_mut(&checkpoint.session_id) {
+                rows.retain(|c| {
+                    !checkpoint
+                        .applied_completions
+                        .iter()
+                        .any(|(e, j)| c.epoch == *e && c.job_id == *j)
+                });
+            }
+        }
+        if let Some(seal) = seal {
+            let stream = JournalStreamId::session(&checkpoint.session_id);
+            inner.journal_roots.insert(
+                (stream, seal.segment),
+                CommittedRoot {
+                    root: seal.root,
+                    signature: seal.signature,
+                },
+            );
+        }
+        // Idle iff no unconsumed work remains INSIDE this transaction, else Ready + self-wake —
+        // a splice or completion that raced in mid-turn is never stranded on an Idle session.
+        let pending_splices = inner
+            .splices
+            .get(&checkpoint.session_id)
+            .map(|rows| {
+                rows.iter()
+                    .any(|r| matches!(r.claim, SpliceClaim::Pending | SpliceClaim::Claimed { .. }))
+            })
+            .unwrap_or(false);
+        let unapplied = inner
+            .unapplied
+            .get(&checkpoint.session_id)
+            .map(|v| !v.is_empty())
+            .unwrap_or(false);
+        let status = if pending_splices || unapplied {
+            SessionStatus::Ready
+        } else {
+            SessionStatus::Idle
+        };
+        inner
+            .sessions
+            .get_mut(&checkpoint.session_id)
+            .unwrap()
+            .status = status.clone();
+        if matches!(status, SessionStatus::Ready) {
+            inner.wake_outbox.push_back(checkpoint.session_id.clone());
+        }
+        Ok(TurnCommit {
+            turn_seq: committed_turn,
+            status,
+        })
     }
 
     async fn record_completion_and_wake(&self, c: &JobCompletion) -> Result<(), StoreError> {
@@ -2576,13 +2766,10 @@ impl SessionStore for InMemoryStore {
         if let Some(job_id) = suspend_job {
             rec.status = SessionStatus::Suspended { job_id };
         }
+        // An approval park suspends mid-turn: stamp the in-flight turn without advancing it.
+        let turn = rec.turn_seq;
         if let Some(up_to) = checkpoint.consumed_splices {
-            Self::consume_splices_locked(
-                &mut inner,
-                &checkpoint.session_id,
-                up_to,
-                checkpoint.epoch.0,
-            );
+            Self::consume_splices_locked(&mut inner, &checkpoint.session_id, up_to, turn);
         }
         let rows = inner
             .pending_approvals
@@ -3238,8 +3425,20 @@ impl SessionStore for InMemoryStore {
         stream: &JournalStreamId,
         segment: u64,
         entry: TraceEntry,
+        fence: Option<FenceToken>,
     ) -> Result<(), StoreError> {
         let mut inner = self.inner.lock().unwrap();
+        // Durable path (session-unification §5): the fence rides every append, so a stale
+        // incarnation cannot write into the winning turn's segment. Non-durable streams pass
+        // `None` (no competing incarnation; the signature is the integrity primitive).
+        if let Some(fence) = fence {
+            let id = SessionId::new(stream.as_str());
+            let rec = inner
+                .sessions
+                .get(&id)
+                .ok_or_else(|| StoreError::NotFound(id.clone()))?;
+            Self::check_fence(rec, fence)?;
+        }
         // Append-only + idempotent per `(segment, seq)`: a redelivered entry is a no-op.
         let log = inner.journal_entries.entry(stream.clone()).or_default();
         if log
@@ -3495,20 +3694,20 @@ mod journal_tests {
         let stream = JournalStreamId::session(&id);
         // Append out of order; load_trace_segment returns them sorted by seq.
         store
-            .append_trace(&stream, 0, entry(2, 0x22))
+            .append_trace(&stream, 0, entry(2, 0x22), None)
             .await
             .unwrap();
         store
-            .append_trace(&stream, 0, entry(0, 0x00))
+            .append_trace(&stream, 0, entry(0, 0x00), None)
             .await
             .unwrap();
         store
-            .append_trace(&stream, 0, entry(1, 0x11))
+            .append_trace(&stream, 0, entry(1, 0x11), None)
             .await
             .unwrap();
         // Redelivered seq is a no-op (append-only, idempotent).
         store
-            .append_trace(&stream, 0, entry(1, 0xFF))
+            .append_trace(&stream, 0, entry(1, 0xFF), None)
             .await
             .unwrap();
 
@@ -3527,8 +3726,14 @@ mod journal_tests {
         // A unit stream has no session record; the journal accepts it (keyed by stream, not session).
         let store = InMemoryStore::new();
         let stream = JournalStreamId::unit(&daemon_common::UnitId::new("fleet-child"));
-        store.append_trace(&stream, 0, entry(0, 1)).await.unwrap();
-        store.append_trace(&stream, 0, entry(1, 2)).await.unwrap();
+        store
+            .append_trace(&stream, 0, entry(0, 1), None)
+            .await
+            .unwrap();
+        store
+            .append_trace(&stream, 0, entry(1, 2), None)
+            .await
+            .unwrap();
         // Unfenced seal (None) succeeds for a non-durable stream.
         store
             .commit_trace_segment(&stream, 0, MerkleRoot::new([5; 32]), vec![9], None)
@@ -3545,19 +3750,19 @@ mod journal_tests {
         let stream = JournalStreamId::session(&id);
         // Segment 0 then segment 1, each with two entries.
         store
-            .append_trace(&stream, 0, entry(0, 0xA0))
+            .append_trace(&stream, 0, entry(0, 0xA0), None)
             .await
             .unwrap();
         store
-            .append_trace(&stream, 0, entry(1, 0xA1))
+            .append_trace(&stream, 0, entry(1, 0xA1), None)
             .await
             .unwrap();
         store
-            .append_trace(&stream, 1, entry(0, 0xB0))
+            .append_trace(&stream, 1, entry(0, 0xB0), None)
             .await
             .unwrap();
         store
-            .append_trace(&stream, 1, entry(1, 0xB1))
+            .append_trace(&stream, 1, entry(1, 0xB1), None)
             .await
             .unwrap();
 
@@ -3578,7 +3783,10 @@ mod journal_tests {
     async fn commit_root_round_trips() {
         let (store, id, fence) = seeded().await;
         let stream = JournalStreamId::session(&id);
-        store.append_trace(&stream, 0, entry(0, 7)).await.unwrap();
+        store
+            .append_trace(&stream, 0, entry(0, 7), None)
+            .await
+            .unwrap();
         let root = MerkleRoot::new([9u8; 32]);
         store
             .commit_trace_segment(&stream, 0, root, vec![1, 2, 3], Some(fence))
@@ -3878,6 +4086,7 @@ mod backward_journal_tests {
                         bytes: vec![seq],
                         content_hash: ContentHash::new([seq; 32]),
                     },
+                    None,
                 )
                 .await
                 .expect("append");
@@ -3974,6 +4183,7 @@ mod backward_journal_tests {
                         bytes: vec![seq],
                         content_hash: ContentHash::new([seq; 32]),
                     },
+                    None,
                 )
                 .await
                 .expect("append");
@@ -4277,6 +4487,431 @@ mod inbox_splice_tests {
     #[tokio::test]
     async fn sqlite_consume_at_commit_and_prune() {
         consume_at_commit_and_prune(&SqliteStore::open_in_memory().unwrap()).await;
+    }
+}
+
+#[cfg(test)]
+mod turn_commit_tests {
+    //! The fenced durable turn boundary (session-unification §5), proven against both backends:
+    //! one `commit_turn` transaction carries the snapshot, the monotonic `turn_seq` advance, the
+    //! consumed-splice flip stamped with the committed turn's identity, the turn's journal-root
+    //! seal, and the Idle-iff-no-work-else-Ready status selection (+ self-wake). Plus: stale
+    //! fences are rejected, a seal for the wrong segment is an incarnation bug, terminal
+    //! `mark_completed` advances the same counter, and fenced `append_trace` refuses a stale
+    //! incarnation's writes.
+
+    use super::*;
+
+    const PARTITION: PartitionId = PartitionId(0);
+
+    fn splice(session: &SessionId, payload: &[u8], op: &str) -> NewSplice {
+        NewSplice {
+            session_id: session.clone(),
+            kind: SpliceKind::Steer,
+            payload: payload.to_vec(),
+            origin_op: op.into(),
+            origin: "test".into(),
+        }
+    }
+
+    /// Drain the wake outbox into a list (order-preserving) so tests can assert the self-wake.
+    async fn drain_wakes(store: &dyn SessionStore) -> Vec<SessionId> {
+        let mut wakes = Vec::new();
+        while let Some(id) = store.dequeue_wake().await {
+            wakes.push(id);
+        }
+        wakes
+    }
+
+    /// A quiet turn commits to `Idle` (no self-wake); a commit with a raced-in splice lands
+    /// `Ready` WITH a self-wake; `turn_seq` advances monotonically through both; and the
+    /// consumed splices carry the committed turn's identity, not the epoch.
+    async fn commit_turn_idle_vs_ready(store: &dyn SessionStore) {
+        let id = SessionId::new("turn-a");
+        store
+            .create_idle(id.clone(), PARTITION, SnapshotBlob::new(vec![1]))
+            .await
+            .unwrap();
+        store
+            .append_splice(splice(&id, b"start", "op-1"))
+            .await
+            .unwrap();
+        drain_wakes(store).await;
+
+        // Turn 0: load claims the splice; the commit consumes it and finds no remaining work.
+        let fence = store.acquire_activation_lease(&id).await.unwrap();
+        let activation = store.load_for_activation(&id, fence).await.unwrap();
+        assert_eq!(activation.turn_seq, 0, "the first turn's identity is 0");
+        assert_eq!(activation.splices.len(), 1);
+        let commit = store
+            .commit_turn(
+                Checkpoint::new(id.clone(), Epoch(0), SnapshotBlob::new(vec![2]))
+                    .with_consumed_splices(Some(1)),
+                None,
+                fence,
+            )
+            .await
+            .unwrap();
+        assert_eq!(commit.turn_seq, 0, "the commit reports the committed turn");
+        assert_eq!(
+            commit.status,
+            SessionStatus::Idle,
+            "no unconsumed work -> Idle"
+        );
+        assert_eq!(store.status(&id).await, Some(SessionStatus::Idle));
+        assert!(
+            drain_wakes(store).await.is_empty(),
+            "an Idle commit publishes no self-wake"
+        );
+        let consumed = store.splices_after(&id, 0).await;
+        assert!(
+            consumed.is_empty(),
+            "the folded splice is consumed, not re-deliverable"
+        );
+
+        // Turn 1: a splice races in mid-turn (after load, before commit) and is NOT folded.
+        store
+            .append_splice(splice(&id, b"turn-two", "op-2"))
+            .await
+            .unwrap();
+        drain_wakes(store).await;
+        let fence2 = store.acquire_activation_lease(&id).await.unwrap();
+        let activation2 = store.load_for_activation(&id, fence2).await.unwrap();
+        assert_eq!(
+            activation2.turn_seq, 1,
+            "the next turn's identity advanced past the committed one"
+        );
+        store
+            .append_splice(splice(&id, b"raced-in", "op-3"))
+            .await
+            .unwrap();
+        drain_wakes(store).await;
+        let commit2 = store
+            .commit_turn(
+                Checkpoint::new(id.clone(), Epoch(0), SnapshotBlob::new(vec![3]))
+                    .with_consumed_splices(Some(2)),
+                None,
+                fence2,
+            )
+            .await
+            .unwrap();
+        assert_eq!(commit2.turn_seq, 1);
+        assert_eq!(
+            commit2.status,
+            SessionStatus::Ready,
+            "unconsumed raced-in work -> Ready, never stranded on Idle"
+        );
+        assert_eq!(
+            drain_wakes(store).await,
+            vec![id.clone()],
+            "the Ready commit publishes exactly one self-wake"
+        );
+        let remaining = store.splices_after(&id, 0).await;
+        assert_eq!(
+            remaining.iter().map(|r| r.splice_seq).collect::<Vec<_>>(),
+            vec![3],
+            "only the raced-in splice remains deliverable"
+        );
+    }
+
+    /// A stale fence cannot commit a turn; the winning fence still can. And the seal's segment
+    /// must equal the in-flight turn — a mismatch is an incarnation bug that fails the commit
+    /// without writing anything.
+    async fn commit_turn_fencing_and_seal_guard(store: &dyn SessionStore) {
+        let id = SessionId::new("turn-b");
+        store
+            .create_idle(id.clone(), PARTITION, SnapshotBlob::new(vec![1]))
+            .await
+            .unwrap();
+        let stale = store.acquire_activation_lease(&id).await.unwrap();
+        let winner = store.acquire_activation_lease(&id).await.unwrap();
+        assert!(
+            matches!(
+                store
+                    .commit_turn(
+                        Checkpoint::new(id.clone(), Epoch(0), SnapshotBlob::new(vec![9])),
+                        None,
+                        stale,
+                    )
+                    .await,
+                Err(StoreError::Fenced { .. })
+            ),
+            "a stale incarnation cannot commit a turn"
+        );
+
+        // A seal for the wrong segment is refused (nothing written: turn_seq unmoved).
+        let bad_seal = TurnSeal {
+            segment: 7,
+            root: MerkleRoot::new([1; 32]),
+            signature: vec![1],
+        };
+        assert!(
+            store
+                .commit_turn(
+                    Checkpoint::new(id.clone(), Epoch(0), SnapshotBlob::new(vec![2])),
+                    Some(bad_seal),
+                    winner,
+                )
+                .await
+                .is_err(),
+            "a seal segment != the in-flight turn is an incarnation bug"
+        );
+        let activation = store.load_for_activation(&id, winner).await.unwrap();
+        assert_eq!(activation.turn_seq, 0, "the failed commit wrote nothing");
+
+        // The correct seal commits atomically with the turn: the root is readable afterwards.
+        let stream = JournalStreamId::session(&id);
+        store
+            .append_trace(
+                &stream,
+                0,
+                TraceEntry {
+                    seq: 0,
+                    bytes: vec![0xAB],
+                    content_hash: ContentHash::new([3; 32]),
+                },
+                Some(winner),
+            )
+            .await
+            .unwrap();
+        let commit = store
+            .commit_turn(
+                Checkpoint::new(id.clone(), Epoch(0), SnapshotBlob::new(vec![3])),
+                Some(TurnSeal {
+                    segment: 0,
+                    root: MerkleRoot::new([4; 32]),
+                    signature: vec![9],
+                }),
+                winner,
+            )
+            .await
+            .unwrap();
+        assert_eq!(commit.turn_seq, 0);
+        let seg = store.load_trace_segment(&stream, 0).await.unwrap();
+        assert_eq!(
+            seg.committed
+                .expect("sealed in the commit transaction")
+                .root,
+            MerkleRoot::new([4; 32])
+        );
+    }
+
+    /// The fence rides every durable journal append (§5): a stale incarnation's `append_trace`
+    /// is refused, so it can never write into the winning turn's segment.
+    async fn append_trace_is_fenced(store: &dyn SessionStore) {
+        let id = SessionId::new("turn-c");
+        store
+            .create_idle(id.clone(), PARTITION, SnapshotBlob::new(vec![1]))
+            .await
+            .unwrap();
+        let stale = store.acquire_activation_lease(&id).await.unwrap();
+        let winner = store.acquire_activation_lease(&id).await.unwrap();
+        let stream = JournalStreamId::session(&id);
+        let entry = |seq: u64, byte: u8| TraceEntry {
+            seq,
+            bytes: vec![byte],
+            content_hash: ContentHash::new([byte; 32]),
+        };
+        assert!(
+            matches!(
+                store
+                    .append_trace(&stream, 0, entry(0, 0x01), Some(stale))
+                    .await,
+                Err(StoreError::Fenced { .. })
+            ),
+            "a stale incarnation cannot append into the winning segment"
+        );
+        store
+            .append_trace(&stream, 0, entry(0, 0x02), Some(winner))
+            .await
+            .unwrap();
+        let seg = store.load_trace_segment(&stream, 0).await.unwrap();
+        assert_eq!(seg.entries.len(), 1);
+        assert_eq!(seg.entries[0].bytes, vec![0x02], "only the winner's entry");
+    }
+
+    /// A terminal `mark_completed` IS that turn's boundary: it advances the same `turn_seq`
+    /// counter and stamps its consumed splices with the committed turn's identity.
+    async fn terminal_commit_advances_turn_seq(store: &dyn SessionStore) {
+        let id = SessionId::new("turn-d");
+        store
+            .create_idle(id.clone(), PARTITION, SnapshotBlob::new(vec![1]))
+            .await
+            .unwrap();
+        store
+            .append_splice(splice(&id, b"only", "op-1"))
+            .await
+            .unwrap();
+        let fence = store.acquire_activation_lease(&id).await.unwrap();
+        let activation = store.load_for_activation(&id, fence).await.unwrap();
+        assert_eq!(activation.turn_seq, 0);
+
+        // Commit turn 0 non-terminally, then complete on turn 1.
+        store
+            .commit_turn(
+                Checkpoint::new(id.clone(), Epoch(0), SnapshotBlob::new(vec![2]))
+                    .with_consumed_splices(Some(1)),
+                None,
+                fence,
+            )
+            .await
+            .unwrap();
+        let fence2 = store.acquire_activation_lease(&id).await.unwrap();
+        let activation2 = store.load_for_activation(&id, fence2).await.unwrap();
+        assert_eq!(activation2.turn_seq, 1);
+        store
+            .mark_completed(
+                Checkpoint::new(id.clone(), Epoch(0), SnapshotBlob::new(vec![3])),
+                fence2,
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.status(&id).await, Some(SessionStatus::Completed));
+        // The counter advanced past the terminal turn too (visible to any post-mortem reader).
+        let fence3 = store.acquire_activation_lease(&id).await.unwrap();
+        let post = store.load_for_activation(&id, fence3).await.unwrap();
+        assert_eq!(
+            post.turn_seq, 2,
+            "the terminal commit advanced the committed-turn counter"
+        );
+    }
+
+    /// The completion sibling of splice consumption: a turn commit that lists the completions it
+    /// folded (`Checkpoint::applied_completions`) deletes exactly those inbox rows, so the session
+    /// lands `Idle` and the next load re-delivers nothing. A commit that does NOT list a delivered
+    /// completion (the raced-in shape) leaves it durable and lands `Ready` + self-wake — the
+    /// livelock regression: without deletion, one applied completion kept every future turn commit
+    /// on `Ready`, self-waking a policy-committing session in a hot loop forever.
+    async fn commit_turn_consumes_applied_completions(store: &dyn SessionStore) {
+        let id = SessionId::new("turn-e");
+        store
+            .create_idle(id.clone(), PARTITION, SnapshotBlob::new(vec![1]))
+            .await
+            .unwrap();
+        let completion = JobCompletion {
+            session_id: id.clone(),
+            epoch: Epoch(0),
+            job_id: JobId::new("job-1"),
+            payload: b"child done".to_vec(),
+        };
+        store.record_completion_and_wake(&completion).await.unwrap();
+        drain_wakes(store).await;
+
+        // Turn 0 folds the completion but does NOT list it as applied (a legacy/raced-in shape):
+        // the row survives, the session stays Ready and self-wakes.
+        let fence = store.acquire_activation_lease(&id).await.unwrap();
+        let activation = store.load_for_activation(&id, fence).await.unwrap();
+        assert_eq!(
+            activation.unapplied.len(),
+            1,
+            "the load delivers the completion"
+        );
+        let commit = store
+            .commit_turn(
+                Checkpoint::new(id.clone(), Epoch(0), SnapshotBlob::new(vec![2])),
+                None,
+                fence,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            commit.status,
+            SessionStatus::Ready,
+            "an unlisted completion still counts as pending work"
+        );
+        assert_eq!(drain_wakes(store).await, vec![id.clone()]);
+
+        // Turn 1 lists it: the row is deleted in the same transaction, the session lands Idle
+        // with no self-wake, and the next load delivers nothing (no livelock, no re-fold).
+        let fence2 = store.acquire_activation_lease(&id).await.unwrap();
+        let activation2 = store.load_for_activation(&id, fence2).await.unwrap();
+        assert_eq!(
+            activation2.unapplied.len(),
+            1,
+            "still delivered until consumed"
+        );
+        let commit2 = store
+            .commit_turn(
+                Checkpoint::new(id.clone(), Epoch(0), SnapshotBlob::new(vec![3]))
+                    .with_applied_completions(
+                        activation2
+                            .unapplied
+                            .iter()
+                            .map(|c| (c.epoch, c.job_id.clone()))
+                            .collect(),
+                    ),
+                None,
+                fence2,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            commit2.status,
+            SessionStatus::Idle,
+            "consuming the folded completion leaves no pending work"
+        );
+        assert!(drain_wakes(store).await.is_empty(), "no self-wake on Idle");
+        let fence3 = store.acquire_activation_lease(&id).await.unwrap();
+        let activation3 = store.load_for_activation(&id, fence3).await.unwrap();
+        assert!(
+            activation3.unapplied.is_empty(),
+            "a consumed completion is never re-delivered"
+        );
+    }
+
+    #[tokio::test]
+    async fn in_memory_commit_turn_idle_vs_ready() {
+        commit_turn_idle_vs_ready(&InMemoryStore::new()).await;
+    }
+
+    #[tokio::test]
+    async fn in_memory_commit_turn_consumes_applied_completions() {
+        commit_turn_consumes_applied_completions(&InMemoryStore::new()).await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_commit_turn_consumes_applied_completions() {
+        commit_turn_consumes_applied_completions(&SqliteStore::open_in_memory().unwrap()).await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_commit_turn_idle_vs_ready() {
+        commit_turn_idle_vs_ready(&SqliteStore::open_in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn in_memory_commit_turn_fencing_and_seal_guard() {
+        commit_turn_fencing_and_seal_guard(&InMemoryStore::new()).await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_commit_turn_fencing_and_seal_guard() {
+        commit_turn_fencing_and_seal_guard(&SqliteStore::open_in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn in_memory_append_trace_is_fenced() {
+        append_trace_is_fenced(&InMemoryStore::new()).await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_append_trace_is_fenced() {
+        append_trace_is_fenced(&SqliteStore::open_in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn in_memory_terminal_commit_advances_turn_seq() {
+        terminal_commit_advances_turn_seq(&InMemoryStore::new()).await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_terminal_commit_advances_turn_seq() {
+        terminal_commit_advances_turn_seq(&SqliteStore::open_in_memory().unwrap()).await;
     }
 }
 

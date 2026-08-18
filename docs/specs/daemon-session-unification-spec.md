@@ -177,6 +177,27 @@ activation fence (attempt-scoped writes): a stale writer can neither append into
 winning `turn_seq` segment. `commit_trace_segment`'s CAS alone is insufficient — the fence rides
 every append.
 
+### Stage-3 mechanics (as landed)
+
+- `Activation` carries `policy` + `turn_seq` from the SAME load transaction as the snapshot; the
+  manager hands them to the incarnation as a `TurnCtx` (policy, turn_seq, fence). A resumed
+  suspension re-loads the same `turn_seq` — the turn is still in flight — and its journal sink
+  (`JournalSink::for_turn`) re-opens the same segment, continuing the per-segment `seq` past the
+  entries already appended (never colliding under the idempotent `(stream, segment, seq)` key).
+- **Deferred seal**: on the interactive path the sink computes + signs the root at the turn
+  boundary but does not commit it; the `TurnSeal` rides `commit_turn`'s transaction, so the root
+  lands atomically with the snapshot it covers. A repeated seal within one activation (the
+  coalescer seals on both an error record and the turn boundary) recomputes over everything
+  appended so far — same segment id, last recompute wins. Non-interactive turns seal directly
+  (their terminal commit closes the session anyway).
+- A terminal `mark_completed` IS that turn's boundary: it advances the same `turn_seq` counter
+  and stamps its consumed splices with the committed turn's identity.
+- Suspension commits (`checkpoint_and_enqueue`, `park_approval`) are mid-turn: they stamp
+  `Consumed { turn_seq }` with the in-flight turn WITHOUT advancing it.
+- **Migration (M20)**: legacy sessions journaled durable segments keyed by epoch, so the new
+  counter is seeded past every segment their stream already used (entries or sealed roots) —
+  turn-keyed segments can never collide with a historically sealed segment.
+
 ## 6. Ownership
 
 - **In-process:** an RAII slot guard — atomic insert-if-vacant directory reservation acquired

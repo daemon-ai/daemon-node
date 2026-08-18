@@ -24,7 +24,7 @@ use crate::journal::{JournalFeeder, JournalSink};
 use crate::node_api::{decode_overlay, DurableProfileResolver};
 use crate::workspace_fs::WorkspaceRoots;
 use async_trait::async_trait;
-use daemon_activation::{EngineError, EngineFactory, Incarnation, SnapshotBlob, Step};
+use daemon_activation::{EngineError, EngineFactory, Incarnation, SnapshotBlob, Step, TurnCtx};
 use daemon_common::{Epoch, JobId, JournalStreamId, ProfileRef, ReqId, SessionId};
 use daemon_core::{
     Completion, Conversation, Effect, Engine, EngineProfile, EventSink, Failure, MockProvider,
@@ -35,7 +35,7 @@ use daemon_protocol::{
     HostRequest, HostRequestHandler, HostRequestKind, HostResponse, HostResponseBody, Outbound,
 };
 use daemon_store::{JobCommand, JobCompletion, ParkedApproval, SessionStore};
-use daemon_telemetry::{TraceSigner, GENESIS_ROOT};
+use daemon_telemetry::TraceSigner;
 use std::sync::{Arc, Mutex};
 
 /// The store + signer a durable incarnation journals into. Injected by the composition root; when
@@ -259,6 +259,8 @@ impl EngineFactory for CoreEngineFactory {
             content: self.content.clone(),
             cron_profile: self.cron_profile.clone(),
             completion_payload: None,
+            ctx: None,
+            turn_seal: None,
         })
     }
 }
@@ -285,6 +287,14 @@ pub struct CoreIncarnation {
     /// over the child's `outbox/`), surfaced via [`Incarnation::completion_payload`]. `None` => no
     /// artifacts captured (the store falls back to the legacy `child:{id}` marker).
     completion_payload: Option<Vec<u8>>,
+    /// The per-activation turn context (session-unification §5), stashed at hydrate: the persisted
+    /// execution policy (terminal-vs-idle at the turn boundary), the in-flight turn's journal
+    /// segment, and the activation fence every durable append rides.
+    ctx: Option<TurnCtx>,
+    /// The committed turn's deferred journal seal (interactive-root path), captured after the
+    /// post-turn journaling and handed to the manager via [`Incarnation::take_turn_seal`] for the
+    /// `commit_turn` transaction.
+    turn_seal: Option<daemon_store::TurnSeal>,
 }
 
 fn map_failure(failure: Failure) -> EngineError {
@@ -386,12 +396,14 @@ impl Incarnation for CoreIncarnation {
         snapshot: SnapshotBlob,
         unapplied: Vec<JobCompletion>,
         splices: Vec<daemon_store::InboxSplice>,
+        ctx: TurnCtx,
     ) -> Result<(), EngineError> {
         if snapshot.is_empty() {
             return Err(EngineError::Other(
                 "core incarnation hydrated from an empty snapshot".into(),
             ));
         }
+        self.ctx = Some(ctx);
         let snap = Snapshot::decode(&snapshot)?;
         let session_id = snap.session_id.clone();
         // I15: read the cron origin once — it drives both the profile selection here (a cron-fired
@@ -495,7 +507,18 @@ impl Incarnation for CoreIncarnation {
             .as_mut()
             .ok_or_else(|| EngineError::Other("run before hydrate".into()))?;
         let session_id = engine.snapshot().session_id.clone();
-        let segment = engine.epoch().0;
+        // Session-unification §5: the durable journal segment is the in-flight TURN, not the
+        // incarnation epoch — a resumed suspension continues the same open segment. The persisted
+        // execution policy decides the turn boundary: an interactive root commits back to
+        // Idle/Ready (`Step::TurnCommitted`, seal deferred into the `commit_turn` transaction);
+        // every other policy (and legacy `None`) stays terminal.
+        let ctx = self
+            .ctx
+            .ok_or_else(|| EngineError::Other("run before hydrate".into()))?;
+        let interactive = matches!(
+            ctx.policy,
+            Some(daemon_store::ExecutionPolicy::InteractiveRoot)
+        );
         // When background spawn is enabled, capture a clone of the parent's live conversation so a
         // mid-turn `Effect::Spawn` can seed the review child `FromConversation` without a store read.
         let seed_conversation = self
@@ -541,31 +564,33 @@ impl Incarnation for CoreIncarnation {
             }
         }
 
-        // Seal this incarnation's turn into the unified verifiable journal (unfenced on the durable
-        // path: the snapshot chain fences durable state, the ed25519 signature seals the transcript).
+        // Journal this turn into the unified verifiable journal, keyed by the TURN's segment and
+        // fenced by the activation lease on every append (session-unification §5: a stale
+        // incarnation can neither append into nor seal the winning segment). On the interactive
+        // path the seal is DEFERRED: the coalescer's turn-boundary `Seal` computes + signs the
+        // root, and the resulting `TurnSeal` rides the `commit_turn` transaction so the root
+        // lands atomically with the snapshot it covers. Terminal/suspension paths seal directly
+        // (a suspension emits no turn-boundary event, leaving its segment open for the resume).
         if let Some(cfg) = &self.journal {
             let stream = JournalStreamId::session(&session_id);
-            let prior = if segment == 0 {
-                GENESIS_ROOT
-            } else {
-                cfg.store
-                    .load_trace_segment(&stream, segment - 1)
-                    .await
-                    .and_then(|s| s.committed.map(|c| c.root))
-                    .unwrap_or(GENESIS_ROOT)
-            };
-            let jsink = Arc::new(JournalSink::with_segment(
-                cfg.store.clone(),
-                cfg.signer.clone(),
-                stream,
-                None,
-                segment,
-                prior,
-            ));
-            let feeder = JournalFeeder::new(jsink);
+            let jsink = Arc::new(
+                JournalSink::for_turn(
+                    cfg.store.clone(),
+                    cfg.signer.clone(),
+                    stream,
+                    ctx.fence,
+                    ctx.turn_seq,
+                    interactive,
+                )
+                .await,
+            );
+            let feeder = JournalFeeder::new(jsink.clone());
             let events = std::mem::take(&mut *captured.lock().unwrap());
             for ev in events {
                 feeder.feed(&Outbound::Event(ev)).await;
+            }
+            if interactive {
+                self.turn_seal = jsink.take_pending_seal();
             }
         }
 
@@ -591,6 +616,14 @@ impl Incarnation for CoreIncarnation {
         }
 
         match outcome {
+            TurnOutcome::Completed(_) if interactive => {
+                // The interactive-root turn boundary (session-unification §3/§5): the session is
+                // NOT terminal — the turn commits back to `Idle`/`Ready` through the fenced
+                // `commit_turn`, and a failed turn stays retryable (retry = a new user action; the
+                // failure is already journaled by the coalescer's error record). No LCM finalize,
+                // no outbox capture: both are terminal-only.
+                Ok(Step::TurnCommitted)
+            }
             TurnOutcome::Completed(_) => {
                 // Terminal deactivation (§10/§11): `Step::Completed` marks the session `Completed`
                 // in the store (never re-activated), so flush the context engine + memory providers
@@ -669,6 +702,10 @@ impl Incarnation for CoreIncarnation {
             .as_ref()
             .map(|e| e.consumed_splice_seq())
             .filter(|seq| *seq > 0)
+    }
+
+    fn take_turn_seal(&mut self) -> Option<daemon_store::TurnSeal> {
+        self.turn_seal.take()
     }
 }
 
@@ -777,6 +814,8 @@ mod tests {
             content: Some(ContentTransfer { blobs, roots }),
             cron_profile: None,
             completion_payload: None,
+            ctx: None,
+            turn_seal: None,
         }
     }
 
@@ -891,6 +930,11 @@ mod tests {
             activation.snapshot,
             activation.unapplied,
             activation.splices,
+            TurnCtx {
+                policy: activation.policy,
+                turn_seq: activation.turn_seq,
+                fence,
+            },
         )
         .await
         .unwrap();
@@ -932,9 +976,18 @@ mod tests {
         let fence2 = store.acquire_activation_lease(&session).await.unwrap();
         let again = store.load_for_activation(&session, fence2).await.unwrap();
         let mut inc2 = factory.create();
-        inc2.hydrate(checkpoint_blob, again.unapplied, again.splices)
-            .await
-            .unwrap();
+        inc2.hydrate(
+            checkpoint_blob,
+            again.unapplied,
+            again.splices,
+            TurnCtx {
+                policy: again.policy,
+                turn_seq: again.turn_seq,
+                fence: fence2,
+            },
+        )
+        .await
+        .unwrap();
         let snap2 = Snapshot::decode(&inc2.checkpoint().unwrap()).unwrap();
         assert_eq!(
             snap2.conversation.turns.len(),
@@ -1019,6 +1072,11 @@ mod tests {
             activation.snapshot,
             activation.unapplied,
             activation.splices,
+            TurnCtx {
+                policy: activation.policy,
+                turn_seq: activation.turn_seq,
+                fence,
+            },
         )
         .await
         .unwrap();

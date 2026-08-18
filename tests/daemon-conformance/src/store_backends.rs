@@ -749,6 +749,262 @@ async fn sqlite_unification_stage2() {
         .await;
 }
 
+/// Session-unification stage 3 (§5): the persisted execution policy drives the turn boundary
+/// through the REAL activation loop. An interactive root commits each turn back to `Idle` via the
+/// fenced `commit_turn` — snapshot + turn_seq + splice consumption + the turn's journal seal in
+/// one transaction — and survives a process restart into turn two (entered via the stage-2
+/// internal append rail), with the journal re-keyed by turn (segment 0, then segment 1, each
+/// sealed). A failed interactive turn stays retryable (never `Completed`). Every other policy
+/// stays terminal at its first turn boundary — success and failure both.
+async fn unification_stage3_suite<S: FaultStore + 'static>(make: impl Fn() -> Arc<S>) {
+    use daemon_core::{
+        Capabilities, EngineProfile, Failure, MockProvider, ModelOutput, Provider, Request,
+        SystemPrompt, ToolCallFormat, ToolRegistry,
+    };
+    use daemon_store::{ExecutionPolicy, NewSplice, RunnableSession, SpliceKind};
+    use daemon_telemetry::TraceSigner;
+
+    fn splice(session: &SessionId, payload: &[u8], op: &str) -> NewSplice {
+        NewSplice {
+            session_id: session.clone(),
+            kind: SpliceKind::StartTurn,
+            payload: payload.to_vec(),
+            origin_op: op.into(),
+            origin: "conformance".into(),
+        }
+    }
+
+    /// A provider whose every call fails non-retryably (a scripted HTTP 400), driving the
+    /// engine's turn to `Completed(Failed)` — the policy then decides terminal vs retryable.
+    struct FailingProvider;
+    #[async_trait::async_trait]
+    impl Provider for FailingProvider {
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                supports_native_tools: true,
+                supports_streaming: false,
+                tool_call_format: ToolCallFormat::Native,
+                max_context: Some(8192),
+            }
+        }
+        async fn chat(&self, _req: Request) -> Result<ModelOutput, Failure> {
+            Err(Failure::InvalidRequest("scripted 400".into()))
+        }
+    }
+
+    fn factory<S: SessionStore + 'static>(
+        store: &Arc<S>,
+        signer: &Arc<TraceSigner>,
+        failing: bool,
+    ) -> Arc<CoreEngineFactory> {
+        let provider: Arc<dyn Fn() -> Arc<dyn Provider> + Send + Sync> = if failing {
+            Arc::new(|| Arc::new(FailingProvider) as Arc<dyn Provider>)
+        } else {
+            Arc::new(|| Arc::new(MockProvider::completing("turn done")) as Arc<dyn Provider>)
+        };
+        let profile = EngineProfile::new(
+            provider,
+            Arc::new(ToolRegistry::new()),
+            SystemPrompt::new("stage-3 conformance"),
+        );
+        Arc::new(
+            CoreEngineFactory::from_profile(profile)
+                .with_journal(store.clone() as Arc<dyn SessionStore>, signer.clone()),
+        )
+    }
+
+    // (a) The interactive-root lifecycle across a restart. Turn one: a spliced input on an Idle
+    // session wakes the activation loop, the turn commits back to Idle (never Completed), the
+    // splice is consumed, and journal segment 0 (= turn 0) is sealed atomically with the commit.
+    // "Restart": a fresh manager over the same store. Turn two enters via the stage-2 internal
+    // append rail and lands in segment 1, itself sealed; the committed-turn counter reads 2.
+    {
+        let store = make();
+        let signer = Arc::new(TraceSigner::generate());
+        let id = SessionId::new("stage3-interactive");
+        let blob = Snapshot::fresh(id.clone()).encode().expect("encode");
+        store
+            .create_idle(id.clone(), PARTITION, blob)
+            .await
+            .expect("create idle");
+
+        // Turn one.
+        {
+            let mgr =
+                ActivationManager::new(store.clone(), factory(&store, &signer, false), PARTITION);
+            store
+                .append_splice(splice(&id, b"first question", "turn-1"))
+                .await
+                .expect("append turn one");
+            assert_eq!(store.status(&id).await, Some(SessionStatus::Ready));
+            mgr.recover().await.expect("drive turn one");
+            assert_eq!(
+                store.status(&id).await,
+                Some(SessionStatus::Idle),
+                "an interactive turn commits back to Idle, never Completed"
+            );
+            assert!(
+                store.splices_after(&id, 0).await.is_empty(),
+                "the turn's commit consumed the folded splice"
+            );
+        }
+
+        // The turn's journal segment (= turn 0) exists and was sealed by the commit transaction.
+        let stream = daemon_common::JournalStreamId::session(&id);
+        let seg0 = store
+            .load_trace_segment(&stream, 0)
+            .await
+            .expect("segment 0 exists");
+        assert!(
+            !seg0.entries.is_empty(),
+            "turn one journaled into segment 0"
+        );
+        assert!(
+            seg0.committed.is_some(),
+            "segment 0 sealed atomically with commit_turn"
+        );
+
+        // Restart: a fresh manager (fresh factory, fresh directory) over the same store. Turn two
+        // enters via the internal append rail (stage 2) exactly like turn one did.
+        {
+            let mgr =
+                ActivationManager::new(store.clone(), factory(&store, &signer, false), PARTITION);
+            store
+                .append_splice(splice(&id, b"second question", "turn-2"))
+                .await
+                .expect("append turn two");
+            mgr.recover().await.expect("drive turn two");
+        }
+        assert_eq!(
+            store.status(&id).await,
+            Some(SessionStatus::Idle),
+            "turn two also commits back to Idle"
+        );
+        let seg1 = store
+            .load_trace_segment(&stream, 1)
+            .await
+            .expect("segment 1 exists");
+        assert!(
+            !seg1.entries.is_empty(),
+            "turn two journaled into its OWN segment (journal re-keyed by turn, not epoch)"
+        );
+        assert!(seg1.committed.is_some(), "segment 1 sealed");
+        let fence = store.acquire_activation_lease(&id).await.expect("lease");
+        let post = store
+            .load_for_activation(&id, fence)
+            .await
+            .expect("post-restart load");
+        assert_eq!(post.turn_seq, 2, "two committed turns");
+        assert_eq!(
+            post.policy,
+            Some(ExecutionPolicy::InteractiveRoot),
+            "the persisted policy rides every activation load"
+        );
+        // Both user inputs live in the durable snapshot: turn two resumed the same conversation.
+        let snap = Snapshot::decode(&post.snapshot).expect("decode snapshot");
+        let users: Vec<&str> = snap
+            .conversation
+            .turns
+            .iter()
+            .filter_map(|t| match t {
+                daemon_core::Turn::User(m) => Some(m.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            users,
+            vec!["first question", "second question"],
+            "the restarted turn folded into the SAME conversation"
+        );
+    }
+
+    // (b) A FAILED interactive turn is not terminal: the session stays retryable (Idle), the
+    // turn still commits (turn_seq advances, the splice is consumed) — retry = a new user action.
+    {
+        let store = make();
+        let signer = Arc::new(TraceSigner::generate());
+        let id = SessionId::new("stage3-interactive-fail");
+        let blob = Snapshot::fresh(id.clone()).encode().expect("encode");
+        store
+            .create_idle(id.clone(), PARTITION, blob)
+            .await
+            .expect("create idle");
+        let mgr = ActivationManager::new(store.clone(), factory(&store, &signer, true), PARTITION);
+        store
+            .append_splice(splice(&id, b"doomed question", "turn-1"))
+            .await
+            .expect("append");
+        mgr.recover().await.expect("drive the failing turn");
+        assert_eq!(
+            store.status(&id).await,
+            Some(SessionStatus::Idle),
+            "a failed interactive turn stays retryable — never Completed"
+        );
+        assert!(
+            store.splices_after(&id, 0).await.is_empty(),
+            "the failed turn still consumed its input (no poison replay loop)"
+        );
+        let fence = store.acquire_activation_lease(&id).await.expect("lease");
+        let post = store.load_for_activation(&id, fence).await.expect("load");
+        assert_eq!(post.turn_seq, 1, "the failed turn committed as a turn");
+    }
+
+    // (c) Every non-interactive policy is terminal at its turn boundary — on success AND on
+    // failure (a one-shot run must close, fulfilling/notifying its parent seam; retryability is
+    // the interactive contract only).
+    for policy in [
+        ExecutionPolicy::JoiningChild,
+        ExecutionPolicy::DetachedChild,
+        ExecutionPolicy::BackgroundChild,
+        ExecutionPolicy::CronRun,
+    ] {
+        for failing in [false, true] {
+            let store = make();
+            let signer = Arc::new(TraceSigner::generate());
+            let id = SessionId::new(format!(
+                "stage3-{policy:?}-{}",
+                if failing { "fail" } else { "ok" }
+            ));
+            let blob = Snapshot::fresh(id.clone()).encode().expect("encode");
+            store
+                .create_runnable(RunnableSession {
+                    id: id.clone(),
+                    partition: PARTITION,
+                    snapshot: blob,
+                    policy,
+                    meta: None,
+                    edge: None,
+                    first_input: None,
+                })
+                .await
+                .expect("create runnable");
+            store
+                .append_splice(splice(&id, b"one-shot task", "task-1"))
+                .await
+                .expect("append task");
+            let mgr =
+                ActivationManager::new(store.clone(), factory(&store, &signer, failing), PARTITION);
+            mgr.recover().await.expect("drive to terminal");
+            assert_eq!(
+                store.status(&id).await,
+                Some(SessionStatus::Completed),
+                "policy {policy:?} (failing={failing}) is terminal at the turn boundary"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn in_memory_unification_stage3() {
+    unification_stage3_suite(|| Arc::new(InMemoryStore::new())).await;
+}
+
+#[tokio::test]
+async fn sqlite_unification_stage3() {
+    unification_stage3_suite(|| Arc::new(SqliteStore::open_in_memory().expect("open sqlite")))
+        .await;
+}
+
 /// Session-unification §6 regression: a concurrent wake of a BUSY session must not bump the fence
 /// past the in-flight incarnation. The in-process slot is reserved before the lease is acquired,
 /// so a busy session's wake returns satisfied without touching the lease; under the old
@@ -774,6 +1030,7 @@ async fn concurrent_wake_does_not_self_fence() {
             snapshot: daemon_activation::SnapshotBlob,
             _unapplied: Vec<JobCompletion>,
             _splices: Vec<daemon_store::InboxSplice>,
+            _ctx: daemon_activation::TurnCtx,
         ) -> Result<(), EngineError> {
             self.snapshot = Some(snapshot);
             Ok(())

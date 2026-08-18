@@ -17,8 +17,8 @@
 use async_trait::async_trait;
 use daemon_common::{DaemonError, Epoch, FenceToken, PartitionId, SessionId};
 use daemon_store::{
-    Checkpoint, InboxSplice, JobCommand, JobCompletion, ParkedApproval, SessionStatus,
-    SessionStore, StoreError,
+    Checkpoint, ExecutionPolicy, InboxSplice, JobCommand, JobCompletion, ParkedApproval,
+    SessionStatus, SessionStore, StoreError, TurnSeal,
 };
 use daemon_telemetry::{current_trace, ingress_trace, with_trace};
 use dashmap::DashMap;
@@ -33,6 +33,12 @@ pub use daemon_common::SnapshotBlob;
 pub enum Step {
     /// The engine reached a terminal state this activation.
     Completed,
+    /// The engine finished a turn WITHOUT terminating the session (session-unification §5): the
+    /// persisted [`ExecutionPolicy`] said the turn boundary commits back to `Idle`/`Ready`
+    /// (interactive-root), never `Completed`. The activation layer routes this through the fenced
+    /// [`SessionStore::commit_turn`] — snapshot, `turn_seq`, splice consumption, the turn's
+    /// journal seal, and the next status in ONE transaction.
+    TurnCommitted,
     /// The engine suspended at a phase boundary, delegating background work.
     Suspended {
         /// The durable job to enqueue on the outbox.
@@ -59,6 +65,22 @@ pub enum EngineError {
     Common(#[from] DaemonError),
 }
 
+/// The per-activation turn context the manager hands to [`Incarnation::hydrate`]
+/// (session-unification §5): everything the incarnation needs to decide and journal the turn
+/// boundary, read from the SAME load transaction as the snapshot it runs.
+#[derive(Clone, Copy, Debug)]
+pub struct TurnCtx {
+    /// The persisted execution policy driving terminal-vs-idle at the turn boundary (`None` on
+    /// legacy rows — the incarnation keeps terminal semantics).
+    pub policy: Option<ExecutionPolicy>,
+    /// The in-flight turn's identity = its journal segment index (the session's committed-turn
+    /// count at load; a resumed suspension re-loads the same value and continues the segment).
+    pub turn_seq: u64,
+    /// The activation fence — rides every durable journal append (§5: a stale incarnation can
+    /// neither append into nor seal the winning segment).
+    pub fence: FenceToken,
+}
+
 /// One live engine incarnation, driven by the activation layer (the phase-1 stand-in for the
 /// `daemon-host` session task). Protocol-agnostic: it deals in opaque [`SnapshotBlob`]s and the
 /// durable job/completion types, never §17 messages directly.
@@ -74,6 +96,7 @@ pub trait Incarnation: Send {
         snapshot: SnapshotBlob,
         unapplied: Vec<JobCompletion>,
         splices: Vec<InboxSplice>,
+        ctx: TurnCtx,
     ) -> Result<(), EngineError>;
 
     /// Process available work, returning whether the engine completed or suspended.
@@ -99,6 +122,14 @@ pub trait Incarnation: Send {
     /// incarnation with a content store + workspace roots overrides it to capture the child's
     /// `outbox/`.
     fn completion_payload(&self) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// The committed turn's journal segment seal, taken by the manager when this incarnation
+    /// returns [`Step::TurnCommitted`] and written INSIDE the `commit_turn` transaction
+    /// (session-unification §5 item 3: the root is promoted atomically with the state it covers).
+    /// Default `None` (a non-journaling incarnation commits the turn without a seal).
+    fn take_turn_seal(&mut self) -> Option<TurnSeal> {
         None
     }
 }
@@ -218,10 +249,25 @@ impl ManagerInner {
                 "activation.hydrate"
             );
             let mut inc = self.factory.create();
+            let ctx = TurnCtx {
+                policy: activation.policy,
+                turn_seq: activation.turn_seq,
+                fence,
+            };
+            // The completion keys this load delivered: the incarnation folds them at hydrate, so
+            // a non-terminal turn commit deletes exactly these rows (`applied_completions`) —
+            // otherwise the folded completions would count as pending work forever and
+            // `commit_turn`'s Idle-iff-no-work rule would livelock the session on Ready+self-wake.
+            let applied_completions: Vec<_> = activation
+                .unapplied
+                .iter()
+                .map(|c| (c.epoch, c.job_id.clone()))
+                .collect();
             inc.hydrate(
                 activation.snapshot,
                 activation.unapplied,
                 activation.splices,
+                ctx,
             )
             .await?;
             match inc.run().await? {
@@ -259,6 +305,27 @@ impl ManagerInner {
                     self.store
                         .park_approval(checkpoint, approvals, fence)
                         .await?;
+                }
+                Step::TurnCommitted => {
+                    // The non-terminal turn boundary (session-unification §5): commit the
+                    // snapshot + turn_seq + consumed splices + the turn's journal seal + the
+                    // Idle/Ready selection in ONE fenced transaction. The incarnation then
+                    // passivates; a raced-in splice re-wakes via the commit's own self-wake.
+                    let snapshot = inc.checkpoint()?;
+                    let checkpoint = Checkpoint::new(id.clone(), inc.epoch(), snapshot)
+                        .with_consumed_splices(inc.consumed_splices())
+                        .with_applied_completions(applied_completions);
+                    let seal = inc.take_turn_seal();
+                    let commit = self.store.commit_turn(checkpoint, seal, fence).await?;
+                    tracing::info!(
+                        trace_id = %current_trace(),
+                        session = %id,
+                        epoch = inc.epoch().0,
+                        step = "TurnCommitted",
+                        turn_seq = commit.turn_seq,
+                        status = ?commit.status,
+                        "activation.commit"
+                    );
                 }
                 Step::Completed => {
                     let snapshot = inc.checkpoint()?;

@@ -21,7 +21,7 @@ use crate::{
     RoomMember, RunnableEdge, RunnableSession, SessionMeta, SessionRole, SessionSearchHit,
     SessionStatus, SessionStore, SpliceClaim, SpliceKind, StoreError, StoreStats, StoredCronJob,
     StoredCronRun, StoredCronSuggestion, StoredSavedPresence, TraceEntry, TraceSegment,
-    TransportPref, COMMAND_DEDUP_TTL_MS, CRON_RUN_RETENTION,
+    TransportPref, TurnCommit, TurnSeal, COMMAND_DEDUP_TTL_MS, CRON_RUN_RETENTION,
 };
 use async_trait::async_trait;
 use daemon_common::{
@@ -504,6 +504,24 @@ static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
              SELECT session_id, MAX(splice_seq) FROM inbox_splice GROUP BY session_id;\n\
              DROP TABLE pending_session_input;",
         ),
+        // M20 (session-unification §5): the per-session committed-turn counter. The in-flight
+        // turn's identity — and its journal segment index — is this value; `commit_turn` / a
+        // terminal `mark_completed` advances it. Legacy sessions journaled durable segments keyed
+        // by EPOCH, so seed the counter past every segment their stream already used (entries or
+        // sealed roots) — re-keying by turn can then never collide with, or clobber, a
+        // historically sealed segment.
+        M::up(
+            "ALTER TABLE session_record ADD COLUMN turn_seq INTEGER NOT NULL DEFAULT 0;\n\
+             UPDATE session_record SET turn_seq = (\n\
+                 SELECT COALESCE(MAX(seg) + 1, 0) FROM (\n\
+                     SELECT segment AS seg FROM journal_entries\n\
+                      WHERE journal_entries.stream = session_record.session_id\n\
+                     UNION ALL\n\
+                     SELECT segment FROM journal_roots\n\
+                      WHERE journal_roots.stream = session_record.session_id\n\
+                 )\n\
+             );",
+        ),
     ])
 });
 
@@ -907,6 +925,19 @@ impl SqliteStore {
         .map(|f| FenceToken(f as u64))
         .ok_or_else(|| StoreError::NotFound(id.clone()))
     }
+
+    /// Read a session's committed-turn counter (the in-flight turn's identity), or `NotFound`.
+    fn turn_seq_of(conn: &Connection, id: &SessionId) -> Result<u64, StoreError> {
+        conn.query_row(
+            "SELECT turn_seq FROM session_record WHERE session_id = ?1",
+            params![id.as_str()],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(sql_err)?
+        .map(|t| t as u64)
+        .ok_or_else(|| StoreError::NotFound(id.clone()))
+    }
 }
 
 #[async_trait]
@@ -1151,16 +1182,27 @@ impl SessionStore for SqliteStore {
     ) -> Result<Activation, StoreError> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction().map_err(sql_err)?;
-        let snapshot = tx
+        // One row read carries the snapshot plus the turn-boundary context (session-unification
+        // §5): the persisted execution policy and the in-flight turn's identity, read in the SAME
+        // transaction so the incarnation can never run under a policy/turn it didn't load.
+        let (snapshot, policy, turn_seq) = tx
             .query_row(
-                "SELECT snapshot FROM session_record WHERE session_id = ?1",
+                "SELECT snapshot, execution_policy, turn_seq \
+                 FROM session_record WHERE session_id = ?1",
                 params![id.as_str()],
-                |row| row.get::<_, Vec<u8>>(0),
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, i64>(2)? as u64,
+                    ))
+                },
             )
             .optional()
             .map_err(sql_err)?
-            .map(SnapshotBlob::new)
             .ok_or_else(|| StoreError::NotFound(id.clone()))?;
+        let snapshot = SnapshotBlob::new(snapshot);
+        let policy = policy.as_deref().and_then(policy_from_str);
 
         let unapplied = {
             let mut stmt = tx
@@ -1195,6 +1237,8 @@ impl SessionStore for SqliteStore {
             unapplied,
             fence,
             splices,
+            policy,
+            turn_seq,
         })
     }
 
@@ -1234,9 +1278,11 @@ impl SessionStore for SqliteStore {
             )
             .map_err(sql_err)?;
             // Consume the splices this commit's snapshot captured, in the SAME transaction
-            // (session-unification §4.2: consumption is never written separately).
+            // (session-unification §4.2: consumption is never written separately). A suspension
+            // is mid-turn: stamp the in-flight turn's identity without advancing it.
             if let Some(up_to) = checkpoint.consumed_splices {
-                Self::consume_splices_conn(&tx, &checkpoint.session_id, up_to, checkpoint.epoch.0)?;
+                let turn = Self::turn_seq_of(&tx, &checkpoint.session_id)?;
+                Self::consume_splices_conn(&tx, &checkpoint.session_id, up_to, turn)?;
             }
             // Dedupe re-enqueues from idempotent re-activation (mirrors `enqueued_jobs`).
             let fresh = tx
@@ -1282,9 +1328,13 @@ impl SessionStore for SqliteStore {
             });
         }
         let tx = guard.transaction().map_err(sql_err)?;
+        // A terminal commit IS this turn's boundary (session-unification §5 item 5): the turn
+        // commits under its identity and the counter advances past it, exactly like `commit_turn`.
+        let committed_turn = Self::turn_seq_of(&tx, &checkpoint.session_id)?;
         tx.execute(
             "UPDATE session_record \
-             SET snapshot = ?2, epoch = ?3, status_kind = 'completed', status_job = NULL \
+             SET snapshot = ?2, epoch = ?3, turn_seq = turn_seq + 1, \
+                 status_kind = 'completed', status_job = NULL \
              WHERE session_id = ?1",
             params![
                 checkpoint.session_id.as_str(),
@@ -1295,7 +1345,7 @@ impl SessionStore for SqliteStore {
         .map_err(sql_err)?;
         // Consume the splices this terminal snapshot captured, in the SAME transaction (§4.2).
         if let Some(up_to) = checkpoint.consumed_splices {
-            Self::consume_splices_conn(&tx, &checkpoint.session_id, up_to, checkpoint.epoch.0)?;
+            Self::consume_splices_conn(&tx, &checkpoint.session_id, up_to, committed_turn)?;
         }
         // Stamp the terminal clock on the session's host meta (the reaper's grace timer), in the
         // same transaction. The upsert supplies an empty overlay so a row created here still reads
@@ -1578,9 +1628,11 @@ impl SessionStore for SqliteStore {
             )
             .map_err(sql_err)?;
         }
-        // Consume the splices this parked snapshot captured, in the SAME transaction (§4.2).
+        // Consume the splices this parked snapshot captured, in the SAME transaction (§4.2). An
+        // approval park suspends mid-turn: stamp the in-flight turn without advancing it.
         if let Some(up_to) = checkpoint.consumed_splices {
-            Self::consume_splices_conn(&tx, &checkpoint.session_id, up_to, checkpoint.epoch.0)?;
+            let turn = Self::turn_seq_of(&tx, &checkpoint.session_id)?;
+            Self::consume_splices_conn(&tx, &checkpoint.session_id, up_to, turn)?;
         }
         for approval in &approvals {
             // Dedupe a re-parked row on deterministic recovery (UNIQUE(session_id, job_id)).
@@ -1813,6 +1865,117 @@ impl SessionStore for SqliteStore {
             Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
             Err(_) => Vec::new(),
         }
+    }
+
+    async fn commit_turn(
+        &self,
+        checkpoint: Checkpoint,
+        seal: Option<TurnSeal>,
+        fence: FenceToken,
+    ) -> Result<TurnCommit, StoreError> {
+        // The durable turn boundary (session-unification §5), ONE transaction under one lock
+        // hold: fence CAS, snapshot + turn_seq advance, splice consumption stamped with the
+        // committed turn, the turn's journal-root seal, and the Idle-iff-no-work-else-Ready
+        // status selection (+ self-wake) land together or not at all.
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(sql_err)?;
+        let current = Self::fence_of(&tx, &checkpoint.session_id)?;
+        if fence < current {
+            return Err(StoreError::Fenced {
+                have: fence.0,
+                current: current.0,
+            });
+        }
+        let committed_turn = Self::turn_seq_of(&tx, &checkpoint.session_id)?;
+        if let Some(seal) = &seal {
+            if seal.segment != committed_turn {
+                return Err(StoreError::Common(DaemonError::Other(format!(
+                    "commit_turn: seal segment {} != in-flight turn {committed_turn} \
+                     (incarnation bug)",
+                    seal.segment
+                ))));
+            }
+        }
+        // Boundary: abort the whole transaction before anything is written.
+        self.take_fault(FaultPoint::BeforeSnapshot)?;
+        tx.execute(
+            "UPDATE session_record \
+             SET snapshot = ?2, epoch = ?3, turn_seq = turn_seq + 1, status_job = NULL \
+             WHERE session_id = ?1",
+            params![
+                checkpoint.session_id.as_str(),
+                checkpoint.snapshot.as_bytes(),
+                checkpoint.epoch.0 as i64,
+            ],
+        )
+        .map_err(sql_err)?;
+        if let Some(up_to) = checkpoint.consumed_splices {
+            Self::consume_splices_conn(&tx, &checkpoint.session_id, up_to, committed_turn)?;
+        }
+        // Consume the completions this turn's snapshot folded (the load-delivered `unapplied`
+        // set): delete exactly those rows, so an applied completion never re-counts as pending
+        // work. A completion that raced in after the load survives and forces `Ready` below.
+        for (epoch, job_id) in &checkpoint.applied_completions {
+            tx.execute(
+                "DELETE FROM completion_inbox \
+                 WHERE session_id = ?1 AND epoch = ?2 AND job_id = ?3",
+                params![
+                    checkpoint.session_id.as_str(),
+                    epoch.0 as i64,
+                    job_id.as_str(),
+                ],
+            )
+            .map_err(sql_err)?;
+        }
+        if let Some(seal) = seal {
+            tx.execute(
+                "INSERT OR REPLACE INTO journal_roots (stream, segment, root, signature) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    checkpoint.session_id.as_str(),
+                    seal.segment as i64,
+                    seal.root.as_bytes().as_slice(),
+                    seal.signature,
+                ],
+            )
+            .map_err(sql_err)?;
+        }
+        // Idle iff no unconsumed work remains INSIDE this transaction, else Ready + self-wake —
+        // a splice or completion that raced in mid-turn is never stranded on an Idle session.
+        let unconsumed: bool = tx
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM inbox_splice \
+                                 WHERE session_id = ?1 AND claim_kind != 'consumed') \
+                     OR EXISTS (SELECT 1 FROM completion_inbox WHERE session_id = ?1)",
+                params![checkpoint.session_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(sql_err)?;
+        let status = if unconsumed {
+            SessionStatus::Ready
+        } else {
+            SessionStatus::Idle
+        };
+        tx.execute(
+            "UPDATE session_record SET status_kind = ?2 WHERE session_id = ?1",
+            params![
+                checkpoint.session_id.as_str(),
+                if unconsumed { "ready" } else { "idle" },
+            ],
+        )
+        .map_err(sql_err)?;
+        if unconsumed {
+            tx.execute(
+                "INSERT INTO wake_outbox (session_id) VALUES (?1)",
+                params![checkpoint.session_id.as_str()],
+            )
+            .map_err(sql_err)?;
+        }
+        tx.commit().map_err(sql_err)?;
+        Ok(TurnCommit {
+            turn_seq: committed_turn,
+            status,
+        })
     }
 
     async fn record_completion_and_wake(&self, c: &JobCompletion) -> Result<(), StoreError> {
@@ -2963,8 +3126,22 @@ impl SessionStore for SqliteStore {
         stream: &JournalStreamId,
         segment: u64,
         entry: TraceEntry,
+        fence: Option<FenceToken>,
     ) -> Result<(), StoreError> {
         let conn = self.conn.lock().unwrap();
+        // Durable path (session-unification §5): the fence rides every append, so a stale
+        // incarnation cannot write into the winning turn's segment. Non-durable streams pass
+        // `None` (no competing incarnation; the signature is the integrity primitive).
+        if let Some(fence) = fence {
+            let id = SessionId::new(stream.as_str());
+            let current = Self::fence_of(&conn, &id)?;
+            if fence < current {
+                return Err(StoreError::Fenced {
+                    have: fence.0,
+                    current: current.0,
+                });
+            }
+        }
         // Append-only + idempotent per `(stream, segment, seq)`; keyed by stream, not by session, so
         // a non-durable unit journals without a session record. The autoincrement `cursor` is the
         // stream-monotonic pagination key.
@@ -3237,8 +3414,9 @@ mod tests {
     /// `saved_presence_active` tables, the `custom_providers` table, the wire-v38
     /// `transport_prefs.settings` account-settings column, and the rung-3 (api/39)
     /// `command_dedup` op-id idempotency table, the wire-v41 `crash_consent` toggle, the
-    /// session-unification `session_record.execution_policy` column, and the session-unification
-    /// §4 durable inbox (`inbox_splice` + `splice_seq`, retiring `pending_session_input`)).
+    /// session-unification `session_record.execution_policy` column, the session-unification
+    /// §4 durable inbox (`inbox_splice` + `splice_seq`, retiring `pending_session_input`), and
+    /// the session-unification §5 `session_record.turn_seq` committed-turn counter).
     #[test]
     fn migration_ladder_valid_and_applied() {
         assert!(MIGRATIONS.validate().is_ok());
@@ -3249,7 +3427,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 19, "fresh DB is stamped to the latest migration");
+        assert_eq!(version, 20, "fresh DB is stamped to the latest migration");
     }
 
     /// The M19 data migration: legacy `pending_session_input` rows land in `inbox_splice` as
@@ -3328,6 +3506,46 @@ mod tests {
             )
             .unwrap();
         assert_eq!(legacy_table, 0, "the legacy table is dropped");
+    }
+
+    /// The M20 data migration: legacy sessions journaled durable segments keyed by EPOCH, so the
+    /// new `turn_seq` counter is seeded past every segment their stream already used (entries or
+    /// sealed roots) — re-keying by turn can never collide with a historically sealed segment. A
+    /// session with no journal history starts at 0.
+    #[test]
+    fn m20_seeds_turn_seq_past_legacy_segments() {
+        let mut conn = Connection::open_in_memory().expect("open");
+        let ladder = &MIGRATIONS;
+        ladder
+            .to_version(&mut conn, 19)
+            .expect("ladder to M19 (user_version 19)");
+        conn.execute_batch(
+            "INSERT INTO session_record \
+                 (session_id, partition, epoch, status_kind, status_job, snapshot, fence) \
+             VALUES ('journaled', 0, 3, 'ready', NULL, x'00', 0), \
+                    ('fresh', 0, 0, 'idle', NULL, x'00', 0);\n\
+             INSERT INTO journal_entries (stream, segment, seq, bytes, content_hash) \
+             VALUES ('journaled', 0, 0, x'aa', x'01'), ('journaled', 2, 0, x'bb', x'02');\n\
+             INSERT INTO journal_roots (stream, segment, root, signature) \
+             VALUES ('journaled', 0, x'0a', x'0b'), ('journaled', 1, x'0c', x'0d');",
+        )
+        .expect("seed legacy epoch-keyed journal");
+        ladder.to_latest(&mut conn).expect("finish the ladder");
+
+        let seq_of = |id: &str| -> i64 {
+            conn.query_row(
+                "SELECT turn_seq FROM session_record WHERE session_id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            seq_of("journaled"),
+            3,
+            "seeded past the highest used segment (entries seg 2 -> next is 3)"
+        );
+        assert_eq!(seq_of("fresh"), 0, "no journal history starts at turn 0");
     }
 
     /// `custom_provider_set`/`list`/`remove` round-trip identically on both the SQLite and in-memory

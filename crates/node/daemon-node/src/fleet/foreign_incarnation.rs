@@ -24,7 +24,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use daemon_activation::{EngineError, EngineFactory, Incarnation, SnapshotBlob, Step};
+use daemon_activation::{EngineError, EngineFactory, Incarnation, SnapshotBlob, Step, TurnCtx};
 use daemon_api::{EngineSelector, ForeignBackend};
 use daemon_common::{Epoch, JobId, JournalStreamId, ReqId, SessionId};
 use daemon_core::Snapshot;
@@ -131,6 +131,7 @@ impl Incarnation for DispatchingIncarnation {
         snapshot: SnapshotBlob,
         unapplied: Vec<daemon_store::JobCompletion>,
         splices: Vec<daemon_store::InboxSplice>,
+        ctx: TurnCtx,
     ) -> Result<(), EngineError> {
         let foreign = self.foreign.clone();
         let mut inner: Box<dyn Incarnation> = match Self::resolve_foreign(&foreign, &snapshot).await
@@ -145,7 +146,7 @@ impl Incarnation for DispatchingIncarnation {
             )),
             None => self.core.create(),
         };
-        inner.hydrate(snapshot, unapplied, splices).await?;
+        inner.hydrate(snapshot, unapplied, splices, ctx).await?;
         self.inner = Some(inner);
         Ok(())
     }
@@ -202,6 +203,9 @@ pub(crate) struct ForeignIncarnation {
     consumed_splices: Option<u64>,
     /// The structured completion payload captured at terminal (a CBOR `DelegationResult`).
     completion_payload: Option<Vec<u8>>,
+    /// The per-activation turn context (session-unification §5): the in-flight turn keys the
+    /// journal segment and the activation fence rides every append.
+    ctx: Option<TurnCtx>,
 }
 
 impl ForeignIncarnation {
@@ -225,12 +229,14 @@ impl ForeignIncarnation {
             inputs: Vec::new(),
             consumed_splices: None,
             completion_payload: None,
+            ctx: None,
         }
     }
 
-    /// Seal this activation's transcript into the unified verifiable journal (segment 0: a foreign
-    /// child runs a single activation to completion, so there is no epoch chain) and fold its token
-    /// usage into the durable per-session usage surface — mirroring the Core incarnation's journaling.
+    /// Seal this activation's transcript into the unified verifiable journal — the segment is the
+    /// in-flight TURN and the activation fence rides every append (session-unification §5),
+    /// mirroring the Core incarnation's journaling — and fold its token usage into the durable
+    /// per-session usage surface.
     async fn journal_turn(&self, events: &[AgentEvent]) {
         let mut delta = daemon_common::UsageDelta::default();
         for ev in events {
@@ -242,14 +248,27 @@ impl ForeignIncarnation {
             self.store.record_usage(&self.session_id, delta).await;
         }
         let stream = JournalStreamId::session(&self.session_id);
-        let jsink = Arc::new(JournalSink::with_segment(
-            self.store.clone(),
-            self.signer.clone(),
-            stream,
-            None,
-            0,
-            GENESIS_ROOT,
-        ));
+        let jsink = match self.ctx {
+            Some(ctx) => Arc::new(
+                JournalSink::for_turn(
+                    self.store.clone(),
+                    self.signer.clone(),
+                    stream,
+                    ctx.fence,
+                    ctx.turn_seq,
+                    false,
+                )
+                .await,
+            ),
+            None => Arc::new(JournalSink::with_segment(
+                self.store.clone(),
+                self.signer.clone(),
+                stream,
+                None,
+                0,
+                GENESIS_ROOT,
+            )),
+        };
         let feeder = JournalFeeder::new(jsink);
         for ev in events {
             feeder.feed(&Outbound::Event(ev.clone())).await;
@@ -264,7 +283,9 @@ impl Incarnation for ForeignIncarnation {
         _snapshot: SnapshotBlob,
         _unapplied: Vec<daemon_store::JobCompletion>,
         splices: Vec<daemon_store::InboxSplice>,
+        ctx: TurnCtx,
     ) -> Result<(), EngineError> {
+        self.ctx = Some(ctx);
         // The agent answers its own blocking §17 requests (ACP permission prompts) against an
         // auto-allow host: a durable child runs headless with no operator to prompt.
         let host: Arc<dyn HostRequestHandler> = Arc::new(AutoAllowHost {
