@@ -805,7 +805,7 @@ async fn serve_access(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse>
 /// a request that carries an `op_id` touches either seam; everything else dispatches directly.
 pub async fn dispatch(api: &dyn NodeApi, req: ApiRequest) -> ApiResponse {
     let Some(op_id) = req.op_id().map(|s| s.to_string()) else {
-        return dispatch_inner(api, req).await;
+        return dispatch_censused(api, req).await;
     };
     // A duplicate returns the original result with no side effect (indistinguishable from the
     // first ack — the point of returning the result, not an error).
@@ -814,12 +814,57 @@ pub async fn dispatch(api: &dyn NodeApi, req: ApiRequest) -> ApiResponse {
             return resp;
         }
     }
-    let resp = with_op_id(Some(op_id.clone()), dispatch_inner(api, req)).await;
+    let resp = with_op_id(Some(op_id.clone()), dispatch_censused(api, req)).await;
     if !matches!(resp, ApiResponse::Error(_)) {
         let mut buf = Vec::new();
         if ciborium::into_writer(&resp, &mut buf).is_ok() {
             api.command_dedup_store(&op_id, buf).await;
         }
+    }
+    resp
+}
+
+/// [`dispatch_inner`] wrapped in the projection-sync census check (spec §5): the handler runs
+/// under a fresh [`with_effects`] scope, and the recorded effects are checked against the
+/// variant's declared [`MutationClass`]. A successful `MustChange` run with zero effects is a
+/// silent-mutation defect; a `NonStateful` run that recorded any is a misclassification. Both log
+/// loud in every build (the conformance census suite hard-asserts per domain — a feed-less
+/// assembly legitimately records nothing, so dispatch must not panic here).
+async fn dispatch_censused(api: &dyn NodeApi, req: ApiRequest) -> ApiResponse {
+    let class = census(&req);
+    // The request is consumed by the fan-out; capture a debug label up front for the (rare)
+    // mutation classes only, so the hot read path pays nothing.
+    let label = match class {
+        MutationClass::NonStateful => None,
+        MutationClass::MustChange(_) | MutationClass::Conditional(_) => {
+            let mut l = format!("{req:?}");
+            l.truncate(96);
+            Some(l)
+        }
+    };
+    // Boxed: `dispatch_inner`'s future inlines every handler arm (hundreds of KB); embedding it
+    // inline in yet another scope wrapper tipped deep call chains (nested delegation) over the
+    // worker stack. One heap allocation per dispatch keeps the outer future small.
+    let (resp, effects) = with_effects(Box::pin(dispatch_inner(api, req))).await;
+    match class {
+        MutationClass::MustChange(expected)
+            if effects.is_empty() && !matches!(resp, ApiResponse::Error(_)) =>
+        {
+            tracing::error!(
+                request = label.as_deref().unwrap_or("?"),
+                ?expected,
+                "census violation: MustChange handler succeeded without recording a mutation \
+                 effect (silent mutation — clients will diverge)"
+            );
+        }
+        MutationClass::NonStateful if !effects.is_empty() => {
+            tracing::error!(
+                ?effects,
+                "census violation: NonStateful handler recorded mutation effects \
+                 (misclassified census entry)"
+            );
+        }
+        _ => {}
     }
     resp
 }

@@ -18,6 +18,9 @@ ciborium = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 futures = { workspace = true }
+# Projection-sync (spec §5): the dispatch-side census check logs a MustChange handler that
+# recorded no mutation effect (a silent-mutation defect) loud in every build.
+tracing = { workspace = true }
 arbitrary = { workspace = true, optional = true }
 
 [features]

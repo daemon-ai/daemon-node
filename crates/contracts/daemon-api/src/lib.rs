@@ -46,6 +46,11 @@ use std::collections::BTreeMap;
 pub mod op_context;
 pub use op_context::{current_op_id, with_op_id};
 
+pub mod census;
+pub use census::{census, MutationClass};
+pub mod effects;
+pub use effects::{record_effect, with_effects};
+
 pub mod vhc;
 pub use vhc::{
     VhcApi, VhcCapabilities, VhcContribution, VhcDiskScope, VhcDiskUsage, VhcDiskWipeOutcome,
@@ -491,6 +496,14 @@ pub trait SessionApi: Send + Sync {
 /// The node/operator control surface: inspect and steer the running node.
 #[async_trait]
 pub trait ControlApi: Send + Sync {
+    /// Projection-sync (spec §4.3): the node's process-incarnation id — the same value
+    /// [`BootstrapReport::incarnation`] carries, exposed separately so the mux handshake can stamp
+    /// it onto the server `Hello` without a `Bootstrap` round-trip. `None` on a node without an
+    /// event feed (nothing to rebaseline against).
+    fn node_incarnation(&self) -> Option<String> {
+        None
+    }
+
     /// The resident-service tree health.
     async fn health(&self) -> HealthReport;
 

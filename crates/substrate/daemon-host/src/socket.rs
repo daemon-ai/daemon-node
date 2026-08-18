@@ -601,9 +601,10 @@ where
                         wire_version: WIRE_VERSION,
                         features,
                         auth_mechanisms,
-                        // Projection-sync stage 3 stamps the process-incarnation id here; the
-                        // stage-2 contract ships the field so clients can already decode it.
-                        incarnation: None,
+                        // Projection-sync stage 3 (spec §4.3): the process-incarnation id, so a
+                        // mux client detects a node restart at the handshake and rebaselines
+                        // without an extra Bootstrap round-trip.
+                        incarnation: api.node_incarnation(),
                     })
                     .await;
             }

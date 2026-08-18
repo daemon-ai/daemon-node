@@ -27,6 +27,9 @@ pub struct MuxConn<S> {
     next_id: u64,
     /// The mechanisms the server advertised on its `Hello` (empty under local trust).
     pub mechanisms: Vec<String>,
+    /// The node's process-incarnation id from the server `Hello` (projection-sync §4.3; `None`
+    /// from a feed-less or pre-projection-sync node).
+    pub incarnation: Option<String>,
 }
 
 impl<S> MuxConn<S>
@@ -52,11 +55,14 @@ where
             .ok_or_else(|| ApiError::Other("closed before hello ack".into()))?;
         match from_cbor::<WireS2C>(&bytes)? {
             WireS2C::Hello {
-                auth_mechanisms, ..
+                auth_mechanisms,
+                incarnation,
+                ..
             } => Ok(Self {
                 stream,
                 next_id: 1,
                 mechanisms: auth_mechanisms,
+                incarnation,
             }),
             other => Err(ApiError::Other(format!(
                 "expected Hello ack, got {other:?}"

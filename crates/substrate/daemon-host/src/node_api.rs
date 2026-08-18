@@ -1100,6 +1100,7 @@ mod messaging;
 mod model;
 mod overlay;
 mod profile;
+mod projection_policy;
 mod provisioning;
 mod roster;
 mod routing;

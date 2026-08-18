@@ -239,35 +239,65 @@ impl NodeApiImpl {
         owner_visible(&principal, &owner)
     }
 
-    /// Auth 4 (F4): keep only the node-events a non-`SessionSeeAll` principal may see. The three
+    /// Auth 4 (F4) + projection-sync §6: keep only the node-events `principal` may see. The three
     /// session-bearing variants (`SessionAdvanced`/`SessionMetaChanged`/`ApprovalPending`) are
-    /// dropped unless the referenced session's owner is visible to `principal`; the payload-free
-    /// node-wide pointers (`RosterChanged`/`FleetChanged`/`CatalogChanged`/`DownloadProgress`/
-    /// `ResyncNeeded`) carry no foreign session id and pass (the refetch they nudge —
-    /// `SessionsQuery`/`Tree`/`ModelCatalog` — is itself owner-scoped or non-session). The page
-    /// cursors are left untouched so a client still advances correctly past filtered events.
-    /// Fail-closed: a `None` principal sees no session-bearing event (`owner_visible` denies `None`).
-    /// A `SessionSeeAll` holder is short-circuited by the caller (the whole feed, unscoped).
+    /// dropped unless the referenced session's owner is visible to `principal` (`owner_visible`
+    /// grants `SessionSeeAll` holders everything); a `ProjectionChanged` is classed by its
+    /// projection's [`visibility_class`](super::projection_policy::visibility_class) —
+    /// OwnerScoped Key events resolve the key's session owner, All-scope rev pointers pass (the
+    /// refetch they nudge is itself authorization-filtered), CapabilityScoped events require the
+    /// projection's read capability. The remaining payload-free pointers carry no foreign session
+    /// id and pass. The page cursors are left untouched so a client still advances correctly past
+    /// filtered events. Fail-closed: a `None` principal sees no session-bearing or
+    /// capability-scoped event.
     pub(crate) async fn scope_events_page(
         &self,
         mut page: daemon_api::EventsPage,
         principal: &Option<daemon_auth::Principal>,
     ) -> daemon_api::EventsPage {
-        use daemon_api::NodeEvent;
+        use super::projection_policy::{visibility_class, VisibilityClass};
+        use daemon_api::{ChangeScope, NodeEvent};
         let mut kept = Vec::with_capacity(page.events.len());
         for ev in page.events {
             let session = match &ev {
                 NodeEvent::SessionAdvanced { session, .. }
                 | NodeEvent::SessionMetaChanged { session, .. }
                 | NodeEvent::ApprovalPending { session, .. } => Some(session.clone()),
+                // An OwnerScoped Key-scoped envelope names a session id as its key (Sessions and
+                // Approvals both partition by session); resolve its owner like the legacy arms.
+                NodeEvent::ProjectionChanged {
+                    projection, scope, ..
+                } if matches!(visibility_class(*projection), VisibilityClass::OwnerScoped) => {
+                    match scope {
+                        ChangeScope::Key { key } => Some(SessionId::new(key.clone())),
+                        ChangeScope::All => None,
+                    }
+                }
                 _ => None,
             };
-            let visible = match session {
-                Some(s) => owner_visible(
-                    principal,
-                    &self.store.session_meta(&s).await.and_then(|m| m.owner),
-                ),
-                None => true,
+            let visible = match &ev {
+                NodeEvent::ProjectionChanged { projection, .. } => {
+                    match visibility_class(*projection) {
+                        VisibilityClass::Public => true,
+                        VisibilityClass::OwnerScoped => match session {
+                            Some(s) => owner_visible(
+                                principal,
+                                &self.store.session_meta(&s).await.and_then(|m| m.owner),
+                            ),
+                            None => true,
+                        },
+                        VisibilityClass::CapabilityScoped(cap) => {
+                            principal.as_ref().is_some_and(|p| p.has(cap))
+                        }
+                    }
+                }
+                _ => match session {
+                    Some(s) => owner_visible(
+                        principal,
+                        &self.store.session_meta(&s).await.and_then(|m| m.owner),
+                    ),
+                    None => true,
+                },
             };
             if visible {
                 kept.push(ev);

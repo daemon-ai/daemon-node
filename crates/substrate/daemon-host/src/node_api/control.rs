@@ -14,21 +14,23 @@ fn now_ms() -> u64 {
 
 #[async_trait]
 impl ControlApi for NodeApiImpl {
+    fn node_incarnation(&self) -> Option<String> {
+        self.node_feed().map(|f| f.incarnation().to_string())
+    }
+
     async fn events_page(&self, cursor: u64, max: u32) -> EventsPage {
         let Some(feed) = &self.node_events else {
             return EventsPage::default();
         };
         let page = feed.page(cursor, max);
-        // Auth 4 (F4): scope the node-wide feed to the request principal — a non-owner must not learn
-        // another owner's session advanced / changed / is awaiting approval. An operator
-        // (SessionSeeAll) reads the whole feed; fail-closed on a missing principal.
+        // Auth 4 (F4) + projection-sync §6: scope the node-wide feed to the request principal — a
+        // non-owner must not learn another owner's session advanced / changed / is awaiting
+        // approval, and a capability-scoped domain's events require its read capability. No
+        // SessionSeeAll short-circuit: `owner_visible` already grants it every session-bearing
+        // event, but it must NOT bypass the capability classes (an operator without
+        // CredentialRead must not see credential invalidations). Fail-closed on a missing
+        // principal.
         let principal = current_principal();
-        if principal
-            .as_ref()
-            .is_some_and(|p| p.has(daemon_auth::Capability::SessionSeeAll))
-        {
-            return page;
-        }
         self.scope_events_page(page, &principal).await
     }
 
@@ -37,18 +39,12 @@ impl ControlApi for NodeApiImpl {
             return Ok(stream::empty().boxed());
         };
         let raw = feed.subscribe(cursor);
-        // Auth 4 (F4): capture the subscriber's principal AT SUBSCRIBE TIME — the returned long-lived
-        // stream is polled outside this request's task-local scope (the same rule `tree_subscribe`
-        // notes), so `current_principal()` would be `None` there. An operator (SessionSeeAll) gets
-        // the raw feed; any other subscriber has each page owner-scoped so no foreign-session event
-        // ever rides through.
+        // Auth 4 (F4) + projection-sync §6: capture the subscriber's principal AT SUBSCRIBE TIME —
+        // the returned long-lived stream is polled outside this request's task-local scope (the
+        // same rule `tree_subscribe` notes), so `current_principal()` would be `None` there. Every
+        // subscriber has each page scoped (no SessionSeeAll short-circuit: `owner_visible` already
+        // grants it the session-bearing events, but the §6 capability classes must still apply).
         let principal = current_principal();
-        if principal
-            .as_ref()
-            .is_some_and(|p| p.has(daemon_auth::Capability::SessionSeeAll))
-        {
-            return Ok(raw);
-        }
         let this = self.clone();
         Ok(raw
             .then(move |page| {
@@ -238,7 +234,22 @@ impl ControlApi for NodeApiImpl {
         // The race-free initial-sync baseline (06G6): every collection's rev + the feed cursor +
         // epoch, snapshotted atomically under one feed-lock acquisition. Empty when no feed is
         // wired (a node assembled without the event feed).
-        self.node_feed().map(|f| f.bootstrap()).unwrap_or_default()
+        let mut report = self.node_feed().map(|f| f.bootstrap()).unwrap_or_default();
+        // Projection-sync §6/§8: the domain-rev table is visibility-filtered per principal at
+        // assembly — a principal without a projection's read capability must not even learn its
+        // revision moved. OwnerScoped entries pass: they are All-scope rev pointers and the
+        // refetch they anchor is itself authorization-filtered.
+        use super::projection_policy::{visibility_class, VisibilityClass};
+        let principal = current_principal();
+        report
+            .domain_revs
+            .retain(|d| match visibility_class(d.projection) {
+                VisibilityClass::Public | VisibilityClass::OwnerScoped => true,
+                VisibilityClass::CapabilityScoped(cap) => {
+                    principal.as_ref().is_some_and(|p| p.has(cap))
+                }
+            });
+        report
     }
 
     async fn command_dedup_lookup(&self, op_id: &str) -> Option<Vec<u8>> {

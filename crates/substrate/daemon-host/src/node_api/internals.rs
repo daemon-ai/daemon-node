@@ -184,6 +184,13 @@ pub struct NodeEventFeed {
     /// This feed's generation (rung 1), minted from [`FEED_EPOCH_SEQ`] at construction and stamped
     /// onto every [`EventsPage`].
     epoch: u64,
+    /// Projection-sync stage 3 (spec §4.3): the node's process-incarnation id — random per feed
+    /// construction, served on `Bootstrap` and the mux server `Hello`. A client persists
+    /// `(cursor, incarnation, revs)` together; a mismatch on reconnect forces a full rebaseline,
+    /// because every rev counter here is in-memory and resets with the process. Unlike `epoch` (a
+    /// process-local counter that restarts at 1), the random id is distinguishable ACROSS process
+    /// restarts — the property crash recovery needs.
+    incarnation: String,
 }
 
 #[derive(Clone)]
@@ -338,6 +345,13 @@ pub(crate) struct NodeFeedInner {
     /// on `ConversationsChanged`, echoed by `ConvList`'s `conv-page`, delta-served on
     /// `ConvList.since_rev`. Keyed by the instance-qualified transport id.
     conversations: HashMap<TransportId, DeltaIndex>,
+    /// Projection-sync stage 3 (spec §3/§8): revision counters for the domains that have **no**
+    /// legacy per-collection field above — everything reached only through `note_domain_change`
+    /// (stage-4 gap closures: credentials, cron, routing, approvals, messages, …). Domains that DO
+    /// have a legacy counter keep it as the single authority (the `ProjectionChanged` twin reuses
+    /// the legacy event's rev, so dual emission can never disagree); this map must not shadow
+    /// them. Keyed by `(projection, partition)`; in-memory like every rev here.
+    domains: std::collections::BTreeMap<(daemon_api::ProjectionId, Option<String>), u64>,
 }
 
 /// Process-global startup counter minting each feed's `epoch` (rung 1). Monotonic from 1 per
@@ -347,6 +361,26 @@ pub(crate) struct NodeFeedInner {
 /// caveat, 06G1) — the epoch only needs to be *distinguishable* from the client's stored value to
 /// force a deliberate re-baseline.
 static FEED_EPOCH_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Mint the feed's random process-incarnation id (spec §4.3): 16 random bytes, hex. Falls back to
+/// a nanosecond stamp if the OS entropy source fails (still distinguishable across restarts, the
+/// only property required).
+fn mint_incarnation() -> String {
+    let mut bytes = [0u8; 16];
+    if getrandom::getrandom(&mut bytes).is_err() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        bytes.copy_from_slice(&nanos.to_le_bytes());
+    }
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        use std::fmt::Write;
+        let _ = write!(hex, "{b:02x}");
+    }
+    hex
+}
 
 impl NodeEventFeed {
     pub fn new(capacity: usize) -> Arc<Self> {
@@ -365,10 +399,17 @@ impl NodeEventFeed {
                 catalog_rev: 0,
                 contacts: HashMap::new(),
                 conversations: HashMap::new(),
+                domains: std::collections::BTreeMap::new(),
             }),
             tx,
             epoch: FEED_EPOCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            incarnation: mint_incarnation(),
         })
+    }
+
+    /// This feed's process-incarnation id (spec §4.3), served on `Bootstrap` + the mux `Hello`.
+    pub fn incarnation(&self) -> &str {
+        &self.incarnation
     }
 
     /// Bump the roster revision, record it as `session`'s last-change rev (L4 delta index), and
@@ -656,6 +697,7 @@ impl NodeEventFeed {
     /// `epoch` is immutable per feed, so it needs no lock. Keys are stable collection names the
     /// client anchors its per-collection `since_rev` reads against.
     pub(crate) fn bootstrap(&self) -> daemon_api::BootstrapReport {
+        use daemon_api::{DomainRev, ProjectionId};
         let g = self.inner.lock().unwrap();
         let mut revs = std::collections::BTreeMap::new();
         revs.insert("roster".to_string(), g.rev);
@@ -670,14 +712,75 @@ impl NodeEventFeed {
         for (transport, index) in &g.contacts {
             revs.insert(format!("contacts:{}", transport.as_str()), index.rev);
         }
+        // Projection-sync stage 3 (spec §8): the uniform revision-domain table — the legacy
+        // counters under their ProjectionId names (same values as `revs`, so the two tables can
+        // never disagree during the migration window), each existing bounded partition, and every
+        // map-backed domain that has been touched. Per-key revs never ride here. The Bootstrap
+        // handler applies the §6 visibility filter per principal; this snapshot is unscoped.
+        let mut domain_revs = vec![
+            DomainRev {
+                projection: ProjectionId::Sessions,
+                partition: None,
+                rev: g.rev,
+            },
+            DomainRev {
+                projection: ProjectionId::Fleet,
+                partition: None,
+                rev: g.fleet_rev,
+            },
+            DomainRev {
+                projection: ProjectionId::Profiles,
+                partition: None,
+                rev: g.profiles_rev,
+            },
+            DomainRev {
+                projection: ProjectionId::Agents,
+                partition: None,
+                rev: g.agents_rev,
+            },
+            DomainRev {
+                projection: ProjectionId::Persons,
+                partition: None,
+                rev: g.persons.rev,
+            },
+            DomainRev {
+                projection: ProjectionId::Notifications,
+                partition: None,
+                rev: g.notifications_rev,
+            },
+            DomainRev {
+                projection: ProjectionId::Catalog,
+                partition: None,
+                rev: g.catalog_rev,
+            },
+        ];
+        for (transport, index) in &g.conversations {
+            domain_revs.push(DomainRev {
+                projection: ProjectionId::Conversations,
+                partition: Some(transport.as_str().to_string()),
+                rev: index.rev,
+            });
+        }
+        for (transport, index) in &g.contacts {
+            domain_revs.push(DomainRev {
+                projection: ProjectionId::Contacts,
+                partition: Some(transport.as_str().to_string()),
+                rev: index.rev,
+            });
+        }
+        for ((projection, partition), rev) in &g.domains {
+            domain_revs.push(DomainRev {
+                projection: *projection,
+                partition: partition.clone(),
+                rev: *rev,
+            });
+        }
         daemon_api::BootstrapReport {
             cursor: g.ring.head(),
             epoch: self.epoch,
             revs,
-            // Projection-sync stage 3 populates the incarnation id and the uniform
-            // (visibility-filtered) revision-domain table; stage 2 ships the wire shapes only.
-            incarnation: None,
-            domain_revs: Vec::new(),
+            incarnation: Some(self.incarnation.clone()),
+            domain_revs,
         }
     }
 
@@ -690,6 +793,12 @@ impl NodeEventFeed {
     /// `SessionAdvanced` for the same session are coalesced in the *backlog* (latest wins) so a
     /// reconnecting reader isn't flooded; the live broadcast still fires per emit (the client
     /// dedups/throttles per-session activity).
+    ///
+    /// Projection-sync stage 3 (spec §3/§10): every legacy invalidation arm is **dual-emitted** —
+    /// the matching [`NodeEvent::ProjectionChanged`] twin (same rev, derived here under the same
+    /// lock so the two can never disagree) rides the ring right behind it, and its
+    /// `(domain, rev)` is recorded into the dispatch effects scope. At cutover the legacy arm is
+    /// dropped and the twin remains.
     pub fn emit(&self, event: NodeEvent) {
         let mut g = self.inner.lock().unwrap();
         if let NodeEvent::SessionAdvanced { session, .. } = &event {
@@ -726,10 +835,235 @@ impl NodeEventFeed {
             g.ring
                 .coalesce(|e| matches!(e, NodeEvent::AgentsChanged { .. }));
         }
+        // A directly-emitted ProjectionChanged (the `note_domain_change` path) takes the
+        // projection push (coalescing + effect recording) instead of the legacy path + twin.
+        if let NodeEvent::ProjectionChanged { .. } = event {
+            let entry = Self::push_projection(&mut g, event);
+            drop(g);
+            let _ = self.tx.send(entry);
+            return;
+        }
+        let twin = Self::derive_twin(&mut g, &event);
         // push assigns the cursor + raises the floor on a capacity eviction.
         let cursor = g.ring.push(event.clone());
+        let twin_entry = twin.map(|t| Self::push_projection(&mut g, t));
         drop(g);
         let _ = self.tx.send(NodeFeedEntry { cursor, event });
+        if let Some(entry) = twin_entry {
+            let _ = self.tx.send(entry);
+        }
+    }
+
+    /// The [`NodeEvent::ProjectionChanged`] twin of a legacy invalidation arm (spec §3's mapping),
+    /// derived under the feed lock so the twin's rev is EXACTLY the legacy event's — dual emission
+    /// can never disagree. `None` for the arms that are not invalidations (`SessionAdvanced`,
+    /// progress, `TransportChanged` live presence, `ResyncNeeded`) and for `ApprovalPending`
+    /// (approvals migrate last, via `note_domain_change` in stage 4).
+    ///
+    /// Two legacy arms carry no usable rev and get one minted here, under the same lock:
+    /// `MessagesChanged` bumps the `(Messages, transport)` domain; `MembershipChanged` bumps the
+    /// conversation delta index (a member-set change IS a change of that conversation's record, so
+    /// marking the conv changed serves the `ConvList.since_rev` delta correctly).
+    fn derive_twin(g: &mut NodeFeedInner, event: &NodeEvent) -> Option<NodeEvent> {
+        use daemon_api::{ChangeScope, ProjectionId};
+        let (projection, partition, scope, rev, origin_op) = match event {
+            NodeEvent::SessionMetaChanged {
+                session,
+                rev,
+                origin_op,
+            } => (
+                ProjectionId::Sessions,
+                None,
+                ChangeScope::Key {
+                    key: session.as_str().to_string(),
+                },
+                *rev,
+                origin_op.clone(),
+            ),
+            NodeEvent::RosterChanged { rev } => {
+                (ProjectionId::Sessions, None, ChangeScope::All, *rev, None)
+            }
+            NodeEvent::FleetChanged { rev } => {
+                (ProjectionId::Fleet, None, ChangeScope::All, *rev, None)
+            }
+            NodeEvent::ProfilesChanged { rev } => {
+                (ProjectionId::Profiles, None, ChangeScope::All, *rev, None)
+            }
+            NodeEvent::CatalogChanged { rev } => {
+                (ProjectionId::Catalog, None, ChangeScope::All, *rev, None)
+            }
+            NodeEvent::AgentsChanged { rev } => {
+                (ProjectionId::Agents, None, ChangeScope::All, *rev, None)
+            }
+            NodeEvent::NotificationsChanged { rev } => (
+                ProjectionId::Notifications,
+                None,
+                ChangeScope::All,
+                *rev,
+                None,
+            ),
+            // The legacy arm is a whole-registry pointer (the keyed detail lives in the rung-2
+            // delta index, not the event), so the twin is All-scoped too.
+            NodeEvent::PersonsChanged { rev } => {
+                (ProjectionId::Persons, None, ChangeScope::All, *rev, None)
+            }
+            NodeEvent::VhcChanged { run_id, rev } => (
+                ProjectionId::Vhc,
+                None,
+                match run_id {
+                    Some(id) => ChangeScope::Key { key: id.clone() },
+                    None => ChangeScope::All,
+                },
+                *rev,
+                None,
+            ),
+            NodeEvent::ContactsChanged { transport, rev } => (
+                ProjectionId::Contacts,
+                Some(transport.as_str().to_string()),
+                ChangeScope::All,
+                *rev,
+                None,
+            ),
+            NodeEvent::ConversationsChanged {
+                transport,
+                conv,
+                rev,
+                origin_op,
+                ..
+            } => (
+                ProjectionId::Conversations,
+                Some(transport.as_str().to_string()),
+                ChangeScope::Key { key: conv.clone() },
+                *rev,
+                origin_op.clone(),
+            ),
+            NodeEvent::MembershipChanged {
+                transport,
+                conv,
+                origin_op,
+                ..
+            } => {
+                let rev = g
+                    .conversations
+                    .entry(transport.clone())
+                    .or_default()
+                    .note_change(conv, origin_op.clone());
+                (
+                    ProjectionId::Conversations,
+                    Some(transport.as_str().to_string()),
+                    ChangeScope::Key { key: conv.clone() },
+                    rev,
+                    origin_op.clone(),
+                )
+            }
+            NodeEvent::MessagesChanged {
+                transport,
+                conv,
+                origin_op,
+            } => {
+                let key = (ProjectionId::Messages, Some(transport.as_str().to_string()));
+                let rev = g.domains.entry(key.clone()).or_insert(0);
+                *rev += 1;
+                (
+                    ProjectionId::Messages,
+                    key.1,
+                    ChangeScope::Key { key: conv.clone() },
+                    *rev,
+                    origin_op.clone(),
+                )
+            }
+            _ => return None,
+        };
+        Some(NodeEvent::ProjectionChanged {
+            projection,
+            partition,
+            scope,
+            rev,
+            origin_op,
+        })
+    }
+
+    /// Push a [`NodeEvent::ProjectionChanged`] onto the ring with the §7 coalescing matrix
+    /// applied, and record its `(domain, rev)` into the dispatch effects scope (a no-op outside
+    /// one — internal producers). Backlog entries with the SAME `(projection, partition, scope)`
+    /// are superseded (latest-wins; floor-exempt); scope is never widened (`Key(a)`/`Key(b)` both
+    /// survive, `All` does not absorb `Key`). If a superseded entry carried a **different**
+    /// `origin_op`, the survivor's is nulled — provenance-based echo suppression must never
+    /// suppress another client's change (§7 rule 3).
+    fn push_projection(g: &mut NodeFeedInner, event: NodeEvent) -> NodeFeedEntry {
+        let NodeEvent::ProjectionChanged {
+            projection,
+            partition,
+            scope,
+            rev,
+            mut origin_op,
+        } = event
+        else {
+            unreachable!("push_projection is only called with ProjectionChanged");
+        };
+        let same_domain_scope = |e: &NodeEvent| {
+            matches!(e, NodeEvent::ProjectionChanged {
+                projection: p, partition: pt, scope: s, ..
+            } if *p == projection && *pt == partition && *s == scope)
+        };
+        // §7 rule 3 needs the superseded entries' provenance BEFORE they're dropped.
+        if g.ring.iter().any(|(_, e)| {
+            same_domain_scope(e)
+                && matches!(e, NodeEvent::ProjectionChanged { origin_op: op, .. } if *op != origin_op)
+        }) {
+            origin_op = None;
+        }
+        g.ring.coalesce(same_domain_scope);
+        daemon_api::record_effect(daemon_api::DomainRev {
+            projection,
+            partition: partition.clone(),
+            rev,
+        });
+        let event = NodeEvent::ProjectionChanged {
+            projection,
+            partition,
+            scope,
+            rev,
+            origin_op,
+        };
+        let cursor = g.ring.push(event.clone());
+        NodeFeedEntry { cursor, event }
+    }
+
+    /// Projection-sync stage 3 (spec §4.1): the single generalized mutation seam for domains with
+    /// **no** legacy counter — bump the `(projection, partition)` revision, emit the
+    /// [`NodeEvent::ProjectionChanged`] pointer (with §7 coalescing), record the effect into the
+    /// dispatch scope, and return the revision assigned. Stage-4 gap closures call this; domains
+    /// with a legacy counter keep their `note_*` + legacy emit (the twin rides automatically).
+    pub fn note_domain_change(
+        &self,
+        projection: daemon_api::ProjectionId,
+        partition: Option<&str>,
+        scope: daemon_api::ChangeScope,
+        origin_op: Option<String>,
+    ) -> u64 {
+        let mut g = self.inner.lock().unwrap();
+        let rev = {
+            let counter = g
+                .domains
+                .entry((projection, partition.map(str::to_string)))
+                .or_insert(0);
+            *counter += 1;
+            *counter
+        };
+        let entry = Self::push_projection(
+            &mut g,
+            NodeEvent::ProjectionChanged {
+                projection,
+                partition: partition.map(str::to_string),
+                scope,
+                rev,
+                origin_op,
+            },
+        );
+        drop(g);
+        let _ = self.tx.send(entry);
+        rev
     }
 
     /// The one-shot cursor read: the retained events past `after_cursor` (capped at `max`, `0` = all),
@@ -2303,13 +2637,16 @@ mod node_feed_tests {
 
     #[test]
     pub(crate) fn page_resyncs_when_cursor_aged_out_of_the_ring() {
-        // A tiny ring (capacity 2) so a few emits push the early cursors out.
+        // A tiny ring (capacity 2) so a few emits push the early cursors out. Each emit
+        // dual-emits (legacy + ProjectionChanged twin, projection-sync stage 3), so 5 emits
+        // assign 10 cursors; the twins coalesce (same domain + All scope), the legacy arms are
+        // evicted by capacity, and the ring ends holding the latest legacy + its twin.
         let feed = NodeEventFeed::new(2);
         for rev in 1..=5 {
             feed.emit(NodeEvent::RosterChanged { rev });
         }
-        // The ring retains only the last two (cursors 4,5). A reader still at cursor 0 lost 1..=3, so
-        // it must be told to re-baseline rather than silently miss them.
+        // A reader still at cursor 0 lost evicted entries, so it must be told to re-baseline
+        // rather than silently miss them.
         let page = feed.page(0, 0);
         assert_eq!(
             page.events,
@@ -2318,18 +2655,25 @@ mod node_feed_tests {
             }],
             "an aged-out cursor must surface ResyncNeeded"
         );
-        assert_eq!(page.head_cursor, 5);
+        assert_eq!(page.head_cursor, 10);
 
-        // A reader still within the ring (cursor 3 -> 4,5) reads forward, no resync.
-        let page = feed.page(3, 0);
+        // A reader at the eviction floor reads forward, no resync: the latest legacy arm + its
+        // coalesced twin (same rev).
+        let page = feed.page(7, 0);
         assert_eq!(
             page.events,
             vec![
-                NodeEvent::RosterChanged { rev: 4 },
-                NodeEvent::RosterChanged { rev: 5 }
+                NodeEvent::RosterChanged { rev: 5 },
+                NodeEvent::ProjectionChanged {
+                    projection: daemon_api::ProjectionId::Sessions,
+                    partition: None,
+                    scope: daemon_api::ChangeScope::All,
+                    rev: 5,
+                    origin_op: None,
+                },
             ]
         );
-        assert_eq!(page.next_cursor, 5);
+        assert_eq!(page.next_cursor, 10);
     }
 
     #[test]
@@ -2384,7 +2728,9 @@ mod node_feed_tests {
             .count();
         assert_eq!(fleet, 1, "the backlog keeps a single (latest) FleetChanged");
         assert!(
-            matches!(page.events.last(), Some(NodeEvent::FleetChanged { rev: 5 })),
+            page.events
+                .iter()
+                .any(|e| matches!(e, NodeEvent::FleetChanged { rev: 5 })),
             "the latest FleetChanged wins"
         );
         assert!(
@@ -2393,6 +2739,21 @@ mod node_feed_tests {
                 .any(|e| matches!(e, NodeEvent::RosterChanged { .. })),
             "FleetChanged coalescing must not drop other events"
         );
+        // Projection-sync stage 3: the dual-emitted twin coalesces identically — one Fleet
+        // envelope survives, carrying the latest rev.
+        let twins: Vec<u64> = page
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                NodeEvent::ProjectionChanged {
+                    projection: daemon_api::ProjectionId::Fleet,
+                    rev,
+                    ..
+                } => Some(*rev),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(twins, vec![5], "one coalesced Fleet twin, latest rev");
     }
 
     #[tokio::test]
@@ -2400,10 +2761,21 @@ mod node_feed_tests {
         let feed = NodeEventFeed::new(64);
         feed.emit(NodeEvent::RosterChanged { rev: 1 });
         let mut stream = feed.subscribe(0);
-        // Backlog first.
+        // Backlog first: the legacy arm, then its dual-emitted ProjectionChanged twin
+        // (projection-sync stage 3), one page each.
         let first = stream.next().await.expect("backlog page");
         assert_eq!(first.events, vec![NodeEvent::RosterChanged { rev: 1 }]);
-        // Then a live emit arrives on the same stream.
+        let twin = stream.next().await.expect("twin backlog page");
+        assert!(matches!(
+            twin.events.as_slice(),
+            [NodeEvent::ProjectionChanged {
+                projection: daemon_api::ProjectionId::Sessions,
+                rev: 1,
+                ..
+            }]
+        ));
+        // Then a live emit arrives on the same stream (ApprovalPending has no twin — approvals
+        // migrate via note_domain_change in stage 4).
         feed.emit(NodeEvent::ApprovalPending {
             session: SessionId::new("s"),
             request_id: "r".into(),
@@ -2615,6 +2987,240 @@ mod node_feed_tests {
         assert_ne!(
             e1, e2,
             "a restart (fresh feed) must mint a distinct epoch so a stale cursor re-baselines"
+        );
+    }
+
+    // ---- projection-sync stage 3 (daemon-projection-sync-spec.md §3/§4/§7/§8) ----
+
+    /// Every legacy invalidation arm dual-emits its `ProjectionChanged` twin with the SAME rev
+    /// (derived under the same lock — the migration-window invariant a client relies on to switch
+    /// arms per vertical without rev skew).
+    #[test]
+    pub(crate) fn legacy_arms_dual_emit_their_projection_twin_with_the_same_rev() {
+        use daemon_api::{ChangeScope, ProjectionId};
+        let feed = NodeEventFeed::new(64);
+        let s = SessionId::new("twin");
+        let rev = feed.note_roster_change_op(&s, Some("op-1".into()));
+        feed.emit(NodeEvent::SessionMetaChanged {
+            session: s.clone(),
+            rev,
+            origin_op: Some("op-1".into()),
+        });
+        let events = feed.page(0, 0).events;
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, NodeEvent::SessionMetaChanged { .. })),
+            "the legacy arm still rides during the migration window"
+        );
+        assert!(
+            events.iter().any(|e| matches!(e,
+                NodeEvent::ProjectionChanged {
+                    projection: ProjectionId::Sessions,
+                    partition: None,
+                    scope: ChangeScope::Key { key },
+                    rev: r,
+                    origin_op: Some(op),
+                } if key == s.as_str() && *r == rev && op == "op-1")),
+            "the twin carries the SAME rev + key + provenance, got {events:?}"
+        );
+    }
+
+    /// `note_domain_change` (the map-backed seam for legacy-less domains) mints monotonic revs per
+    /// `(projection, partition)` and emits the envelope directly.
+    #[test]
+    pub(crate) fn note_domain_change_mints_monotonic_revs_per_domain() {
+        use daemon_api::{ChangeScope, ProjectionId};
+        let feed = NodeEventFeed::new(64);
+        assert_eq!(
+            feed.note_domain_change(ProjectionId::Cron, None, ChangeScope::All, None),
+            1
+        );
+        assert_eq!(
+            feed.note_domain_change(ProjectionId::Cron, None, ChangeScope::All, None),
+            2
+        );
+        // A partitioned domain counts independently, per partition.
+        assert_eq!(
+            feed.note_domain_change(
+                ProjectionId::Messages,
+                Some("matrix/@a:hs"),
+                ChangeScope::All,
+                None
+            ),
+            1
+        );
+        assert_eq!(
+            feed.note_domain_change(
+                ProjectionId::Messages,
+                Some("matrix/@b:hs"),
+                ChangeScope::All,
+                None
+            ),
+            1,
+            "partitions are independent"
+        );
+        let cron: Vec<u64> = feed
+            .page(0, 0)
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                NodeEvent::ProjectionChanged {
+                    projection: daemon_api::ProjectionId::Cron,
+                    rev,
+                    ..
+                } => Some(*rev),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            cron,
+            vec![2],
+            "same-domain All envelopes coalesce, latest wins"
+        );
+    }
+
+    /// §7 rules 2 + 3: coalescing never widens scope (`Key(a)`/`Key(b)`/`All` all survive one
+    /// another), and a coalesce across DIFFERENT `origin_op`s nulls the survivor's provenance so
+    /// echo suppression can never swallow another client's change.
+    #[test]
+    pub(crate) fn projection_coalescing_never_widens_scope_and_nulls_mixed_provenance() {
+        use daemon_api::{ChangeScope, ProjectionId};
+        let feed = NodeEventFeed::new(64);
+        let key = |k: &str| ChangeScope::Key { key: k.into() };
+        feed.note_domain_change(ProjectionId::Cron, None, key("a"), Some("op-a".into()));
+        feed.note_domain_change(ProjectionId::Cron, None, key("b"), Some("op-b".into()));
+        feed.note_domain_change(ProjectionId::Cron, None, ChangeScope::All, None);
+        let survivors: Vec<(ChangeScope, Option<String>)> = feed
+            .page(0, 0)
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                NodeEvent::ProjectionChanged {
+                    projection: ProjectionId::Cron,
+                    scope,
+                    origin_op,
+                    ..
+                } => Some((scope.clone(), origin_op.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            survivors.len(),
+            3,
+            "Key(a), Key(b) and All must ALL survive (no widening), got {survivors:?}"
+        );
+
+        // Same (domain, scope) with different provenance: latest wins, provenance nulled.
+        feed.note_domain_change(ProjectionId::Cron, None, key("a"), Some("op-c".into()));
+        let a_survivor: Vec<Option<String>> = feed
+            .page(0, 0)
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                NodeEvent::ProjectionChanged {
+                    projection: ProjectionId::Cron,
+                    scope: ChangeScope::Key { key: k },
+                    origin_op,
+                    ..
+                } if k == "a" => Some(origin_op.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            a_survivor,
+            vec![None],
+            "coalescing op-a with op-c must null the survivor's origin_op (§7 rule 3)"
+        );
+    }
+
+    /// §4.2: a `note_domain_change` inside a dispatch effects scope records its `(domain, rev)`;
+    /// outside any scope the recording seam is a silent no-op (internal producers).
+    #[tokio::test]
+    pub(crate) async fn domain_changes_record_mutation_effects_in_scope() {
+        use daemon_api::{ChangeScope, DomainRev, ProjectionId};
+        let feed = NodeEventFeed::new(64);
+        // Outside any scope: must not panic, must still bump.
+        assert_eq!(
+            feed.note_domain_change(ProjectionId::Routing, None, ChangeScope::All, None),
+            1
+        );
+        let ((), effects) = daemon_api::with_effects(async {
+            feed.note_domain_change(ProjectionId::Routing, None, ChangeScope::All, None);
+            let s = SessionId::new("fx");
+            let rev = feed.note_roster_change(&s);
+            feed.emit(NodeEvent::SessionMetaChanged {
+                session: s,
+                rev,
+                origin_op: None,
+            });
+        })
+        .await;
+        assert_eq!(
+            effects,
+            vec![
+                DomainRev {
+                    projection: ProjectionId::Routing,
+                    partition: None,
+                    rev: 2,
+                },
+                DomainRev {
+                    projection: ProjectionId::Sessions,
+                    partition: None,
+                    rev: 1,
+                },
+            ],
+            "both the direct note and the dual-emission twin record their effect"
+        );
+    }
+
+    /// §8: `bootstrap()` serves the uniform domain-rev table — the legacy counters under their
+    /// `ProjectionId` names (numerically equal to the string-keyed `revs`, so the two tables can
+    /// never disagree in the migration window), map-backed domains once touched, and the feed's
+    /// random incarnation id (stable within the feed, distinct across feeds).
+    #[test]
+    pub(crate) fn bootstrap_serves_domain_revs_and_incarnation() {
+        use daemon_api::{ChangeScope, ProjectionId};
+        let feed = NodeEventFeed::new(64);
+        feed.note_roster_change(&SessionId::new("b1"));
+        feed.note_profiles_change();
+        feed.note_domain_change(ProjectionId::Fingerprints, None, ChangeScope::All, None);
+        let report = feed.bootstrap();
+
+        let rev_of = |p: ProjectionId| {
+            report
+                .domain_revs
+                .iter()
+                .find(|d| d.projection == p && d.partition.is_none())
+                .map(|d| d.rev)
+        };
+        assert_eq!(rev_of(ProjectionId::Sessions), Some(report.revs["roster"]));
+        assert_eq!(
+            rev_of(ProjectionId::Profiles),
+            Some(report.revs["profiles"])
+        );
+        assert_eq!(
+            rev_of(ProjectionId::Agents),
+            Some(0),
+            "every single-domain projection with a counter rides the table, even untouched"
+        );
+        assert_eq!(
+            rev_of(ProjectionId::Fingerprints),
+            Some(1),
+            "a touched map-backed domain rides the table"
+        );
+
+        let inc = report.incarnation.expect("incarnation is served");
+        assert_eq!(
+            feed.bootstrap().incarnation.as_deref(),
+            Some(inc.as_str()),
+            "stable within one feed"
+        );
+        let other = NodeEventFeed::new(64);
+        assert_ne!(
+            other.bootstrap().incarnation.as_deref(),
+            Some(inc.as_str()),
+            "a restart (fresh feed) mints a distinct incarnation"
         );
     }
 
