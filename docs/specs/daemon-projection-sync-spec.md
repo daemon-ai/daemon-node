@@ -258,9 +258,12 @@ TelemetryConsentGet, CrashConsentGet, PresenceList, NotificationList, PersonList
 FsStat, FsRead, FsSearch, FsWatchPoll, BlobGet, BlobStat, UserList, RoleList, WhoAmI, Bootstrap.
 
 Also `NonStateful`: **Poll** (queue drain, no domain state), **FeedbackSubmit** (writes an
-OTLP outbox invisible to clients), **AuthBegin/AuthStep/AuthCancel** (flow-local state polled by
-the initiating client only), and the `Unsupported` trait-default stubs **ToolRegister,
+OTLP outbox invisible to clients), **AuthBegin/AuthCancel** (flow-local state polled by the
+initiating client only), and the `Unsupported` trait-default stubs **ToolRegister,
 ProviderRegister, ConfigSet** (reclassified when implemented — the census test pins this).
+**AuthStep** is `Conditional(Credentials, Profiles, Agents)` (stage-4 reclassification): a step
+that COMPLETES the flow lands a credential through the same path `AuthComplete` uses, and can
+rebind a profile / flip an agent verdict.
 
 ### 5.2 Mutating variants
 
@@ -272,48 +275,48 @@ Legend: **emits?** = current behavior. Gap = currently silent (closed at stage 1
 | SessionCreate | MustChange | Sessions/All | yes (`RosterChanged`) |
 | SessionUpdateMeta | MustChange | Sessions/Key | yes (`SessionMetaChanged`) |
 | SetSessionModel/Mode/Overlay | MustChange | Sessions/Key | **gap — stage 1** |
-| Assign | MustChange | Sessions/All | **gap** |
-| Cancel | Conditional | Sessions/Key | **gap** |
+| Assign | MustChange | Sessions/All | yes (stage 4: `RosterChanged` after the create/re-arm) |
+| Cancel | MustChange | Sessions/Key | yes (stage 4: `SessionMetaChanged` after the interrupt) |
 | RecordMeta | Conditional | Sessions/Key | partial (log append) |
-| Handover | MustChange | Sessions/Key | **gap** |
-| CheckpointRewind, Rewind | Conditional | Sessions/Key (+ session stream) | **gap** |
-| Respond | Conditional | Approvals/Key(session) | **gap** |
-| ApprovalDecide | MustChange | Approvals/Key(session) | **gap** (B's prompt never clears) |
-| FingerprintRevoke | MustChange | Fingerprints/All | **gap** |
-| TelemetryConsentSet | MustChange | TelemetryConsent/All | **gap** |
-| CrashConsentSet | MustChange | CrashConsent/All | **gap** |
-| PresenceSave/Delete/SetActive | MustChange | Presence/All | **gap** |
+| Handover | MustChange | Sessions/Key | yes (stage 4) |
+| CheckpointRewind, Rewind | MustChange | Sessions/Key (+ session stream) | yes (stage 4: emit on success) |
+| Respond | MustChange | Approvals/Key(session) | yes (stage 4: every accepted answer) |
+| ApprovalDecide | MustChange | Approvals/Key(session) | yes (stage 4: at the durable answer, before the wake) |
+| FingerprintRevoke | MustChange | Fingerprints/All | yes (stage 4) |
+| TelemetryConsentSet | MustChange | TelemetryConsent/All | yes (stage 4) |
+| CrashConsentSet | MustChange | CrashConsent/All | yes (stage 4) |
+| PresenceSave/Delete/SetActive | MustChange | Presence/All | yes (stage 4) |
 | Pause, Resume, Scale (fleet) | Conditional | Fleet/All | stubs today |
 | ModelDownload/InstallFromUrl/Cancel/Pause/Resume | Conditional | Catalog/All on completion | progress events + `CatalogChanged` |
 | ModelDelete | MustChange | Catalog/All | yes |
 | ModelQuantize | Conditional | Catalog/All | progress + conditional catalog |
-| ModelActivate | MustChange | Profiles/Key (mutates the profile's model binding) | **gap** |
-| CustomProviderSet/Remove | MustChange | CustomProviders/All | **gap** |
-| VhcJoin/Leave/Pause/Resume/SwitchModule/SetPolicy | MustChange | Vhc/Key or All | yes (service `emit_changed`) |
+| ModelActivate | MustChange | Profiles/Key (mutates the profile's model binding) | yes (stage 4: `ProfilesChanged` from the handler) |
+| CustomProviderSet/Remove | MustChange | CustomProviders/All | yes (stage 4) |
+| VhcJoin/Leave/Pause/Resume/SwitchModule/SetPolicy | Conditional | Vhc/Key or All | yes, but via the service's worker event pump (not verifiably synchronous within the handler — stays Conditional under the §10 promotion rule) |
 | VhcDiskWipe | Conditional | Vhc/All | conditional |
 | ProfileCreate/Update/Delete/Clone/Import/Revert, SoulSet | MustChange | Profiles/All or Key | yes |
 | ProfileSelect | MustChange | Profiles/All | **gap — stage 1** |
-| SkillPut, SkillRevert | MustChange | Skills/All | **gap** |
-| CuratorPin/Unpin/Archive/Restore | MustChange | Curator/All | **gap** |
-| CuratorRun | Conditional | Curator/All | **gap** |
-| CredentialSet/Remove/SetLabel | MustChange | Credentials/All | **gap** |
+| SkillPut, SkillRevert | MustChange | Skills/All | yes (stage 4) |
+| CuratorPin/Unpin/Archive/Restore | MustChange | Curator/All (+ Skills/All on archive/restore) | yes (stage 4) |
+| CuratorRun | Conditional | Curator/All + Skills/All | yes (stage 4: only when a transition landed) |
+| CredentialSet/Remove/SetLabel | MustChange | Credentials/All | yes (stage 4) |
 | AuthComplete | MustChange | Credentials/All (+ Conditional Agents, Profiles) | partial (`AgentsChanged` for agent creds) |
-| CronCreate/Update/Delete/Trigger/Pause/AcceptSuggestion/DismissSuggestion | MustChange | Cron/All | **gap** |
-| RoutingSet/BindChat/UnbindChat | MustChange | Routing/All | **gap** |
+| CronCreate/Update/Delete/Trigger/Pause/AcceptSuggestion/DismissSuggestion | MustChange | Cron/All | yes (stage 4) |
+| RoutingSet/BindChat/UnbindChat | MustChange | Routing/All | yes (stage 4: after persist + hot-reload) |
 | TransportSetLabel/SetEnabled/Configure/Remove | MustChange | Transports/Key(account) | partial (`TransportChanged` presence nudges only) |
 | TransportConnect/Disconnect | Conditional | Transports/Key | `TransportChanged` (live presence — stays specialized) |
 | ConvCreate/Join/Leave/Delete | Conditional | Conversations@t/Key | via LifecycleSink (adapter-reported — the sink is the census producer) |
 | ConvSend, FtSend, FtReceive | Conditional | Messages@t/Key(conv) | via sink |
 | ConvSetTopic/Title/Description | Conditional | Conversations@t/Key | adapter-reported |
 | MemberInvite/Remove/Ban/SetRole | Conditional | Conversations@t/Key | via sink |
-| ContactSetAlias | MustChange | Contacts@t/All | **gap** |
+| ContactSetAlias | MustChange | Contacts@t/All | yes (stage 4: via the shared contacts seam) |
 | RosterAdd/Update/Remove | MustChange | Contacts@t/All | yes |
 | AgentDiscover | Conditional | Agents/All | yes |
 | AgentRegister/Remove | MustChange | Agents/All | yes |
-| ToolSetEnabled | MustChange | Tools/All | **gap** |
+| ToolSetEnabled | MustChange | Tools/All | yes (stage 4) |
 | CommandInvoke | Conditional | (nested — whatever the command touches) | nested |
-| GatewaySet | MustChange | Gateway/All | **gap** |
-| UserCreate/Disable/SetRoles/SetPassword, SessionRevoke, ResourceGrant/Revoke | MustChange | AccessControl/All | **gap** |
+| GatewaySet | MustChange | Gateway/All | yes (stage 4) |
+| UserCreate/Disable/SetRoles/SetPassword, SessionRevoke, ResourceGrant/Revoke | MustChange | AccessControl/All | yes (stage 4; the reserved grants stay MustChange so an implementation landing without an emission is caught) |
 | FsWrite, FsWriteFromBlob, BlobPut | NonProjection (explicit) | — | FS has its own watch/etag surface (`FsWatchPoll`, `base_revision`); out of scope by design |
 
 ### 5.3 Internal producers (non-dispatch; covered by conformance, not the dispatch assertion)
@@ -323,8 +326,8 @@ Legend: **emits?** = current behavior. Gap = currently silent (closed at stage 1
 | LifecycleSink adapter ingress (`membership.rs`) | Conversations@t, Contacts@t, Messages@t, + live `TransportChanged` | yes (all four) |
 | Notifications/persons internal APIs (`membership.rs`) | Notifications, Persons | yes |
 | Fleet bus bridge, job worker, ephemeral reaper | Fleet | yes |
-| Background spawner (`background.rs`) | Sessions/All (child appears in roster) | **gap** |
-| Cron worker (tick/fire → runs + seeded sessions) | Cron/All + Sessions/All | **gap** |
+| Background spawner (`background.rs`) | Sessions/All (child appears in roster) | yes (stage 4: `RosterChanged` after the atomic publication) |
+| Cron worker (tick/fire → runs + seeded sessions) | Cron/All + Sessions/All | yes (stage 4: fire/settle/re-arm note Cron; a seeded session emits `RosterChanged`) |
 | Notice worker (parent turn injection) | Sessions/Key | yes (activity/log path) |
 | Model download/quantize jobs | Catalog + progress streams | yes |
 | Agent discovery sweep, agent-auth rejection note | Agents | yes |

@@ -97,6 +97,9 @@ pub struct BackgroundSpawner {
     store: Arc<dyn SessionStore>,
     partition: PartitionId,
     registry: BackgroundProfileRegistry,
+    /// Projection-sync stage 4 (spec §5.3): the node feed, so a materialized child's roster
+    /// appearance is announced cross-client (`None` on a feed-less assembly — tests).
+    feed: Option<Arc<crate::NodeEventFeed>>,
 }
 
 impl BackgroundSpawner {
@@ -110,7 +113,14 @@ impl BackgroundSpawner {
             store,
             partition,
             registry,
+            feed: None,
         }
+    }
+
+    /// Wire the node event feed so each spawn announces the child's roster row (spec §5.3).
+    pub fn with_feed(mut self, feed: Arc<crate::NodeEventFeed>) -> Self {
+        self.feed = Some(feed);
+        self
     }
 
     /// The constrained profile a session id resolves to (when it is a background child), so the
@@ -190,6 +200,12 @@ impl BackgroundSpawner {
             })
             .await
             .ok()?;
+        // Projection-sync stage 4 (spec §5.3): the child is a new roster row — without this,
+        // a background review child appears on other clients only after its first advance.
+        if let Some(feed) = &self.feed {
+            let rev = feed.note_roster_change(&child);
+            feed.emit(daemon_api::NodeEvent::RosterChanged { rev });
+        }
         self.store.enqueue_wake(child.clone()).await;
         Some(child)
     }

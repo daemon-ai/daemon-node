@@ -31,6 +31,9 @@ impl CredentialApi for NodeApiImpl {
         if let Some(revoker) = &self.credential_revoker {
             revoker.revoke_profile(&key);
         }
+        // Projection-sync stage 4 (spec §5): the credential table changed — every client's
+        // manager view (`CredentialList`) is stale. The pointer carries no material.
+        self.note_credentials_changed();
         Ok(())
     }
 
@@ -88,6 +91,7 @@ impl CredentialApi for NodeApiImpl {
         }
         // Drop any human label for this credential too, so a later re-add starts clean (wire v35).
         let _ = self.store.set_credential_label(&profile, None).await;
+        self.note_credentials_changed();
         Ok(())
     }
 
@@ -103,6 +107,7 @@ impl CredentialApi for NodeApiImpl {
             .set_credential_label(&profile, label)
             .await
             .map_err(|e| ApiError::Other(format!("set_credential_label: {e}")))?;
+        self.note_credentials_changed();
         Ok(())
     }
 }
@@ -286,6 +291,8 @@ impl NodeApiImpl {
             if let Some(revoker) = &self.credential_revoker {
                 revoker.revoke_profile(&credential_ref);
             }
+            // Projection-sync stage 4 (spec §5): the flow landed a credential row.
+            self.note_credentials_changed();
             // Point the bound profile at the shared ref. Best-effort by design: a bind naming a
             // not-yet-created profile still lands the key (creation will mint the same ref from
             // the vendor's model namespace).
@@ -294,6 +301,8 @@ impl NodeApiImpl {
                 if spec.credential_ref.as_deref() != Some(credential_ref.as_str()) {
                     spec.credential_ref = Some(credential_ref.clone());
                     profiles.update(spec).map_err(profile_err)?;
+                    // The direct store update bypasses the ProfileApi handlers' emission.
+                    self.emit_profiles_changed();
                 }
             }
             return Ok(AuthCompleteResponse {
@@ -314,6 +323,8 @@ impl NodeApiImpl {
         store
             .set(&credential_ref, &outcome.credential_blob)
             .map_err(|e| ApiError::Other(format!("credential set: {e}")))?;
+        // Projection-sync stage 4 (spec §5): the flow landed a credential row.
+        self.note_credentials_changed();
 
         // Optional account→profile bind: attach (or replace) the BoundAccount on the target profile so
         // the transport's account bring-up (`AccountProvisioning::bound_accounts`) discovers it.
@@ -335,6 +346,8 @@ impl NodeApiImpl {
                 &credential_ref,
             ));
             profiles.update(spec).map_err(profile_err)?;
+            // The direct store update bypasses the ProfileApi handlers' emission.
+            self.emit_profiles_changed();
             bound_profile = Some(bind.profile.clone());
         }
 

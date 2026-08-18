@@ -42,6 +42,8 @@ arange = "arange"           # numpy np.arange in skill examples
 canva = "canva"             # Canva (product name)
 grammers = "grammers"       # the `grammers` Telegram MTProto crate family (daemon-telegram)
 scaned = "scaned"           # WeChat iLink QR wire status value (the server's own spelling)
+comptue = "comptue"         # psyche's own misspelled `comptue_hash` wire method, quoted verbatim
+                            # in docs/specs/vhc-sdk-primitives-spec.md as a porting trap
 # Short fragments typos extracts from larger identifiers/words/fixtures (PNGs, MorAlekss, ...).
 nd = "nd"
 ot = "ot"

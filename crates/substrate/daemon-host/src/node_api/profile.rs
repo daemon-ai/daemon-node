@@ -378,7 +378,10 @@ impl ProfileApi for NodeApiImpl {
                 daemon_common::Author::Operator,
                 &format!("revert to {seq}"),
             )
-            .map_err(|e| ApiError::Other(format!("skill revert: {e}")))
+            .map_err(|e| ApiError::Other(format!("skill revert: {e}")))?;
+        // Projection-sync stage 4 (spec §5): the active skill body changed cross-client.
+        self.note_skills_changed();
+        Ok(())
     }
 
     async fn skill_get(&self, name: String) -> Result<daemon_common::SkillBundle, ApiError> {
@@ -397,7 +400,10 @@ impl ProfileApi for NodeApiImpl {
         }
         skills
             .import_bundle(&bundle, daemon_common::Author::Operator, "skill_put")
-            .map_err(|e| ApiError::Other(format!("skill put: {e}")))
+            .map_err(|e| ApiError::Other(format!("skill put: {e}")))?;
+        // Projection-sync stage 4 (spec §5): a new/edited skill body is cross-client state.
+        self.note_skills_changed();
+        Ok(())
     }
 
     async fn curator_list(
@@ -435,25 +441,35 @@ impl ProfileApi for NodeApiImpl {
     async fn curator_pin(&self, profile: Option<String>, name: String) -> Result<(), ApiError> {
         let store = self.curator_store(profile)?;
         self.curator_usage(&store)?.set_pinned(&name, true);
+        // Projection-sync stage 4 (spec §5): the pin flips every client's `CuratorList` row.
+        self.note_curator_changed();
         Ok(())
     }
 
     async fn curator_unpin(&self, profile: Option<String>, name: String) -> Result<(), ApiError> {
         let store = self.curator_store(profile)?;
         self.curator_usage(&store)?.set_pinned(&name, false);
+        self.note_curator_changed();
         Ok(())
     }
 
     async fn curator_archive(&self, profile: Option<String>, name: String) -> Result<(), ApiError> {
         self.curator_store(profile)?
             .archive(&name)
-            .map_err(skill_err)
+            .map_err(skill_err)?;
+        // The archive also removes the skill from discovery — the skills view moved too.
+        self.note_skills_changed();
+        self.note_curator_changed();
+        Ok(())
     }
 
     async fn curator_restore(&self, profile: Option<String>, name: String) -> Result<(), ApiError> {
         self.curator_store(profile)?
             .restore(&name)
-            .map_err(skill_err)
+            .map_err(skill_err)?;
+        self.note_skills_changed();
+        self.note_curator_changed();
+        Ok(())
     }
 
     async fn curator_run(
@@ -489,6 +505,12 @@ impl ProfileApi for NodeApiImpl {
                 from: t.from,
                 to: t.to,
             });
+        }
+        // Projection-sync stage 4 (spec §5, Conditional): only a run that actually transitioned
+        // something invalidates (archives also change discovery — the skills view).
+        if !changes.is_empty() {
+            self.note_skills_changed();
+            self.note_curator_changed();
         }
         Ok(changes)
     }

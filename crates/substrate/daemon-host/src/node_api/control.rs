@@ -529,6 +529,16 @@ impl ControlApi for NodeApiImpl {
                 "no pending approval {request_id} on session {session}"
             )));
         }
+        // Projection-sync stage 4 (spec §5): a decided approval leaves every client's pending
+        // list — without this pointer a second client's approval prompt never cleared. Keyed by
+        // session (the Approvals partition key), emitted at the durable answer, before the wake.
+        self.note_projection_change(
+            daemon_api::ProjectionId::Approvals,
+            None,
+            daemon_api::ChangeScope::Key {
+                key: session.as_str().to_string(),
+            },
+        );
         self.manager
             .wake(session)
             .await
@@ -557,7 +567,17 @@ impl ControlApi for NodeApiImpl {
     ) -> Result<GatewayStatus, ApiError> {
         let gateway = self.gateway.lock().unwrap().clone();
         match gateway {
-            Some(gw) => gw.set(enabled, addr).await,
+            Some(gw) => {
+                let status = gw.set(enabled, addr).await?;
+                // Projection-sync stage 4 (spec §5): gateway on/off/addr is node-wide state every
+                // client's settings surface renders.
+                self.note_projection_change(
+                    daemon_api::ProjectionId::Gateway,
+                    None,
+                    daemon_api::ChangeScope::All,
+                );
+                Ok(status)
+            }
             None => Err(ApiError::Unsupported("gateway_set".into())),
         }
     }
@@ -595,7 +615,14 @@ impl ControlApi for NodeApiImpl {
         self.store
             .set_tool_override(&tool, enabled)
             .await
-            .map_err(|e| ApiError::Other(format!("set tool override: {e}")))
+            .map_err(|e| ApiError::Other(format!("set tool override: {e}")))?;
+        // Projection-sync stage 4 (spec §5): the override changes every client's `ToolList`.
+        self.note_projection_change(
+            daemon_api::ProjectionId::Tools,
+            None,
+            daemon_api::ChangeScope::All,
+        );
+        Ok(())
     }
 
     async fn feedback_submit(&self, args: FeedbackSubmitArgs) -> Result<FeedbackAck, ApiError> {
@@ -734,6 +761,13 @@ impl ControlApi for NodeApiImpl {
             .telemetry_consent_set(enabled)
             .await
             .map_err(|e| ApiError::Other(format!("set telemetry consent: {e}")))?;
+        // Projection-sync stage 4 (spec §5): the toggle is node-wide; every client's settings
+        // surface renders it.
+        self.note_projection_change(
+            daemon_api::ProjectionId::TelemetryConsent,
+            None,
+            daemon_api::ChangeScope::All,
+        );
         Ok(enabled)
     }
 
@@ -753,6 +787,12 @@ impl ControlApi for NodeApiImpl {
         std::env::set_var(
             daemon_telemetry::crash::ENV_CONSENT,
             if enabled { "1" } else { "0" },
+        );
+        // Projection-sync stage 4 (spec §5): node-wide toggle, cross-client like telemetry consent.
+        self.note_projection_change(
+            daemon_api::ProjectionId::CrashConsent,
+            None,
+            daemon_api::ChangeScope::All,
         );
         Ok(enabled)
     }
@@ -838,6 +878,13 @@ impl ControlApi for NodeApiImpl {
                  revoke when it is dormant"
             )));
         }
+        // Projection-sync stage 4 (spec §5): a revoked fingerprint changes every trusted client's
+        // `FingerprintList` (AccessAdmin-scoped, §6).
+        self.note_projection_change(
+            daemon_api::ProjectionId::Fingerprints,
+            None,
+            daemon_api::ChangeScope::All,
+        );
         Ok(())
     }
 
@@ -870,6 +917,12 @@ impl ControlApi for NodeApiImpl {
             .mark_ready_if_idle(&session)
             .await
             .map_err(|e| ApiError::Other(format!("mark assigned: {e}")))?;
+        // Projection-sync stage 4 (spec §5): the assign created and/or re-armed the durable row —
+        // other clients' rosters are stale (previously silent until the engine's first advance).
+        if let Some(feed) = self.node_feed() {
+            let rev = feed.note_roster_change(&session);
+            feed.emit(NodeEvent::RosterChanged { rev });
+        }
         // Wake it: the activation manager runs (or resumes) the engine; the resident services then
         // carry the durable delegate -> suspend -> resume -> complete cycle forward.
         self.manager
@@ -886,6 +939,17 @@ impl ControlApi for NodeApiImpl {
             fleet.cancel(&UnitId::new(session.as_str())).await;
         }
         self.live.interrupt(&auth).await;
+        // Projection-sync stage 4 (spec §5, Conditional): the interrupt likely flipped the
+        // session's run state — invalidate its row so other clients refetch rather than render a
+        // stale "running" badge (the engine's own terminal advance may lag or never come).
+        if let Some(feed) = self.node_feed() {
+            let rev = feed.note_roster_change(&session);
+            feed.emit(NodeEvent::SessionMetaChanged {
+                session,
+                rev,
+                origin_op: daemon_api::current_op_id(),
+            });
+        }
         Ok(())
     }
 
@@ -1084,6 +1148,13 @@ impl ControlApi for NodeApiImpl {
         // Ride the §5.9 hot-reload seam: reload pins into the live registry so the new pin resolves
         // immediately (resolve-first), without a restart.
         self.load_routing_pins().await;
+        // Projection-sync stage 4 (spec §5): the pin table changed — every client's routing view
+        // (`RoutingListChats`/`RoutingGet`) is stale. `routing_bind_chat` funnels through here.
+        self.note_projection_change(
+            daemon_api::ProjectionId::Routing,
+            None,
+            daemon_api::ChangeScope::All,
+        );
         Ok(())
     }
 
@@ -1111,6 +1182,12 @@ impl ControlApi for NodeApiImpl {
             .await
             .map_err(|e| ApiError::Other(format!("routing unbind: {e}")))?;
         self.load_routing_pins().await;
+        // Projection-sync stage 4 (spec §5): like `routing_set` — the pin table changed.
+        self.note_projection_change(
+            daemon_api::ProjectionId::Routing,
+            None,
+            daemon_api::ChangeScope::All,
+        );
         Ok(())
     }
 
@@ -1283,11 +1360,21 @@ impl ControlApi for NodeApiImpl {
         if enabled {
             // Best-effort: attempt to (re)connect. A transport with no owning adapter simply has
             // nothing to spawn — the persisted desire still stands for a future boot.
-            let _ = self.transport_connect(transport).await;
+            let _ = self.transport_connect(transport.clone()).await;
         } else {
             // Disconnect now (reuse the reversible v30 op; it emits the Offline `TransportChanged`).
-            self.transport_disconnect(transport).await?;
+            self.transport_disconnect(transport.clone()).await?;
         }
+        // Projection-sync stage 4 (spec §5): the persisted desired-state changed the instance's
+        // `TransportInstanceInfo` row (the live `TransportChanged` presence pushes stay
+        // specialized — this is the durable-config invalidation).
+        self.note_projection_change(
+            daemon_api::ProjectionId::Transports,
+            None,
+            daemon_api::ChangeScope::Key {
+                key: transport.as_str().to_string(),
+            },
+        );
         Ok(())
     }
 
@@ -1315,7 +1402,7 @@ impl ControlApi for NodeApiImpl {
                 .find(|i| i.transport == transport)
             {
                 feed.emit(daemon_api::NodeEvent::TransportChanged {
-                    transport,
+                    transport: transport.clone(),
                     connection: cur.connection,
                     presence: cur.presence,
                     reason: cur.reason,
@@ -1325,6 +1412,14 @@ impl ControlApi for NodeApiImpl {
                 });
             }
         }
+        // Projection-sync stage 4 (spec §5): the durable label changed the instance's config row.
+        self.note_projection_change(
+            daemon_api::ProjectionId::Transports,
+            None,
+            daemon_api::ChangeScope::Key {
+                key: transport.as_str().to_string(),
+            },
+        );
         Ok(())
     }
 
@@ -1404,8 +1499,17 @@ impl ControlApi for NodeApiImpl {
         });
         if connected {
             self.transport_disconnect(transport.clone()).await?;
-            self.transport_connect(transport).await?;
+            self.transport_connect(transport.clone()).await?;
         }
+        // Projection-sync stage 4 (spec §5): the persisted settings changed the instance's
+        // config row (`TransportSettings`/`TransportInstances`).
+        self.note_projection_change(
+            daemon_api::ProjectionId::Transports,
+            None,
+            daemon_api::ChangeScope::Key {
+                key: transport.as_str().to_string(),
+            },
+        );
         Ok(())
     }
 
@@ -1441,6 +1545,14 @@ impl ControlApi for NodeApiImpl {
         let _ = self
             .credential_remove(transport.as_str().to_string(), true)
             .await;
+        // Projection-sync stage 4 (spec §5): the instance is gone from `TransportInstances`.
+        self.note_projection_change(
+            daemon_api::ProjectionId::Transports,
+            None,
+            daemon_api::ChangeScope::Key {
+                key: transport.as_str().to_string(),
+            },
+        );
         Ok(())
     }
 
@@ -1810,13 +1922,21 @@ impl ControlApi for NodeApiImpl {
             "transport={} contact={id} alias={alias:?}",
             transport.as_str()
         );
-        self.audited(
-            "mgmt.contact.set_alias",
-            detail,
-            self.contacts_for(&transport)?
-                .set_alias(transport.clone(), contact, alias.clone()),
-        )
-        .await
+        let res = self
+            .audited(
+                "mgmt.contact.set_alias",
+                detail,
+                self.contacts_for(&transport)?
+                    .set_alias(transport.clone(), contact, alias.clone()),
+            )
+            .await;
+        // Projection-sync stage 4 (spec §5): an alias changes the contact's roster row — reuse
+        // the existing per-transport contacts seam (rev bump + delta index + ContactsChanged,
+        // which dual-emits the Contacts envelope) exactly like roster_add/update/remove.
+        if res.is_ok() {
+            self.emit_contacts_changed(transport, &id, false);
+        }
+        res
     }
 
     async fn directory_search(
@@ -2225,31 +2345,42 @@ impl ControlApi for NodeApiImpl {
     }
 
     async fn cron_create(&self, spec: daemon_api::CronSpec) -> Result<String, ApiError> {
-        match &self.cron {
-            Some(cron) => cron.create(spec).await,
-            None => Err(ApiError::Unsupported("cron_create".into())),
-        }
+        let id = match &self.cron {
+            Some(cron) => cron.create(spec).await?,
+            None => return Err(ApiError::Unsupported("cron_create".into())),
+        };
+        // Projection-sync stage 4 (spec §5): the job table changed cross-client (every cron
+        // mutation below emits the same All-scope pointer — clients re-list, wire v45 shape).
+        self.note_cron_changed();
+        Ok(id)
     }
 
     async fn cron_update(&self, id: String, spec: daemon_api::CronSpec) -> Result<(), ApiError> {
         match &self.cron {
-            Some(cron) => cron.update(id, spec).await,
-            None => Err(ApiError::Unsupported("cron_update".into())),
+            Some(cron) => cron.update(id, spec).await?,
+            None => return Err(ApiError::Unsupported("cron_update".into())),
         }
+        self.note_cron_changed();
+        Ok(())
     }
 
     async fn cron_delete(&self, id: String) -> Result<(), ApiError> {
         match &self.cron {
-            Some(cron) => cron.delete(id).await,
-            None => Err(ApiError::Unsupported("cron_delete".into())),
+            Some(cron) => cron.delete(id).await?,
+            None => return Err(ApiError::Unsupported("cron_delete".into())),
         }
+        self.note_cron_changed();
+        Ok(())
     }
 
     async fn cron_trigger(&self, id: String) -> Result<(), ApiError> {
         match &self.cron {
-            Some(cron) => cron.trigger(id).await,
-            None => Err(ApiError::Unsupported("cron_trigger".into())),
+            Some(cron) => cron.trigger(id).await?,
+            None => return Err(ApiError::Unsupported("cron_trigger".into())),
         }
+        // The trigger seeds a run row (visible in `CronRuns`) and flips `last_run`.
+        self.note_cron_changed();
+        Ok(())
     }
 
     async fn cron_runs(&self, id: String) -> Vec<daemon_api::CronRun> {
@@ -2261,9 +2392,11 @@ impl ControlApi for NodeApiImpl {
 
     async fn cron_pause(&self, id: String, paused: bool) -> Result<(), ApiError> {
         match &self.cron {
-            Some(cron) => cron.pause(id, paused).await,
-            None => Err(ApiError::Unsupported("cron_pause".into())),
+            Some(cron) => cron.pause(id, paused).await?,
+            None => return Err(ApiError::Unsupported("cron_pause".into())),
         }
+        self.note_cron_changed();
+        Ok(())
     }
 
     async fn cron_suggestions(&self) -> Vec<daemon_api::CronSuggestion> {
@@ -2274,17 +2407,22 @@ impl ControlApi for NodeApiImpl {
     }
 
     async fn cron_accept_suggestion(&self, id: String) -> Result<String, ApiError> {
-        match &self.cron {
-            Some(cron) => cron.accept_suggestion(id).await,
-            None => Err(ApiError::Unsupported("cron_accept_suggestion".into())),
-        }
+        let job = match &self.cron {
+            Some(cron) => cron.accept_suggestion(id).await?,
+            None => return Err(ApiError::Unsupported("cron_accept_suggestion".into())),
+        };
+        // The acceptance both created a job and consumed the suggestion.
+        self.note_cron_changed();
+        Ok(job)
     }
 
     async fn cron_dismiss_suggestion(&self, id: String) -> Result<(), ApiError> {
         match &self.cron {
-            Some(cron) => cron.dismiss_suggestion(id).await,
-            None => Err(ApiError::Unsupported("cron_dismiss_suggestion".into())),
+            Some(cron) => cron.dismiss_suggestion(id).await?,
+            None => return Err(ApiError::Unsupported("cron_dismiss_suggestion".into())),
         }
+        self.note_cron_changed();
+        Ok(())
     }
 
     // -- Saved presences (wire v37): every op delegates to the shared `PresenceManager`;
@@ -2298,23 +2436,43 @@ impl ControlApi for NodeApiImpl {
 
     async fn presence_save(&self, presence: daemon_api::SavedPresence) -> Result<(), ApiError> {
         match &self.presences {
-            Some(presences) => presences.save(presence).await,
-            None => Err(ApiError::Unsupported("presence_save".into())),
+            Some(presences) => presences.save(presence).await?,
+            None => return Err(ApiError::Unsupported("presence_save".into())),
         }
+        // Projection-sync stage 4 (spec §5): the saved-presence table is node state every
+        // client's presence picker renders.
+        self.note_projection_change(
+            daemon_api::ProjectionId::Presence,
+            None,
+            daemon_api::ChangeScope::All,
+        );
+        Ok(())
     }
 
     async fn presence_delete(&self, id: String) -> Result<(), ApiError> {
         match &self.presences {
-            Some(presences) => presences.remove(&id).await.map(|_| ()),
-            None => Err(ApiError::Unsupported("presence_delete".into())),
+            Some(presences) => presences.remove(&id).await.map(|_| ())?,
+            None => return Err(ApiError::Unsupported("presence_delete".into())),
         }
+        self.note_projection_change(
+            daemon_api::ProjectionId::Presence,
+            None,
+            daemon_api::ChangeScope::All,
+        );
+        Ok(())
     }
 
     async fn presence_set_active(&self, id: String) -> Result<(), ApiError> {
         match &self.presences {
-            Some(presences) => presences.set_active(&id).await,
-            None => Err(ApiError::Unsupported("presence_set_active".into())),
+            Some(presences) => presences.set_active(&id).await?,
+            None => return Err(ApiError::Unsupported("presence_set_active".into())),
         }
+        self.note_projection_change(
+            daemon_api::ProjectionId::Presence,
+            None,
+            daemon_api::ChangeScope::All,
+        );
+        Ok(())
     }
 
     async fn unit_events(&self, id: UnitId, max: u32) -> Vec<ManageEventView> {
@@ -2456,7 +2614,18 @@ impl ControlApi for NodeApiImpl {
         store
             .restore(&record)
             .await
-            .map_err(|e| ApiError::Other(format!("rewind failed: {e}")))
+            .map_err(|e| ApiError::Other(format!("rewind failed: {e}")))?;
+        // Projection-sync stage 4 (spec §5, Conditional): the restore changed the session's
+        // workspace/state — invalidate its row so other clients refetch.
+        if let Some(feed) = self.node_feed() {
+            let rev = feed.note_roster_change(&session);
+            feed.emit(NodeEvent::SessionMetaChanged {
+                session,
+                rev,
+                origin_op: daemon_api::current_op_id(),
+            });
+        }
+        Ok(())
     }
 
     // ----- filesystem / workspace surface (daemon-fs-surface-spec.md) -----
@@ -2689,14 +2858,25 @@ impl ControlApi for NodeApiImpl {
         // dormant-only snapshot CAS through the shared surgery + side-effects. Armed with the
         // stage-5 cutover; a pre-cutover node keeps the explicit refusal.
         if self.attachments.is_some() {
-            return self
-                .rewind_durable(
-                    &session,
-                    &point.anchor,
-                    daemon_common::ReqId(0),
-                    point.restore_workspace,
-                )
-                .await;
+            self.rewind_durable(
+                &session,
+                &point.anchor,
+                daemon_common::ReqId(0),
+                point.restore_workspace,
+            )
+            .await?;
+            // Projection-sync stage 4 (spec §5, Conditional): the truncation changed the
+            // session's history/state — invalidate its row cross-client (the session stream's
+            // own `SessionAdvanced` only reaches clients watching that stream).
+            if let Some(feed) = self.node_feed() {
+                let rev = feed.note_roster_change(&session);
+                feed.emit(NodeEvent::SessionMetaChanged {
+                    session,
+                    rev,
+                    origin_op: daemon_api::current_op_id(),
+                });
+            }
+            return Ok(());
         }
         Err(ApiError::Unsupported(
             "rewind of a non-resident durable session (re-incarnation path deferred)".into(),

@@ -85,6 +85,9 @@ pub struct CronWorker {
     /// Late-bound (the handle is `NodeApiImpl`, built after the worker) via [`set_delivery`](Self::set_delivery);
     /// unset => store-only runs (no transport delivery).
     pub(crate) delivery: std::sync::OnceLock<Arc<dyn CronDelivery>>,
+    /// Projection-sync (spec §5.3): the node feed, so a fire/settle announces the Cron domain
+    /// change (and a seeded agent session its roster row) cross-client. `None` in tests.
+    pub(crate) feed: Option<Arc<daemon_host::NodeEventFeed>>,
 }
 
 impl CronWorker {
@@ -101,6 +104,26 @@ impl CronWorker {
             scripts_dir: None,
             skill_loader: None,
             delivery: std::sync::OnceLock::new(),
+            feed: None,
+        }
+    }
+
+    /// Wire the node event feed so worker-driven cron mutations (fires, settles, re-arms) are
+    /// announced cross-client (projection-sync spec §5.3).
+    pub fn with_feed(mut self, feed: Arc<daemon_host::NodeEventFeed>) -> Self {
+        self.feed = Some(feed);
+        self
+    }
+
+    /// Announce a worker-driven Cron domain change (runs/jobs moved) — spec §5.3. No-op feed-less.
+    fn note_cron_changed(&self) {
+        if let Some(feed) = &self.feed {
+            feed.note_domain_change(
+                daemon_api::ProjectionId::Cron,
+                None,
+                daemon_api::ChangeScope::All,
+                None,
+            );
         }
     }
 
@@ -198,6 +221,8 @@ impl CronWorker {
         updated.last_detail = Some(detail);
         let _ = self.store.cron_run_append(run).await;
         let _ = self.store.cron_set(updated).await;
+        // Spec §5.3: the settle moved the run + job bookkeeping every client's cron view reads.
+        self.note_cron_changed();
         // Post-settle delivery (Phase 2): push the captured result to the job's `deliver` transport(s)
         // through the host's existing `DeliverySink` registry. Suppressed for a `[SILENT]` run, a
         // failed/empty run, a store-only (`deliver = None`) job, or a node with no delivery handle.
@@ -245,6 +270,7 @@ impl CronWorker {
             job.last_detail = Some(detail);
             job.fire_count = job.fire_count.saturating_add(1);
             let _ = self.store.cron_set(job).await;
+            self.note_cron_changed();
             return;
         }
 
@@ -298,6 +324,12 @@ impl CronWorker {
             {
                 return;
             }
+            // Spec §5.3: the seeded cron session is a new roster row (ephemeral scope, but a
+            // client browsing that scope must learn of it before its first advance).
+            if let Some(feed) = &self.feed {
+                let rev = feed.note_roster_change(&session);
+                feed.emit(daemon_api::NodeEvent::RosterChanged { rev });
+            }
         }
         let _ = self
             .store
@@ -315,6 +347,8 @@ impl CronWorker {
         updated.last_run_unix = Some(now);
         updated.fire_count = updated.fire_count.saturating_add(1);
         let _ = self.store.cron_set(updated).await;
+        // Spec §5.3: the fire moved the run table + job bookkeeping.
+        self.note_cron_changed();
         // Kick the cron session into its turn via the shared wake dispatcher.
         self.store.enqueue_wake(session).await;
     }
@@ -377,6 +411,9 @@ impl CronScheduler for CronWorker {
                 } else {
                     let _ = self.store.cron_set(advanced).await;
                 }
+                // Spec §5.3: the re-arm/removal changed `next_fire`/the job table (the firing
+                // branch already noted from `fire`; its follow-up re-arm coalesces into that).
+                self.note_cron_changed();
             }
         }
         Ok(())

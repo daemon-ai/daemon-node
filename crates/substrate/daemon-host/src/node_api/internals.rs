@@ -414,8 +414,10 @@ impl NodeEventFeed {
 
     /// Bump the roster revision, record it as `session`'s last-change rev (L4 delta index), and
     /// return it. The §5 emit hooks call this then stamp the returned `rev` onto the
-    /// `RosterChanged`/`SessionMetaChanged` event, so the feed's `rev` and `SessionsQuery.rev` agree.
-    pub(crate) fn note_roster_change(&self, session: &SessionId) -> u64 {
+    /// `RosterChanged`/`SessionMetaChanged` event, so the feed's `rev` and `SessionsQuery.rev`
+    /// agree. `pub` for out-of-crate internal producers (the cron worker announcing a seeded
+    /// session, projection-sync spec §5.3) — not a wire surface.
+    pub fn note_roster_change(&self, session: &SessionId) -> u64 {
         self.note_roster_change_op(session, None)
     }
 

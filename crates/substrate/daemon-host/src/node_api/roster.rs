@@ -38,6 +38,71 @@ impl NodeApiImpl {
         }
     }
 
+    /// Projection-sync stage 4 (daemon-projection-sync-spec.md §4.1/§5): note a mutation on a
+    /// legacy-less revision domain — bump its `(projection, partition)` rev, emit the
+    /// `ProjectionChanged` pointer, and record the dispatch effect — stamping the causing op from
+    /// the dispatch context. The one-liner every census gap closure calls at its durable
+    /// persistence path. A no-op when no feed is wired (tests / headless).
+    pub(crate) fn note_projection_change(
+        &self,
+        projection: daemon_api::ProjectionId,
+        partition: Option<&str>,
+        scope: daemon_api::ChangeScope,
+    ) {
+        if let Some(feed) = self.node_feed() {
+            feed.note_domain_change(projection, partition, scope, daemon_api::current_op_id());
+        }
+    }
+
+    /// Skills' All-scope pointer (spec §5): the active skill bodies + discovery set.
+    pub(crate) fn note_skills_changed(&self) {
+        self.note_projection_change(
+            daemon_api::ProjectionId::Skills,
+            None,
+            daemon_api::ChangeScope::All,
+        );
+    }
+
+    /// Curator's All-scope pointer (spec §5): pin/archive/usage state over the skill set.
+    pub(crate) fn note_curator_changed(&self) {
+        self.note_projection_change(
+            daemon_api::ProjectionId::Curator,
+            None,
+            daemon_api::ChangeScope::All,
+        );
+    }
+
+    /// Credentials' All-scope pointer (spec §5): the credential-manager table — every credential
+    /// mutation (set/remove/label, and the interactive-auth landings) calls this. The pointer
+    /// carries no material, ever. CredentialAdmin-scoped delivery (§6).
+    pub(crate) fn note_credentials_changed(&self) {
+        self.note_projection_change(
+            daemon_api::ProjectionId::Credentials,
+            None,
+            daemon_api::ChangeScope::All,
+        );
+    }
+
+    /// AccessControl's All-scope pointer (spec §5): the user/role/session-revocation table —
+    /// every admin verb in `access.rs` calls this. AccessAdmin-scoped delivery (§6).
+    pub(crate) fn note_access_control_changed(&self) {
+        self.note_projection_change(
+            daemon_api::ProjectionId::AccessControl,
+            None,
+            daemon_api::ChangeScope::All,
+        );
+    }
+
+    /// Cron's All-scope pointer (spec §5): jobs, runs and suggestions share one domain — the
+    /// dispatch verbs and the cron worker's fire path both call this.
+    pub(crate) fn note_cron_changed(&self) {
+        self.note_projection_change(
+            daemon_api::ProjectionId::Cron,
+            None,
+            daemon_api::ChangeScope::All,
+        );
+    }
+
     /// Ping the fleet bus that the roster/tree changed (a rename/pin/archive that no producer models
     /// as a subagent transition). Projects a fresh `tree()` snapshot onto the bus off-thread so live
     /// `tree_subscribe` subscribers refresh promptly; a no-op when no bus is wired or there are no

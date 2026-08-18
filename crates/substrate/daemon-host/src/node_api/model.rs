@@ -115,7 +115,12 @@ impl ModelApi for NodeApiImpl {
         m.activate(&id, &profile)
             .await
             .map(|_| ())
-            .map_err(map_model_err)
+            .map_err(map_model_err)?;
+        // Projection-sync stage 4 (spec §5, the stage-1 deferral): the activation rewrote the
+        // profile's model binding through the model manager (bypassing the ProfileApi handlers'
+        // emission) — other clients' `ProfileList`/`ModelCurrent` views are stale.
+        self.emit_profiles_changed();
+        Ok(())
     }
 
     async fn model_recommend(
@@ -298,7 +303,15 @@ impl ModelApi for NodeApiImpl {
                 entry: to_cbor(&provider),
             })
             .await
-            .map_err(|e| ApiError::Other(format!("custom provider set: {e}")))
+            .map_err(|e| ApiError::Other(format!("custom provider set: {e}")))?;
+        // Projection-sync stage 4 (spec §5): the entry changes every client's `ProviderCatalog`
+        // overlay + `CustomProviderList`.
+        self.note_projection_change(
+            daemon_api::ProjectionId::CustomProviders,
+            None,
+            daemon_api::ChangeScope::All,
+        );
+        Ok(())
     }
 
     async fn custom_provider_remove(&self, id: String) -> Result<(), ApiError> {
@@ -314,7 +327,13 @@ impl ModelApi for NodeApiImpl {
         self.store
             .custom_provider_remove(&id)
             .await
-            .map_err(|e| ApiError::Other(format!("custom provider remove: {e}")))
+            .map_err(|e| ApiError::Other(format!("custom provider remove: {e}")))?;
+        self.note_projection_change(
+            daemon_api::ProjectionId::CustomProviders,
+            None,
+            daemon_api::ChangeScope::All,
+        );
+        Ok(())
     }
 }
 

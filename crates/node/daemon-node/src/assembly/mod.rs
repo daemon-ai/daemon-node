@@ -174,7 +174,7 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
     )
     .with_event_sink(fleet_events.clone());
 
-    let cron = build_cron_stack(&a, &child_profile, &workspace_roots);
+    let cron = build_cron_stack(&a, &child_profile, &workspace_roots, &node_events);
     // The shared profile-authoring surface + `profile_manage` tool (Phase 2), built before the
     // orchestrator profile so the tool is registered onto it. `None` on a node without profile mgmt.
     let profile_stack = build_profile_stack(&a, &node_events);
@@ -197,11 +197,15 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
     // mid-turn resolves its constrained profile during hydrate) and the live surface (so a `Spawn`
     // host request from an interactive session is materialized fire-and-forget). Inert when the
     // registry is empty (no skills/memory tools) — `Effect::Spawn` then no-ops.
-    let background = Arc::new(BackgroundSpawner::new(
-        a.store.clone(),
-        a.partition,
-        background_registry(&a, &launch_skill_tools),
-    ));
+    let background = Arc::new(
+        BackgroundSpawner::new(
+            a.store.clone(),
+            a.partition,
+            background_registry(&a, &launch_skill_tools),
+        )
+        // Projection-sync (spec §5.3): announce each materialized child's roster row.
+        .with_feed(node_events.clone()),
+    );
 
     // From here on every phase shares one set of node-wide singletons (the capture-list contract).
     let shared = Shared {
@@ -525,9 +529,13 @@ fn build_cron_stack(
     a: &NodeAssembly,
     child_profile: &EngineProfile,
     workspace_roots: &Option<Arc<WorkspaceRoots>>,
+    node_events: &Arc<daemon_host::NodeEventFeed>,
 ) -> CronStack {
     let cron_run_profile = child_profile.clone();
-    let mut cron_worker = CronWorker::new(a.store.clone(), a.partition, cron_run_profile.clone());
+    // Projection-sync (spec §5.3): worker-driven fires/settles/re-arms announce Cron domain
+    // changes (and seeded sessions their roster rows) cross-client.
+    let mut cron_worker = CronWorker::new(a.store.clone(), a.partition, cron_run_profile.clone())
+        .with_feed(node_events.clone());
     if let Some(roots) = workspace_roots {
         cron_worker = cron_worker.with_scripts_dir(roots.workspace_root().join("scripts"));
     }

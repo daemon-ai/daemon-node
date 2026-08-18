@@ -276,6 +276,173 @@ async fn bootstrap_carries_incarnation_and_the_domain_rev_table_impl() {
     handle.shutdown().await;
 }
 
+/// Stage 4 (spec §5): the census gap closures — every formerly-silent mutation now lands its
+/// `ProjectionChanged` pointer on the feed, from the handler's own success path. One dispatch per
+/// domain, then one feed read asserting each expected `(projection, scope)` arrived. A domain
+/// regressing to silence fails here by name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn formerly_silent_mutations_emit_their_domain_pointer() {
+    as_system(formerly_silent_mutations_emit_their_domain_pointer_impl()).await;
+}
+async fn formerly_silent_mutations_emit_their_domain_pointer_impl() {
+    let (node, handle) = assemble();
+
+    let ok = |resp: ApiResponse, what: &str| match resp {
+        ApiResponse::Error(e) => panic!("{what}: {e:?}"),
+        other => other,
+    };
+
+    // Consent toggles.
+    ok(
+        dispatch(
+            node.as_ref(),
+            ApiRequest::TelemetryConsentSet { enabled: true },
+        )
+        .await,
+        "telemetry consent",
+    );
+    ok(
+        dispatch(
+            node.as_ref(),
+            ApiRequest::CrashConsentSet { enabled: false },
+        )
+        .await,
+        "crash consent",
+    );
+    // Routing pin + unbind.
+    let origin = daemon_protocol::Origin::new(
+        daemon_protocol::TransportId::new("room"),
+        daemon_protocol::OriginScope::Group {
+            chat: "psync".into(),
+            thread: None,
+        },
+    );
+    ok(
+        dispatch(
+            node.as_ref(),
+            ApiRequest::RoutingBindChat {
+                origin: origin.clone(),
+                session: SessionId::new("psync-routed"),
+                profile: None,
+            },
+        )
+        .await,
+        "routing bind",
+    );
+    ok(
+        dispatch(node.as_ref(), ApiRequest::RoutingUnbindChat { origin }).await,
+        "routing unbind",
+    );
+    // Tool enablement override.
+    ok(
+        dispatch(
+            node.as_ref(),
+            ApiRequest::ToolSetEnabled {
+                tool: "psync-tool".into(),
+                enabled: false,
+            },
+        )
+        .await,
+        "tool override",
+    );
+    // Credential label (durable-store backed, no credential store required).
+    ok(
+        dispatch(
+            node.as_ref(),
+            ApiRequest::CredentialSetLabel {
+                profile: "psync-cred".into(),
+                label: Some("label".into()),
+            },
+        )
+        .await,
+        "credential label",
+    );
+    // Custom provider set + remove.
+    ok(
+        dispatch(
+            node.as_ref(),
+            ApiRequest::CustomProviderSet {
+                provider: daemon_api::CustomProvider {
+                    id: "psync-provider".into(),
+                    display_name: "Projection Sync".into(),
+                    base_url: "https://example.invalid/v1".into(),
+                    wire_selector: daemon_api::ProviderSelector::DaemonApi,
+                    requires_key: false,
+                    credential_ref: None,
+                    source: daemon_api::CustomProviderSource::User,
+                },
+            },
+        )
+        .await,
+        "custom provider set",
+    );
+    // Cron job create.
+    ok(
+        dispatch(
+            node.as_ref(),
+            ApiRequest::CronCreate {
+                spec: daemon_api::CronSpec {
+                    name: "psync-cron".into(),
+                    schedule: "0 0 * * *".into(),
+                    payload: "hi".into(),
+                    enabled: false,
+                    ..Default::default()
+                },
+            },
+        )
+        .await,
+        "cron create",
+    );
+    // Assign: creates + re-arms a durable row -> RosterChanged -> the Sessions/All twin.
+    ok(
+        dispatch(
+            node.as_ref(),
+            ApiRequest::Assign {
+                session: SessionId::new("psync-assigned"),
+            },
+        )
+        .await,
+        "assign",
+    );
+
+    let events = match dispatch(
+        node.as_ref(),
+        ApiRequest::EventsSince {
+            cursor: 0,
+            wait_ms: None,
+        },
+    )
+    .await
+    {
+        ApiResponse::EventsPage(page) => page.events,
+        other => panic!("expected EventsPage, got {other:?}"),
+    };
+    let has = |p: ProjectionId, all: bool| {
+        events.iter().any(|e| {
+            matches!(e,
+            NodeEvent::ProjectionChanged { projection, scope, .. }
+                if *projection == p && (matches!(scope, ChangeScope::All) == all))
+        })
+    };
+    for p in [
+        ProjectionId::TelemetryConsent,
+        ProjectionId::CrashConsent,
+        ProjectionId::Routing,
+        ProjectionId::Tools,
+        ProjectionId::Credentials,
+        ProjectionId::CustomProviders,
+        ProjectionId::Cron,
+        ProjectionId::Sessions,
+    ] {
+        assert!(
+            has(p, true),
+            "expected an All-scope ProjectionChanged for {p:?}, got {events:?}"
+        );
+    }
+
+    handle.shutdown().await;
+}
+
 /// §4.3: the mux server `Hello` stamps the node's incarnation id — equal to `Bootstrap`'s and
 /// stable across connections to the same process, so a reconnecting client detects a restart at
 /// the handshake without an extra round-trip.

@@ -269,10 +269,24 @@ impl SessionApi for NodeApiImpl {
         let auth = self.require_session_access(&session, true).await?;
         // Stage-5 cutover (§8): a durable session's parked Input/Choice/Approval is answered on
         // its hub (the request parked there via the incarnation's HubParkingResolver).
-        if self.cutover_routes(&session).await {
-            return self.attach_hub(&session).await.respond(response);
+        let res = if self.cutover_routes(&session).await {
+            self.attach_hub(&session).await.respond(response)
+        } else {
+            self.live.respond(&auth, response)
+        };
+        // Projection-sync stage 4 (spec §5, Conditional): an accepted respond consumed a parked
+        // host request — an approval answered here (not via ApprovalDecide) must still clear the
+        // other clients' pending prompts, so invalidate the session's Approvals partition.
+        if res.is_ok() {
+            self.note_projection_change(
+                daemon_api::ProjectionId::Approvals,
+                None,
+                daemon_api::ChangeScope::Key {
+                    key: session.as_str().to_string(),
+                },
+            );
         }
-        self.live.respond(&auth, response)
+        res
     }
 
     async fn session_history(
@@ -394,11 +408,25 @@ impl SessionApi for NodeApiImpl {
         // Auth 4: own-or-`SessionControlAny`.
         let auth = self.require_session_access(&session, true).await?;
         // Stage-5 cutover (§8): a durable session's delivery roster is homed on its hub.
-        if self.cutover_routes(&session).await {
+        let res = if self.cutover_routes(&session).await {
             self.attach_hub(&session).await.handover(target);
-            return Ok(());
+            Ok(())
+        } else {
+            self.live.handover(&auth, target)
+        };
+        // Projection-sync stage 4 (spec §5): the delivery roster is session state other clients
+        // render (`DeliveryTargets`) — invalidate the session's row.
+        if res.is_ok() {
+            if let Some(feed) = self.node_feed() {
+                let rev = feed.note_roster_change(&session);
+                feed.emit(daemon_api::NodeEvent::SessionMetaChanged {
+                    session,
+                    rev,
+                    origin_op: daemon_api::current_op_id(),
+                });
+            }
         }
-        self.live.handover(&auth, target)
+        res
     }
 
     async fn record_meta(&self, args: RecordMetaArgs) -> Result<(), ApiError> {

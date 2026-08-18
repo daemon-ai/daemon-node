@@ -123,6 +123,9 @@ impl AccessControlApi for NodeApiImpl {
             a.user_created(&user.user_id, &user.username, &user.roles)
                 .await;
         }
+        // Projection-sync stage 4 (spec §5): the user table changed — every trusted client's
+        // admin surface (`UserList`) is stale. AccessAdmin-scoped delivery (§6).
+        self.note_access_control_changed();
         Ok(user)
     }
 
@@ -152,6 +155,7 @@ impl AccessControlApi for NodeApiImpl {
         if let Some(a) = &self.auth_audit {
             a.user_disabled(&user_id, disabled).await;
         }
+        self.note_access_control_changed();
         Ok(())
     }
 
@@ -169,6 +173,7 @@ impl AccessControlApi for NodeApiImpl {
         if let Some(a) = &self.auth_audit {
             a.roles_changed(&user_id, &roles).await;
         }
+        self.note_access_control_changed();
         Ok(())
     }
 
@@ -185,6 +190,8 @@ impl AccessControlApi for NodeApiImpl {
         if let Some(a) = &self.auth_audit {
             a.password_reset(&user_id).await;
         }
+        // No password material rides the event — the pointer only says "the table changed".
+        self.note_access_control_changed();
         Ok(())
     }
 
@@ -217,6 +224,7 @@ impl AccessControlApi for NodeApiImpl {
         if let Some(a) = &self.auth_audit {
             a.sessions_revoked(&user_id).await;
         }
+        self.note_access_control_changed();
         Ok(())
     }
 

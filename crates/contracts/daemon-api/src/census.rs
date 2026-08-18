@@ -175,33 +175,40 @@ pub fn census(req: &ApiRequest) -> MutationClass {
             MustChange(&[P::Contacts])
         }
 
-        // -- session control (outcome-dependent: a no-op cancel/assign is a valid success) ---
-        R::Respond { .. }
-        | R::Assign { .. }
+        // -- session control: stage 4 wired each success path to emit synchronously ----------
+        // Assign emits RosterChanged after the create/re-arm; Cancel / Handover / both rewinds
+        // emit SessionMetaChanged from their success paths.
+        R::Assign { .. }
         | R::Cancel { .. }
         | R::Handover { .. }
-        | R::RecordMeta(..)
         | R::Rewind { .. }
-        | R::CheckpointRewind { .. } => Conditional(&[P::Sessions]),
+        | R::CheckpointRewind { .. } => MustChange(&[P::Sessions]),
+        // A respond's Approvals invalidation lands on every accepted answer; RecordMeta is a log
+        // append (only sometimes projection-visible).
+        R::Respond { .. } => MustChange(&[P::Approvals]),
+        R::RecordMeta(..) => Conditional(&[P::Sessions]),
 
-        // -- approvals (GAP: decide has no invalidation event yet) --------------------------
-        R::ApprovalDecide { .. } => Conditional(&[P::Approvals, P::Sessions]),
+        // -- approvals: stage 4 emits at the durable answer, before the wake -----------------
+        R::ApprovalDecide { .. } => MustChange(&[P::Approvals]),
 
         // -- fleet drive (effects surface via the async fleet bridge) -----------------------
         R::Pause { .. } | R::Resume { .. } | R::Scale { .. } => Conditional(&[P::Fleet]),
 
-        // -- model catalog / downloads (worker-driven; catalog sink emits from the download
-        // worker, GAP: ModelActivate/ModelDelete synchronous paths unverified) ---------------
+        // -- model catalog / downloads (worker-driven; the catalog sink emits from the download
+        // worker when the artifact lands) ----------------------------------------------------
         R::ModelDownload { .. }
         | R::ModelInstallFromUrl { .. }
         | R::ModelCancel { .. }
         | R::ModelPause { .. }
         | R::ModelResume { .. }
-        | R::ModelDelete { .. }
-        | R::ModelActivate { .. }
         | R::ModelQuantize { .. } => Conditional(&[P::Catalog]),
+        // Delete invokes the catalog-changed callback inline; Activate rewrites the profile's
+        // model binding and emits `ProfilesChanged` from the handler (stage 4).
+        R::ModelDelete { .. } => MustChange(&[P::Catalog]),
+        R::ModelActivate { .. } => MustChange(&[P::Profiles]),
 
-        // -- vhc (service-driven emission; verify synchronicity before promoting) -----------
+        // -- vhc (service-driven emission rides the worker event pump — not verifiably
+        // synchronous within the handler, so no dispatch assertion) --------------------------
         R::VhcJoin { .. }
         | R::VhcLeave { .. }
         | R::VhcPause { .. }
@@ -210,73 +217,72 @@ pub fn census(req: &ApiRequest) -> MutationClass {
         | R::VhcSetPolicy { .. }
         | R::VhcDiskWipe { .. } => Conditional(&[P::Vhc]),
 
-        // -- skills (GAP: no skills-scoped invalidation; edits surface via profile reads) ----
-        R::SkillPut { .. } | R::SkillRevert { .. } => Conditional(&[P::Skills, P::Profiles]),
+        // -- skills: stage 4 emits after the import/revert lands ----------------------------
+        R::SkillPut { .. } | R::SkillRevert { .. } => MustChange(&[P::Skills]),
 
-        // -- curator (GAP: pin/archive flip roster meta silently today) ---------------------
-        R::CuratorPin { .. }
-        | R::CuratorUnpin { .. }
-        | R::CuratorArchive { .. }
-        | R::CuratorRestore { .. }
-        | R::CuratorRun { .. } => Conditional(&[P::Curator, P::Sessions]),
+        // -- curator: stage 4 emits per verb (archive/restore also move the discovery set) ---
+        R::CuratorPin { .. } | R::CuratorUnpin { .. } => MustChange(&[P::Curator]),
+        R::CuratorArchive { .. } | R::CuratorRestore { .. } => MustChange(&[P::Curator, P::Skills]),
+        R::CuratorRun { .. } => Conditional(&[P::Curator, P::Skills]),
 
-        // -- credentials (GAP: no CredentialsChanged; auth flows may land one at completion) -
-        R::CredentialSet { .. }
-        | R::CredentialRemove { .. }
-        | R::CredentialSetLabel { .. }
-        | R::AuthBegin { .. }
-        | R::AuthStep { .. }
-        | R::AuthComplete { .. }
-        | R::AuthCancel { .. } => Conditional(&[P::Credentials]),
+        // -- credentials: stage 4 emits from every store landing (set/remove/label and the
+        // interactive-auth completion paths — never carrying material) -----------------------
+        R::CredentialSet { .. } | R::CredentialRemove { .. } | R::CredentialSetLabel { .. } => {
+            MustChange(&[P::Credentials])
+        }
+        // The single-callback wrapper completes the flow or errors — a success landed a row.
+        R::AuthComplete { .. } => MustChange(&[P::Credentials]),
+        // A step may or may not complete the flow (a completion lands Credentials, and can
+        // rebind Profiles / flip Agents); begin/cancel are flow-local.
+        R::AuthStep { .. } => Conditional(&[P::Credentials, P::Profiles, P::Agents]),
+        R::AuthBegin { .. } | R::AuthCancel { .. } => NonStateful,
 
-        // -- custom providers (GAP) ----------------------------------------------------------
+        // -- custom providers: stage 4 emits after the durable write ------------------------
         R::CustomProviderSet { .. } | R::CustomProviderRemove { .. } => {
-            Conditional(&[P::CustomProviders])
+            MustChange(&[P::CustomProviders])
         }
 
-        // -- foreign agents (register/remove emit AgentsChanged; discover lands async) ------
-        R::AgentDiscover | R::AgentRegister { .. } | R::AgentRemove { .. } => {
-            Conditional(&[P::Agents])
-        }
+        // -- foreign agents (register/remove emit AgentsChanged synchronously; a discover
+        // sweep only emits when the catalog actually moved) ----------------------------------
+        R::AgentRegister { .. } | R::AgentRemove { .. } => MustChange(&[P::Agents]),
+        R::AgentDiscover => Conditional(&[P::Agents]),
 
-        // -- registry / tools / config (GAP: ToolSetEnabled + ConfigSet mutate silently;
-        // Provider/ToolRegister are unsupported stubs on this node) --------------------------
-        R::ProviderRegister { .. } | R::ToolRegister { .. } | R::ToolSetEnabled { .. } => {
-            Conditional(&[P::Tools])
-        }
-        R::ConfigSet { .. } => Conditional(&[P::Gateway]),
-        R::GatewaySet { .. } => Conditional(&[P::Gateway]),
+        // -- registry / tools / config (Provider/ToolRegister + ConfigSet are unsupported
+        // stubs on this node — reclassified when implemented; the census test pins this) -----
+        R::ToolSetEnabled { .. } => MustChange(&[P::Tools]),
+        R::ProviderRegister { .. } | R::ToolRegister { .. } | R::ConfigSet { .. } => NonStateful,
+        R::GatewaySet { .. } => MustChange(&[P::Gateway]),
 
-        // -- consent toggles (GAP) -----------------------------------------------------------
-        R::TelemetryConsentSet { .. } => Conditional(&[P::TelemetryConsent]),
-        R::CrashConsentSet { .. } => Conditional(&[P::CrashConsent]),
+        // -- consent toggles: stage 4 emits after the durable write -------------------------
+        R::TelemetryConsentSet { .. } => MustChange(&[P::TelemetryConsent]),
+        R::CrashConsentSet { .. } => MustChange(&[P::CrashConsent]),
 
-        // -- cron (GAP) ----------------------------------------------------------------------
+        // -- cron: stage 4 emits after every successful verb --------------------------------
         R::CronCreate { .. }
         | R::CronUpdate { .. }
         | R::CronDelete { .. }
         | R::CronTrigger { .. }
         | R::CronPause { .. }
         | R::CronAcceptSuggestion { .. }
-        | R::CronDismissSuggestion { .. } => Conditional(&[P::Cron]),
+        | R::CronDismissSuggestion { .. } => MustChange(&[P::Cron]),
 
-        // -- routing (GAP) -------------------------------------------------------------------
+        // -- routing: stage 4 emits after persist + hot-reload -------------------------------
         R::RoutingSet { .. } | R::RoutingBindChat { .. } | R::RoutingUnbindChat { .. } => {
-            Conditional(&[P::Routing])
+            MustChange(&[P::Routing])
         }
 
-        // -- presence profiles (GAP) ---------------------------------------------------------
+        // -- presence profiles: stage 4 emits after the manager write -----------------------
         R::PresenceSave { .. } | R::PresenceDelete { .. } | R::PresenceSetActive { .. } => {
-            Conditional(&[P::Presence])
+            MustChange(&[P::Presence])
         }
 
-        // -- transports (lifecycle lands via the async adapter -> TransportChanged) ----------
-        R::TransportDisconnect { .. }
-        | R::TransportRemove { .. }
-        | R::TransportConnect { .. }
+        // -- transports: the four durable-config verbs emit the Transports pointer (stage 4);
+        // connect/disconnect surface via the async adapter's live TransportChanged -----------
+        R::TransportRemove { .. }
         | R::TransportSetEnabled { .. }
         | R::TransportSetLabel { .. }
-        | R::TransportConfigure { .. } => Conditional(&[P::Transports]),
+        | R::TransportConfigure { .. } => MustChange(&[P::Transports]),
+        R::TransportDisconnect { .. } | R::TransportConnect { .. } => Conditional(&[P::Transports]),
 
         // -- conversations / membership / messages (adapter round-trips; echoes land async) --
         R::ConvCreate { .. }
@@ -291,21 +297,25 @@ pub fn census(req: &ApiRequest) -> MutationClass {
         | R::MemberRemove { .. }
         | R::MemberBan { .. }
         | R::MemberSetRole { .. } => Conditional(&[P::Conversations]),
-        R::ContactSetAlias { .. } => Conditional(&[P::Contacts]),
+        // Stage 4: the alias write emits via the shared contacts seam after the awaited adapter op.
+        R::ContactSetAlias { .. } => MustChange(&[P::Contacts]),
 
         // -- command invocation (content-dependent: may drive any surface) -------------------
         R::CommandInvoke { .. } => Conditional(&[]),
 
-        // -- access control (GAP: admin mutations are invisible to other admin clients) ------
+        // -- access control: stage 4 emits after every committed admin mutation --------------
         R::UserCreate { .. }
         | R::UserDisable { .. }
         | R::UserSetRoles { .. }
         | R::UserSetPassword { .. }
-        | R::SessionRevoke { .. }
-        | R::ResourceGrantCreate { .. }
-        | R::ResourceGrantRevoke { .. } => Conditional(&[P::AccessControl]),
+        | R::SessionRevoke { .. } => MustChange(&[P::AccessControl]),
+        // Reserved (`Unsupported` trait defaults, option B) — MustChange so an implementation
+        // landing without an emission is caught on its first successful call.
+        R::ResourceGrantCreate { .. } | R::ResourceGrantRevoke { .. } => {
+            MustChange(&[P::AccessControl])
+        }
 
-        // -- fingerprints (GAP: revoke is invisible cross-client today) ---------------------
-        R::FingerprintRevoke { .. } => Conditional(&[P::Fingerprints]),
+        // -- fingerprints: stage 4 emits after the dormant-snapshot swap ---------------------
+        R::FingerprintRevoke { .. } => MustChange(&[P::Fingerprints]),
     }
 }
