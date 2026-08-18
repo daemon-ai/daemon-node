@@ -129,7 +129,12 @@ impl ProfileApi for NodeApiImpl {
     }
 
     async fn profile_select(&self, id: String) -> Result<(), ApiError> {
-        self.profile_store()?.set_active(&id).map_err(profile_err)
+        self.profile_store()?.set_active(&id).map_err(profile_err)?;
+        // Selection flips `ProfileInfo.active` in every client's `ProfileList` — invalidate
+        // cross-client like every other profile mutation (daemon-projection-sync-spec.md §10
+        // stage 1).
+        self.emit_profiles_changed();
+        Ok(())
     }
 
     async fn profile_clone(&self, source: String, new_id: String) -> Result<(), ApiError> {

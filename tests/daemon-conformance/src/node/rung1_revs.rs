@@ -180,6 +180,124 @@ async fn notification_list_rev(node: &Arc<NodeApiImpl>) -> u64 {
     }
 }
 
+/// Projection-sync stage 1 (daemon-projection-sync-spec.md §10): every per-session override write
+/// (`SetSessionModel` / `SetSessionMode` / `SetSessionOverlay`) emits `SessionMetaChanged` from the
+/// single durable persistence path (`update_overlay`), so a second client's cached session detail
+/// is invalidated — previously these persisted silently and clients diverged until reconnect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn overlay_writes_emit_session_meta_changed() {
+    as_system(overlay_writes_emit_session_meta_changed_impl()).await;
+}
+async fn overlay_writes_emit_session_meta_changed_impl() {
+    use daemon_api::{dispatch, NodeEvent, SessionApi, SessionOverlay};
+    use daemon_protocol::{AgentCommand, UserMsg};
+
+    let (node, handle) = assemble();
+    let session = SessionId::new("ovl-meta");
+
+    // Open the session (creates its durable meta; also emits its own roster/meta activity).
+    node.submit(
+        session.clone(),
+        AgentCommand::StartTurn {
+            input: UserMsg::new("hi"),
+            request_id: daemon_common::ReqId(1),
+        },
+    )
+    .await
+    .expect("submit opens the session");
+
+    // Drain the feed so only the override writes below land past `after`.
+    let after = match dispatch(
+        node.as_ref(),
+        ApiRequest::EventsSince {
+            cursor: 0,
+            wait_ms: None,
+        },
+    )
+    .await
+    {
+        ApiResponse::EventsPage(page) => page.next_cursor,
+        other => panic!("expected EventsPage, got {other:?}"),
+    };
+
+    // All three override writes: model, mode (narrowing — no operator gate), unified overlay.
+    match dispatch(
+        node.as_ref(),
+        ApiRequest::SetSessionModel {
+            session: session.clone(),
+            model: "claude-opus-4-8".into(),
+            provider: None,
+        },
+    )
+    .await
+    {
+        ApiResponse::Ok => {}
+        other => panic!("expected Ok from SetSessionModel, got {other:?}"),
+    }
+    match dispatch(
+        node.as_ref(),
+        ApiRequest::SetSessionMode {
+            session: session.clone(),
+            mode: daemon_api::ApprovalMode::Ask,
+        },
+    )
+    .await
+    {
+        ApiResponse::Ok => {}
+        other => panic!("expected Ok from SetSessionMode, got {other:?}"),
+    }
+    match dispatch(
+        node.as_ref(),
+        ApiRequest::SetSessionOverlay {
+            session: session.clone(),
+            overlay: SessionOverlay {
+                model: Some("claude-3-5-sonnet-latest".into()),
+                ..Default::default()
+            },
+        },
+    )
+    .await
+    {
+        ApiResponse::Ok => {}
+        other => panic!("expected Ok from SetSessionOverlay, got {other:?}"),
+    }
+
+    // The emission is synchronous with the write (no async bridge), so one page suffices: three
+    // SessionMetaChanged pointers for this session, revs strictly increasing (one bump per write).
+    let revs: Vec<u64> = match dispatch(
+        node.as_ref(),
+        ApiRequest::EventsSince {
+            cursor: after,
+            wait_ms: None,
+        },
+    )
+    .await
+    {
+        ApiResponse::EventsPage(page) => page
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                NodeEvent::SessionMetaChanged {
+                    session: s, rev, ..
+                } if *s == session => Some(*rev),
+                _ => None,
+            })
+            .collect(),
+        other => panic!("expected EventsPage, got {other:?}"),
+    };
+    assert_eq!(
+        revs.len(),
+        3,
+        "each override write must emit exactly one SessionMetaChanged, got revs {revs:?}"
+    );
+    assert!(
+        revs.windows(2).all(|w| w[0] < w[1]),
+        "override writes bump the roster rev monotonically, got {revs:?}"
+    );
+
+    handle.shutdown().await;
+}
+
 /// Every `EventsPage` is stamped with the feed generation (rung 1): the one-shot `EventsSince` read
 /// carries `Some(epoch)`, the signal a client uses to distinguish a new feed generation from a ring
 /// overflow.

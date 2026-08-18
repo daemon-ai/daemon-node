@@ -73,6 +73,84 @@ fn assemble_versioning(
     (node, handle, skills)
 }
 
+/// Projection-sync stage 1 (daemon-projection-sync-spec.md §10): `ProfileSelect` flips
+/// `ProfileInfo.active` in every client's `ProfileList`, so it must emit `ProfilesChanged` like
+/// every other profile mutation — previously a selection propagated only on reconnect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn profile_select_emits_profiles_changed() {
+    as_system(profile_select_emits_profiles_changed_impl()).await;
+}
+async fn profile_select_emits_profiles_changed_impl() {
+    use daemon_api::{dispatch, NodeEvent, ProfileApi, ProfileSpec, ProviderSelector};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "daemon-psel-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (node, handle, _skills) = assemble_versioning(&dir);
+
+    node.profile_create(ProfileSpec::new("psel-a", ProviderSelector::GenAi, "m-a"))
+        .await
+        .expect("create psel-a");
+    node.profile_create(ProfileSpec::new("psel-b", ProviderSelector::GenAi, "m-b"))
+        .await
+        .expect("create psel-b");
+
+    // Drain the creates' own ProfilesChanged pointers.
+    let after = match dispatch(
+        node.as_ref(),
+        ApiRequest::EventsSince {
+            cursor: 0,
+            wait_ms: None,
+        },
+    )
+    .await
+    {
+        ApiResponse::EventsPage(page) => page.next_cursor,
+        other => panic!("expected EventsPage, got {other:?}"),
+    };
+
+    node.profile_select("psel-b".into())
+        .await
+        .expect("select psel-b");
+
+    let saw_profiles_changed = match dispatch(
+        node.as_ref(),
+        ApiRequest::EventsSince {
+            cursor: after,
+            wait_ms: None,
+        },
+    )
+    .await
+    {
+        ApiResponse::EventsPage(page) => page
+            .events
+            .iter()
+            .any(|e| matches!(e, NodeEvent::ProfilesChanged { .. })),
+        other => panic!("expected EventsPage, got {other:?}"),
+    };
+    assert!(
+        saw_profiles_changed,
+        "ProfileSelect must emit ProfilesChanged so other clients refresh the active flag"
+    );
+
+    // And the selection is visible in the authoritative read the pointer invalidates.
+    let list = node.profile_list().await;
+    let active: Vec<&str> = list
+        .iter()
+        .filter(|p| p.is_active)
+        .map(|p| p.id.as_str())
+        .collect();
+    assert_eq!(active, vec!["psel-b"], "psel-b is the active default");
+
+    handle.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Wire page bound (v25): a revision history past `WIRE_PAGE_MAX` entries is served in cursor
 /// pages (the stringified-`seq` cursor, resumed numerically) — 71 revisions page as 64 + 7,
 /// oldest-first, chaining to completion with no dup or gap.

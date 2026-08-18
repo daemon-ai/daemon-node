@@ -412,7 +412,7 @@ domain-rev = { "projection": projection-id, ? "partition": (tstr / null), "rev":
 | Stage | Repo | Content |
 |---|---|---|
 | 0 | node | this spec |
-| 1 | node | **bug fixes with existing variants, no wire change**: overlays → `SessionMetaChanged` (emitted after durable persistence, even if live hot-apply fails); `ProfileSelect`/`ModelActivate` → `ProfilesChanged`; regression tests |
+| 1 | node | **bug fixes with existing variants, no wire change**: overlays → `SessionMetaChanged` (emitted at the durable persistence path, so it fires even if live hot-apply fails); `ProfileSelect` → `ProfilesChanged` (it flips `ProfileInfo.active`); regression tests. `ModelActivate` stays a stage-4 gap: its active-model binding is not in the `ProfileList` payload, so a legacy `ProfilesChanged` would trigger the wrong refetch |
 | 2 | node(+app codec) | additive CDDL + Rust: `projection-id`, `change-scope`, `ProjectionChanged`, `bootstrap-view` domain revs + incarnation, `Hello` incarnation. Old arms retained. `just update-codec`; app decodes both |
 | 3 | node | rev table keyed by `RevisionDomain` behind `note_change` + `MutationEffects`; census registry + dispatch assertion; coalescing matrix; visibility classes enforced at feed + Bootstrap; migrate existing emit sites to dual emission; two-client conformance (`tests/daemon-conformance`) |
 | 4 | node | close every §5 gap via `note_change`; per-domain conformance extension |

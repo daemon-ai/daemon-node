@@ -49,7 +49,22 @@ impl NodeApiImpl {
         let mut overlay = decode_overlay(&meta.overlay);
         f(&mut overlay);
         meta.overlay = encode_overlay(&overlay);
-        let _ = self.store.set_session_meta(session, meta).await;
+        if self.store.set_session_meta(session, meta).await.is_ok() {
+            // A persisted override is session metadata every client renders (model/mode badges,
+            // SessionDetail): invalidate cross-client HERE, at the single durable persistence
+            // path, so the pointer fires even when the live hot-apply that follows fails — a
+            // rehydration reads the overlay, not the resident actor
+            // (daemon-projection-sync-spec.md §10 stage 1).
+            if let Some(feed) = self.node_feed() {
+                let origin_op = daemon_api::current_op_id();
+                let rev = feed.note_roster_change_op(session, origin_op.clone());
+                feed.emit(NodeEvent::SessionMetaChanged {
+                    session: session.clone(),
+                    rev,
+                    origin_op,
+                });
+            }
+        }
         overlay
     }
 
