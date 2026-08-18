@@ -228,6 +228,34 @@ boundary. The incarnation then stays hydrated draining the inbox (no rehydrate c
 the idle timeout only passivates the already-committed incarnation — releasing the slot, with no
 commit owed at passivation. Crash-of-resident loses nothing that a fresh hydrate cannot replay.
 
+### Stage-4 mechanics (as landed, dark)
+
+- `node_api::attachments` owns the hub: `AttachmentHubs` is a host-owned get-or-create registry
+  (`attach`/`get`/`detach`; absent session = zero overhead), each `AttachmentHub` bundling the
+  live rail's four surfaces around the SAME internals the live actor uses — a `MergedLog`
+  (non-destructive `log_after`/`subscribe`, appends badge `SessionAdvanced` on the node feed), a
+  destructive `poll` drain, a parked-request table answered by `respond` (an `Approval` park
+  badges `ApprovalPending`; answered = removed, a second respond errs), and an occupied-turn
+  `TurnControl` slot with a `watch` notifier (`send_replace`, so occupancy is correct even with
+  no subscriber). `deliver_steer` claims into the resident turn and returns `false` when the slot
+  is empty — the caller routes unclaimed steers durably (splice + wake, §8).
+- `CoreEngineFactory::with_attachments` threads the registry into every `CoreIncarnation`. A turn
+  whose session has a hub attached streams engine events to it from the live `EventSink` (the
+  journal capture is unchanged and journals at the boundary as before), brackets `run_turn` with
+  `begin_turn`/`end_turn` on every exit path, and — interactive-root only — wraps the
+  `DelegateResolver` in a `HubParkingResolver`: `Input`/`Choice`/`Approval` park on the hub for a
+  client `respond` (live-`ParkingHandler` parity; a dropped hub declines safely), while
+  `Delegate`/`Spawn` keep the durable resolution. Non-interactive policies and hubless sessions
+  keep today's auto-answer/deferral behavior exactly.
+- Dark: the production assembly builds one `AttachmentHubs` on the node feed and wires it into the
+  durable factory, but nothing attaches hubs yet — the wire (`Poll`/`Subscribe`/`Respond`/
+  `Steer`/`Interrupt`) keeps routing to the live actor until the §8 cutover.
+- Parity conformance (`unification_stage4_suite`, both backends, through the REAL activation
+  loop): mid-turn occupancy + steer claimed into the resident turn and acked `Steered` on the
+  hub's surfaces; destructive poll vs non-destructive log/subscription over one seq timeline;
+  `SessionAdvanced` on the node feed; a hubless session under the same factory runs the exact
+  stage-3 path.
+
 ## 8. Cutover routing matrix (stage 5)
 
 | command | route after cutover |

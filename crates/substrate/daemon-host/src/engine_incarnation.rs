@@ -21,6 +21,7 @@
 use crate::background::BackgroundSpawner;
 use crate::blob_store::BlobStore;
 use crate::journal::{JournalFeeder, JournalSink};
+use crate::node_api::attachments::{AttachmentHub, AttachmentHubs};
 use crate::node_api::{decode_overlay, DurableProfileResolver};
 use crate::workspace_fs::WorkspaceRoots;
 use async_trait::async_trait;
@@ -77,6 +78,12 @@ pub struct CoreEngineFactory {
     /// run cannot self-schedule or self-delegate (runaway prevention). When set it overrides the
     /// resolver/fallback for any scheduled session; `None` leaves cron sessions on the default path.
     cron_profile: Option<EngineProfile>,
+    /// The host-owned attachment registry (session-unification §7): when set, an incarnation whose
+    /// session has an attached [`AttachmentHub`] streams its events to the hub's consumers,
+    /// registers its `TurnControl` in the hub's occupied slot, and (interactive-root only) parks
+    /// blocking `Input`/`Choice`/`Approval` requests on the hub for a client `respond` instead of
+    /// the `DelegateResolver` auto-answers. `None` (or no hub attached) keeps today's behavior.
+    attachments: Option<Arc<AttachmentHubs>>,
 }
 
 /// The node-side content-transfer handles threaded into a durable incarnation (blob store +
@@ -170,6 +177,7 @@ impl CoreEngineFactory {
             resolver: None,
             content: None,
             cron_profile: None,
+            attachments: None,
         }
     }
 
@@ -186,6 +194,7 @@ impl CoreEngineFactory {
             resolver: None,
             content: None,
             cron_profile: None,
+            attachments: None,
         }
     }
 
@@ -198,6 +207,7 @@ impl CoreEngineFactory {
             resolver: None,
             content: None,
             cron_profile: None,
+            attachments: None,
         }
     }
 
@@ -212,6 +222,15 @@ impl CoreEngineFactory {
     /// attached, non-joining review children and hydrate them under their constrained profile.
     pub fn with_background(mut self, background: Arc<BackgroundSpawner>) -> Self {
         self.background = Some(background);
+        self
+    }
+
+    /// Inject the host-owned attachment registry (session-unification §7) so this factory's
+    /// incarnations serve attached clients: events stream to the session's [`AttachmentHub`], the
+    /// in-flight turn's `TurnControl` occupies the hub's slot (mid-turn `Steer`/`Interrupt`), and
+    /// an interactive-root turn parks `Input`/`Choice`/`Approval` on the hub for a `respond`.
+    pub fn with_attachments(mut self, attachments: Arc<AttachmentHubs>) -> Self {
+        self.attachments = Some(attachments);
         self
     }
 
@@ -258,6 +277,7 @@ impl EngineFactory for CoreEngineFactory {
             resolver: self.resolver.clone(),
             content: self.content.clone(),
             cron_profile: self.cron_profile.clone(),
+            attachments: self.attachments.clone(),
             completion_payload: None,
             ctx: None,
             turn_seal: None,
@@ -283,6 +303,8 @@ pub struct CoreIncarnation {
     /// The constrained cron-run profile (I15/G3): used in place of the resolver/fallback when this
     /// incarnation hydrates a cron-fired session, so the run carries no `cron`/`orchestrate` tools.
     cron_profile: Option<EngineProfile>,
+    /// The host-owned attachment registry (§7): consulted at turn time for this session's hub.
+    attachments: Option<Arc<AttachmentHubs>>,
     /// The structured completion payload captured at `Step::Completed` (a CBOR `DelegationResult`
     /// over the child's `outbox/`), surfaced via [`Incarnation::completion_payload`]. `None` => no
     /// artifacts captured (the store falls back to the legacy `child:{id}` marker).
@@ -532,22 +554,57 @@ impl Incarnation for CoreIncarnation {
             seed_conversation,
             approval_seq: Mutex::new(0),
         };
+        // Session-unification §7: an attached hub makes this activation observable + controllable
+        // live — events stream to its consumers as they happen, the turn's control occupies its
+        // slot (mid-turn Steer/Interrupt), and an interactive turn parks blocking requests on it.
+        let hub = self
+            .attachments
+            .as_ref()
+            .and_then(|hubs| hubs.get(&session_id));
         // When journaling, capture the engine's events so they can be coalesced into finished blocks
         // and sealed after the turn, and so the turn's token usage can be folded into the durable
         // per-session usage surface (the tree projection's usage source); otherwise discard.
         let captured: Arc<Mutex<Vec<daemon_protocol::AgentEvent>>> =
             Arc::new(Mutex::new(Vec::new()));
-        let sink = if self.journal.is_some() {
+        let journaling = self.journal.is_some();
+        let sink = if journaling || hub.is_some() {
             let cap = captured.clone();
-            EventSink::new(move |ev| cap.lock().unwrap().push(ev))
+            let stream_hub = hub.clone();
+            EventSink::new(move |ev| {
+                if let Some(h) = &stream_hub {
+                    h.publish_event(ev.clone());
+                }
+                if journaling {
+                    cap.lock().unwrap().push(ev);
+                }
+            })
         } else {
             EventSink::discarding()
         };
+        // Interactive-root with an attached client: blocking Input/Choice/Approval park on the hub
+        // for a real `respond` (the DelegateResolver auto-answers are retired for this shape —
+        // §7's parking resolver). Headless interactive and every child policy keep the durable
+        // behavior (Approval -> Deferred -> park_approval; Input/Choice auto-answered).
+        let parking = hub
+            .as_ref()
+            .filter(|_| interactive)
+            .map(|h| HubParkingResolver {
+                inner: &host,
+                hub: h.clone(),
+            });
+        let host_ref: &dyn HostRequestHandler = match &parking {
+            Some(p) => p,
+            None => &host,
+        };
         let control = TurnControl::new();
-        let outcome = engine
-            .run_turn(&host, &sink, &control)
-            .await
-            .map_err(map_failure)?;
+        if let Some(h) = &hub {
+            h.begin_turn(&control);
+        }
+        let outcome = engine.run_turn(host_ref, &sink, &control).await;
+        if let Some(h) = &hub {
+            h.end_turn();
+        }
+        let outcome = outcome.map_err(map_failure)?;
 
         // Fold this turn's token usage into the durable per-session usage surface so the management
         // tree projects real, recovery-survivable usage at every node (replacing the in-memory fleet
@@ -709,6 +766,28 @@ impl Incarnation for CoreIncarnation {
     }
 }
 
+/// The §7 parking resolver for an interactive-root activation with an attached client: blocking
+/// `Input`/`Choice`/`Approval` requests park on the session's [`AttachmentHub`] awaiting a real
+/// `respond` (live-`ParkingHandler` parity — the [`DelegateResolver`] auto-answers are retired for
+/// this shape), while `Delegate`/`Spawn` (and any other kind) keep the durable resolution the
+/// inner resolver provides.
+struct HubParkingResolver<'a> {
+    inner: &'a DelegateResolver,
+    hub: Arc<AttachmentHub>,
+}
+
+#[async_trait]
+impl HostRequestHandler for HubParkingResolver<'_> {
+    async fn request(&self, req: HostRequest) -> HostResponse {
+        match req.kind {
+            HostRequestKind::Input { .. }
+            | HostRequestKind::Choice { .. }
+            | HostRequestKind::Approval { .. } => self.hub.park(req).await,
+            _ => self.inner.request(req).await,
+        }
+    }
+}
+
 /// The substrate-path host handler: resolves a delegation to the deterministic durable `JobId` the
 /// activation outbox dedupes on, materializes an attached non-joining background child for a
 /// `Spawn` (§4.3, fire-and-forget — never suspends the parent), and trivially answers the other §17
@@ -813,6 +892,7 @@ mod tests {
             resolver: None,
             content: Some(ContentTransfer { blobs, roots }),
             cron_profile: None,
+            attachments: None,
             completion_payload: None,
             ctx: None,
             turn_seal: None,
@@ -1100,5 +1180,148 @@ mod tests {
             again.splices.is_empty(),
             "consumed splices never re-claim: the fold happened exactly once"
         );
+    }
+}
+
+/// The §7 parking-resolver seam in isolation: which request kinds park on the hub for a client
+/// `respond`, which pass through to the durable [`DelegateResolver`], and what the observation
+/// surfaces record around a park.
+#[cfg(test)]
+mod attachment_resolver_tests {
+    use super::*;
+    use crate::node_api::attachments::AttachmentHubs;
+    use crate::node_api::NodeEventFeed;
+    use daemon_api::NodeEvent;
+    use daemon_common::Budget;
+    use daemon_common::ReqId;
+    use daemon_protocol::{Direction, SessionPayload};
+
+    fn inner(session: &SessionId) -> DelegateResolver {
+        DelegateResolver {
+            session_id: session.clone(),
+            epoch: Epoch::ZERO,
+            background: None,
+            seed_conversation: None,
+            approval_seq: Mutex::new(0),
+        }
+    }
+
+    /// An interactive `Input` parks on the hub (drain + merged log see the raised request) and the
+    /// client's `respond` resumes the awaiting turn with the answered body — request and response
+    /// share one seq-ordered timeline.
+    #[tokio::test]
+    async fn input_parks_and_respond_resumes() {
+        let session = SessionId::new("park-input");
+        let hubs = AttachmentHubs::new(None);
+        let hub = hubs.attach(&session, 0);
+        let inner = inner(&session);
+        let resolver = HubParkingResolver {
+            inner: &inner,
+            hub: hub.clone(),
+        };
+        let parked = resolver.request(HostRequest {
+            request_id: ReqId(7),
+            kind: HostRequestKind::Input {
+                prompt: "your name?".into(),
+            },
+        });
+        let answer = async {
+            // The raised request reached the observation surfaces before the answer.
+            let frames = hub.poll(0);
+            assert!(matches!(&frames[..], [Outbound::Request(r)] if r.request_id == ReqId(7)));
+            hub.respond(HostResponse {
+                request_id: ReqId(7),
+                body: HostResponseBody::Input("Ada".into()),
+            })
+            .expect("respond to the parked request");
+        };
+        let (resp, ()) = tokio::join!(parked, answer);
+        assert_eq!(resp.body, HostResponseBody::Input("Ada".into()));
+        // One timeline: outbound request, then inbound response, in seq order.
+        let page = hub.log_after(0, 0);
+        assert!(matches!(
+            (&page.entries[0].direction, &page.entries[0].payload),
+            (Direction::Outbound, SessionPayload::Request(_))
+        ));
+        assert!(matches!(
+            (&page.entries[1].direction, &page.entries[1].payload),
+            (Direction::Inbound, SessionPayload::Response(_))
+        ));
+        // Answered = gone: a second respond to the same id is an error, not a double-delivery.
+        assert!(hub
+            .respond(HostResponse {
+                request_id: ReqId(7),
+                body: HostResponseBody::Input("again".into()),
+            })
+            .is_err());
+    }
+
+    /// A parked `Approval` badges `ApprovalPending` on the node feed (live parity: payload-free
+    /// notification, the client fetches detail out of band) and resolves on `respond`.
+    #[tokio::test]
+    async fn approval_park_badges_the_node_feed() {
+        let session = SessionId::new("park-approval");
+        let feed = NodeEventFeed::new(16);
+        let hubs = AttachmentHubs::new(Some(feed.clone()));
+        let hub = hubs.attach(&session, 0);
+        let inner = inner(&session);
+        let resolver = HubParkingResolver {
+            inner: &inner,
+            hub: hub.clone(),
+        };
+        let parked = resolver.request(HostRequest {
+            request_id: ReqId(9),
+            kind: HostRequestKind::Approval {
+                prompt: "run rm -rf /tmp/x?".into(),
+                allow_permanent_offered: true,
+            },
+        });
+        let answer = async {
+            let badged = feed.page(0, 0).events.iter().any(|e| {
+                matches!(e, NodeEvent::ApprovalPending { session: s, request_id }
+                    if *s == session && request_id == "9")
+            });
+            assert!(badged, "the park badged ApprovalPending on the node feed");
+            hub.respond(HostResponse {
+                request_id: ReqId(9),
+                body: HostResponseBody::Approved {
+                    approved: true,
+                    allow_permanent: false,
+                    reason: None,
+                },
+            })
+            .expect("respond");
+        };
+        let (resp, ()) = tokio::join!(parked, answer);
+        assert!(matches!(
+            resp.body,
+            HostResponseBody::Approved { approved: true, .. }
+        ));
+    }
+
+    /// `Delegate` is NOT a client-facing ask: it passes through to the inner durable resolver's
+    /// deterministic `JobId` without parking anything on the hub.
+    #[tokio::test]
+    async fn delegate_passes_through_to_the_durable_resolver() {
+        let session = SessionId::new("park-delegate");
+        let hubs = AttachmentHubs::new(None);
+        let hub = hubs.attach(&session, 0);
+        let inner = inner(&session);
+        let resolver = HubParkingResolver {
+            inner: &inner,
+            hub: hub.clone(),
+        };
+        let resp = resolver
+            .request(HostRequest {
+                request_id: ReqId(3),
+                kind: HostRequestKind::Delegate {
+                    label: "background work".into(),
+                    budget: Budget::default(),
+                },
+            })
+            .await;
+        assert!(matches!(resp.body, HostResponseBody::Delegated(_)));
+        assert!(hub.poll(0).is_empty(), "nothing parked, nothing streamed");
+        assert!(hub.log_after(0, 0).entries.is_empty());
     }
 }

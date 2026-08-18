@@ -63,6 +63,10 @@ struct Shared {
     signer: Arc<TraceSigner>,
     /// The §4.3 background-review spawner, shared by the durable factory + the live surface.
     background: Arc<BackgroundSpawner>,
+    /// The host-owned attachment-hub registry (session-unification §7): the durable factory's
+    /// incarnations serve any attached hub (events, mid-turn control, interactive parking). Built
+    /// dark in stage 4 — the wire attach side routes here at the stage-5 cutover.
+    attachments: Arc<daemon_host::AttachmentHubs>,
 }
 
 /// The resident cron scheduler (I15) + its shared ops surface and agent veneer, built BEFORE the
@@ -205,6 +209,7 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
         workspace_roots,
         blob_store,
         fleet_events,
+        attachments: Arc::new(daemon_host::AttachmentHubs::new(Some(node_events.clone()))),
         node_events,
         signer,
         background,
@@ -640,6 +645,9 @@ fn build_factory(
     let mut factory = CoreEngineFactory::from_profile(orchestrator_profile.clone())
         .with_journal(a.store.clone(), shared.signer.clone())
         .with_background(shared.background.clone())
+        // Session-unification §7: incarnations serve any attached hub (dark until the stage-5
+        // wire cutover routes Poll/Subscribe/Respond here — no hub attaches before then).
+        .with_attachments(shared.attachments.clone())
         // I15/G3: a cron-fired session (`session_meta.scheduled_job`) hydrates under the constrained,
         // `cron`/`orchestrate`-free profile so a scheduled run cannot self-schedule or self-delegate.
         .with_cron_profile(cron_run_profile.clone());

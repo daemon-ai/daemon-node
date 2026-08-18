@@ -786,6 +786,7 @@ fn mint_op_id() -> String {
 
 mod access;
 mod assembly;
+pub mod attachments;
 mod authorized;
 mod builtins;
 mod control;
@@ -809,6 +810,7 @@ mod internals;
 // Public re-exports (the stable `node_api::*` surface lib.rs re-exports for daemon-node / daemon-ffi
 // / daemon-conformance).
 pub use assembly::NodeApiParts;
+pub use attachments::{AttachmentHub, AttachmentHubs};
 pub use delivery::DeliveryHost;
 pub use internals::NodeEventFeed;
 pub use overlay::{decode_overlay, encode_overlay};

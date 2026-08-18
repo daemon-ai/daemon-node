@@ -1005,6 +1005,252 @@ async fn sqlite_unification_stage3() {
         .await;
 }
 
+/// Session-unification stage 4 (§7): activation-vs-live parity through the REAL activation loop.
+/// A durable interactive session with an attached [`daemon_host::AttachmentHub`] serves the live
+/// rail's client surface — engine events stream onto the hub's merged log (non-destructive
+/// `log_after`/`subscribe`, N consumers) and its destructive `poll` drain, each append badges
+/// `SessionAdvanced` on the node feed, the in-flight turn's control occupies the hub's slot so a
+/// MID-TURN steer is delivered INTO the resident turn (acked by `Steered`, folded into the same
+/// turn — never deferred to the next activation), and the boundary releases the slot. A session
+/// without a hub is untouched (the registry is pay-for-what-you-attach).
+async fn unification_stage4_suite<S: FaultStore + 'static>(make: impl Fn() -> Arc<S>) {
+    use daemon_api::{LogStreamItem, NodeEvent};
+    use daemon_common::ReqId;
+    use daemon_core::{
+        Capabilities, EngineProfile, Failure, ModelOutput, Provider, Request, SystemPrompt,
+        ToolCallFormat, ToolRegistry,
+    };
+    use daemon_host::{AttachmentHubs, NodeEventFeed};
+    use daemon_protocol::{AgentCommand, AgentEvent, Direction, Outbound, SessionPayload};
+    use daemon_store::{NewSplice, SpliceKind};
+    use daemon_telemetry::TraceSigner;
+    use futures::StreamExt;
+    use tokio::sync::Notify;
+
+    /// A provider that opens a mid-turn window: the FIRST call parks until the test releases it
+    /// (entered/release notify pair), so the test can act on the turn while it is provably in
+    /// flight; every call returns a plain completion (a steer folded at the phase boundary simply
+    /// drives one more call).
+    struct GatedProvider {
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+        first_done: std::sync::atomic::AtomicBool,
+    }
+    #[async_trait::async_trait]
+    impl Provider for GatedProvider {
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                supports_native_tools: true,
+                supports_streaming: false,
+                tool_call_format: ToolCallFormat::Native,
+                max_context: Some(8192),
+            }
+        }
+        async fn chat(&self, _req: Request) -> Result<ModelOutput, Failure> {
+            if !self
+                .first_done
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            Ok(ModelOutput {
+                text: "gated turn done".into(),
+                reasoning: None,
+                tool_calls: vec![],
+                usage: Default::default(),
+                meta: None,
+            })
+        }
+    }
+
+    let store = make();
+    let signer = Arc::new(TraceSigner::generate());
+    let feed = NodeEventFeed::new(64);
+    let hubs = Arc::new(AttachmentHubs::new(Some(feed.clone())));
+    let id = SessionId::new("stage4-attached");
+    let blob = Snapshot::fresh(id.clone()).encode().expect("encode");
+    store
+        .create_idle(id.clone(), PARTITION, blob)
+        .await
+        .expect("create idle");
+
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let provider = {
+        let (entered, release) = (entered.clone(), release.clone());
+        let gate: Arc<dyn Provider> = Arc::new(GatedProvider {
+            entered,
+            release,
+            first_done: std::sync::atomic::AtomicBool::new(false),
+        });
+        Arc::new(move || gate.clone())
+    };
+    let profile = EngineProfile::new(
+        provider,
+        Arc::new(ToolRegistry::new()),
+        SystemPrompt::new("stage-4 conformance"),
+    );
+    let factory = Arc::new(
+        CoreEngineFactory::from_profile(profile)
+            .with_journal(store.clone() as Arc<dyn SessionStore>, signer.clone())
+            .with_attachments(hubs.clone()),
+    );
+
+    // Attach BEFORE the turn (an already-observing client), take a push subscription from seq 0,
+    // and prove the slot is empty pre-turn: a steer with no resident turn is NOT claimed — the
+    // caller must route it durably (splice + wake) instead.
+    let hub = hubs.attach(&id, 0);
+    let mut sub = hub.subscribe(0);
+    assert!(!hub.occupied(), "no turn resident before activation");
+    assert!(
+        !hub.deliver_steer(ReqId(41), "too early".into()),
+        "a steer with no resident turn is not claimed by the hub"
+    );
+
+    // Open the turn through the durable rail (stage 2/3: splice + activation), holding the engine
+    // mid-model-call so the turn is provably in flight.
+    store
+        .append_splice(NewSplice {
+            session_id: id.clone(),
+            kind: SpliceKind::StartTurn,
+            payload: b"start the gated turn".to_vec(),
+            origin_op: "stage4-turn".into(),
+            origin: "conformance".into(),
+        })
+        .await
+        .expect("append splice");
+    let mgr = ActivationManager::new(store.clone(), factory, PARTITION);
+    let drive = tokio::spawn(async move { mgr.recover().await });
+
+    // Mid-turn: the incarnation registered its TurnControl on the hub, so the slot is occupied and
+    // a steer is delivered INTO the resident turn (live parity — not parked for the next turn).
+    entered.notified().await;
+    assert!(hub.occupied(), "the in-flight turn occupies the hub's slot");
+    assert!(
+        hub.deliver_steer(ReqId(42), "mid-turn steer".into()),
+        "a mid-turn steer is claimed into the resident turn"
+    );
+    release.notify_one();
+    drive.await.expect("join").expect("drive the gated turn");
+
+    // Boundary parity: the turn committed back to Idle (stage 3) and released the hub's slot.
+    assert_eq!(store.status(&id).await, Some(SessionStatus::Idle));
+    assert!(!hub.occupied(), "the turn boundary releases the slot");
+
+    // The steer reached the SAME turn: the engine acked it (`Steered`, accepted) and the ack
+    // streamed onto the hub — the activation path emits events as they happen, not post hoc.
+    let polled = hub.poll(0);
+    assert!(
+        polled.iter().any(|f| matches!(
+            f,
+            Outbound::Event(AgentEvent::Steered { request_id, accepted, .. })
+                if *request_id == ReqId(42) && *accepted
+        )),
+        "the mid-turn steer was folded and acked by the resident turn"
+    );
+    assert!(
+        polled
+            .iter()
+            .any(|f| matches!(f, Outbound::Event(AgentEvent::TurnFinished { .. }))),
+        "the turn's terminal event streamed onto the drain"
+    );
+    assert!(hub.poll(0).is_empty(), "poll is destructive (live parity)");
+
+    // The merged log is NON-destructive and carries both directions on one seq timeline: the
+    // outbound engine events survive the poll, and the claimed steer was recorded as the inbound
+    // command it was.
+    let page = hub.log_after(0, 0);
+    assert!(
+        page.entries.iter().any(|e| matches!(
+            (&e.direction, &e.payload),
+            (
+                Direction::Inbound,
+                SessionPayload::Command(AgentCommand::Steer { request_id, .. })
+            ) if *request_id == ReqId(42)
+        )),
+        "the claimed steer is on the merged log as an inbound command"
+    );
+    assert!(
+        page.entries.iter().any(|e| matches!(
+            (&e.direction, &e.payload),
+            (
+                Direction::Outbound,
+                SessionPayload::Event(AgentEvent::TurnFinished { .. })
+            )
+        )),
+        "the merged log retains outbound events after the destructive poll"
+    );
+    // The pre-turn push subscription replays the same timeline (backfill + live on one stream).
+    let mut streamed = 0usize;
+    while streamed < page.entries.len() {
+        match sub.next().await {
+            Some(LogStreamItem::Entry(e)) => {
+                assert_eq!(e.seq, page.entries[streamed].seq, "same seq timeline");
+                streamed += 1;
+            }
+            other => panic!("subscription ended early: {other:?}"),
+        }
+    }
+
+    // Each hub append coalesced a `SessionAdvanced` onto the node feed (live-advance parity).
+    let advanced = feed.page(0, 0).events.into_iter().any(|e| {
+        matches!(&e, NodeEvent::SessionAdvanced { session, head_seq, .. }
+            if *session == id && *head_seq >= page.entries.len() as u64)
+    });
+    assert!(
+        advanced,
+        "hub appends badge SessionAdvanced on the node feed"
+    );
+
+    // Pay-for-what-you-attach: a session with NO hub runs exactly the stage-3 path under the same
+    // attachment-carrying factory (nothing streams, nothing occupies, the turn still commits).
+    let bare = SessionId::new("stage4-bare");
+    let blob = Snapshot::fresh(bare.clone()).encode().expect("encode");
+    store
+        .create_idle(bare.clone(), PARTITION, blob)
+        .await
+        .expect("create idle");
+    store
+        .append_splice(NewSplice {
+            session_id: bare.clone(),
+            kind: SpliceKind::StartTurn,
+            payload: b"unattached turn".to_vec(),
+            origin_op: "stage4-bare".into(),
+            origin: "conformance".into(),
+        })
+        .await
+        .expect("append splice");
+    let gate: Arc<dyn Provider> = Arc::new(daemon_core::MockProvider::completing("done"));
+    let profile = EngineProfile::new(
+        Arc::new(move || gate.clone()),
+        Arc::new(ToolRegistry::new()),
+        SystemPrompt::new("stage-4 bare"),
+    );
+    let factory = Arc::new(
+        CoreEngineFactory::from_profile(profile)
+            .with_journal(store.clone() as Arc<dyn SessionStore>, signer.clone())
+            .with_attachments(hubs.clone()),
+    );
+    ActivationManager::new(store.clone(), factory, PARTITION)
+        .recover()
+        .await
+        .expect("drive the unattached turn");
+    assert_eq!(store.status(&bare).await, Some(SessionStatus::Idle));
+    assert!(hubs.get(&bare).is_none(), "no hub was implicitly created");
+}
+
+#[tokio::test]
+async fn in_memory_unification_stage4() {
+    unification_stage4_suite(|| Arc::new(InMemoryStore::new())).await;
+}
+
+#[tokio::test]
+async fn sqlite_unification_stage4() {
+    unification_stage4_suite(|| Arc::new(SqliteStore::open_in_memory().expect("open sqlite")))
+        .await;
+}
+
 /// Session-unification §6 regression: a concurrent wake of a BUSY session must not bump the fence
 /// past the in-flight incarnation. The in-process slot is reserved before the lease is acquired,
 /// so a busy session's wake returns satisfied without touching the lease; under the old

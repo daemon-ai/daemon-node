@@ -6,7 +6,7 @@
 use super::*;
 
 /// The session's own attribution for engine-emitted (outbound) merged-log entries.
-fn engine_origin() -> Origin {
+pub(super) fn engine_origin() -> Origin {
     Origin {
         transport: TransportId::new("engine"),
         scope: OriginScope::Internal,
@@ -17,7 +17,7 @@ fn engine_origin() -> Origin {
 /// The attribution stamped on inbound items entering through the node api surface. The api `submit`
 /// op carries no per-event origin yet (the surface-aware transports thread real origins in a later
 /// phase), so node-api inbound is tagged with this generic local-api origin.
-fn api_origin() -> Origin {
+pub(super) fn api_origin() -> Origin {
     Origin {
         transport: TransportId::new("api"),
         scope: OriginScope::Internal,
@@ -730,7 +730,7 @@ impl NodeEventFeed {
 
     /// The one-shot cursor read: the retained events past `after_cursor` (capped at `max`, `0` = all),
     /// or a single `ResyncNeeded` when `after_cursor` aged out of the ring.
-    pub(crate) fn page(&self, after_cursor: u64, max: u32) -> EventsPage {
+    pub fn page(&self, after_cursor: u64, max: u32) -> EventsPage {
         let g = self.inner.lock().unwrap();
         let head_cursor = g.ring.head();
         if g.ring.lagged(after_cursor) {
