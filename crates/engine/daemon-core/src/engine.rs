@@ -222,6 +222,46 @@ struct Handoff {
 }
 
 /// The pre-cloned handles [`Engine::execute_tool_batch`] runs a tool batch against without holding
+/// Build the read-only, wire-bounded [`ConvView`] projection of a [`Snapshot`] (the §17 snapshot
+/// reply body): the last [`WIRE_PAGE_MAX`](daemon_common::WIRE_PAGE_MAX) turns + capped
+/// `waiting_for`, never any live resource. Free-standing so the durable path can serve a snapshot
+/// request from the persisted blob without hydrating an engine; [`Engine::conv_view`] delegates.
+pub fn conv_view_of(snapshot: &Snapshot) -> ConvView {
+    let all = &snapshot.conversation.turns;
+    let skip = all.len().saturating_sub(daemon_common::WIRE_PAGE_MAX);
+    let turns = all
+        .iter()
+        .skip(skip)
+        .map(|turn| match turn {
+            Turn::User(u) => ConvTurnView {
+                role: "user".into(),
+                text: u.text.clone(),
+                tools: Vec::new(),
+            },
+            Turn::Assistant(a) => ConvTurnView {
+                role: "assistant".into(),
+                text: a.text.clone(),
+                tools: Vec::new(),
+            },
+            Turn::Tool(t) => ConvTurnView {
+                role: "tool".into(),
+                text: t.assistant.text.clone(),
+                tools: t.calls.iter().map(|(call, _)| call.name.clone()).collect(),
+            },
+        })
+        .collect();
+    ConvView {
+        epoch: snapshot.epoch.0,
+        turns,
+        waiting_for: snapshot
+            .waiting_for
+            .iter()
+            .take(daemon_common::WIRE_PAGE_MAX)
+            .map(|j| j.to_string())
+            .collect(),
+    }
+}
+
 /// `&mut self` across an await: the per-turn [`TurnCx`], the tool registry, the shared
 /// [`TurnControl`] (boundary checks), and the §17 event sink.
 struct BatchCtx<'a, 'c> {
@@ -367,41 +407,11 @@ impl Engine {
     /// journal's job (`session_history`), not the live view's. `waiting_for` is capped defensively
     /// under the same bound.
     pub fn conv_view(&self) -> ConvView {
-        let all = &self.snapshot.conversation.turns;
-        let skip = all.len().saturating_sub(daemon_common::WIRE_PAGE_MAX);
-        let turns = all
-            .iter()
-            .skip(skip)
-            .map(|turn| match turn {
-                Turn::User(u) => ConvTurnView {
-                    role: "user".into(),
-                    text: u.text.clone(),
-                    tools: Vec::new(),
-                },
-                Turn::Assistant(a) => ConvTurnView {
-                    role: "assistant".into(),
-                    text: a.text.clone(),
-                    tools: Vec::new(),
-                },
-                Turn::Tool(t) => ConvTurnView {
-                    role: "tool".into(),
-                    text: t.assistant.text.clone(),
-                    tools: t.calls.iter().map(|(call, _)| call.name.clone()).collect(),
-                },
-            })
-            .collect();
-        ConvView {
-            epoch: self.snapshot.epoch.0,
-            turns,
-            waiting_for: self
-                .snapshot
-                .waiting_for
-                .iter()
-                .take(daemon_common::WIRE_PAGE_MAX)
-                .map(|j| j.to_string())
-                .collect(),
-        }
+        conv_view_of(&self.snapshot)
     }
+
+    // (the projection itself lives in the free function `conv_view_of`, so the durable path can
+    // serve a §17 snapshot reply from a decoded `Snapshot` without a resident engine)
 
     /// Serve any pending snapshot requests at a consistent phase boundary by emitting a
     /// [`AgentEvent::Snapshot`] carrying the current [`ConvView`].
@@ -2054,6 +2064,7 @@ impl Engine {
 
 mod builder;
 mod rewind;
+pub use rewind::rewind_snapshot;
 mod views;
 use views::{
     batch_is_parallelizable, failure_kind, partition_tool_effects, recovery_step_kind,

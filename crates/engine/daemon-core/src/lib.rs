@@ -75,8 +75,8 @@ pub use conversation::{
 pub use credentials::{CredentialProvider, EmbeddedCredentialPool};
 pub use embed::{cosine, EmbeddingProvider, MockEmbedder};
 pub use engine::{
-    Completion, Engine, RewindError, RewindOutcome, Suspension, TurnOutcome,
-    APPROVAL_SUSPEND_PAYLOAD,
+    conv_view_of, rewind_snapshot, Completion, Engine, RewindError, RewindOutcome, Suspension,
+    TurnOutcome, APPROVAL_SUSPEND_PAYLOAD,
 };
 pub use events::{EventSink, SessionLog};
 pub use exec::{

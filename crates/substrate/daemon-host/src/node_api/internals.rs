@@ -63,7 +63,7 @@ pub(crate) struct MergedLog {
     /// The session-activation generation (L2 resync): a fresh log after a restart/reactivation
     /// carries a strictly greater epoch, sourced from the durable `SessionMeta.activation_epoch` in
     /// `ensure()`. Stamped onto every `LogPageView` so a client detects a generation change.
-    epoch: u64,
+    pub(crate) epoch: u64,
     /// The full ordered history as a shared cursored ring (unbounded: a late joiner can backfill
     /// from any cursor). The entry's own `seq` equals its ring id.
     ring: CursoredRing<SessionLogEntry>,
@@ -2205,7 +2205,7 @@ fn title_replaceable(meta: &SessionMeta, first_user: &str) -> bool {
 ///    roster subscribers refresh, and refresh the FTS row's title column.
 ///
 /// Runs entirely off the turn path; every failure leaves the seed/index as they were.
-async fn index_and_title_session(
+pub(crate) async fn index_and_title_session(
     store: Arc<dyn SessionStore>,
     session: SessionId,
     view: ConvView,

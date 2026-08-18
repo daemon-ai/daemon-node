@@ -205,16 +205,16 @@ async fn session_recap_serves_durable_and_live_sessions_owner_scoped() {
     .await;
     assert!(hits.iter().any(|h| h.session_id == durable));
 
-    // Live: a resident interactive session recaps through its live conversation view (it has no
-    // durable snapshot row).
+    // Wire-opened interactive session (stage-5 cutover): `submit` is durable-first — the session
+    // gets a durable row and its recap reads the committed snapshot (there is no separate
+    // live-only source anymore; the resident-view leg now only serves Foreign residencies).
     let live = SessionId::new("r-live");
     with_request_context(ctx("alice", Role::User), async {
         node.submit(live.clone(), start_turn("what is the meaning of life"))
             .await
     })
     .await
-    .expect("alice opens live");
-    assert!(store.peek_snapshot(&live).await.is_none(), "live-only");
+    .expect("alice opens the interactive session");
     let live_recap = wait_for("the live recap", || {
         let node = node.clone();
         let live = live.clone();

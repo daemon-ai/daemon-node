@@ -264,6 +264,11 @@ pub type ModelProviderFactory = Arc<dyn Fn(&ProfileSpec) -> Arc<dyn Provider> + 
 /// profile source); the host never links the routing-from-profiles policy directly.
 pub type RoutingBuilder = Arc<dyn Fn() -> RoutingRegistry + Send + Sync>;
 
+/// The stage-5 backend probe (session-unification §8): whether a bound profile resolves to a
+/// Foreign engine, which keeps its explicit live actor rail under the cutover. Injected by the
+/// assembly, which owns the profile store + resolution rules.
+pub type ForeignProbe = Arc<dyn Fn(&ProfileRef) -> bool + Send + Sync>;
+
 /// Which lifecycle owns a `SessionId`. The durable and live lifecycles are intentionally distinct
 /// (one runs an engine dormant-between-turns through the activation seam, the other keeps it
 /// resident in an actor), and a single id must not exist as two divergent engine instances. This is
@@ -589,6 +594,18 @@ pub struct NodeApiImpl {
     /// [`NodeEvent::PersonsChanged`](daemon_api::NodeEvent) via
     /// [`emit_persons_changed`](Self::emit_persons_changed) so clients re-list.
     persons: Arc<std::sync::Mutex<crate::person::PersonManager>>,
+    /// The stage-5 cutover arm (session-unification §8): when set, a NON-resident, Core-backed
+    /// session's wire commands route onto the durable rail (typed splice + wake / the session's
+    /// [`AttachmentHub`]) and the observation ops (`poll`/`log_after`/`subscribe`/`respond`) are
+    /// served from the hub — the live actor stops being the interactive authority. The SAME
+    /// registry must be wired into the durable [`CoreEngineFactory`] (the incarnation side).
+    /// `None` => every route keeps the legacy live-first behavior (the pre-cutover node).
+    attachments: Option<Arc<attachments::AttachmentHubs>>,
+    /// The stage-5 backend probe: whether a bound profile resolves to a Foreign engine (which
+    /// keeps its explicit live actor rail — the cutover moves only Core-backed sessions). Injected
+    /// by the assembly (which owns the profile store + resolution rules); `None` (with the cutover
+    /// armed) treats every bound profile as Core.
+    foreign_probe: Option<ForeignProbe>,
     /// The vhc-training service backing the [`daemon_api::VhcApi`] sub-surface (spec §10.4).
     /// `None` on a node built without vhc training (`[vhc] enabled = false`, the default): every
     /// `VhcApi` call then resolves to [`ApiError::Unsupported`] / an empty stream. Bound at
@@ -727,6 +744,314 @@ impl NodeApiImpl {
         Ok(())
     }
 
+    /// The stage-5 cutover routing gate (session-unification §8): whether wire commands addressed
+    /// at `session` route onto the durable rail. True iff the cutover is armed
+    /// ([`Self::attachments`]), the session is NOT currently live-resident (a resident actor —
+    /// Foreign, or a legacy live Core session — keeps its rail until it winds down), and the
+    /// session is not Foreign-bound (the Foreign actor rail is untouched by the cutover).
+    async fn cutover_routes(&self, session: &SessionId) -> bool {
+        if self.attachments.is_none() {
+            return false;
+        }
+        if self.live.is_resident(session) {
+            return false;
+        }
+        if let Some(probe) = &self.foreign_probe {
+            let bound = self
+                .store
+                .session_meta(session)
+                .await
+                .and_then(|m| m.bound_profile);
+            if let Some(profile) = &bound {
+                if probe(profile) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Get-or-create the session's [`attachments::AttachmentHub`] (cutover-armed paths only).
+    /// Creation stamps the merged log with the durable activation generation and BUMPS the stored
+    /// generation (the same L2-resync rule the live `ensure()` applies): a fresh hub after a
+    /// restart carries a strictly greater `log_epoch`, so a client detects the generation change
+    /// and re-baselines its cursor.
+    async fn attach_hub(&self, session: &SessionId) -> Arc<attachments::AttachmentHub> {
+        let hubs = self
+            .attachments
+            .as_ref()
+            .expect("attach_hub only routes when the cutover is armed");
+        if let Some(hub) = hubs.get(session) {
+            return hub;
+        }
+        let mut meta = self.store.session_meta(session).await.unwrap_or_default();
+        let epoch = meta.activation_epoch;
+        meta.activation_epoch = epoch + 1;
+        let _ = self.store.set_session_meta(session, meta).await;
+        hubs.attach(session, epoch)
+    }
+
+    /// The stage-5 durable command router (§8's matrix): every wire command a live actor used to
+    /// serve, homed on the durable lifecycle + the session's [`attachments::AttachmentHub`].
+    ///
+    /// - `StartTurn`/`Steer`/`Observe` → typed splice + wake (the ack rides the splice commit);
+    ///   a `Steer` that finds the hub's turn slot OCCUPIED is delivered INTO the resident turn
+    ///   instead (§7's timing contract — steering never waits for the next activation).
+    /// - `Interrupt` → the resident turn's `TurnControl` via the hub (idle = benign no-op).
+    /// - `Snapshot` → the resident turn serves it at its next phase boundary; an idle session's
+    ///   reply is projected from the durable snapshot (`conv_view_of`) — current live semantics.
+    /// - `Shutdown` → detach the hub (observers' streams end; nothing to tear down durably).
+    /// - `RewindTo` → NOT yet served durably (the fenced re-incarnation rewind lands before the
+    ///   production arm); explicit `Unsupported`, mirroring `ControlApi::rewind`'s durable path.
+    ///
+    /// The caller has already enforced Auth 4 and `note_activity`. Inbound commands are recorded
+    /// on the hub's merged log so subscribers replay one seq-ordered conversation (live parity).
+    async fn submit_attached(
+        &self,
+        session: &SessionId,
+        command: AgentCommand,
+    ) -> Result<(), ApiError> {
+        let hubs = self
+            .attachments
+            .as_ref()
+            .expect("submit_attached only routes when the cutover is armed");
+        // A brand-new id submitted without a `session_create`: create the durable Idle row first
+        // (the same atomic create-if-absent; a concurrent duplicate is benign).
+        if self.store.status(session).await.is_none() {
+            let blob = Snapshot::fresh(session.clone())
+                .encode()
+                .map_err(|e| ApiError::Other(format!("encode initial snapshot: {e}")))?;
+            match self
+                .store
+                .create_idle(session.clone(), self.partition, blob)
+                .await
+            {
+                Ok(()) | Err(daemon_store::StoreError::AlreadyExists(_)) => {}
+                Err(e) => return Err(ApiError::Other(format!("create session: {e}"))),
+            }
+            if let Some(feed) = self.node_feed() {
+                let rev = feed.note_roster_change(session);
+                feed.emit(NodeEvent::RosterChanged { rev });
+            }
+        }
+        let hub = self.attach_hub(session).await;
+        match command {
+            AgentCommand::StartTurn { input, request_id } => {
+                hub.record_inbound(AgentCommand::StartTurn {
+                    input: input.clone(),
+                    request_id,
+                });
+                self.enqueue_wire_input(session, SpliceKind::StartTurn, &input)
+                    .await
+            }
+            AgentCommand::Steer { text, request_id } => {
+                // Occupied slot: claimed into the resident turn (the hub records it inbound).
+                if hub.deliver_steer(request_id, text.clone()) {
+                    return Ok(());
+                }
+                hub.record_inbound(AgentCommand::Steer {
+                    text: text.clone(),
+                    request_id,
+                });
+                self.enqueue_wire_input(session, SpliceKind::Steer, &UserMsg::new(text))
+                    .await?;
+                // Splice-before-ack (§4.2): the append IS acceptance — the fold at the next wake
+                // cannot correlate (the splice payload is the bare `UserMsg`), so the routing
+                // layer acks here, the durable analogue of the live actor's idle-steer ack.
+                hub.publish_event(daemon_protocol::AgentEvent::Steered {
+                    seq: 0,
+                    request_id,
+                    accepted: true,
+                });
+                Ok(())
+            }
+            AgentCommand::Observe { input, request_id } => {
+                hub.record_inbound(AgentCommand::Observe {
+                    input: input.clone(),
+                    request_id,
+                });
+                // Fold-only: the woken incarnation commits the folded context without opening a
+                // model turn (`CoreIncarnation::fold_only`).
+                self.enqueue_wire_input(session, SpliceKind::Observe, &input)
+                    .await
+            }
+            AgentCommand::Interrupt { reason } => {
+                hub.record_inbound(AgentCommand::Interrupt { reason });
+                // Idle = benign no-op, exactly like a live interrupt with no turn in flight.
+                hub.interrupt();
+                Ok(())
+            }
+            AgentCommand::Snapshot { request_id } => {
+                if hub.request_snapshot(request_id) {
+                    return Ok(());
+                }
+                // Commit-boundary consistency: the engine publishes `TurnFinished` and frees the
+                // hub slot BEFORE the activation manager persists the checkpoint (`commit_turn`),
+                // so an idle-path read raced against that window would serve the pre-turn
+                // snapshot. `Active` marks exactly that in-flight cycle — wait it out (bounded)
+                // before peeking, mirroring the live actor's read-your-turn snapshot semantics.
+                let settle = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while matches!(
+                    self.store.status(session).await,
+                    Some(SessionStatus::Active)
+                ) && std::time::Instant::now() < settle
+                {
+                    // A turn may have started between `request_snapshot` and here: queue on it.
+                    if hub.request_snapshot(request_id) {
+                        return Ok(());
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                let blob = self.store.peek_snapshot(session).await.ok_or_else(|| {
+                    ApiError::Other(format!("session {session} has no durable snapshot"))
+                })?;
+                let snap = Snapshot::decode(&blob)
+                    .map_err(|e| ApiError::Other(format!("decode durable snapshot: {e}")))?;
+                hub.publish_snapshot(request_id, daemon_core::conv_view_of(&snap));
+                Ok(())
+            }
+            AgentCommand::Shutdown => {
+                hubs.detach(session);
+                Ok(())
+            }
+            AgentCommand::RewindTo { anchor, request_id } => {
+                // A bare `RewindTo` command rewinds the conversation *and* rolls the workspace
+                // back — the live command's historical behavior. Conversation-only rewind is
+                // reachable via `ControlApi::rewind` with `restore_workspace = false`.
+                self.rewind_durable(session, &anchor, request_id, true)
+                    .await
+            }
+            // `#[non_exhaustive]`: a future command must be routed deliberately, not dropped.
+            other => Err(ApiError::Unsupported(format!(
+                "durable routing for {other:?}"
+            ))),
+        }
+    }
+
+    /// Sticky-on-first-open profile binding for the durable rail (§8): record `explicit`, else the
+    /// node's ACTIVE default, onto the durable meta — the same resolution the live builder performs
+    /// at open (`store.active()`), persisted so every later hydrate resolves the identical profile
+    /// through the `DurableProfileResolver`. A recorded binding is never overwritten.
+    async fn bind_profile_on_first_open(&self, session: &SessionId, explicit: Option<ProfileRef>) {
+        let bind = match explicit {
+            Some(p) => Some(p),
+            None => self
+                .profile_store()
+                .ok()
+                .and_then(|s| s.active().ok().flatten())
+                .map(ProfileRef::new),
+        };
+        let Some(profile) = bind else { return };
+        let mut meta = self.store.session_meta(session).await.unwrap_or_default();
+        if meta.bound_profile.is_none() {
+            meta.bound_profile = Some(profile);
+            let _ = self.store.set_session_meta(session, meta).await;
+        }
+    }
+
+    /// The wire-addressed durable input rail (§8): splice, then — Completed only — REOPEN the
+    /// settled session (`Completed → Ready`), then wake. An explicit client submit addressed at a
+    /// settled one-shot resurrects it over its retained durable transcript (the pre-cutover live
+    /// rail opened a BLANK fresh engine over the id; the durable resume is strictly better).
+    /// Splice-before-reopen so a raced scanner never sees a `Ready` row with nothing to run.
+    /// Host-originated injections keep dropping input at settled sessions (`inject_session_msg`).
+    async fn enqueue_wire_input(
+        &self,
+        session: &SessionId,
+        kind: SpliceKind,
+        msg: &UserMsg,
+    ) -> Result<(), ApiError> {
+        let mut payload = Vec::new();
+        ciborium::into_writer(msg, &mut payload)
+            .map_err(|e| ApiError::Other(format!("encode wire input: {e}")))?;
+        self.store
+            .append_splice(NewSplice {
+                session_id: session.clone(),
+                kind,
+                payload,
+                origin_op: mint_op_id(),
+                origin: "wire-submit".into(),
+            })
+            .await
+            .map_err(|e| ApiError::Other(format!("append wire input: {e}")))?;
+        let _ = self.store.reopen_if_settled(session).await;
+        self.store.enqueue_wake(session.clone()).await;
+        Ok(())
+    }
+
+    /// Rewind a DURABLE (non-resident) session (§8 + conversation-rewind spec): interrupt-first
+    /// when a turn occupies the session's hub slot (waiting for its commit to land), then a
+    /// dormant-only compare-and-swap of the persisted snapshot through the shared snapshot
+    /// surgery ([`daemon_core::rewind_snapshot`] — the same truncate + reset + epoch bump the
+    /// resident engine performs), then the shared durable side-effects (journal seal + optional
+    /// workspace rollback). The `Rewound` event is published on the hub so subscribers see the
+    /// same reply a live rewind streams.
+    async fn rewind_durable(
+        &self,
+        session: &SessionId,
+        anchor: &daemon_protocol::RewindAnchor,
+        request_id: daemon_common::ReqId,
+        restore_workspace: bool,
+    ) -> Result<(), ApiError> {
+        // Interrupt-first: cooperatively cancel a resident turn and wait (bounded) for it to
+        // commit and vacate the slot, so the CAS below sees a dormant session.
+        if let Some(hubs) = &self.attachments {
+            if let Some(hub) = hubs.get(session) {
+                if hub.occupied() {
+                    hub.interrupt();
+                    let mut occupancy = hub.occupancy();
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(15),
+                        occupancy.wait_for(|occupied| !occupied),
+                    )
+                    .await;
+                }
+            }
+        }
+        // Dormant-only CAS: the swap refuses while an activation is `Active` or when the blob
+        // changed under us; bounded retries cover the interrupt's commit landing just after the
+        // occupancy flip.
+        for attempt in 0..5u32 {
+            let blob = self
+                .store
+                .peek_snapshot(session)
+                .await
+                .ok_or_else(|| ApiError::UnknownSession(session.to_string()))?;
+            let mut snap = Snapshot::decode(&blob)
+                .map_err(|e| ApiError::Other(format!("decode durable snapshot: {e}")))?;
+            let outcome = daemon_core::rewind_snapshot(&mut snap, anchor)
+                .map_err(|e| ApiError::Other(e.to_string()))?;
+            let new = snap
+                .encode()
+                .map_err(|e| ApiError::Other(format!("encode rewound snapshot: {e}")))?;
+            let swapped = self
+                .store
+                .swap_snapshot_if_dormant(session, &blob, new)
+                .await
+                .map_err(|e| ApiError::Other(format!("rewind swap: {e}")))?;
+            if swapped {
+                self.live
+                    .seal_and_rollback_after_rewind(session, &outcome, restore_workspace)
+                    .await;
+                if self.attachments.is_some() {
+                    self.attach_hub(session).await.publish_event(
+                        daemon_protocol::AgentEvent::Rewound {
+                            seq: 0,
+                            request_id,
+                            to_cursor: outcome.retained_turns as u64,
+                            epoch: outcome.epoch.0,
+                        },
+                    );
+                }
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50 << attempt)).await;
+        }
+        Err(ApiError::Conflict(format!(
+            "session {session} stayed active; rewind could not claim a dormant snapshot"
+        )))
+    }
+
     /// The F4 durable-resume gate: whether a wire `Submit { StartTurn | Steer }` addressed at
     /// `session` must ride the durable inbox rail instead of opening a fresh live incarnation.
     /// Returns `Some((kind, msg))` — the typed splice to fold into the durable transcript —
@@ -820,7 +1145,9 @@ pub use provisioning::{AccountProvisioning, ProvisionedAccount};
 // that live in another concern module.
 pub(crate) use authorized::{AuthorizedFor, Session};
 pub(crate) use builtins::command_err_to_api;
-pub(crate) use internals::{apply_rewind_side_effects, LiveSessions, RewindSideEffects};
+pub(crate) use internals::{
+    apply_rewind_side_effects, index_and_title_session, LiveSessions, RewindSideEffects,
+};
 pub(crate) use messaging::participant_label;
 pub(crate) use overlay::approval_mode_to_policy;
 pub(crate) use profile::profile_err;

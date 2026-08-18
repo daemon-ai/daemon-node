@@ -23,8 +23,8 @@ use daemon_api::{ApiError, LogPageView, LogStream, NodeEvent};
 use daemon_common::{ReqId, SessionId};
 use daemon_core::{SteerReq, TurnControl};
 use daemon_protocol::{
-    AgentCommand, AgentEvent, Direction, Disposition, HostRequest, HostRequestKind, HostResponse,
-    HostResponseBody, Outbound, SessionPayload,
+    AgentCommand, AgentEvent, DeliveryTarget, Direction, Disposition, HostRequest, HostRequestKind,
+    HostResponse, HostResponseBody, Outbound, SessionPayload, SinkKind, TransportId,
 };
 use dashmap::DashMap;
 use std::collections::{HashMap, VecDeque};
@@ -53,6 +53,10 @@ pub struct AttachmentHub {
     occupied_tx: watch::Sender<bool>,
     /// The node-wide event feed (`ApprovalPending` when an approval parks).
     feed: Option<Arc<NodeEventFeed>>,
+    /// The session's delivery roster (§8 sidecar re-homing): the reply targets a live residency
+    /// used to keep on its actor entry, now homed here so a durable session's `handover` /
+    /// `delivery_targets` / transport enumeration serve identically.
+    delivery: Mutex<Vec<DeliveryTarget>>,
 }
 
 impl AttachmentHub {
@@ -70,6 +74,7 @@ impl AttachmentHub {
             occupied_tx,
             feed,
             session,
+            delivery: Mutex::new(Vec::new()),
         }
     }
 
@@ -146,6 +151,62 @@ impl AttachmentHub {
 
     // -- control + response (the client side) ----------------------------------------------------
 
+    /// Record an inbound client command on the merged log (the live `record_inbound` parity):
+    /// the user's `StartTurn`/`Observe`/… shares the same seq timeline as the outbound events the
+    /// turn it opens will stream, so a subscriber replays one ordered conversation.
+    pub fn record_inbound(&self, command: AgentCommand) {
+        self.log.lock().unwrap().append(
+            Direction::Inbound,
+            LogEntryParts {
+                origin: api_origin(),
+                disposition: Disposition::Context,
+                payload: SessionPayload::Command(command),
+            },
+        );
+    }
+
+    /// Record a transport-scoped meta entry on the merged log (the live `record_meta` parity):
+    /// observable on `log_after`/`subscribe`, never entering the prompt or the journal.
+    pub fn record_meta(&self, origin: daemon_protocol::Origin, kind: String, body: Vec<u8>) {
+        self.log.lock().unwrap().append(
+            Direction::Inbound,
+            LogEntryParts {
+                origin,
+                disposition: Disposition::Transport,
+                payload: SessionPayload::Meta { kind, body },
+            },
+        );
+    }
+
+    /// Ask the RESIDENT turn for a read-only snapshot (served at its next phase boundary as an
+    /// [`AgentEvent::Snapshot`] on this hub's stream). `false` when no turn occupies the slot —
+    /// the caller serves the durable snapshot itself via [`Self::publish_snapshot`].
+    pub fn request_snapshot(&self, request_id: ReqId) -> bool {
+        match self.control.lock().unwrap().as_ref() {
+            Some(control) => {
+                control.push_snapshot(request_id);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Serve an idle-path snapshot reply: the host projects the durable snapshot to a `ConvView`
+    /// and this publishes it as the §17 [`AgentEvent::Snapshot`] on the drain + merged log —
+    /// identical delivery shape to a resident turn's boundary reply.
+    pub fn publish_snapshot(&self, request_id: ReqId, view: daemon_protocol::ConvView) {
+        self.publish_event(AgentEvent::Snapshot {
+            seq: 0,
+            request_id,
+            view,
+        });
+    }
+
+    /// The merged log's activation generation (L2 resync; the live `log_epoch` parity).
+    pub fn log_epoch(&self) -> u64 {
+        self.log.lock().unwrap().epoch
+    }
+
     /// Deliver a steer INTO the resident turn, if one occupies the slot: the engine folds it at
     /// its next phase boundary (§7's timing contract — steering never waits for the next turn).
     /// Returns `false` when no turn is resident (the caller then routes it as a durable splice).
@@ -207,6 +268,43 @@ impl AttachmentHub {
                 response.request_id.0, self.session
             ))),
         }
+    }
+
+    // -- delivery roster (§8 sidecar re-homing) --------------------------------------------------
+
+    /// Promote `target` to the session's `Primary` reply sink, demoting any current primary to
+    /// `Spectator` (the live `handover` semantics, homed on the hub).
+    pub fn handover(&self, target: DeliveryTarget) {
+        let mut targets = self.delivery.lock().unwrap();
+        for t in targets.iter_mut() {
+            if t.kind == SinkKind::Primary {
+                t.kind = SinkKind::Spectator;
+            }
+        }
+        targets.retain(|t| !(t.transport == target.transport && t.route == target.route));
+        targets.push(target);
+    }
+
+    /// Seed the `Primary` reply target if none exists yet (the routed-submit seeding semantics).
+    pub fn seed_primary_target(&self, target: DeliveryTarget) {
+        let mut targets = self.delivery.lock().unwrap();
+        if !targets.iter().any(|t| t.kind == SinkKind::Primary) {
+            targets.push(target);
+        }
+    }
+
+    /// The session's current delivery targets.
+    pub fn delivery_targets(&self) -> Vec<DeliveryTarget> {
+        self.delivery.lock().unwrap().clone()
+    }
+
+    /// Whether this session's roster carries a `Primary` target on `transport`.
+    pub fn primary_on(&self, transport: &TransportId) -> bool {
+        self.delivery
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|t| t.kind == SinkKind::Primary && &t.transport == transport)
     }
 
     // -- observation (the client side) -----------------------------------------------------------
@@ -288,5 +386,33 @@ impl AttachmentHubs {
     /// via the oneshot drop).
     pub fn detach(&self, session: &SessionId) {
         self.map.remove(session);
+    }
+
+    /// Every attached session whose roster carries a `Primary` target on `transport` (§8 sidecar
+    /// re-homing; the durable half of the transport's delivery enumeration).
+    pub fn delivery_sessions(&self, transport: &TransportId) -> Vec<SessionId> {
+        self.map
+            .iter()
+            .filter(|e| e.value().primary_on(transport))
+            .map(|e| e.key().clone())
+            .collect()
+    }
+
+    /// Every distinct `Primary` target across attached sessions, deduplicated by
+    /// `(transport, route)` — the durable half of a cron `deliver = "all"` broadcast.
+    pub fn all_primary_targets(&self) -> Vec<DeliveryTarget> {
+        let mut out: Vec<DeliveryTarget> = Vec::new();
+        for e in self.map.iter() {
+            for t in e.value().delivery.lock().unwrap().iter() {
+                if t.kind == SinkKind::Primary
+                    && !out
+                        .iter()
+                        .any(|o| o.transport == t.transport && o.route == t.route)
+                {
+                    out.push(t.clone());
+                }
+            }
+        }
+        out
     }
 }

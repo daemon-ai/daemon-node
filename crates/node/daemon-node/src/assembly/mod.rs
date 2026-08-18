@@ -230,11 +230,23 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
     // sessions fall back to the single fixed `session_profile` (legacy single-profile behavior).
     let session_ctx = build_session_ctx(&a, &shared, &cron.cron_tool, &procs);
 
+    // The interactive session profile is shared by the live session builder AND (stage-5 cutover)
+    // the durable factory's interactive-root fallback, so a wire session hydrates identically on
+    // either rail.
+    let session_profile = build_session_profile(
+        &a,
+        &launch_skill_tools,
+        launch_index,
+        &cron.cron_tool,
+        &shared.workspace_roots,
+        &procs,
+    );
     // The durable path journals too, and (when per-session resolution is available) re-resolves a
     // durable session's engine from its recorded bound profile + overlay on rehydration.
     let factory = build_factory(
         &a,
         &orchestrator_profile,
+        &session_profile,
         &cron.cron_run_profile,
         &session_ctx,
         &shared,
@@ -249,14 +261,6 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
     let handle = host.start();
 
     // The interactive (session sub-surface) engines + the profile-aware session builder.
-    let session_profile = build_session_profile(
-        &a,
-        &launch_skill_tools,
-        launch_index,
-        &cron.cron_tool,
-        &shared.workspace_roots,
-        &procs,
-    );
     let session_builder = build_session_builder(
         &session_ctx,
         session_profile,
@@ -294,6 +298,10 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
     // The node-wide event feed (L3): `events_since` serves from this ring and the §5 emit hooks
     // push onto it.
     .with_node_events(shared.node_events.clone())
+    // Stage-5 cutover (session-unification §8): the SAME hub registry the durable
+    // `CoreEngineFactory` publishes into serves the wire observation surface, and non-resident
+    // Core-backed sessions route onto the durable rail (splice + wake / hub control).
+    .with_attachments(shared.attachments.clone())
     // The read-only guardrail caps (`Caps`, wire v29): the EFFECTIVE orchestrate ceilings — the
     // same composition the tool registration below enforces.
     .with_caps(daemon_api::CapsReport {
@@ -306,6 +314,18 @@ pub fn assemble(a: NodeAssembly) -> AssembledNode {
     // an auxiliary provider for it.
     if let Some(aux) = a.title_aux.clone() {
         node_api = node_api.with_title_aux(aux);
+    }
+    // Stage-5 backend probe: a bound profile that resolves `Foreign{agent}` keeps the explicit
+    // live actor rail (the cutover moves only Core-backed sessions).
+    if let Some(profiles) = a.profiles.clone() {
+        node_api = node_api.with_foreign_probe(std::sync::Arc::new(move |p: &ProfileRef| {
+            profiles
+                .get(p.as_str())
+                .ok()
+                .flatten()
+                .map(|spec| matches!(spec.engine, EngineSelector::Foreign { .. }))
+                .unwrap_or(false)
+        }));
     }
     // Bind every optional sub-surface (workspace/blob/cron/models/profiles/credentials/auth/skills/
     // routing/cloud/acp/model-factory/background/checkpoints) + the fleet-change bridge. Order
@@ -638,6 +658,7 @@ fn build_session_ctx(
 fn build_factory(
     a: &NodeAssembly,
     orchestrator_profile: &EngineProfile,
+    session_profile: &EngineProfile,
     cron_run_profile: &EngineProfile,
     session_ctx: &Option<(Arc<dyn ProfileStore>, Arc<SessionFactoryCtx>)>,
     shared: &Shared,
@@ -645,9 +666,20 @@ fn build_factory(
     let mut factory = CoreEngineFactory::from_profile(orchestrator_profile.clone())
         .with_journal(a.store.clone(), shared.signer.clone())
         .with_background(shared.background.clone())
-        // Session-unification §7: incarnations serve any attached hub (dark until the stage-5
-        // wire cutover routes Poll/Subscribe/Respond here — no hub attaches before then).
+        // Session-unification §7/§8: incarnations serve any attached hub (the stage-5 cutover
+        // routes Poll/Subscribe/Respond + wire submits here for non-resident Core sessions).
         .with_attachments(shared.attachments.clone())
+        // Stage-5 cutover parity: an interactive-root session with no bound-profile resolution
+        // hydrates under the SAME session profile the live builder used (tools + default
+        // provider), never the orchestrator fallback.
+        .with_interactive_profile(session_profile.clone())
+        // Stage-5 cutover parity: the live pump's post-turn FTS indexing + first-exchange title
+        // generation run at the durable turn boundary for interactive sessions.
+        .with_indexing(
+            a.store.clone(),
+            a.title_aux.clone(),
+            Some(shared.node_events.clone()),
+        )
         // I15/G3: a cron-fired session (`session_meta.scheduled_job`) hydrates under the constrained,
         // `cron`/`orchestrate`-free profile so a scheduled run cannot self-schedule or self-delegate.
         .with_cron_profile(cron_run_profile.clone());

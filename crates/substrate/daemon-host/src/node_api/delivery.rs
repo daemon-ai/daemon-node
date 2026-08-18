@@ -39,7 +39,22 @@ impl NodeApiImpl {
     fn resolve_delivery(&self, deliver: &str, origin: Option<&Origin>) -> Vec<DeliveryTarget> {
         match deliver.trim() {
             "origin" => origin.map(|o| vec![o.primary_target()]).unwrap_or_default(),
-            "all" => self.live.all_primary_targets(),
+            // §8 sidecar re-homing: broadcast unions the live residencies' targets with the
+            // attachment hubs' (durable sessions), deduped by (transport, route).
+            "all" => {
+                let mut out = self.live.all_primary_targets();
+                if let Some(hubs) = &self.attachments {
+                    for t in hubs.all_primary_targets() {
+                        if !out
+                            .iter()
+                            .any(|o| o.transport == t.transport && o.route == t.route)
+                        {
+                            out.push(t);
+                        }
+                    }
+                }
+                out
+            }
             spec => match spec.split_once(':') {
                 Some((transport, route)) if !transport.is_empty() && !route.is_empty() => {
                     vec![DeliveryTarget::new(transport, route, SinkKind::Primary)]

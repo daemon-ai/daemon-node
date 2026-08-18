@@ -6,6 +6,21 @@ use super::*;
 #[async_trait]
 impl SessionApi for NodeApiImpl {
     async fn submit(&self, session: SessionId, command: AgentCommand) -> Result<(), ApiError> {
+        // Stage-5 cutover (session-unification §8): a non-resident Core session's commands are
+        // homed on the durable rail — splice + wake for input, the AttachmentHub for control.
+        if self.cutover_routes(&session).await {
+            let _auth = self.require_session_access(&session, true).await?;
+            self.bind_profile_on_first_open(&session, None).await;
+            // Live parity: an opening StartTurn seeds the Primary reply sink from the generic
+            // `api` origin (the same seam `LiveSessions::submit` rides); handover re-points later.
+            if matches!(command, AgentCommand::StartTurn { .. }) {
+                self.attach_hub(&session)
+                    .await
+                    .seed_primary_target(internals::api_origin().primary_target());
+            }
+            self.note_activity(&session, &command).await;
+            return self.submit_attached(&session, command).await;
+        }
         // F4 durable-resume: a `StartTurn`/`Steer` at a PARKED-DURABLE session rides the durable
         // inbox rail (typed splice into the durable transcript + wake) instead of opening a
         // divergent fresh live incarnation. Auth 4 is enforced before enqueuing (own-or-operator,
@@ -32,6 +47,20 @@ impl SessionApi for NodeApiImpl {
         origin: Origin,
         command: AgentCommand,
     ) -> Result<(), ApiError> {
+        // Stage-5 cutover (§8): a non-resident Core session routes durable (origin attribution is
+        // delivery metadata the durable session already owns).
+        if self.cutover_routes(&session).await {
+            self.require_session_access(&session, true).await?;
+            self.bind_profile_on_first_open(&session, None).await;
+            // Live parity: an opening StartTurn seeds the Primary from the submitting origin.
+            if matches!(command, AgentCommand::StartTurn { .. }) {
+                self.attach_hub(&session)
+                    .await
+                    .seed_primary_target(origin.primary_target());
+            }
+            self.note_activity(&session, &command).await;
+            return self.submit_attached(&session, command).await;
+        }
         // F4 durable-resume: a parked-durable `StartTurn`/`Steer` folds into the durable transcript
         // (the origin is delivery attribution the durable session already owns) rather than opening
         // a fresh live incarnation.
@@ -56,10 +85,13 @@ impl SessionApi for NodeApiImpl {
         // body of `assign` (durable row + fresh snapshot + owner stamp) enriched with `bound_profile`,
         // MINUS `manager.wake()` — no turn runs and no engine is woken.
         let session = session.unwrap_or_else(mint_session_id);
-        // Reserve the id for the live lifecycle: the GUI binds its composer to this id and opens it
-        // with a live `StartTurn`, so claiming `Live` keeps that subsequent submit idempotent (a
-        // `Durable` claim would make the first turn conflict with the guard-rail).
-        self.claim(&session, Lifecycle::Live)?;
+        // Pre-cutover: reserve the id for the live lifecycle — the GUI binds its composer to this
+        // id and opens it with a live `StartTurn`, so claiming `Live` keeps that subsequent submit
+        // idempotent. Under the armed cutover (§8) the first submit routes DURABLE, so no live
+        // claim is taken (the owners map itself retires with the live Core rail).
+        if self.attachments.is_none() {
+            self.claim(&session, Lifecycle::Live)?;
+        }
         // Auth 4: an `Absent` session passes; the durable-create + meta stamp below fixes ownership.
         self.require_session_access(&session, true).await?;
         // Resolve the profile to bind: an explicit ref, else the node's active default — so a blank
@@ -117,6 +149,30 @@ impl SessionApi for NodeApiImpl {
             command,
             profile,
         } = args;
+        // Stage-5 cutover (§8): a non-resident Core session routes durable. An explicitly-passed
+        // FOREIGN profile keeps the live actor rail (the probe can only inspect the durable
+        // binding, which does not exist yet on a first open); a Core profile binds
+        // sticky-on-first-open onto the durable meta (the same rule `session_create` uses), so
+        // "open this chat as agent X" works without forcing a live residency.
+        let explicit_foreign = match (&profile, &self.foreign_probe) {
+            (Some(p), Some(probe)) => probe(p),
+            _ => false,
+        };
+        if !explicit_foreign && self.cutover_routes(&session).await {
+            self.require_session_access(&session, true).await?;
+            self.bind_profile_on_first_open(&session, profile).await;
+            // Live parity: an opening StartTurn seeds the Primary from the submitting origin
+            // (the generic `api` origin when the surface passed none).
+            if matches!(command, AgentCommand::StartTurn { .. }) {
+                let target = origin
+                    .as_ref()
+                    .map(|o| o.primary_target())
+                    .unwrap_or_else(|| internals::api_origin().primary_target());
+                self.attach_hub(&session).await.seed_primary_target(target);
+            }
+            self.note_activity(&session, &command).await;
+            return self.submit_attached(&session, command).await;
+        }
         // F4 durable-resume: a parked-durable `StartTurn`/`Steer` folds into the durable transcript
         // (its engine profile is already bound durably) rather than opening a fresh live incarnation.
         if let Some((kind, msg)) = self.durable_resume_input(&session, &command).await {
@@ -184,11 +240,20 @@ impl SessionApi for NodeApiImpl {
     async fn poll(&self, session: SessionId, max: u32) -> Result<Vec<Outbound>, ApiError> {
         // Auth 4: own-or-`SessionControlAny` (the task's named control ops include `poll`).
         let auth = self.require_session_access(&session, true).await?;
+        // Stage-5 cutover (§8): a non-resident Core session's drain is its AttachmentHub's.
+        if self.cutover_routes(&session).await {
+            return Ok(self.attach_hub(&session).await.poll(max));
+        }
         self.live.poll(&auth, max)
     }
 
     async fn respond(&self, session: SessionId, response: HostResponse) -> Result<(), ApiError> {
         let auth = self.require_session_access(&session, true).await?;
+        // Stage-5 cutover (§8): a durable session's parked Input/Choice/Approval is answered on
+        // its hub (the request parked there via the incarnation's HubParkingResolver).
+        if self.cutover_routes(&session).await {
+            return self.attach_hub(&session).await.respond(response);
+        }
         self.live.respond(&auth, response)
     }
 
@@ -224,12 +289,20 @@ impl SessionApi for NodeApiImpl {
         // `Call` and `Open` forms of one op deny identically). Previously unguarded — the gap that
         // let a non-owner read another user's live transcript.
         let auth = self.require_session_access(&session, true).await?;
+        // Stage-5 cutover (§8): a non-resident Core session's merged log is its AttachmentHub's.
+        if self.cutover_routes(&session).await {
+            return Ok(self.attach_hub(&session).await.log_after(after_seq, max));
+        }
         Ok(self.live.log_after(&auth, after_seq, max))
     }
 
     async fn subscribe(&self, session: SessionId, after_seq: u64) -> Result<LogStream, ApiError> {
         // Auth 4: own-or-`SessionControlAny` (a live subscription is a session-interaction op).
         let auth = self.require_session_access(&session, true).await?;
+        // Stage-5 cutover (§8): subscribe to the hub's merged log (backfill + live continuation).
+        if self.cutover_routes(&session).await {
+            return Ok(self.attach_hub(&session).await.subscribe(after_seq));
+        }
         Ok(self.live.subscribe(&auth, after_seq))
     }
 
@@ -240,6 +313,10 @@ impl SessionApi for NodeApiImpl {
         let Ok(auth) = self.require_session_access(&session, false).await else {
             return 0;
         };
+        // Stage-5 cutover (§8): the hub's merged-log generation (L2 resync) for durable sessions.
+        if self.cutover_routes(&session).await {
+            return self.attach_hub(&session).await.log_epoch();
+        }
         self.live.log_epoch(&auth)
     }
 
@@ -249,6 +326,13 @@ impl SessionApi for NodeApiImpl {
         let Ok(auth) = self.require_session_access(&session, false).await else {
             return Vec::new();
         };
+        // Stage-5 cutover (§8): a durable session's delivery roster is homed on its hub.
+        if self.cutover_routes(&session).await {
+            return match self.attachments.as_ref().and_then(|h| h.get(&session)) {
+                Some(hub) => hub.delivery_targets(),
+                None => Vec::new(),
+            };
+        }
         self.live.delivery_targets(&auth)
     }
 
@@ -258,8 +342,17 @@ impl SessionApi for NodeApiImpl {
         after: Option<String>,
     ) -> daemon_api::WirePage<SessionId> {
         // The live registry is a DashMap scan with no stable order; sort by session id (the
-        // cursor key) before slicing.
-        let sessions = self.live.delivery_sessions(&transport);
+        // cursor key) before slicing. Stage-5 cutover (§8): the durable half of the roster lives
+        // on the attachment hubs — union both (a session is only ever homed on one).
+        let mut sessions = self.live.delivery_sessions(&transport);
+        if let Some(hubs) = &self.attachments {
+            for s in hubs.delivery_sessions(&transport) {
+                if !sessions.contains(&s) {
+                    sessions.push(s);
+                }
+            }
+        }
+        let sessions = sessions;
         // Auth 4 (F4): a non-owner must not enumerate another owner's sessions on a shared transport
         // (own sessions only unless SessionSeeAll) — per-row owner_visible, mirroring the roster /
         // checkpoints filter. The internal delivery bridge (daemon-http `serve_delivery_scoped`) runs
@@ -282,12 +375,28 @@ impl SessionApi for NodeApiImpl {
     async fn handover(&self, session: SessionId, target: DeliveryTarget) -> Result<(), ApiError> {
         // Auth 4: own-or-`SessionControlAny`.
         let auth = self.require_session_access(&session, true).await?;
+        // Stage-5 cutover (§8): a durable session's delivery roster is homed on its hub.
+        if self.cutover_routes(&session).await {
+            self.attach_hub(&session).await.handover(target);
+            return Ok(());
+        }
         self.live.handover(&auth, target)
     }
 
     async fn record_meta(&self, args: RecordMetaArgs) -> Result<(), ApiError> {
         // Auth 4: own-or-`SessionControlAny` (writes into the session's live log).
         let auth = self.require_session_access(&args.session, true).await?;
+        // Stage-5 cutover (§8): a durable session's merged log is its hub's.
+        if self.cutover_routes(&args.session).await {
+            let session = args.session.clone();
+            let RecordMetaArgs {
+                origin, kind, body, ..
+            } = args;
+            self.attach_hub(&session)
+                .await
+                .record_meta(origin, kind, body);
+            return Ok(());
+        }
         self.live.record_meta(&auth, args)
     }
 

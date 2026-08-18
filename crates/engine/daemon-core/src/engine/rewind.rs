@@ -34,50 +34,29 @@ impl Engine {
         );
         let _guard = span.enter();
         let len = self.snapshot.conversation.turns.len();
-        let retained = match self.resolve_anchor(anchor, len) {
-            Ok(retained) => retained,
+        // The snapshot surgery is shared with the durable (dormant, non-resident) rewind path.
+        let outcome = match rewind_snapshot(&mut self.snapshot, anchor) {
+            Ok(outcome) => outcome,
             Err(err) => {
                 tracing::warn!(error = ?err, turns_before = len, "engine.rewind.rejected");
                 return Err(err);
             }
         };
 
-        // Collect the tool call-ids in the sealed-off tail (oldest first) so the host can roll the
-        // workspace back via the §12 checkpoints captured before those tools ran.
-        let dropped_call_ids: Vec<String> = self.snapshot.conversation.turns[retained..]
-            .iter()
-            .filter_map(|t| match t {
-                Turn::Tool(tt) => Some(tt),
-                _ => None,
-            })
-            .flat_map(|tt| tt.calls.iter().map(|(call, _)| call.call_id.clone()))
-            .collect();
-
-        // Reconstruct the snapshot for the rewound point: drop the sealed-off tail and reset every
-        // derived/transient field that described the now-abandoned suffix.
-        self.snapshot.conversation.turns.truncate(retained);
+        // Clear the ENGINE-transient in-flight state the snapshot surgery cannot see.
         self.pending.clear();
         self.next_trigger = None;
         self.next_origin = None;
-        self.snapshot.waiting_for.clear();
-        self.snapshot.pending_approvals.clear();
-        // Cadence counters are relative to the dropped tail; reset so the rewound point starts clean.
-        self.snapshot.iters_since_skill = 0;
-        self.snapshot.turns_since_memory = 0;
         // A rewind to the conversation root is a full context clear — the daemon's `/new` analog.
         // Notify the §10 context engine so a stateful engine resets its per-session state in step
         // with the emptied conversation (LCM: retained-DAG prune + ingest-cursor/counter reset).
         // Partial rewinds are not resets: the engine re-measures the shortened body next turn.
-        if retained == 0 {
+        if outcome.retained_turns == 0 {
             self.context.on_session_reset(&self.snapshot.session_id);
         }
 
-        // Bump the incarnation epoch so any in-flight commit/event from the interrupted turn that
-        // arrives late is fenced and dropped (mirrors the suspension epoch bump).
-        self.snapshot.epoch = self.snapshot.epoch.next();
-        let epoch = self.snapshot.epoch;
-        let to_cursor = retained as u64;
-
+        let epoch = outcome.epoch;
+        let to_cursor = outcome.retained_turns as u64;
         events.emit(|seq| AgentEvent::Rewound {
             seq,
             request_id,
@@ -86,56 +65,98 @@ impl Engine {
         });
         tracing::info!(
             turns_before = len,
-            turns_after = retained,
-            dropped_call_ids = dropped_call_ids.len(),
+            turns_after = outcome.retained_turns,
+            dropped_call_ids = outcome.dropped_call_ids.len(),
             new_epoch = epoch.0,
             to_cursor,
             "engine.rewind.applied"
         );
 
-        Ok(RewindOutcome {
-            retained_turns: retained,
-            epoch,
-            dropped_call_ids,
-        })
+        Ok(outcome)
     }
+}
 
-    /// Resolve a [`RewindAnchor`] to the number of turns to retain (`[0, retained)` survive). `len` is
-    /// the live conversation turn count.
-    fn resolve_anchor(&self, anchor: &RewindAnchor, len: usize) -> Result<usize, RewindError> {
-        match anchor {
-            // Seal off the user turn at `ordinal` and everything after: keep `[0, ordinal)`.
-            RewindAnchor::UserTurn { ordinal } => {
-                let o = usize::try_from(*ordinal).map_err(|_| RewindError::OutOfRange)?;
-                if o >= len {
-                    return Err(RewindError::OutOfRange);
-                }
-                if !matches!(self.snapshot.conversation.turns.get(o), Some(Turn::User(_))) {
-                    return Err(RewindError::NotAUserTurn);
-                }
-                Ok(o)
+/// The snapshot-level rewind surgery (conversation-rewind spec §2/§4), shared by the resident
+/// path ([`Engine::rewind_to`]) and the durable path (the host rewinds a DORMANT session's
+/// persisted [`Snapshot`] directly — no engine exists to truncate): resolve the anchor, truncate
+/// the sealed-off tail, reset every snapshot-derived field that described the dropped suffix, and
+/// bump the [`Epoch`] to fence late arrivals. Purely snapshot-local — engine-transient state
+/// (in-flight batch, armed trigger, the §10 context engine's root-reset hook) is the resident
+/// caller's responsibility, and the durable caller has none of it by construction (the session is
+/// dormant; a root rewind's LCM prune simply happens lazily at the next hydration's re-measure).
+pub fn rewind_snapshot(
+    snapshot: &mut Snapshot,
+    anchor: &RewindAnchor,
+) -> Result<RewindOutcome, RewindError> {
+    let len = snapshot.conversation.turns.len();
+    let retained = resolve_anchor(&snapshot.conversation.turns, anchor, len)?;
+
+    // Collect the tool call-ids in the sealed-off tail (oldest first) so the host can roll the
+    // workspace back via the §12 checkpoints captured before those tools ran.
+    let dropped_call_ids: Vec<String> = snapshot.conversation.turns[retained..]
+        .iter()
+        .filter_map(|t| match t {
+            Turn::Tool(tt) => Some(tt),
+            _ => None,
+        })
+        .flat_map(|tt| tt.calls.iter().map(|(call, _)| call.call_id.clone()))
+        .collect();
+
+    // Reconstruct the snapshot for the rewound point: drop the sealed-off tail and reset every
+    // derived field that only made sense relative to the now-abandoned suffix.
+    snapshot.conversation.turns.truncate(retained);
+    snapshot.waiting_for.clear();
+    snapshot.pending_approvals.clear();
+    // Cadence counters are relative to the dropped tail; reset so the rewound point starts clean.
+    snapshot.iters_since_skill = 0;
+    snapshot.turns_since_memory = 0;
+
+    // Bump the incarnation epoch so any in-flight commit/event from the interrupted turn that
+    // arrives late is fenced and dropped (mirrors the suspension epoch bump).
+    snapshot.epoch = snapshot.epoch.next();
+
+    Ok(RewindOutcome {
+        retained_turns: retained,
+        epoch: snapshot.epoch,
+        dropped_call_ids,
+    })
+}
+
+/// Resolve a [`RewindAnchor`] to the number of turns to retain (`[0, retained)` survive). `len` is
+/// the live conversation turn count.
+fn resolve_anchor(turns: &[Turn], anchor: &RewindAnchor, len: usize) -> Result<usize, RewindError> {
+    match anchor {
+        // Seal off the user turn at `ordinal` and everything after: keep `[0, ordinal)`.
+        RewindAnchor::UserTurn { ordinal } => {
+            let o = usize::try_from(*ordinal).map_err(|_| RewindError::OutOfRange)?;
+            if o >= len {
+                return Err(RewindError::OutOfRange);
             }
-            // Keep the user turn at `ordinal`, seal off its reply: keep `[0, ordinal]`.
-            RewindAnchor::ReplyAfter { ordinal } => {
-                let o = usize::try_from(*ordinal).map_err(|_| RewindError::OutOfRange)?;
-                if o >= len {
-                    return Err(RewindError::OutOfRange);
-                }
-                if !matches!(self.snapshot.conversation.turns.get(o), Some(Turn::User(_))) {
-                    return Err(RewindError::NotAUserTurn);
-                }
-                Ok(o + 1)
+            if !matches!(turns.get(o), Some(Turn::User(_))) {
+                return Err(RewindError::NotAUserTurn);
             }
-            // A durable journal cursor maps 1:1 onto a retained turn count in this engine's
-            // coordinate space (each kept turn is one journal-addressable position). A cursor past
-            // the live conversation is out of range.
-            RewindAnchor::Cursor { seq } => {
-                let keep = usize::try_from(*seq).map_err(|_| RewindError::OutOfRange)?;
-                if keep > len {
-                    return Err(RewindError::OutOfRange);
-                }
-                Ok(keep)
+            Ok(o)
+        }
+        // Keep the user turn at `ordinal`, seal off its reply: keep `[0, ordinal]`.
+        RewindAnchor::ReplyAfter { ordinal } => {
+            let o = usize::try_from(*ordinal).map_err(|_| RewindError::OutOfRange)?;
+            if o >= len {
+                return Err(RewindError::OutOfRange);
             }
+            if !matches!(turns.get(o), Some(Turn::User(_))) {
+                return Err(RewindError::NotAUserTurn);
+            }
+            Ok(o + 1)
+        }
+        // A durable journal cursor maps 1:1 onto a retained turn count in this engine's
+        // coordinate space (each kept turn is one journal-addressable position). A cursor past
+        // the live conversation is out of range.
+        RewindAnchor::Cursor { seq } => {
+            let keep = usize::try_from(*seq).map_err(|_| RewindError::OutOfRange)?;
+            if keep > len {
+                return Err(RewindError::OutOfRange);
+            }
+            Ok(keep)
         }
     }
 }

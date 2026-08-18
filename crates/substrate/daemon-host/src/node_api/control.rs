@@ -2650,10 +2650,19 @@ impl ControlApi for NodeApiImpl {
                 .rewind_resident(&auth, point.anchor, point.restore_workspace)
                 .await;
         }
-        // A durable (non-resident) session has no live engine to truncate: its transcript is the
-        // sealed journal, and rewinding it means re-incarnating the engine to truncate-and-reseal.
-        // That activation-driven path is deferred (the checkpoint-ledger extension it needs is out of
-        // scope this phase); surface it explicitly rather than silently no-op.
+        // A durable (non-resident) session (§8): interrupt-first via the hub's occupied slot, then
+        // the dormant-only snapshot CAS through the shared surgery + side-effects. Armed with the
+        // stage-5 cutover; a pre-cutover node keeps the explicit refusal.
+        if self.attachments.is_some() {
+            return self
+                .rewind_durable(
+                    &session,
+                    &point.anchor,
+                    daemon_common::ReqId(0),
+                    point.restore_workspace,
+                )
+                .await;
+        }
         Err(ApiError::Unsupported(
             "rewind of a non-resident durable session (re-incarnation path deferred)".into(),
         ))

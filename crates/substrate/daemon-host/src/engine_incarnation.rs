@@ -78,6 +78,16 @@ pub struct CoreEngineFactory {
     /// run cannot self-schedule or self-delegate (runaway prevention). When set it overrides the
     /// resolver/fallback for any scheduled session; `None` leaves cron sessions on the default path.
     cron_profile: Option<EngineProfile>,
+    /// The profile an INTERACTIVE-ROOT session (`ExecutionPolicy::InteractiveRoot`) falls back to
+    /// when no bound-profile/inline resolution applies (stage-5 cutover parity): the same session
+    /// profile the live builder used, NOT this factory's fixed (orchestrator) `profile` — a wire
+    /// session hydrating durably must carry the interactive toolset + default provider. `None`
+    /// keeps the fixed-profile fallback (pre-cutover behavior).
+    interactive_profile: Option<EngineProfile>,
+    /// Post-turn bookkeeping for INTERACTIVE turns (stage-5 cutover parity with the live pump):
+    /// FTS-index the conversation and (when `title_aux` is set) generate the roster title after
+    /// the first exchange. `None` => no bookkeeping (pre-cutover durable behavior).
+    indexing: Option<TurnIndexing>,
     /// The host-owned attachment registry (session-unification §7): when set, an incarnation whose
     /// session has an attached [`AttachmentHub`] streams its events to the hub's consumers,
     /// registers its `TurnControl` in the hub's occupied slot, and (interactive-root only) parks
@@ -92,6 +102,17 @@ pub struct CoreEngineFactory {
 struct ContentTransfer {
     blobs: Arc<dyn BlobStore>,
     roots: Arc<WorkspaceRoots>,
+}
+
+/// The post-turn FTS-index + title-generation bookkeeping handles (stage-5 cutover: the live
+/// pump's `index_and_title_session` re-homed onto the durable turn boundary for interactive
+/// sessions). One `titled` guard per factory — once-per-process, like the live once-per-residency.
+#[derive(Clone)]
+pub struct TurnIndexing {
+    store: Arc<dyn SessionStore>,
+    title_aux: Option<Arc<dyn Provider>>,
+    titled: Arc<dashmap::DashMap<SessionId, ()>>,
+    feed: Option<Arc<crate::NodeEventFeed>>,
 }
 
 /// A minimal conformance/test delegation tool standing in for the node's `orchestrate` tool on the
@@ -177,6 +198,8 @@ impl CoreEngineFactory {
             resolver: None,
             content: None,
             cron_profile: None,
+            interactive_profile: None,
+            indexing: None,
             attachments: None,
         }
     }
@@ -194,6 +217,8 @@ impl CoreEngineFactory {
             resolver: None,
             content: None,
             cron_profile: None,
+            interactive_profile: None,
+            indexing: None,
             attachments: None,
         }
     }
@@ -207,6 +232,8 @@ impl CoreEngineFactory {
             resolver: None,
             content: None,
             cron_profile: None,
+            interactive_profile: None,
+            indexing: None,
             attachments: None,
         }
     }
@@ -239,6 +266,33 @@ impl CoreEngineFactory {
     /// profile. Requires the journal store (the source of the session metadata) to be set too.
     pub fn with_session_resolver(mut self, resolver: DurableProfileResolver) -> Self {
         self.resolver = Some(resolver);
+        self
+    }
+
+    /// Inject the post-turn FTS-index + title-generation bookkeeping (stage-5 cutover parity with
+    /// the live pump): after an interactive turn commits, the conversation is indexed for search
+    /// and — when `title_aux` is set — the roster title is generated after the first exchange.
+    pub fn with_indexing(
+        mut self,
+        store: Arc<dyn SessionStore>,
+        title_aux: Option<Arc<dyn Provider>>,
+        feed: Option<Arc<crate::NodeEventFeed>>,
+    ) -> Self {
+        self.indexing = Some(TurnIndexing {
+            store,
+            title_aux,
+            titled: Arc::new(dashmap::DashMap::new()),
+            feed,
+        });
+        self
+    }
+
+    /// Inject the INTERACTIVE session profile (stage-5 cutover parity): a session whose persisted
+    /// execution policy is `InteractiveRoot` and that no bound-profile/inline resolution claimed
+    /// hydrates under this profile — the same one the live session builder used — instead of the
+    /// factory's fixed (orchestrator) fallback. Leave unset pre-cutover.
+    pub fn with_interactive_profile(mut self, profile: EngineProfile) -> Self {
+        self.interactive_profile = Some(profile);
         self
     }
 
@@ -277,8 +331,11 @@ impl EngineFactory for CoreEngineFactory {
             resolver: self.resolver.clone(),
             content: self.content.clone(),
             cron_profile: self.cron_profile.clone(),
+            interactive_profile: self.interactive_profile.clone(),
+            indexing: self.indexing.clone(),
             attachments: self.attachments.clone(),
             completion_payload: None,
+            fold_only: false,
             ctx: None,
             turn_seal: None,
         })
@@ -300,11 +357,21 @@ pub struct CoreIncarnation {
     /// Node-side content transfer (blob store + workspace roots) for capturing/materializing
     /// delegated artifacts; `None` disables it.
     content: Option<ContentTransfer>,
+    /// The interactive-root fallback profile (stage-5 cutover parity; see
+    /// [`CoreEngineFactory::with_interactive_profile`]).
+    interactive_profile: Option<EngineProfile>,
+    /// Post-turn FTS-index + title bookkeeping (see [`CoreEngineFactory::with_indexing`]).
+    indexing: Option<TurnIndexing>,
     /// The constrained cron-run profile (I15/G3): used in place of the resolver/fallback when this
     /// incarnation hydrates a cron-fired session, so the run carries no `cron`/`orchestrate` tools.
     cron_profile: Option<EngineProfile>,
     /// The host-owned attachment registry (§7): consulted at turn time for this session's hub.
     attachments: Option<Arc<AttachmentHubs>>,
+    /// Stage-5 fold-only wake (§8 `Observe` routing): set by `hydrate` when this activation
+    /// claimed ONLY context-only `Observe` splices (no turn-opening input, no completions, no
+    /// scheduled trigger, no suspension to resume). `run` then commits the folded snapshot
+    /// (`Step::TurnCommitted`) WITHOUT opening a model turn — observes fold, they never trigger.
+    fold_only: bool,
     /// The structured completion payload captured at `Step::Completed` (a CBOR `DelegationResult`
     /// over the child's `outbox/`), surfaced via [`Incarnation::completion_payload`]. `None` => no
     /// artifacts captured (the store falls back to the legacy `child:{id}` marker).
@@ -470,6 +537,15 @@ impl Incarnation for CoreIncarnation {
             }
         } else if let Some(resolved) = self.resolve_session_profile(&snap.session_id).await {
             resolved
+        } else if matches!(
+            self.ctx.and_then(|c| c.policy),
+            Some(daemon_store::ExecutionPolicy::InteractiveRoot)
+        ) && self.interactive_profile.is_some()
+        {
+            // Stage-5 cutover parity: an interactive-root wire session with no bound-profile
+            // resolution hydrates under the SAME session profile the live builder used, not the
+            // factory's fixed (orchestrator) fallback.
+            self.interactive_profile.clone().expect("checked above")
         } else {
             self.profile.clone()
         };
@@ -481,6 +557,7 @@ impl Incarnation for CoreIncarnation {
             self.materialize_artifacts(&session_id, &completion.payload)
                 .await;
         }
+        let has_completions = !unapplied.is_empty();
         let completions = unapplied
             .into_iter()
             .map(|c| Completion {
@@ -500,19 +577,32 @@ impl Incarnation for CoreIncarnation {
         // engine's cursor advances with each fold, so the commit that persists this snapshot
         // flips exactly the folded prefix to `Consumed` in the same transaction.
         let cursor = engine.consumed_splice_seq();
+        let mut observed = false;
+        let mut opened = has_completions;
         for splice in splices {
             if splice.splice_seq <= cursor {
                 continue;
             }
             let msg = daemon_protocol::UserMsg::decode(&splice.payload);
             match splice.kind {
-                daemon_store::SpliceKind::Observe => engine.push_observe(msg),
+                daemon_store::SpliceKind::Observe => {
+                    engine.push_observe(msg);
+                    observed = true;
+                }
                 daemon_store::SpliceKind::StartTurn | daemon_store::SpliceKind::Steer => {
-                    engine.push_user(msg)
+                    engine.push_user(msg);
+                    opened = true;
                 }
             }
             engine.note_consumed_splice(splice.splice_seq);
         }
+        // §8 Observe routing: a wake that folded ONLY context is fold-only — commit, don't turn.
+        // Anything turn-opening (user input, a completion to resume on, a scheduled fire, or a
+        // suspension that must deterministically re-park) keeps the normal turn path.
+        self.fold_only = observed
+            && !opened
+            && scheduled_job.is_none()
+            && engine.snapshot().waiting_for.is_empty();
         // I15: a cron-fired session carries `SessionMeta::scheduled_job` (read above). Arm the next
         // turn's trigger as `TurnTrigger::Scheduled { job }` so the fired turn reports its scheduled
         // origin instead of the durable wake path's default `User`. One-shot (consumed by `run_turn`).
@@ -541,6 +631,12 @@ impl Incarnation for CoreIncarnation {
             ctx.policy,
             Some(daemon_store::ExecutionPolicy::InteractiveRoot)
         );
+        // §8 Observe routing: this wake folded only context — commit the folded snapshot without
+        // opening a model turn (no events, no journal segment content; the manager's `commit_turn`
+        // consumes the folded splices and selects Idle/Ready).
+        if self.fold_only {
+            return Ok(Step::TurnCommitted);
+        }
         // When background spawn is enabled, capture a clone of the parent's live conversation so a
         // mid-turn `Effect::Spawn` can seed the review child `FromConversation` without a store read.
         let seed_conversation = self
@@ -618,6 +714,23 @@ impl Incarnation for CoreIncarnation {
             }
             if delta != daemon_common::UsageDelta::default() {
                 cfg.store.record_usage(&session_id, delta).await;
+            }
+        }
+
+        // Stage-5 cutover parity: the live pump's post-turn bookkeeping — FTS-index the
+        // conversation for search/recall and (first exchange only) generate the roster title —
+        // re-homed onto the durable turn boundary for interactive sessions. Off-path, like the
+        // live pump's spawn (best-effort; a failed index/title never blocks the commit).
+        if interactive {
+            if let Some(ix) = &self.indexing {
+                tokio::spawn(crate::node_api::index_and_title_session(
+                    ix.store.clone(),
+                    session_id.clone(),
+                    engine.conv_view(),
+                    ix.title_aux.clone(),
+                    ix.titled.clone(),
+                    ix.feed.clone(),
+                ));
             }
         }
 
@@ -892,8 +1005,11 @@ mod tests {
             resolver: None,
             content: Some(ContentTransfer { blobs, roots }),
             cron_profile: None,
+            interactive_profile: None,
+            indexing: None,
             attachments: None,
             completion_payload: None,
+            fold_only: false,
             ctx: None,
             turn_seal: None,
         }

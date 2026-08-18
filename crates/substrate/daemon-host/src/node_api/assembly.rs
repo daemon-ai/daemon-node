@@ -100,8 +100,30 @@ impl NodeApiImpl {
                 crate::notifications::NotificationManager::new(),
             )),
             persons: Arc::new(std::sync::Mutex::new(crate::person::PersonManager::new())),
+            attachments: None,
+            foreign_probe: None,
             vhc: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Arm the stage-5 cutover (session-unification §8): route NON-resident Core-backed sessions'
+    /// wire commands onto the durable rail and serve their observation surface from the
+    /// per-session [`AttachmentHub`](super::attachments::AttachmentHub). Pass the SAME registry
+    /// wired into the durable `CoreEngineFactory` (`CoreEngineFactory::with_attachments`) — the
+    /// incarnation publishes into the hubs this surface attaches. Absent, the node keeps the
+    /// legacy live-first routing.
+    pub fn with_attachments(mut self, hubs: Arc<super::attachments::AttachmentHubs>) -> Self {
+        self.attachments = Some(hubs);
+        self
+    }
+
+    /// Install the stage-5 backend probe: `true` when a bound profile resolves to a Foreign
+    /// engine, which keeps its explicit live actor rail under the cutover. Injected by the
+    /// assembly (which owns profile resolution). Absent, an armed cutover treats every bound
+    /// profile as Core-backed.
+    pub fn with_foreign_probe(mut self, probe: super::ForeignProbe) -> Self {
+        self.foreign_probe = Some(probe);
+        self
     }
 
     /// Bind the vhc-training service backing the [`daemon_api::VhcApi`] sub-surface (spec §10.4)

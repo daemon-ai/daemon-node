@@ -1191,6 +1191,17 @@ pub trait SessionStore: Send + Sync {
         )))
     }
 
+    /// Reopen a SETTLED session for further input (session-unification §8): flip `Completed` back
+    /// to `Ready` so an explicit client `StartTurn`/`Steer` splice runs a fresh turn over the
+    /// retained durable transcript (an operator re-driving a settled delegated child). Returns
+    /// `true` when the flip happened, `false` when the session was not `Completed` (no-op).
+    /// Deliberately NOT part of `append_splice`: host-originated injections (notifications) must
+    /// keep dropping input at settled sessions — only the wire's addressed submit resurrects.
+    /// Default: `false` (a non-authoritative proxy store).
+    async fn reopen_if_settled(&self, _id: &SessionId) -> Result<bool, StoreError> {
+        Ok(false)
+    }
+
     /// Every unconsumed splice (`Pending`/`Claimed`) with `splice_seq > after_seq`, ordered by
     /// sequence — the replay/projection read. Default: empty.
     async fn splices_after(&self, _id: &SessionId, _after_seq: u64) -> Vec<InboxSplice> {
@@ -2302,6 +2313,19 @@ impl SessionStore for InMemoryStore {
 
     async fn execution_policy(&self, id: &SessionId) -> Option<ExecutionPolicy> {
         self.inner.lock().unwrap().execution_policy.get(id).copied()
+    }
+
+    async fn reopen_if_settled(&self, id: &SessionId) -> Result<bool, StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        let rec = inner
+            .sessions
+            .get_mut(id)
+            .ok_or_else(|| StoreError::NotFound(id.clone()))?;
+        if matches!(rec.status, SessionStatus::Completed) {
+            rec.status = SessionStatus::Ready;
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     async fn append_splice(&self, splice: NewSplice) -> Result<u64, StoreError> {
