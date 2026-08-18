@@ -279,6 +279,23 @@ async fn remembered_fingerprint_lists_revokes_and_reprompts_impl() {
         "provenance timestamp is captured"
     );
 
+    // The park row lands DURING the turn (before the suspension commit), so settle the durable
+    // status to `Suspended` before revoking — the dormant-only CAS is documented client-retryable
+    // ("retry the revoke when it is dormant"), and this is that retry, bounded.
+    {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !matches!(
+            store.status(&session).await,
+            Some(daemon_store::SessionStatus::Suspended { .. })
+        ) {
+            assert!(
+                Instant::now() < deadline,
+                "the session never settled Suspended after park #2 (got {:?})",
+                store.status(&session).await
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
     // Revoke it (the session is dormant, so the compare-and-swap applies cleanly), and prove the
     // list is empty afterwards. A second revoke of the same fingerprint errors (nothing to drop).
     node.fingerprint_revoke(session.clone(), fp_a.clone())

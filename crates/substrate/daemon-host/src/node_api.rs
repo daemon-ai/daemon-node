@@ -639,6 +639,18 @@ impl NodeApiImpl {
                 }
                 Some(_) => {}
             }
+            // Live-log parity: the injected StartTurn (with its provenance chip fields) is
+            // recorded inbound on the session's merged log, exactly as a wire submit is — so an
+            // observer tailing `log_after`/`subscribe` sees the turn-opening command, not just
+            // the engine's replies. (The splice payload itself is the engine-facing copy.)
+            if self.attachments.is_some() {
+                self.attach_hub(session).await.record_inbound(
+                    daemon_protocol::AgentCommand::StartTurn {
+                        input: msg.clone(),
+                        request_id: daemon_common::ReqId(0),
+                    },
+                );
+            }
             self.enqueue_durable_input(session, SpliceKind::StartTurn, &msg, "host-inject")
                 .await?;
             return Ok(());
