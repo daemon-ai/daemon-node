@@ -59,6 +59,11 @@ ignore = [
   "RUSTSEC-2026-0098", # rustls-webpki 0.101.7/0.102.8: URI name constraints; via serenity_self
   "RUSTSEC-2026-0099", # rustls-webpki 0.101.7/0.102.8: wildcard-name constraints; via serenity_self
   "RUSTSEC-2026-0104", # rustls-webpki 0.101.7/0.102.8: reachable CRL-parse panic; via serenity_self
+  # h2 0.3.27 (hyper 0.14 line): unbounded empty DATA frames, LOW severity; the fix (0.4.16) exists
+  # only on the 0.4 line, which this workspace already carries (patched). The 0.3 entry is pinned
+  # solely by serenity_self's reqwest 0.11 / hyper 0.14 stack (same tree as the IDs above) and has
+  # no patched 0.3.x release. Same bounded exposure + tracked serenity_self bump as the block above.
+  "RUSTSEC-2026-0258", # h2 0.3.27: unbounded empty DATA frames; via serenity_self (0.4 line patched)
 ]
 
 [bans]
