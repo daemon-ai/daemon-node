@@ -237,6 +237,14 @@ impl NodeApiImpl {
         if self.store.routing_get(&key).await.is_some() {
             let _ = self.store.routing_remove(&key).await;
             self.load_routing_pins().await;
+            // Projection-sync stage 5: the reconcile mutated the pin table — every client's
+            // routing view is stale. Clients no longer side-fetch routing off MembershipChanged;
+            // this pointer is the only thing that refreshes them.
+            self.note_projection_change(
+                daemon_api::ProjectionId::Routing,
+                None,
+                daemon_api::ChangeScope::All,
+            );
         }
     }
 }
