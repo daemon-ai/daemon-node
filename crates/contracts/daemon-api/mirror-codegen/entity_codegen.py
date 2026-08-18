@@ -617,7 +617,10 @@ def emit_schema_sql(entities: list[Entity]) -> str:
     out.append("")
     out.append("CREATE TABLE journal_watermarks(consumer TEXT PRIMARY KEY, rev INTEGER NOT NULL);")
     out.append("")
-    out.append("CREATE TABLE sync_cursors(name TEXT PRIMARY KEY, cursor INTEGER, epoch INTEGER);")
+    # incarnation (projection-sync §4.3): the node's process-incarnation id persisted WITH the
+    # cursor it scopes — a mismatch at reconnect forces a full Bootstrap re-baseline (stage 6).
+    out.append("CREATE TABLE sync_cursors(name TEXT PRIMARY KEY, cursor INTEGER, epoch INTEGER,")
+    out.append("  incarnation TEXT);")
     out.append("")
     out.append("CREATE TABLE node_revs(collection TEXT PRIMARY KEY, rev INTEGER,")
     out.append("  fetched_at_ms INTEGER, state INTEGER, last_error TEXT);")
