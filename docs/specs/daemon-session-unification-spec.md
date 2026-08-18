@@ -273,6 +273,41 @@ commit owed at passivation. Crash-of-resident loses nothing that a fresh hydrate
 After the matrix is green: retire the Core live actor, delete `owners`/`Lifecycle`, route
 everything through activation + attachments. The Foreign actor rail is untouched.
 
+### Stage-5 mechanics (as landed)
+
+- **Cutover gate** (`cutover_routes`): armed (`with_attachments`) AND not live-resident AND not
+  Foreign-bound (the assembly-injected `foreign_probe`). Every `SessionApi` route consults it:
+  `submit`/`submit_from`/`submit_as`/`submit_routed` (splice + wake through `submit_attached`),
+  `poll`/`respond`/`log_after`/`subscribe`/`log_epoch`/`record_meta` and the delivery surface
+  (`delivery_targets`/`delivery_sessions`/`handover`) serve from the session's hub. A routed or
+  explicit-profile submit binds the resolved profile sticky-on-first-open onto the durable meta
+  and seeds the resolved `Primary` on the hub. A wire submit addressed at a settled (`Completed`)
+  session reopens it over its retained transcript (`reopen_if_settled`, splice-before-reopen).
+- **Per-turn origin**: the wire splice's provenance carries the submitting origin's transport id;
+  the fold arms the engine's one-shot `next_origin` for `StartTurn` splices, so origin-aware
+  nudge sources (the transport surface hint) key on exactly that submit — rail labels are unknown
+  families and compose nothing (live `start_turn_from` parity).
+- **Sink push**: `AttachmentHubs` owns the durable half of the `DeliverySink` registry
+  (registration covers both rails); each hub runs a push pump that re-reads the roster's current
+  `Primary` targets per outbound event — handover demotion stops/starts push like the live pump.
+  Cron `deliver` pushes through the hub registry when armed.
+- **Commit-then-linger** (§7 residency): `ActivationManager::with_linger` keeps a
+  `TurnCommitted` incarnation hydrated after its commit, absorbing wakes via per-session notify;
+  each subsequent turn re-acquires a fresh fenced lease and reuses the resident engine ONLY while
+  the session's profile inputs (`ProfileKey`: bound profile, overlay bytes, scheduled job) are
+  unchanged — a mid-linger rebind/overlay switch rebuilds at the very next turn. The idle timeout
+  (or shutdown) passivates the already-committed incarnation; every exit path drops the slot
+  before reporting, and `scan_resumable` additionally covers `Suspended` sessions with unapplied
+  completions as the wake-absorption safety net.
+- **Retired**: `owners`/`Lifecycle`/`claim` (routing is residency + durable evidence),
+  `LiveHandle::Core` and the actor spawn in `ensure` (a Core-built backend is refused loudly),
+  `handle_if_live`/`rewind_resident` (rewind is Foreign-refusal + the durable interrupt-first
+  CAS), and the live model-provider hot-swap (`ModelProviderFactory`) — an overlay change alters
+  the `ProfileKey`, so the next hydrate rebuilds under the overlay-resolved provider.
+- **Kept for Foreign**: `LiveSessions` (residency registry, pump, `ParkingHandler`, selectors /
+  advertised commands / credential eviction), `foreign_probe`, and the explicit rewind refusal.
+  `MergedLog` is shared infrastructure (each hub owns its own instance).
+
 ## 9. Failure classification (containment, stage 1)
 
 - New `Failure::InvalidRequest` — deterministic, non-retryable 4xx (plain 400/422) →

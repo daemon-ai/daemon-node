@@ -416,6 +416,12 @@ impl AttachmentHubs {
         self.map.get(session).map(|h| h.clone())
     }
 
+    /// Every currently-attached session id — the durable analogue of the live registry's
+    /// residency enumeration (a hub means a client opened/observes the session).
+    pub fn session_ids(&self) -> Vec<SessionId> {
+        self.map.iter().map(|e| e.key().clone()).collect()
+    }
+
     /// Drop `session`'s hub (subscribers see their streams end; parked requests decline safely
     /// via the oneshot drop).
     pub fn detach(&self, session: &SessionId) {

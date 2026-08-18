@@ -2464,11 +2464,20 @@ impl ControlApi for NodeApiImpl {
             kind: FsRootKind::Workspace,
             session: None,
         });
-        // Opened (live) session sandboxes — Auth 4 (F2): only the caller's own (or, for a
-        // `SessionSeeAll` operator, every) live session is advertised, so the enumeration never
-        // reveals another owner's session ids/sandboxes.
+        // Opened session sandboxes — Foreign residencies plus durable sessions with an attached
+        // hub (§8: attachment is the durable analogue of "opened"). Auth 4 (F2): only the
+        // caller's own (or, for a `SessionSeeAll` operator, every) session is advertised, so the
+        // enumeration never reveals another owner's session ids/sandboxes.
         let principal = current_principal();
-        for sid in self.live.live_ids() {
+        let mut opened = self.live.live_ids();
+        if let Some(hubs) = &self.attachments {
+            for sid in hubs.session_ids() {
+                if !opened.contains(&sid) {
+                    opened.push(sid);
+                }
+            }
+        }
+        for sid in opened {
             let owner = self.store.session_meta(&sid).await.and_then(|m| m.owner);
             if !owner_visible(&principal, &owner) {
                 continue;
