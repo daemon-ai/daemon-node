@@ -623,6 +623,7 @@ node-event = node-event-session-advanced
            / node-event-messages-changed
            / node-event-vhc-changed
            / node-event-agents-changed
+           / node-event-projection-changed
 node-event-session-advanced     = { "SessionAdvanced":    { "session": session-id, "epoch": uint64, "head_seq": uint64 } }
 ; rung 3 (api/39): + `? "origin_op"` (carrier 3) — the causing op when the emit site knows it
 ; (a SessionUpdateMeta that carried one); null otherwise.
@@ -669,6 +670,21 @@ node-event-vhc-changed        = { "VhcChanged":       { ? "run_id": tstr, "rev":
 ; the background initialize-verification pass on completion — or an agent was registered/removed)
 ; -> refetch AgentCatalog. Like ProfilesChanged, a payload-free pointer with a coalescing rev.
 node-event-agents-changed     = { "AgentsChanged":    { "rev": uint64 } }
+; projection-sync (daemon-projection-sync-spec.md §3): THE generalized revisioned invalidation
+; pointer — "domain (projection, partition) is now at rev; refetch scope if you care". Dual-emitted
+; alongside the matching legacy arm during the migration window; the only invalidation event after
+; cutover. `projection-id` is a CLOSED enum (a new projection = a new arm here + census + policy).
+projection-id = "Sessions" / "Fleet" / "Profiles" / "Skills" / "Curator" / "Catalog" / "Agents"
+              / "Approvals" / "Credentials" / "CustomProviders" / "Gateway" / "Tools"
+              / "TelemetryConsent" / "CrashConsent" / "Cron" / "Presence" / "Routing"
+              / "Transports" / "Conversations" / "Contacts" / "Messages" / "Persons"
+              / "Notifications" / "Vhc" / "Fingerprints" / "AccessControl"
+; How much of the domain an event invalidates: everything, or one projection-defined key. Scope
+; narrows the refetch; the revision that advances is always the domain's.
+change-scope     = change-scope-all / change-scope-key
+change-scope-all = "All"
+change-scope-key = { "Key": { "key": tstr } }
+node-event-projection-changed = { "ProjectionChanged": { "projection": projection-id, ? "partition": (tstr / null), "scope": change-scope, "rev": uint64, ? "origin_op": (origin-op / null) } }
 events-page = {
   "events": [0*64 node-event],
   "next_cursor": uint64,                ; pass as the next EventsSince cursor
@@ -2214,7 +2230,14 @@ response-transport-settings = { "TransportSettings": account-settings-values }
 
 ; rung 3 (api/39): the Bootstrap probe reply — every collection's rev keyed by a stable name,
 ; plus the feed cursor + epoch, snapshotted atomically under one feed lock (06G6).
-response-bootstrap = { "Bootstrap": { "cursor": uint64, "epoch": uint64, "revs": { * tstr => uint64 } } }
+; projection-sync stage 2 (additive; daemon-projection-sync-spec.md §4.3+§8): + the node's
+; process-incarnation id (a client persists (cursor, incarnation, revs) together; a mismatch on
+; reconnect forces a full rebaseline) and the uniform revision-domain table (visibility-filtered;
+; every single-domain projection + each bounded partition, never per-key). `domain_revs`
+; supersedes the string-keyed `revs` at cutover; both are served during the migration window.
+domain-rev = { "projection": projection-id, ? "partition": (tstr / null), "rev": uint64 }
+response-bootstrap = { "Bootstrap": { "cursor": uint64, "epoch": uint64, "revs": { * tstr => uint64 },
+                                      ? "incarnation": tstr, ? "domain_revs": [0*64 domain-rev] } }
 api-response = response-ok
              / response-routed
              / response-session-created
@@ -2335,7 +2358,9 @@ api-response = response-ok
 ; (no serde_bytes), so they encode as a CBOR array of ints (`[* uint]`), not `bstr`; the envelope is
 ; not a zcbor entry type, so this is a cddl-cat conformance target only.
 wire-hello-c2s = { "Hello": { "wire_version": uint, "features": [* tstr] } }
-wire-hello-s2c = { "Hello": { "wire_version": uint, "features": [* tstr], "auth_mechanisms": [* tstr] } }
+; projection-sync stage 2 (additive): the server Hello also carries the node's process-incarnation
+; id (mirrors response-bootstrap), so a mux client detects a restart at the handshake.
+wire-hello-s2c = { "Hello": { "wire_version": uint, "features": [* tstr], "auth_mechanisms": [* tstr], ? "incarnation": tstr } }
 wire-call   = { "Call":   { "id": uint64, "req": api-request } }
 wire-open   = { "Open":   { "id": uint64, "req": api-request } }
 wire-cancel = { "Cancel": { "id": uint64 } }

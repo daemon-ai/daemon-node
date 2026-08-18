@@ -1848,6 +1848,19 @@ pub struct BootstrapReport {
     pub epoch: u64,
     /// Every tracked collection's current revision, keyed by a stable collection name.
     pub revs: std::collections::BTreeMap<String, u64>,
+    /// Projection-sync stage 2 (additive; daemon-projection-sync-spec.md §4.3): the node's
+    /// process-incarnation id (random per start, also on the mux server `Hello`). A client
+    /// persists `(cursor, incarnation, revs)` together; an incarnation mismatch on reconnect
+    /// forces a full rebaseline — the in-memory revs of a restarted node are meaningless even
+    /// when they numerically match persisted values. Absent from a pre-projection-sync node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incarnation: Option<String>,
+    /// Projection-sync stage 2 (additive; spec §8): the uniform revision-domain table —
+    /// visibility-filtered per principal, every single-domain projection plus each existing
+    /// bounded partition, never per-key. Supersedes the ad-hoc string-keyed `revs` at cutover;
+    /// both are served during the migration window. Empty from a pre-projection-sync node.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub domain_revs: Vec<crate::DomainRev>,
 }
 
 /// Slice one page out of a full, **key-ascending-sorted** listing — the shared pagination the
@@ -2008,6 +2021,12 @@ pub enum WireS2C {
         /// "EXTERNAL", "PLAIN"]`). Empty when the server does not advertise [`WIRE_FEATURE_AUTH`]
         /// (an unauthenticated/local-trust node), so an older client still negotiates cleanly.
         auth_mechanisms: Vec<String>,
+        /// Projection-sync stage 2 (additive; daemon-projection-sync-spec.md §4.3): the node's
+        /// process-incarnation id (mirrors [`BootstrapReport::incarnation`]), so a mux client
+        /// detects a restart at the handshake without an extra `Bootstrap` round-trip. Absent
+        /// from a pre-projection-sync node.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        incarnation: Option<String>,
     },
     /// The single result of a one-shot `Call` (closes `id`).
     Reply {
@@ -2546,6 +2565,7 @@ mod auth_contract_tests {
             wire_version: WIRE_VERSION,
             features: vec![WIRE_FEATURE_MUX.into(), WIRE_FEATURE_AUTH.into()],
             auth_mechanisms: vec!["SCRAM-SHA-256".into(), "PLAIN".into()],
+            incarnation: Some("b5c1d2aa".into()),
         };
         let mut bytes = Vec::new();
         ciborium::into_writer(&hello, &mut bytes).unwrap();

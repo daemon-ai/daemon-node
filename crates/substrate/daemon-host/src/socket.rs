@@ -601,6 +601,9 @@ where
                         wire_version: WIRE_VERSION,
                         features,
                         auth_mechanisms,
+                        // Projection-sync stage 3 stamps the process-incarnation id here; the
+                        // stage-2 contract ships the field so clients can already decode it.
+                        incarnation: None,
                     })
                     .await;
             }

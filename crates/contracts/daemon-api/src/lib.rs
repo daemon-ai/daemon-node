@@ -4746,6 +4746,99 @@ pub enum MembershipChange {
     Banned,
 }
 
+/// The closed set of client-visible projections (daemon-projection-sync-spec.md §2). Adding a
+/// projection is ONE new arm here (+ its CDDL twin, census row, and client policy arm) — the cost
+/// structure that makes "every mutation emits" enforceable. Serialized as its variant name.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum ProjectionId {
+    /// Roster + per-session metadata (the existing shared roster rev + changed index).
+    Sessions,
+    /// The subagent/fleet tree.
+    Fleet,
+    /// Profile specs + the active-profile selection + per-profile active-model binding.
+    Profiles,
+    /// The per-profile skill libraries.
+    Skills,
+    /// The curator surface (pins/archive/runs).
+    Curator,
+    /// The installed-model registry.
+    Catalog,
+    /// The foreign-agent catalog.
+    Agents,
+    /// Pending HITL approvals (keyed by session).
+    Approvals,
+    /// Credential metadata (presence/hint/label — never secrets).
+    Credentials,
+    /// Operator-defined custom providers.
+    CustomProviders,
+    /// The OpenAI-gateway settings/status singleton.
+    Gateway,
+    /// The tool inventory + enablement.
+    Tools,
+    /// The telemetry-consent singleton.
+    TelemetryConsent,
+    /// The crash-consent singleton.
+    CrashConsent,
+    /// Cron entries, runs, and suggestions.
+    Cron,
+    /// Saved presence configurations (live transport presence stays `TransportChanged`).
+    Presence,
+    /// Routing rules + chat bindings.
+    Routing,
+    /// Stored transport account configuration (labels/enabled/config — live connection state
+    /// stays `TransportChanged`).
+    Transports,
+    /// Conversation sets + membership, partitioned by transport.
+    Conversations,
+    /// Contact rosters, partitioned by transport.
+    Contacts,
+    /// Per-conversation chat journals, partitioned by transport.
+    Messages,
+    /// The person registry.
+    Persons,
+    /// The notification set.
+    Notifications,
+    /// vhc-training runs.
+    Vhc,
+    /// Trusted client fingerprints.
+    Fingerprints,
+    /// Users / roles / grants / auth sessions.
+    AccessControl,
+}
+
+/// How much of a projection an event invalidates (daemon-projection-sync-spec.md §3.1): the whole
+/// domain, or one key within it (key semantics are per-projection — session id, conversation id,
+/// profile id, run id, …). Scope narrows the REFETCH; the revision that advances is always the
+/// domain's.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChangeScope {
+    /// The whole domain changed (or a producer changed many keys at once).
+    #[default]
+    All,
+    /// One record changed.
+    Key {
+        /// The changed record's projection-defined key.
+        key: String,
+    },
+}
+
+/// One revision-domain entry (daemon-projection-sync-spec.md §2): the revision of
+/// `(projection, partition)`. The uniform bootstrap/receipt currency — every event, bootstrap
+/// entry, delta read, and client watermark refers to this same domain.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DomainRev {
+    /// The projection.
+    pub projection: ProjectionId,
+    /// The partition within it (present iff the projection is partitioned, e.g. a transport id).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition: Option<String>,
+    /// The domain's current revision.
+    pub rev: u64,
+}
+
 /// One payload-free node-wide notification (L3 `EventsSince`). A pointer, not a payload: it tells a
 /// client that *something* changed out of focus so it can update a badge / mark a roster row stale /
 /// nudge a focused turn and then lazily fetch the detail; it never carries transcript/model bytes.
@@ -4993,6 +5086,27 @@ pub enum NodeEvent {
     AgentsChanged {
         /// The new agents-catalog revision. In-memory; a restart resets it -> full read.
         rev: u64,
+    },
+    /// Projection-sync (daemon-projection-sync-spec.md §3): THE generalized revisioned
+    /// invalidation pointer — "domain `(projection, partition)` is now at `rev`; refetch `scope`
+    /// if you care". During the migration window the node dual-emits this alongside the matching
+    /// legacy arm above; at cutover the migrated legacy arms are removed and this is the only
+    /// invalidation event. Specialized events (`SessionAdvanced`, progress, `TransportChanged`
+    /// live presence, `ResyncNeeded`) are NOT invalidations and stay as they are.
+    ProjectionChanged {
+        /// The projection that changed.
+        projection: ProjectionId,
+        /// Its partition (present iff the projection is partitioned, e.g. a transport id).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        partition: Option<String>,
+        /// How much of the domain to consider stale.
+        scope: ChangeScope,
+        /// The domain's revision AFTER this change (monotonic within a feed incarnation).
+        rev: u64,
+        /// Rung-3 provenance: the causing op's `op_id` when the emit site knows it. A client may
+        /// use its own op id to skip a redundant refetch, never to skip rev advancement.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin_op: Option<String>,
     },
 }
 

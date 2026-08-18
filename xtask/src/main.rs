@@ -4118,6 +4118,21 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
             ]
             .into_iter()
             .collect(),
+            // Projection-sync stage 2: prove decoders accept the additive incarnation +
+            // uniform domain-rev table (a partitioned and an unpartitioned entry).
+            incarnation: Some("018f3b9c-1e7a-7c3e-9d2f-5a6b7c8d9e0f".into()),
+            domain_revs: vec![
+                daemon_api::DomainRev {
+                    projection: daemon_api::ProjectionId::Sessions,
+                    partition: None,
+                    rev: 7,
+                },
+                daemon_api::DomainRev {
+                    projection: daemon_api::ProjectionId::Conversations,
+                    partition: Some("rooms".into()),
+                    rev: 8,
+                },
+            ],
         }),
     )?;
     // Server-side roster (wire v34): a paged list request + resume, the mutation requests carrying a
@@ -5028,9 +5043,28 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                     // rung 3 (api/39): carrier-3 provenance — the client send op that caused it.
                     origin_op: Some("018f3b9c-op".into()),
                 },
+                // Projection-sync stage 2: the generalized invalidation pointer, in both scope
+                // forms (All / Key) with and without a partition + provenance, so verify-codec
+                // proves the generated decoder accepts the new arm and its nested enums.
+                NodeEvent::ProjectionChanged {
+                    projection: daemon_api::ProjectionId::Credentials,
+                    partition: None,
+                    scope: daemon_api::ChangeScope::All,
+                    rev: 3,
+                    origin_op: None,
+                },
+                NodeEvent::ProjectionChanged {
+                    projection: daemon_api::ProjectionId::Conversations,
+                    partition: Some("matrix/@bot:hs.org".into()),
+                    scope: daemon_api::ChangeScope::Key {
+                        key: "!room:hs.org".into(),
+                    },
+                    rev: 9,
+                    origin_op: Some("018f3b9c-op".into()),
+                },
             ],
-            next_cursor: 13,
-            head_cursor: 13,
+            next_cursor: 15,
+            head_cursor: 15,
             // rung 1 (api/39): the feed generation stamped on every page.
             epoch: Some(1),
         }),
@@ -5371,6 +5405,7 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                 wire_version: WIRE_VERSION,
                 features,
                 auth_mechanisms: Vec::new(),
+                incarnation: Some("018f3b9c-1e7a-7c3e-9d2f-5a6b7c8d9e0f".into()),
             },
         )?;
         write_cbor(

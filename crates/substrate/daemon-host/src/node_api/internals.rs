@@ -674,6 +674,10 @@ impl NodeEventFeed {
             cursor: g.ring.head(),
             epoch: self.epoch,
             revs,
+            // Projection-sync stage 3 populates the incarnation id and the uniform
+            // (visibility-filtered) revision-domain table; stage 2 ships the wire shapes only.
+            incarnation: None,
+            domain_revs: Vec::new(),
         }
     }
 
