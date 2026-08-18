@@ -22,9 +22,8 @@ use daemon_core::{ApprovalPolicy, Config, EngineProfile, StablePromptSource, Sys
 use daemon_host::{
     BackgroundSpawner, BlobStore, BlueprintSource, CoreEngineFactory, CronFiring, CronOps,
     CronScheduler, DurableProfileResolver, FileBlobStore, FleetControl, Host, JournalConfig,
-    ModelProviderFactory, NodeApiImpl, NodeApiParts, NodeEventFeed, ProfileOps, ProfileStore,
-    RoutingBuilder, RoutingRegistry, SessionBackend, SessionEngineBuilder, WorkspaceFs,
-    WorkspaceRoots,
+    NodeApiImpl, NodeApiParts, NodeEventFeed, ProfileOps, ProfileStore, RoutingBuilder,
+    RoutingRegistry, SessionBackend, SessionEngineBuilder, WorkspaceFs, WorkspaceRoots,
 };
 use daemon_orchestration::{ChildSpawner, DefaultAnswerPolicy, FleetRuntime};
 use daemon_supervision::ManageRequestHandler;
@@ -1106,13 +1105,9 @@ fn bind_discovery_surfaces(
     // Wired here — after `bind_identity_surfaces` installed any static factories — because
     // `with_auth_factories` replaces the flow registry this attaches to.
     node_api = node_api.with_agent_auth(Some(Arc::new(daemon_acp::AcpAuthenticator::new())));
-    // Bind the live model-switch factory when this node resolves per-session profiles: a
-    // `SetSessionModel` rebuilds a running session's provider for the new model id from the
-    // (model-overridden) profile bundle via the same provider resolver.
-    if let Some(resolver) = a.provider_resolver.clone() {
-        let factory: ModelProviderFactory = Arc::new(move |spec| (resolver)(spec)());
-        node_api = node_api.with_model_factory(factory);
-    }
+    // (The live model-switch provider factory is retired with the Core live actor: a durable
+    // session's model override changes its profile inputs, so the next hydrate rebuilds the
+    // engine under the overlay-resolved provider via the DurableProfileResolver.)
     // Bind the background-review spawner so live sessions materialize `Spawn` requests fire-and-forget.
     node_api = node_api.with_background(shared.background.clone());
     // Bind the §12 tool-checkpoint store so the `Checkpoint{List,Rewind}` ops see the same rewind

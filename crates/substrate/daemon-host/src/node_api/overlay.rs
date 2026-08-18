@@ -37,20 +37,6 @@ pub(crate) fn approval_mode_to_policy(
 }
 
 impl NodeApiImpl {
-    /// Resolve the [`ProfileSpec`] a session resolves its engine from: the session's persisted
-    /// bound profile, falling back to the node's active default. The base for a live override apply.
-    async fn session_spec(&self, session: &SessionId) -> Result<Option<ProfileSpec>, ApiError> {
-        let bound = self
-            .store
-            .session_meta(session)
-            .await
-            .and_then(|m| m.bound_profile);
-        match bound {
-            Some(r) => self.resolve_profile(Some(r.as_str().to_string())),
-            None => self.resolve_profile(None),
-        }
-    }
-
     /// Read-modify-write a session's persisted [`SessionOverlay`] (preserving its bound profile),
     /// returning the updated overlay. This is the single persistence path for every per-session
     /// override (model/provider/tools/approval), so an override is restored on rehydration.
@@ -67,16 +53,15 @@ impl NodeApiImpl {
         overlay
     }
 
-    /// Apply a session's overlay to a live (resident) actor in place: rebuild the provider for a
-    /// model/provider override and switch the edit-approval policy for a mode override. A
-    /// non-resident (durable) session is a no-op here — it picks the overlay up at its next
-    /// (re)hydration. Tool-allowlist overrides are *not* hot-applied (the live registry is fixed for
-    /// the actor's lifetime); they take effect on the next (re)hydration.
+    /// Apply a session's overlay to a live (resident, Foreign-only post-retire) backend in place.
+    /// A non-resident (durable Core) session is a no-op here — the overlay changes its profile
+    /// inputs (`ProfileKey`), so the next hydrate rebuilds the engine under the new resolution
+    /// (including a lingering resident incarnation, which rebuilds at its very next turn).
     ///
-    /// A resident FOREIGN (ACP) session has no model provider to swap — a model/provider override
-    /// is refused explicitly (the profile's engine owns its own model). Its approval-mode override
-    /// IS honored: the shared `session_modes` map is what the ParkingHandler consults, for both
-    /// backend kinds.
+    /// A resident FOREIGN (ACP) session has no model provider to swap — a provider override is
+    /// refused explicitly (the profile's engine owns its own model). Its model override routes to
+    /// the live backend (`set_foreign_model`), and its approval-mode override IS honored: the
+    /// shared `session_modes` map is what the ParkingHandler consults.
     pub(crate) async fn apply_overlay_live(
         &self,
         session: &SessionId,
@@ -91,15 +76,12 @@ impl NodeApiImpl {
                 "a foreign-engine (ACP) session has no model provider to override".into(),
             ));
         }
-        // Edit-approval mode is honored for both backend kinds (the shared `session_modes` map is
-        // what the live ParkingHandler consults).
+        // Edit-approval mode: the shared `session_modes` map is what the live ParkingHandler
+        // consults (Foreign residencies); durable Core turns read the persisted overlay.
         if let Some(mode) = overlay.approval_mode {
-            let policy = approval_mode_to_policy(mode);
-            if let Some(handle) = self.live.handle_if_live(session) {
-                handle.set_approval_policy(policy).await;
-            }
             if self.live.is_resident(session) {
-                self.session_modes.insert(session.clone(), policy);
+                self.session_modes
+                    .insert(session.clone(), approval_mode_to_policy(mode));
             }
         }
         // Foreign model override (Phase 3): route the change to the live backend — a foreign ACP
@@ -110,23 +92,6 @@ impl NodeApiImpl {
             if let Some(model) = &overlay.model {
                 self.live.set_foreign_model(session, model.clone()).await?;
             }
-            return Ok(());
-        }
-        let Some(handle) = self.live.handle_if_live(session) else {
-            return Ok(());
-        };
-        if overlay.model.is_some() || overlay.provider.is_some() {
-            let factory = self.model_factory.as_ref().ok_or_else(|| {
-                ApiError::Unsupported("per-session model switch is not available".into())
-            })?;
-            let mut spec = self.session_spec(session).await?.ok_or_else(|| {
-                ApiError::Unsupported("no profile to derive a provider from".into())
-            })?;
-            overlay.apply_to(&mut spec);
-            // The effective model id rides along so the boundary recompose re-keys the
-            // model-dependent guidance against the model that will actually run.
-            let model = spec.model.clone();
-            handle.set_provider((factory)(&spec), Some(model)).await;
         }
         Ok(())
     }

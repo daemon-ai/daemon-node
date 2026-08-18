@@ -55,7 +55,6 @@ impl NodeApiImpl {
             credentials: None,
             metrics: None,
             cloud_catalog: None,
-            model_factory: None,
             session_models: Arc::new(DashMap::new()),
             session_modes,
             revisions: None,
@@ -521,14 +520,6 @@ impl NodeApiImpl {
         // Share it with the live-session layer too, so a `RewindTo` rolls the workspace back to the
         // sealed-off range's earliest pre-mutation checkpoint (conversation-rewind spec §6).
         self.live.set_checkpoints(checkpoints);
-        self
-    }
-
-    /// Attach the live model-provider factory so [`SessionApi::set_session_model`] can rebuild a
-    /// running session's provider for a new model id. Call during assembly (needs the profile store
-    /// + provider resolver to derive the provider from the session's profile bundle).
-    pub fn with_model_factory(mut self, factory: ModelProviderFactory) -> Self {
-        self.model_factory = Some(factory);
         self
     }
 

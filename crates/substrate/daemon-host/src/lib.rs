@@ -133,8 +133,8 @@ pub use managed::{GatewayControl, ManagedResource};
 pub use node_api::{
     decode_overlay, encode_overlay, AccountProvisioning, AgentDiscovery, AttachmentHub,
     AttachmentHubs, CloudCatalog, DeliveryHost, DurableProfileResolver, ForeignSessionFactory,
-    ModelProviderFactory, NodeApiImpl, NodeApiParts, NodeEventFeed, ProvisionedAccount,
-    RoutingBuilder, SessionBackend, SessionEngineBuilder,
+    NodeApiImpl, NodeApiParts, NodeEventFeed, ProvisionedAccount, RoutingBuilder, SessionBackend,
+    SessionEngineBuilder,
 };
 pub use notifications::{AddOutcome, NotificationManager, ReadChange};
 pub use persona_ops::PersonaOps;

@@ -155,8 +155,7 @@ use daemon_common::{
     QuantizeId, QuantizeStatus, ReqId, SearchPage, SearchQuery, SessionId, UnitId, UsageDelta,
 };
 use daemon_core::{
-    is_sensitive_path, spawn_agent_session, AgentHandle, ApprovalPolicy, Engine, LocalEnvironment,
-    Provider, Snapshot,
+    is_sensitive_path, ApprovalPolicy, Engine, LocalEnvironment, Provider, Snapshot,
 };
 use daemon_models::{ModelError, ModelManager};
 use daemon_protocol::{
@@ -252,11 +251,6 @@ pub type DurableProfileResolver = Arc<
         + Send
         + Sync,
 >;
-
-/// Builds a fresh model [`Provider`] from a (model-overridden) [`ProfileSpec`] — the seam a live
-/// [`SessionApi::set_session_model`](daemon_api::SessionApi::set_session_model) uses to rebuild a
-/// running session's provider without `daemon-host` linking the provider crate.
-pub type ModelProviderFactory = Arc<dyn Fn(&ProfileSpec) -> Arc<dyn Provider> + Send + Sync>;
 
 /// The routing rebuild hook (the §5.9 hot-reload seam): produces a fresh [`RoutingRegistry`] from
 /// current node state (profiles + bound accounts). Re-run on `profile_update` / `auth_complete` so
@@ -380,9 +374,6 @@ pub struct NodeApiImpl {
     /// The live networked-model discovery hook injected by the binary (the host never links
     /// `genai`). `None` => `models()` lists only the static cloud catalog + local models.
     cloud_catalog: Option<Arc<dyn CloudCatalog>>,
-    /// The live model-provider factory backing `set_session_model`. `None` => per-session model
-    /// switching resolves to [`ApiError::Unsupported`] (needs the profile store + provider resolver).
-    model_factory: Option<ModelProviderFactory>,
     /// The per-session live model override set by `set_session_model` (transient; not persisted to
     /// the profile). Read by `model_current` when a session is being inspected.
     session_models: Arc<DashMap<SessionId, String>>,

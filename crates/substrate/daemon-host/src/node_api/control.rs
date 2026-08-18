@@ -144,9 +144,18 @@ impl ControlApi for NodeApiImpl {
         // `SessionScope`/sort/pagination below.
         let mut roster = self.roster_scoped().await;
         // The scope predicate, evaluated per session (so a delta can tell "still in scope" from "left
-        // the scope"). `ByTransport` needs the live owned-session set, resolved once.
+        // the scope"). `ByTransport` needs the transport's owned-session set, resolved once — the
+        // union of live residencies (Foreign) and the durable attachment hubs (§8), like
+        // `SessionApi::delivery_sessions`.
         let owned: std::collections::HashSet<SessionId> = match &query.scope {
-            SessionScope::ByTransport(t) => self.live.delivery_sessions(t).into_iter().collect(),
+            SessionScope::ByTransport(t) => {
+                let mut owned: std::collections::HashSet<SessionId> =
+                    self.live.delivery_sessions(t).into_iter().collect();
+                if let Some(hubs) = &self.attachments {
+                    owned.extend(hubs.delivery_sessions(t));
+                }
+                owned
+            }
             _ => std::collections::HashSet::new(),
         };
         let in_scope = |i: &SessionInfo| session_in_scope(i, &query.scope, &owned);
@@ -285,7 +294,14 @@ impl ControlApi for NodeApiImpl {
         );
         let overlay = (!meta.overlay.is_empty()).then(|| decode_overlay(&meta.overlay));
         let model = self.session_models.get(&session).map(|m| m.clone());
-        let delivery_targets = self.live.delivery_targets(&auth);
+        // The delivery roster: a durable session's is homed on its attachment hub (§8), a live
+        // (Foreign) residency's on its actor entry — a session is only ever homed on one.
+        let mut delivery_targets = self.live.delivery_targets(&auth);
+        if delivery_targets.is_empty() {
+            if let Some(hub) = self.attachments.as_ref().and_then(|h| h.get(&session)) {
+                delivery_targets = hub.delivery_targets();
+            }
+        }
         let children = self.store.children_of(&session).await;
         let checkpoints = match &self.checkpoints {
             Some(store) => store.list(Some(session.as_str())).await.len() as u32,
@@ -2632,21 +2648,18 @@ impl ControlApi for NodeApiImpl {
         point: daemon_api::RewindPoint,
     ) -> Result<(), ApiError> {
         // Auth 4: only the owner (or a `SessionControlAny` operator) may rewind a session.
-        let auth = self.require_session_access(&session, true).await?;
+        let _auth = self.require_session_access(&session, true).await?;
         // The unified rewind (conversation-rewind spec): truncate the transcript at `point.anchor`
         // and, when `point.restore_workspace`, roll the workspace back to the matching checkpoint —
-        // sealing the journal on the way out. A resident session rewinds its in-process engine
-        // directly through the shared seal+rollback seam that the live `RewindTo` command and the
-        // managed/fleet engine path also call (so all three stay consistent). A resident foreign
-        // (ACP) session is refused inside `rewind_resident` (not rewindable).
+        // sealing the journal on the way out. A resident session is Foreign-only post-retire, and
+        // a foreign (ACP) engine has no truncate-at-anchor primitive — refused explicitly.
         if self.live.is_resident(&session) {
-            return self
-                .live
-                .rewind_resident(&auth, point.anchor, point.restore_workspace)
-                .await;
+            return Err(ApiError::Unsupported(
+                "conversation rewind is not supported for a foreign-engine (ACP) session".into(),
+            ));
         }
-        // A durable (non-resident) session (§8): interrupt-first via the hub's occupied slot, then
-        // the dormant-only snapshot CAS through the shared surgery + side-effects. Armed with the
+        // A durable session (§8): interrupt-first via the hub's occupied slot, then the
+        // dormant-only snapshot CAS through the shared surgery + side-effects. Armed with the
         // stage-5 cutover; a pre-cutover node keeps the explicit refusal.
         if self.attachments.is_some() {
             return self
