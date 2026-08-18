@@ -317,14 +317,18 @@ async fn event_fanout_persists_broadcasts_and_pings_feed() {
         .collect();
     assert_eq!(kinds, ["phase", "progress", "round_outcome", "error"]);
 
-    // Each handled worker event pinged the node feed with a VhcChanged pointer. Scope the guard so
-    // it never crosses the await below.
+    // Each handled worker event pinged the node feed with a run-keyed Vhc pointer. Scope the
+    // guard so it never crosses the await below.
     {
         let feed_events = feed_log.lock().unwrap();
         assert_eq!(feed_events.len(), 4);
         assert!(feed_events.iter().all(|e| matches!(
             e,
-            NodeEvent::VhcChanged { run_id: Some(r), .. } if r == "run-1"
+            NodeEvent::ProjectionChanged {
+                projection: daemon_api::ProjectionId::Vhc,
+                scope: daemon_api::ChangeScope::Key { key },
+                ..
+            } if key == "run-1"
         )));
     }
 

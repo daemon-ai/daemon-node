@@ -28,15 +28,20 @@ fn start_turn() -> AgentCommand {
     }
 }
 
-/// Whether any node-event names `s` (the three session-bearing variants; the payload-free node-wide
-/// pointers are not owner-identifying and intentionally pass to any authenticated principal).
+/// Whether any node-event names `s` — `SessionAdvanced` plus the keyed session-scoped projection
+/// pointers (Sessions/Approvals). The payload-free node-wide pointers are not owner-identifying
+/// and intentionally pass to any authenticated principal.
 fn events_name_session(events: &[NodeEvent], s: &SessionId) -> bool {
+    use daemon_api::{ChangeScope, ProjectionId};
     events.iter().any(|e| {
         matches!(e,
-            NodeEvent::SessionAdvanced { session, .. }
-            | NodeEvent::SessionMetaChanged { session, .. }
-            | NodeEvent::ApprovalPending { session, .. }
-                if session == s)
+            NodeEvent::SessionAdvanced { session, .. } if session == s)
+            || matches!(e,
+                NodeEvent::ProjectionChanged {
+                    projection: ProjectionId::Sessions | ProjectionId::Approvals,
+                    scope: ChangeScope::Key { key },
+                    ..
+                } if key == s.as_str())
     })
 }
 

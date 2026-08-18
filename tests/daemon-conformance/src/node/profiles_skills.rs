@@ -101,15 +101,7 @@ async fn profile_select_emits_profiles_changed_impl() {
         .expect("create psel-b");
 
     // Drain the creates' own ProfilesChanged pointers.
-    let after = match dispatch(
-        node.as_ref(),
-        ApiRequest::EventsSince {
-            cursor: 0,
-            wait_ms: None,
-        },
-    )
-    .await
-    {
+    let after = match dispatch(node.as_ref(), ApiRequest::EventsSince { cursor: 0 }).await {
         ApiResponse::EventsPage(page) => page.next_cursor,
         other => panic!("expected EventsPage, got {other:?}"),
     };
@@ -118,24 +110,22 @@ async fn profile_select_emits_profiles_changed_impl() {
         .await
         .expect("select psel-b");
 
-    let saw_profiles_changed = match dispatch(
-        node.as_ref(),
-        ApiRequest::EventsSince {
-            cursor: after,
-            wait_ms: None,
-        },
-    )
-    .await
-    {
-        ApiResponse::EventsPage(page) => page
-            .events
-            .iter()
-            .any(|e| matches!(e, NodeEvent::ProfilesChanged { .. })),
-        other => panic!("expected EventsPage, got {other:?}"),
-    };
+    let saw_profiles_changed =
+        match dispatch(node.as_ref(), ApiRequest::EventsSince { cursor: after }).await {
+            ApiResponse::EventsPage(page) => page.events.iter().any(|e| {
+                matches!(
+                    e,
+                    NodeEvent::ProjectionChanged {
+                        projection: daemon_api::ProjectionId::Profiles,
+                        ..
+                    }
+                )
+            }),
+            other => panic!("expected EventsPage, got {other:?}"),
+        };
     assert!(
         saw_profiles_changed,
-        "ProfileSelect must emit ProfilesChanged so other clients refresh the active flag"
+        "ProfileSelect must emit the Profiles pointer so other clients refresh the active flag"
     );
 
     // And the selection is visible in the authoritative read the pointer invalidates.

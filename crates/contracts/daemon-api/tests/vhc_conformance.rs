@@ -349,16 +349,25 @@ fn vhc_responses_validate() {
 
 #[test]
 fn vhc_changed_feed_pointer_validates() {
-    // The live `vhc_subscribe` rides the existing events feed as a `VhcChanged` pointer.
+    // The live `vhc_subscribe` rides the existing events feed as a Vhc `ProjectionChanged`
+    // pointer (keyed to the run when known, All for enable/config changes).
     let page = EventsPage {
         events: vec![
-            NodeEvent::VhcChanged {
-                run_id: Some("run-1".into()),
+            NodeEvent::ProjectionChanged {
+                projection: daemon_api::ProjectionId::Vhc,
+                partition: None,
+                scope: daemon_api::ChangeScope::Key {
+                    key: "run-1".into(),
+                },
                 rev: 9,
+                origin_op: None,
             },
-            NodeEvent::VhcChanged {
-                run_id: None,
+            NodeEvent::ProjectionChanged {
+                projection: daemon_api::ProjectionId::Vhc,
+                partition: None,
+                scope: daemon_api::ChangeScope::All,
                 rev: 10,
+                origin_op: None,
             },
         ],
         next_cursor: 10,
@@ -368,7 +377,7 @@ fn vhc_changed_feed_pointer_validates() {
     valid(
         "api-response",
         &enc(&ApiResponse::EventsPage(page)),
-        "EventsPage[VhcChanged]",
+        "EventsPage[ProjectionChanged{Vhc}]",
     );
 }
 

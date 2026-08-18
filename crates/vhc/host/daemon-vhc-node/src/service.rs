@@ -2832,7 +2832,18 @@ impl VhcService {
     fn emit_changed(&self, run_id: Option<String>) {
         if let Some(feed) = &self.feed {
             let rev = self.rev.fetch_add(1, Ordering::SeqCst) + 1;
-            feed(NodeEvent::VhcChanged { run_id, rev });
+            feed(NodeEvent::ProjectionChanged {
+                projection: daemon_api::ProjectionId::Vhc,
+                partition: None,
+                // Keyed to the run when known (the client refetches that run's detail), else the
+                // whole vhc surface (enable/config changes).
+                scope: match run_id {
+                    Some(id) => daemon_api::ChangeScope::Key { key: id },
+                    None => daemon_api::ChangeScope::All,
+                },
+                rev,
+                origin_op: None,
+            });
         }
     }
 

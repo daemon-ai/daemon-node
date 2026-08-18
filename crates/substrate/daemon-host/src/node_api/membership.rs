@@ -59,11 +59,11 @@ impl NodeApiImpl {
         }
     }
 
-    /// Emit a `ContactsChanged` for `transport` (wire v34) after a successful roster mutation
+    /// Emit the Contacts invalidation pointer for `transport` after a successful roster mutation
     /// (`roster_add`/`roster_update`/`roster_remove`) so clients refetch `RosterList` without
-    /// polling. A payload-free-per-transport invalidation pointer, mirroring `conversations_changed`.
-    /// The mutated `contact` id + whether it was a removal feed the rung-2 delta index (the event
-    /// shape itself stays the rung-1 `{transport, rev}` pointer).
+    /// polling — `ProjectionChanged{Contacts, transport, All}` (the retired `ContactsChanged`
+    /// shape). The mutated `contact` id + whether it was a removal feed the rung-2 delta index
+    /// (the event itself stays a payload-free rung-1 pointer).
     pub(crate) fn emit_contacts_changed(
         &self,
         transport: TransportId,
@@ -76,24 +76,32 @@ impl NodeApiImpl {
             // rung 3 (api/39): stamp the causing op token (from the dispatch context — a
             // `RosterAdd`/`RosterUpdate`/`RosterRemove`/`ContactSetAlias` op_id) so the contact-page
             // delta's `origin_ops` names it. `None` outside an op-carrying dispatch (null path).
-            let rev = feed.note_contacts_change_op(
-                &transport,
-                contact,
-                removed,
-                daemon_api::current_op_id(),
+            let origin_op = daemon_api::current_op_id();
+            let rev = feed.note_contacts_change_op(&transport, contact, removed, origin_op.clone());
+            feed.emit_projection(
+                daemon_api::ProjectionId::Contacts,
+                Some(transport.as_str().to_string()),
+                daemon_api::ChangeScope::All,
+                rev,
+                origin_op,
             );
-            feed.emit(NodeEvent::ContactsChanged { transport, rev });
         }
     }
 
-    /// Emit a payload-free `NotificationsChanged` pointer (wire v37) after a notification-manager
-    /// mutation so clients re-list via `NotificationList`. Mirrors `emit_contacts_changed` /
-    /// `CatalogChanged`: the whole list is cheap to refetch, so the event carries no detail.
+    /// Emit the Notifications invalidation pointer after a notification-manager mutation so
+    /// clients re-list via `NotificationList` — `ProjectionChanged{Notifications, All}` (the
+    /// retired `NotificationsChanged` shape); the whole list is cheap to refetch.
     pub(crate) fn emit_notifications_changed(&self) {
         if let Some(feed) = self.node_feed() {
             // rung 1: bump the notifications rev (once per emit) and stamp it (echoed by `NotificationList`).
             let rev = feed.note_notifications_change();
-            feed.emit(NodeEvent::NotificationsChanged { rev });
+            feed.emit_projection(
+                daemon_api::ProjectionId::Notifications,
+                None,
+                daemon_api::ChangeScope::All,
+                rev,
+                None,
+            );
         }
     }
 
@@ -138,17 +146,24 @@ impl NodeApiImpl {
         removed
     }
 
-    /// Emit a payload-free `PersonsChanged` pointer (wire v37) after a person-registry mutation
-    /// so clients re-list via `PersonList`. Mirrors `emit_notifications_changed`: the whole list is
-    /// cheap to refetch, so the event carries no detail. The mutated `person` id + whether it was a
-    /// removal feed the rung-2 delta index (the event shape stays the rung-1 `{rev}` pointer).
+    /// Emit the Persons invalidation pointer after a person-registry mutation so clients re-list
+    /// via `PersonList` — `ProjectionChanged{Persons, All}` (the retired `PersonsChanged` shape).
+    /// The mutated `person` id + whether it was a removal feed the rung-2 delta index (the event
+    /// itself stays a payload-free rung-1 pointer).
     pub(crate) fn emit_persons_changed(&self, person: &str, removed: bool) {
         if let Some(feed) = self.node_feed() {
             // rung 1: bump the persons rev (once per emit) and stamp it (echoed by `PersonList`).
             // rung 3 (api/39): stamp any causing op token from the dispatch context (`None`
             // outside one, which is the common case for adapter/tool-driven registry mutations).
-            let rev = feed.note_persons_change_op(person, removed, daemon_api::current_op_id());
-            feed.emit(NodeEvent::PersonsChanged { rev });
+            let origin_op = daemon_api::current_op_id();
+            let rev = feed.note_persons_change_op(person, removed, origin_op.clone());
+            feed.emit_projection(
+                daemon_api::ProjectionId::Persons,
+                None,
+                daemon_api::ChangeScope::All,
+                rev,
+                origin_op,
+            );
         }
     }
 
@@ -269,21 +284,23 @@ impl LifecycleSink for NodeApiImpl {
         if let Some(feed) = self.node_feed() {
             // rung 1: bump the per-transport conversation-set rev (once per emit) and stamp it so
             // `ConvList`'s echoed rev and this pointer agree on the reflected generation. rung 2:
-            // the keyed change feeds the delta index (`Removed` -> tombstone).
+            // the keyed change feeds the delta index (`Removed` -> tombstone). The pointer is the
+            // keyed Conversations envelope (the retired `ConversationsChanged` shape): the client
+            // re-lists and replace-and-prune reconciles added/removed alike.
             let rev = feed.note_conversations_change(
                 &transport,
                 &conv,
                 matches!(change, ConvChange::Removed),
             );
-            feed.emit(NodeEvent::ConversationsChanged {
-                transport,
-                conv,
-                change,
+            feed.emit_projection(
+                daemon_api::ProjectionId::Conversations,
+                Some(transport.as_str().to_string()),
+                daemon_api::ChangeScope::Key { key: conv },
                 rev,
                 // rung 3 (api/39): adapter-reported set changes carry no local op token; the
                 // page-side `origin_ops` map is the provenance carrier for these (null here).
-                origin_op: None,
-            });
+                None,
+            );
         }
     }
 
@@ -306,19 +323,22 @@ impl LifecycleSink for NodeApiImpl {
         {
             self.reconcile_self_removal(&transport, &conv).await;
         }
+        // The member/actor/reason detail rides the `ConvGet` refetch, not the pointer.
+        let _ = (member, actor, reason);
         if let Some(feed) = self.node_feed() {
-            feed.emit(NodeEvent::MembershipChanged {
-                transport,
-                conv,
-                member,
-                change,
-                actor,
-                reason,
-                is_self,
+            // A member-set change IS a change of that conversation's record: mark the conv
+            // changed in the delta index (serving `ConvList.since_rev` correctly) and emit the
+            // keyed Conversations envelope (the retired `MembershipChanged` arm's stage-7 form).
+            let rev = feed.note_conversations_change(&transport, &conv, false);
+            feed.emit_projection(
+                daemon_api::ProjectionId::Conversations,
+                Some(transport.as_str().to_string()),
+                daemon_api::ChangeScope::Key { key: conv },
+                rev,
                 // rung 3 (api/39): membership pushes come from the adapter seam with no local
                 // op token; `None` is the null-provenance path (a future token round-trip fills it).
-                origin_op: None,
-            });
+                None,
+            );
         }
     }
 
@@ -343,11 +363,14 @@ impl LifecycleSink for NodeApiImpl {
             .await
         {
             if let Some(feed) = self.node_feed() {
-                feed.emit(NodeEvent::MessagesChanged {
-                    transport,
-                    conv,
+                // The keyed Messages envelope (the retired `MessagesChanged` shape): the
+                // `(Messages, transport)` domain rev is map-backed, minted here at the emit.
+                feed.note_domain_change(
+                    daemon_api::ProjectionId::Messages,
+                    Some(transport.as_str()),
+                    daemon_api::ChangeScope::Key { key: conv },
                     origin_op,
-                });
+                );
             }
         }
     }

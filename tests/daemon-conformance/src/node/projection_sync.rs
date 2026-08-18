@@ -23,9 +23,8 @@ fn ctx(name: &str, role: Role) -> RequestContext {
     RequestContext::authenticated(Principal::from_roles(name, name, vec![role]), None)
 }
 
-/// Every override write dual-emits: the legacy `SessionMetaChanged` AND its
-/// `ProjectionChanged { Sessions, Key(session) }` twin with the IDENTICAL rev — the
-/// migration-window invariant that lets a client switch arms per vertical without rev skew.
+/// Every override write emits the keyed `ProjectionChanged { Sessions, Key(session) }` pointer
+/// (stage 7: the legacy `SessionMetaChanged` arm is retired — this envelope is the only carrier).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn override_write_dual_emits_the_sessions_twin() {
     as_system(override_write_dual_emits_the_sessions_twin_impl()).await;
@@ -45,15 +44,7 @@ async fn override_write_dual_emits_the_sessions_twin_impl() {
     .expect("submit opens the session");
 
     // Drain, so only the override write below lands past `after`.
-    let after = match dispatch(
-        node.as_ref(),
-        ApiRequest::EventsSince {
-            cursor: 0,
-            wait_ms: None,
-        },
-    )
-    .await
-    {
+    let after = match dispatch(node.as_ref(), ApiRequest::EventsSince { cursor: 0 }).await {
         ApiResponse::EventsPage(page) => page.next_cursor,
         other => panic!("expected EventsPage, got {other:?}"),
     };
@@ -72,27 +63,10 @@ async fn override_write_dual_emits_the_sessions_twin_impl() {
         other => panic!("expected Ok, got {other:?}"),
     }
 
-    let events = match dispatch(
-        node.as_ref(),
-        ApiRequest::EventsSince {
-            cursor: after,
-            wait_ms: None,
-        },
-    )
-    .await
-    {
+    let events = match dispatch(node.as_ref(), ApiRequest::EventsSince { cursor: after }).await {
         ApiResponse::EventsPage(page) => page.events,
         other => panic!("expected EventsPage, got {other:?}"),
     };
-    let legacy_rev = events
-        .iter()
-        .find_map(|e| match e {
-            NodeEvent::SessionMetaChanged {
-                session: s, rev, ..
-            } if *s == session => Some(*rev),
-            _ => None,
-        })
-        .expect("the legacy SessionMetaChanged still rides in the migration window");
     assert!(
         events.iter().any(|e| matches!(e,
             NodeEvent::ProjectionChanged {
@@ -101,8 +75,8 @@ async fn override_write_dual_emits_the_sessions_twin_impl() {
                 scope: ChangeScope::Key { key },
                 rev,
                 ..
-            } if key == session.as_str() && *rev == legacy_rev)),
-        "the twin must carry the SAME rev + session key, got {events:?}"
+            } if key == session.as_str() && *rev >= 1)),
+        "the override write must emit the keyed Sessions pointer, got {events:?}"
     );
 
     handle.shutdown().await;
@@ -405,15 +379,7 @@ async fn formerly_silent_mutations_emit_their_domain_pointer_impl() {
         "assign",
     );
 
-    let events = match dispatch(
-        node.as_ref(),
-        ApiRequest::EventsSince {
-            cursor: 0,
-            wait_ms: None,
-        },
-    )
-    .await
-    {
+    let events = match dispatch(node.as_ref(), ApiRequest::EventsSince { cursor: 0 }).await {
         ApiResponse::EventsPage(page) => page.events,
         other => panic!("expected EventsPage, got {other:?}"),
     };

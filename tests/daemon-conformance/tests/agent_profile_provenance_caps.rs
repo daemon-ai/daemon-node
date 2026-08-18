@@ -205,14 +205,18 @@ async fn agent_profiles_carry_provenance_and_respect_the_composed_cap_impl() {
     );
     assert_eq!(info.owner.as_deref(), Some(parent.as_str()));
 
-    // The node emitted a `ProfilesChanged` pointer so a thin client refetches the profile list
+    // The node emitted a Profiles pointer so a thin client refetches the profile list
     // (the node-authoritative GUI/TUI surface — no client-side domain logic).
     let page = node.events_page(0, 64).await;
     assert!(
-        page.events
-            .iter()
-            .any(|e| matches!(e, NodeEvent::ProfilesChanged { .. })),
-        "authoring a profile must emit a ProfilesChanged pointer: {:?}",
+        page.events.iter().any(|e| matches!(
+            e,
+            NodeEvent::ProjectionChanged {
+                projection: daemon_api::ProjectionId::Profiles,
+                ..
+            }
+        )),
+        "authoring a profile must emit a Profiles pointer: {:?}",
         page.events
     );
 

@@ -797,7 +797,7 @@ impl NodeApiImpl {
             }
             if let Some(feed) = self.node_feed() {
                 let rev = feed.note_roster_change(session);
-                feed.emit(NodeEvent::RosterChanged { rev });
+                feed.emit_roster(rev);
             }
         }
         let hub = self.attach_hub(session).await;

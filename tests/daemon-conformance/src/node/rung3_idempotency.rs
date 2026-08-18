@@ -188,8 +188,10 @@ async fn conv_send_dedup_impl() {
 // ---------------------------------------------------------------------------
 
 /// The node stamps `origin_op` at the `LifecycleSink::chat_message` choke point: the journaled
-/// record envelope carries it (carrier 1) and the emitted `MessagesChanged` pointer carries it
-/// (carrier 3). A token-less report leaves both absent (the null-provenance path).
+/// record envelope carries it (carrier 1) and the emitted keyed Messages pointer carries it
+/// (carrier 3). A token-less report leaves both absent (the null-provenance path), and when it
+/// coalesces over a provenance-carrying pointer the survivor's provenance is nulled (§7 rule 3 —
+/// echo suppression must never suppress another client's change).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn chat_message_stamps_origin_op_on_journal_and_event() {
     as_system(chat_message_provenance_impl()).await;
@@ -198,6 +200,26 @@ async fn chat_message_provenance_impl() {
     let h = RoomsNode::bring_up("prov", [0x82; 32]).await;
     h.create_room("p").await;
 
+    // The surviving keyed Messages pointer provenances for conv "p" on the feed.
+    let pointer_ops = |node: Arc<NodeApiImpl>| async move {
+        match daemon_api::dispatch(node.as_ref(), ApiRequest::EventsSince { cursor: 0 }).await {
+            ApiResponse::EventsPage(p) => p
+                .events
+                .iter()
+                .filter_map(|e| match e {
+                    daemon_api::NodeEvent::ProjectionChanged {
+                        projection: daemon_api::ProjectionId::Messages,
+                        scope: daemon_api::ChangeScope::Key { key },
+                        origin_op,
+                        ..
+                    } if key == "p" => Some(origin_op.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<Option<String>>>(),
+            other => panic!("expected EventsPage, got {other:?}"),
+        }
+    };
+
     // A provenance-carrying report (the node owns the record; the token is opaque).
     let mut msg = daemon_api::ChatMessage::new(None, "carried".to_string());
     msg.timestamp = Some(1234);
@@ -205,6 +227,11 @@ async fn chat_message_provenance_impl() {
         .lifecycle_sink()
         .chat_message(room(), "p".to_string(), msg, Some("op-prov".to_string()))
         .await;
+    assert_eq!(
+        pointer_ops(h.node.clone()).await,
+        vec![Some("op-prov".to_string())],
+        "carrier 3: the keyed Messages pointer carries the causing origin_op"
+    );
 
     // A token-less report (the null path).
     let plain = daemon_api::ChatMessage::new(None, "plain".to_string());
@@ -234,33 +261,12 @@ async fn chat_message_provenance_impl() {
         "null path: a token-less record has no origin_op"
     );
 
-    // Carrier 3: the MessagesChanged pointer for the carried message names the causing op.
-    let events = match daemon_api::dispatch(
-        h.node.as_ref(),
-        ApiRequest::EventsSince {
-            cursor: 0,
-            wait_ms: None,
-        },
-    )
-    .await
-    {
-        ApiResponse::EventsPage(p) => p.events,
-        other => panic!("expected EventsPage, got {other:?}"),
-    };
-    let origin_ops: Vec<Option<String>> = events
-        .iter()
-        .filter_map(|e| match e {
-            daemon_api::NodeEvent::MessagesChanged { origin_op, .. } => Some(origin_op.clone()),
-            _ => None,
-        })
-        .collect();
-    assert!(
-        origin_ops.contains(&Some("op-prov".to_string())),
-        "carrier 3: a MessagesChanged event carries the causing origin_op: {origin_ops:?}"
-    );
-    assert!(
-        origin_ops.contains(&None),
-        "the token-less report emits a null-provenance MessagesChanged: {origin_ops:?}"
+    // §7 rule 3: the token-less pointer coalesced over the provenance-carrying one — the single
+    // survivor's provenance is nulled, so no client's echo suppression can hide this change.
+    assert_eq!(
+        pointer_ops(h.node.clone()).await,
+        vec![None],
+        "differing-provenance coalescing must null the survivor's origin_op"
     );
 
     h.tear_down().await;

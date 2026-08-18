@@ -1,16 +1,14 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // SPDX-FileCopyrightText: 2026 Jarrad Hope
 
-//! Membership push (wire v30, item 3): the two `NodeEvent` tiers + their enums round-trip, and the
+//! Membership push (wire v30, item 3): the keyed Conversations envelope round-trips, and the
 //! node-owned routing reconciliation — on a self `Kicked` the node drops the dangling `ChatRoute`
-//! pin BEFORE emitting, and surfaces both events on the L3 feed. A non-self departure leaves the
+//! pin BEFORE emitting, and surfaces the pointer on the L3 feed. A non-self departure leaves the
 //! pin intact.
 
 use std::sync::Arc;
 
-use daemon_api::{
-    from_cbor, to_cbor, ChatRoute, ControlApi, ConvChange, MembershipChange, NodeEvent,
-};
+use daemon_api::{from_cbor, to_cbor, ChatRoute, ControlApi, MembershipChange, NodeEvent};
 use daemon_common::{PartitionId, ProfileRef, SessionId};
 use daemon_core::{MockProvider, Provider, ProviderRegistry};
 use daemon_host::HostConfig;
@@ -74,28 +72,17 @@ fn group_origin(transport: &str, conv: &str) -> Origin {
 
 #[test]
 fn membership_events_round_trip() {
-    let events = [
-        NodeEvent::ConversationsChanged {
-            transport: TransportId::new("matrix/@bot:hs.org"),
-            conv: "!r:hs".into(),
-            change: ConvChange::Added,
-            rev: 3,
-            origin_op: None,
+    // Both membership-push tiers reduce to the keyed Conversations envelope since stage 7.
+    let ev = NodeEvent::ProjectionChanged {
+        projection: daemon_api::ProjectionId::Conversations,
+        partition: Some("matrix/@bot:hs.org".into()),
+        scope: daemon_api::ChangeScope::Key {
+            key: "!r:hs".into(),
         },
-        NodeEvent::MembershipChanged {
-            transport: TransportId::new("matrix/@bot:hs.org"),
-            conv: "!r:hs".into(),
-            member: "@bot:hs.org".into(),
-            change: MembershipChange::Kicked,
-            actor: Some("@admin:hs".into()),
-            reason: Some("cleanup".into()),
-            is_self: true,
-            origin_op: None,
-        },
-    ];
-    for ev in events {
-        assert_eq!(ev, from_cbor::<NodeEvent>(&to_cbor(&ev)).unwrap());
-    }
+        rev: 3,
+        origin_op: None,
+    };
+    assert_eq!(ev, from_cbor::<NodeEvent>(&to_cbor(&ev)).unwrap());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -137,18 +124,19 @@ async fn self_removal_drops_the_routing_pin_and_emits() {
             node.routing_get(origin.clone()).await.is_none(),
             "the dangling pin was dropped on self removal"
         );
-        // The invalidation event is on the L3 feed.
+        // The invalidation event is on the L3 feed — the keyed Conversations envelope (the
+        // member/actor detail rides the `ConvGet` refetch, not the pointer).
         let page = node.events_page(0, 0).await;
         assert!(
             page.events.iter().any(|e| matches!(
                 e,
-                NodeEvent::MembershipChanged {
-                    is_self: true,
-                    change: MembershipChange::Kicked,
+                NodeEvent::ProjectionChanged {
+                    projection: daemon_api::ProjectionId::Conversations,
+                    scope: daemon_api::ChangeScope::Key { key },
                     ..
-                }
+                } if key == conv
             )),
-            "the membership event was emitted"
+            "the membership change emitted the keyed Conversations pointer"
         );
     })
     .await;

@@ -19,7 +19,7 @@
 
 use super::internals::{api_origin, engine_origin, Drain, LogEntryParts, MergedLog, Pending};
 use super::NodeEventFeed;
-use daemon_api::{ApiError, DeliverySink, LogPageView, LogStream, NodeEvent, SessionLogEntry};
+use daemon_api::{ApiError, DeliverySink, LogPageView, LogStream, SessionLogEntry};
 use daemon_common::{ReqId, SessionId};
 use daemon_core::{SteerReq, TurnControl};
 use daemon_protocol::{
@@ -110,19 +110,24 @@ impl AttachmentHub {
 
     /// Park a blocking host request until a client answers via [`Self::respond`] — the live
     /// `ParkingHandler` semantics on the activation path: the request lands on the merged log and
-    /// the poll drain (one ordered timeline), an approval badges `ApprovalPending` on the node
-    /// feed, and the caller (the engine's turn) awaits the response. A hub dropped before an
-    /// answer declines safely, exactly as a torn-down live session does.
+    /// the poll drain (one ordered timeline), an approval badges an Approvals-domain
+    /// `ProjectionChanged` on the node feed, and the caller (the engine's turn) awaits the
+    /// response. A hub dropped before an answer declines safely, exactly as a torn-down live
+    /// session does.
     pub async fn park(&self, req: HostRequest) -> HostResponse {
         let request_id = req.request_id;
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(request_id, tx);
         if matches!(req.kind, HostRequestKind::Approval { .. }) {
             if let Some(feed) = &self.feed {
-                feed.emit(NodeEvent::ApprovalPending {
-                    session: self.session.clone(),
-                    request_id: request_id.0.to_string(),
-                });
+                feed.note_domain_change(
+                    daemon_api::ProjectionId::Approvals,
+                    None,
+                    daemon_api::ChangeScope::Key {
+                        key: self.session.as_str().to_string(),
+                    },
+                    None,
+                );
             }
         }
         self.log.lock().unwrap().append(

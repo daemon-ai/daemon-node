@@ -843,10 +843,7 @@ fn owner_gated_samples(s: &SessionId) -> Vec<(&'static str, ApiRequest, Deny)> {
         // F4 (now gated): the node-wide feeds — deny by returning nothing of the owner's.
         (
             "EventsSince",
-            ApiRequest::EventsSince {
-                cursor: 0,
-                wait_ms: None,
-            },
+            ApiRequest::EventsSince { cursor: 0 },
             Deny::EmptyOrAbsent,
         ),
         (
@@ -926,11 +923,18 @@ fn assert_denied(label: &str, resp: &ApiResponse, deny: Deny, s: &SessionId) {
             }
             // F4 node-wide feeds (now gated): no session-bearing event / no session-scoped list entry.
             ApiResponse::EventsPage(p) => assert!(
-                !p.events.iter().any(|e| matches!(e,
-                    daemon_api::NodeEvent::SessionAdvanced { session, .. }
-                    | daemon_api::NodeEvent::SessionMetaChanged { session, .. }
-                    | daemon_api::NodeEvent::ApprovalPending { session, .. }
-                        if session == s)),
+                !p.events.iter().any(|e| {
+                    matches!(e,
+                        daemon_api::NodeEvent::SessionAdvanced { session, .. } if session == s)
+                        || matches!(e,
+                            daemon_api::NodeEvent::ProjectionChanged {
+                                projection:
+                                    daemon_api::ProjectionId::Sessions
+                                    | daemon_api::ProjectionId::Approvals,
+                                scope: daemon_api::ChangeScope::Key { key },
+                                ..
+                            } if key == s.as_str())
+                }),
                 "{label}: leaked a session-bearing node event"
             ),
             ApiResponse::DeliverySessions(p) => {

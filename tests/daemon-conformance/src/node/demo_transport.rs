@@ -614,13 +614,11 @@ async fn demo_send_journals_chat_and_scripted_reply() {
         "the scripted reply is journaled with a contact author"
     );
 
-    // Each Chat append raised a MessagesChanged pointer for (demo, conv).
+    // Each Chat append raised the keyed Messages pointer for (demo, conv); same-conv pointers
+    // coalesce in the backlog, so at least one survivor remains.
     let messages_changed = match h
         .client
-        .call(ApiRequest::EventsSince {
-            cursor: 0,
-            wait_ms: None,
-        })
+        .call(ApiRequest::EventsSince { cursor: 0 })
         .await
         .unwrap()
     {
@@ -628,16 +626,19 @@ async fn demo_send_journals_chat_and_scripted_reply() {
             .events
             .iter()
             .filter(|e| {
-                matches!(e, NodeEvent::MessagesChanged { transport: t, conv: c, .. }
-                    if t.as_str() == "demo" && c == conv)
+                matches!(e, NodeEvent::ProjectionChanged {
+                    projection: daemon_api::ProjectionId::Messages,
+                    partition: Some(p),
+                    scope: daemon_api::ChangeScope::Key { key },
+                    ..
+                } if p == "demo" && key == conv)
             })
             .count(),
         other => panic!("expected EventsPage, got {other:?}"),
     };
     assert!(
-        messages_changed >= page.entries.len(),
-        "MessagesChanged is emitted per Chat append (>= {}, got {messages_changed})",
-        page.entries.len()
+        messages_changed >= 1,
+        "Chat appends must leave a keyed Messages pointer for the conv (got {messages_changed})"
     );
 
     h.tear_down().await;

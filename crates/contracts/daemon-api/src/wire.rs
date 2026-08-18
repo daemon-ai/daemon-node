@@ -139,9 +139,6 @@ pub enum ApiRequest {
     EventsSince {
         /// The exclusive lower-bound feed cursor (0 from the start of the retained ring).
         cursor: u64,
-        /// One-shot long-poll hold (ms); `None`/`0` returns immediately. Ignored by the push path.
-        #[serde(default)]
-        wait_ms: Option<u32>,
     },
     /// [`SessionApi::delivery_targets`].
     DeliveryTargets {
@@ -1294,7 +1291,8 @@ pub enum ApiRequest {
     // -- notifications (wire v37) --------------------------------------------------------------
     /// [`ControlApi::notification_list`] — the node's live notification list (wire v37). A
     /// read-only snapshot (newest first); the client re-lists on a
-    /// [`NodeEvent::NotificationsChanged`] pointer. Answered by [`ApiResponse::Notifications`].
+    /// Notifications [`NodeEvent::ProjectionChanged`] pointer. Answered by
+    /// [`ApiResponse::Notifications`].
     NotificationList,
 
     // -- file transfer (wire v37) --------------------------------------------------------------
@@ -1322,7 +1320,7 @@ pub enum ApiRequest {
     // -- persons / metacontacts (wire v37) -----------------------------------------------------
     /// [`ControlApi::person_list`] — the node's person/metacontact registry (wire v37). A
     /// read-only snapshot (insertion order); the client re-lists on a
-    /// [`NodeEvent::PersonsChanged`] pointer. Answered by [`ApiResponse::Persons`].
+    /// Persons [`NodeEvent::ProjectionChanged`] pointer. Answered by [`ApiResponse::Persons`].
     ///
     /// rung 2 (api/39): the former unit variant becomes a struct variant so the request can
     /// carry `since_rev` (a breaking arm-shape change, bundled into the deferred v38->v39 bump).
@@ -2034,6 +2032,11 @@ pub enum WireS2C {
         id: u64,
         /// The wrapped response.
         res: ApiResponse,
+        /// Response metadata (projection-sync stage 7, spec §9): the COMPLETE receipt schema,
+        /// reserved on the envelope now so stage 8 populates behavior without a wire change.
+        /// Absent until receipts ship.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        meta: Option<ResponseMetadata>,
     },
     /// One chunk of a streaming `Call`; `id` stays open until `End`.
     Item {
@@ -2041,6 +2044,9 @@ pub enum WireS2C {
         id: u64,
         /// The wrapped response chunk.
         res: ApiResponse,
+        /// Response metadata (projection-sync stage 7, spec §9) — same reservation as `Reply`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        meta: Option<ResponseMetadata>,
     },
     /// A stream closed (clean iff `error` is `None`).
     End {
@@ -2080,6 +2086,21 @@ pub enum WireS2C {
         /// A short, non-revealing failure reason.
         reason: String,
     },
+}
+
+/// Response metadata on the mux envelope (projection-sync spec §9): the complete, reserved
+/// receipt schema. Landed at the stage-7 cutover so the stage-8 receipts track is behavior-only —
+/// populating `changes` from the dispatch `MutationEffects` collector never changes the wire
+/// shape again. Riding the envelope (not the response payload) covers every response type
+/// uniformly, including streamed `Item`s.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResponseMetadata {
+    /// The revision domains this request's handling advanced (exact per-request effects from the
+    /// `MutationEffects` collector — never post-handler sampling). Absent until receipts ship
+    /// (stage 8); a client must treat absence as "no receipt", not "no changes".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changes: Option<Vec<crate::DomainRev>>,
 }
 
 /// Whether a request is served as a server-stream (`Item`* then `End`) rather than a single `Reply`.
@@ -2495,20 +2516,19 @@ mod auth_contract_tests {
     }
 
     /// The contract wire version (`daemon_common::WireVersion::CURRENT`, mirrored by
-    /// [`crate::API_WIRE_VERSION`]) is pinned to the sealed surface: v50 (the credential plan's
-    /// typed manager — `credential-info` gains node-derived provider/kind/scope/classification/
-    /// expires_at/refresh_status/used_by and `CredentialRemove` gains guarded-by-default
-    /// `? force` — on top of v49's honest `cloud_credentials` provider-auth arm and v48's
-    /// provider-centric model-catalog surface). Distinct from the transport-envelope
+    /// [`crate::API_WIRE_VERSION`]) is pinned to the sealed surface: v51 (the projection-sync
+    /// stage-7 cutover — the 14 legacy per-collection invalidation arms removed in favor of
+    /// `ProjectionChanged`, `EventsSince.wait_ms` deleted, and the mux `Reply`/`Item` frames gain
+    /// the optional `response-metadata` receipt envelope). Distinct from the transport-envelope
     /// [`WIRE_VERSION`] above (= 2), which these rungs did not touch. Bumping the contract
     /// version is a deliberate act — this assertion is the gate.
     #[test]
-    fn contract_wire_version_is_v50() {
+    fn contract_wire_version_is_v51() {
         assert_eq!(
             daemon_common::WireVersion::CURRENT,
-            daemon_common::WireVersion(50)
+            daemon_common::WireVersion(51)
         );
-        assert_eq!(crate::API_WIRE_VERSION, daemon_common::WireVersion(50));
+        assert_eq!(crate::API_WIRE_VERSION, daemon_common::WireVersion(51));
     }
 
     /// The `api/<N>` feature string is formatted from the API mirror version (never hardcoded)

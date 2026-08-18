@@ -1450,8 +1450,9 @@ mod attachment_resolver_tests {
             .is_err());
     }
 
-    /// A parked `Approval` badges `ApprovalPending` on the node feed (live parity: payload-free
-    /// notification, the client fetches detail out of band) and resolves on `respond`.
+    /// A parked `Approval` badges a keyed Approvals `ProjectionChanged` on the node feed (live
+    /// parity: payload-free notification, the client fetches detail out of band) and resolves on
+    /// `respond`.
     #[tokio::test]
     async fn approval_park_badges_the_node_feed() {
         let session = SessionId::new("park-approval");
@@ -1472,10 +1473,16 @@ mod attachment_resolver_tests {
         });
         let answer = async {
             let badged = feed.page(0, 0).events.iter().any(|e| {
-                matches!(e, NodeEvent::ApprovalPending { session: s, request_id }
-                    if *s == session && request_id == "9")
+                matches!(e, NodeEvent::ProjectionChanged {
+                    projection: daemon_api::ProjectionId::Approvals,
+                    scope: daemon_api::ChangeScope::Key { key },
+                    ..
+                } if key == session.as_str())
             });
-            assert!(badged, "the park badged ApprovalPending on the node feed");
+            assert!(
+                badged,
+                "the park badged the Approvals pointer on the node feed"
+            );
             hub.respond(HostResponse {
                 request_id: ReqId(9),
                 body: HostResponseBody::Approved {

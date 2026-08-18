@@ -19,7 +19,7 @@ kv-pair = [k: tstr, v: tstr]
 ; cap) - the fix that lets arbitrary file sizes round-trip. Fixed 32-byte hashes stay arrays
 ; (`content-hash`, below) since they are small and `ContentHash([u8; 32])` serializes as a sequence.
 byte-array = bstr
-wire_version = uint                 ; daemon-common WireVersion (current = 49)
+wire_version = uint                 ; daemon-common WireVersion (current = 51)
 
 ; ----- uniform wire pagination (wire v25) -----
 ; Every list op that can exceed the client codec's fixed 64-element array buffers is paginated
@@ -601,79 +601,35 @@ log-page-view = {
 }
 
 ; ----- node-wide event feed (L3 EventsSince): payload-free "what changed out of focus" pointers -----
-; wire v30 membership-push deltas.
+; wire v30 membership-push deltas (adapter lifecycle-seam enums; the node reduces both to the
+; keyed Conversations projection-changed envelope since the v51 cutover).
 conv-change = "Added" / "Removed"
 membership-change = "Joined" / "Left" / "Invited" / "Kicked" / "Banned"
+; v51 (projection-sync stage 7 cutover): the 14 legacy per-collection invalidation arms are
+; REMOVED — `node-event-projection-changed` is the ONLY invalidation pointer. The surviving
+; specialized arms are the non-invalidation events (session stream advance, transfer/quantize
+; progress, live transport presence, feed resync).
 node-event = node-event-session-advanced
-           / node-event-session-meta-changed
-           / node-event-roster-changed
-           / node-event-fleet-changed
-           / node-event-profiles-changed
-           / node-event-approval-pending
            / node-event-download-progress
            / node-event-quantize-progress
-           / node-event-catalog-changed
            / node-event-transport-changed
-           / node-event-conversations-changed
-           / node-event-membership-changed
-           / node-event-contacts-changed
            / node-event-resync-needed
-           / node-event-notifications-changed
-           / node-event-persons-changed
-           / node-event-messages-changed
-           / node-event-vhc-changed
-           / node-event-agents-changed
            / node-event-projection-changed
 node-event-session-advanced     = { "SessionAdvanced":    { "session": session-id, "epoch": uint64, "head_seq": uint64 } }
-; rung 3 (api/39): + `? "origin_op"` (carrier 3) — the causing op when the emit site knows it
-; (a SessionUpdateMeta that carried one); null otherwise.
-node-event-session-meta-changed = { "SessionMetaChanged": { "session": session-id, "rev": uint64, ? "origin_op": (origin-op / null) } }
-node-event-roster-changed       = { "RosterChanged":      { "rev": uint64 } }
-node-event-fleet-changed        = { "FleetChanged":       { "rev": uint64 } }
-; v31: the profile set changed (author/edit/delete via operator op or the profile_manage tool) ->
-; refetch ProfileList. Like RosterChanged/FleetChanged, a payload-free pointer with a coalescing rev.
-node-event-profiles-changed     = { "ProfilesChanged":   { "rev": uint64 } }
-node-event-approval-pending     = { "ApprovalPending":    { "session": session-id, "request_id": tstr } }
 ; v26: byte counters ride the event (throttled byte-level emission node-side).
 ; v48: + node-computed transfer rate / remaining-time estimate (absent until the first sample).
 node-event-download-progress    = { "DownloadProgress":   { "id": download-id, "pct": uint, "state": tstr, "downloaded_bytes": uint64, "total_bytes": uint64, ? "rate_bps": (uint64 / null), ? "eta_seconds": (uint64 / null), ? "result_model_id": (model-id / null) } }
 ; v48: a quantize job advanced (state transitions; the Completed emit carries the produced catalog
 ; id) — the push that retires the client's ModelQuantizes poll.
 node-event-quantize-progress    = { "QuantizeProgress":   { "id": quantize-id, "state": tstr, ? "model_id": (model-id / null), ? "error": (tstr / null) } }
-; v26: the installed-model registry changed (download cataloged / model deleted) -> refetch ModelCatalog.
-; rung 1 (api/39): gains a coalescing rev (breaking arm-shape change, bundled into the deferred bump).
-node-event-catalog-changed      = { "CatalogChanged":     { "rev": uint64 } }
 ; v29: a transport instance's connection/presence changed (adapter serve start / teardown / crash),
 ; carrying the full new state so clients stop navigation-polling TransportInstances.
 node-event-transport-changed    = { "TransportChanged":   { "transport": transport-id, "connection": connection-state, ? "presence": presence-state, ? "reason": (disconnect-reason / null), ? "message": (tstr / null), ? "fatal": bool, ? "origin_op": (origin-op / null) } }
-; rung 1 (api/39): + per-transport conversation-set rev (echoed by conv-page).
-node-event-conversations-changed = { "ConversationsChanged": { "transport": transport-id, "conv": tstr, "change": conv-change, "rev": uint64, ? "origin_op": (origin-op / null) } }
-node-event-membership-changed   = { "MembershipChanged":  { "transport": transport-id, "conv": tstr, "member": tstr, "change": membership-change, ? "actor": (tstr / null), ? "reason": (tstr / null), "is_self": bool, ? "origin_op": (origin-op / null) } }
-; rung 1 (api/39): + per-transport contact-roster rev (echoed by contact-page).
-node-event-contacts-changed     = { "ContactsChanged":    { "transport": transport-id, "rev": uint64 } }
 node-event-resync-needed        = { "ResyncNeeded":       { "scope": tstr } }
-; wire v37: the notification set changed (add/remove/read/delete) -> re-list NotificationList.
-; rung 1 (api/39): gains a coalescing rev (echoed by response-notifications).
-node-event-notifications-changed = { "NotificationsChanged": { "rev": uint64 } }
-; wire v37: the person registry changed (create/remove/associate/dissociate) -> re-list PersonList.
-; rung 1 (api/39): gains a coalescing rev (echoed by response-persons).
-node-event-persons-changed      = { "PersonsChanged":     { "rev": uint64 } }
-; wire v38: a conversation's durable chat journal grew (one Chat record appended) -> refetch
-; ConvHistory from the client's cursor. Granular per-(transport, conv), emitted once per message.
-; rung 3 (api/39): + `? "origin_op"` (carrier 3) — the client send op stamped at the
-; `LifecycleSink::chat_message` choke point (the same token as the journal record's `origin_op`).
-node-event-messages-changed     = { "MessagesChanged":    { "transport": transport-id, "conv": tstr, ? "origin_op": (origin-op / null) } }
-; vhc-training run pointer (spec §10.4): payload-free invalidation — the client refetches
-; VhcRunDetail. `run_id` absent => a roster-level change (a run appeared/vanished).
-node-event-vhc-changed        = { "VhcChanged":       { ? "run_id": tstr, "rev": uint64 } }
-; wire v46: the foreign-agent catalog changed (a discovery scan landed — presence immediately,
-; the background initialize-verification pass on completion — or an agent was registered/removed)
-; -> refetch AgentCatalog. Like ProfilesChanged, a payload-free pointer with a coalescing rev.
-node-event-agents-changed     = { "AgentsChanged":    { "rev": uint64 } }
 ; projection-sync (daemon-projection-sync-spec.md §3): THE generalized revisioned invalidation
-; pointer — "domain (projection, partition) is now at rev; refetch scope if you care". Dual-emitted
-; alongside the matching legacy arm during the migration window; the only invalidation event after
-; cutover. `projection-id` is a CLOSED enum (a new projection = a new arm here + census + policy).
+; pointer — "domain (projection, partition) is now at rev; refetch scope if you care". The only
+; invalidation event since the v51 cutover. `projection-id` is a CLOSED enum (a new projection =
+; a new arm here + census + policy).
 projection-id = "Sessions" / "Fleet" / "Profiles" / "Skills" / "Curator" / "Catalog" / "Agents"
               / "Approvals" / "Credentials" / "CustomProviders" / "Gateway" / "Tools"
               / "TelemetryConsent" / "CrashConsent" / "Cron" / "Presence" / "Routing"
@@ -1546,7 +1502,8 @@ request-unit-outbound = { "UnitOutbound": { "unit": unit-id, "max": uint } }
 request-session-history = { "SessionHistory": { "session": session-id, ? "after_cursor": uint64,
                                                 ? "before_cursor": uint64, "max": uint } }
 request-subscribe = { "Subscribe": { "session": session-id, "after_seq": uint64, "max": uint } }
-request-events-since = { "EventsSince": { "cursor": uint64, ? "wait_ms": (uint / null) } }
+; v51: `wait_ms` removed — the mux stream (`Open`) owns liveness; a one-shot read never blocks.
+request-events-since = { "EventsSince": { "cursor": uint64 } }
 request-delivery-targets = { "DeliveryTargets": { "session": session-id } }
 request-delivery-sessions = { "DeliverySessions": { "transport": transport-id, ? "after": (tstr / null) } }
 request-handover = { "Handover": { "session": session-id, "target": delivery-target } }
@@ -2375,8 +2332,14 @@ wire-c2s = wire-hello-c2s
          / wire-auth-step
          / wire-auth-resume
 
-wire-reply = { "Reply": { "id": uint64, "res": api-response } }
-wire-item  = { "Item":  { "id": uint64, "res": api-response } }
+; v51 (projection-sync stage 7): Reply/Item gain `? meta` — the COMPLETE response-metadata
+; envelope. `changes` (absent until stage 8 populates it from MutationEffects) lists the
+; (projection, partition, rev) domains this response's mutation touched, the client-side receipt
+; that retires refetch-after-write; future receipt/OCC fields extend response-metadata, not the
+; envelope. `domain-rev` is the same rule the bootstrap snapshot uses.
+response-metadata = { ? "changes": ([* domain-rev] / null) }
+wire-reply = { "Reply": { "id": uint64, "res": api-response, ? "meta": (response-metadata / null) } }
+wire-item  = { "Item":  { "id": uint64, "res": api-response, ? "meta": (response-metadata / null) } }
 wire-end   = { "End":   { "id": uint64, "error": (api-error / null) } }
 wire-reset = { "Reset": { "id": uint64, "epoch": uint64, "head_seq": uint64 } }
 ; The authenticated principal surfaced on AuthOk (wire mirror of daemon_auth::Principal).

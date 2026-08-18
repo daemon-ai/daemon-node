@@ -1133,9 +1133,10 @@ pub trait ControlApi: Send + Sync {
     }
 
     /// The node's live notification list (wire v37), newest first — the node-authoritative
-    /// [`NotificationInfo`] collection a client renders and re-lists on a
-    /// [`NodeEvent::NotificationsChanged`] pointer (ported from libpurple's `PurpleNotificationManager`).
-    /// Default: empty (a node assembled without a notification manager).
+    /// [`NotificationInfo`] collection a client renders and re-lists on a Notifications
+    /// [`NodeEvent::ProjectionChanged`] pointer (ported from libpurple's
+    /// `PurpleNotificationManager`). Default: empty (a node assembled without a notification
+    /// manager).
     async fn notification_list(&self) -> RevList<NotificationInfo> {
         RevList::default()
     }
@@ -1161,8 +1162,8 @@ pub trait ControlApi: Send + Sync {
     }
 
     /// The node's person/metacontact registry (wire v37), insertion order — the
-    /// node-authoritative [`Person`] collection a client renders and re-lists on a
-    /// [`NodeEvent::PersonsChanged`] pointer (ported from the person half of libpurple's
+    /// node-authoritative [`Person`] collection a client renders and re-lists on a Persons
+    /// [`NodeEvent::ProjectionChanged`] pointer (ported from the person half of libpurple's
     /// `PurpleContactManager`). `since_rev` (rung 2, api/39) requests a delta read — only the
     /// persons changed after that revision plus `removed` tombstones; an unservable revision
     /// degrades to the full list. Default: empty (a node assembled without a person registry).
@@ -1176,8 +1177,8 @@ pub trait ControlApi: Send + Sync {
     /// known-agent recipe table on the daemon's `PATH` and answer **immediately** with the
     /// presence results (installed rows surface `Unverified`). The ACP `initialize` handshakes
     /// that confirm candidates (filling `version`/`capabilities` -> `Verified`) run as a
-    /// background pass; its completion updates the catalog and emits
-    /// [`NodeEvent::AgentsChanged`] (wire v46), so clients refetch rather than block on the
+    /// background pass; its completion updates the catalog and emits an Agents
+    /// [`NodeEvent::ProjectionChanged`], so clients refetch rather than block on the
     /// slowest probe. Stream-json entries are PATH-probed only. Agents outside the curated table
     /// reach the catalog through `agent_register`, not this scan. Operator-triggered (spawns
     /// subprocesses), like `model_search`. Default: empty.
@@ -3940,13 +3941,13 @@ pub trait LifecycleSink: Send + Sync {
     /// The NODE owns the consequences at this single seam, so every messaging adapter inherits
     /// them: it appends the message as a [`JournalRecordPayload::Chat`] record onto the
     /// conversation's verifiable journal stream (`conv:<transport>:<conv>`, the stream
-    /// `ConvHistory` pages) and then emits [`NodeEvent::MessagesChanged`]. Adapters never journal
-    /// conversation history themselves.
+    /// `ConvHistory` pages) and then emits a keyed Messages [`NodeEvent::ProjectionChanged`]
+    /// pointer. Adapters never journal conversation history themselves.
     ///
     /// `origin_op` (rung 3, api/39) is the OPAQUE node token an adapter hands back from the send
     /// seam where its protocol can round-trip one — the client-minted `op_id` of the causing
     /// `ConvSend`. The node stamps it as uniform `origin_op` provenance on both the journal record
-    /// and the `MessagesChanged` pointer (it never interprets the token). `None` for inbound
+    /// and the Messages pointer (it never interprets the token). `None` for inbound
     /// deliveries and token-incapable adapters — the null-provenance path (degraded, never
     /// heuristic).
     async fn chat_message(
@@ -4733,7 +4734,8 @@ pub struct LogPageView {
 // Node-wide event feed DTOs (L3; daemon-sync-protocol-spec.md §5)
 // ---------------------------------------------------------------------------
 
-/// A coarse conversation-set delta (wire v30; [`NodeEvent::ConversationsChanged`]).
+/// A coarse conversation-set delta (wire v30; the adapter lifecycle seam — the node reduces it
+/// to a keyed Conversations [`NodeEvent::ProjectionChanged`]).
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConvChange {
@@ -4743,7 +4745,8 @@ pub enum ConvChange {
     Removed,
 }
 
-/// A membership transition (wire v30; [`NodeEvent::MembershipChanged`]).
+/// A membership transition (wire v30; the adapter lifecycle seam — the node reduces it to a
+/// keyed Conversations [`NodeEvent::ProjectionChanged`]).
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MembershipChange {
@@ -4867,42 +4870,6 @@ pub enum NodeEvent {
         /// The highest `seq` now retained.
         head_seq: u64,
     },
-    /// A session's roster metadata changed (rename / pin / archive / activity).
-    SessionMetaChanged {
-        /// The affected session.
-        session: SessionId,
-        /// The roster revision at the change.
-        rev: u64,
-        /// Rung 3 (api/39) uniform provenance (carrier 3): the causing op's `op_id` when the
-        /// emit site knows it (a `SessionUpdateMeta` carrying one); `None` otherwise.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        origin_op: Option<String>,
-    },
-    /// The roster set changed (a session opened/closed/moved); the client refetches (delta in L4).
-    RosterChanged {
-        /// The new roster revision.
-        rev: u64,
-    },
-    /// The fleet/subagent tree changed (a unit spawned / changed state / finished); the client
-    /// refetches `Tree`. Like `RosterChanged`, a payload-free pointer carrying a coalescing `rev`.
-    FleetChanged {
-        /// The new fleet revision.
-        rev: u64,
-    },
-    /// The profile set changed (wire v31): a profile was authored/edited/deleted by an operator op
-    /// or the agent `profile_manage` tool; the client refetches the profile list (`ProfileList`).
-    /// Like `RosterChanged`/`FleetChanged`, a payload-free pointer carrying a coalescing `rev`.
-    ProfilesChanged {
-        /// The new profiles revision.
-        rev: u64,
-    },
-    /// An approval is pending operator action.
-    ApprovalPending {
-        /// The session it belongs to.
-        session: SessionId,
-        /// The approval's request id.
-        request_id: String,
-    },
     /// A model download advanced (replaces the client's poll). Emitted from the byte-level
     /// transfer sink, throttled node-side (>= 1 percent-point advance or >= 500 ms since the last
     /// emit), plus on every state transition and per-file completion.
@@ -4945,15 +4912,6 @@ pub enum NodeEvent {
         #[serde(default)]
         error: Option<String>,
     },
-    /// The installed-model registry changed (a finished download was cataloged / a model was
-    /// deleted): the client refetches `ModelCatalog`. Globally coalesced in the backlog (a refetch
-    /// always reads the whole catalog); carries a coalescing `rev` (rung 1, api/39) the client
-    /// compares against `ModelCatalog`'s echoed rev to skip an unchanged refetch.
-    CatalogChanged {
-        /// The new catalog revision (rung 1). In-memory; a restart resets it -> stale rev degrades
-        /// to a full read (the roster's shipped fallback).
-        rev: u64,
-    },
     /// An events-io transport instance's connection/presence changed (wire v29): emitted at the
     /// coarse real transitions (adapter serve start with the instance's reported state, clean
     /// teardown -> `Offline`, a crashed serve loop -> `Error`), carrying the full new state so a
@@ -4981,131 +4939,17 @@ pub enum NodeEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin_op: Option<String>,
     },
-    /// A transport's conversation set changed (wire v30): a conversation was added or removed.
-    /// Retires client `ConvList` re-polling — a pointer; the client refetches `ConvGet`/`ConvList`.
-    ConversationsChanged {
-        /// The owning transport instance.
-        transport: TransportId,
-        /// The affected conversation id.
-        conv: String,
-        /// Added or removed.
-        change: ConvChange,
-        /// The owning transport's conversation-set revision at this change (rung 1, api/39); the
-        /// client compares it against `conv-page`'s echoed rev to reconcile drift. Per-transport,
-        /// in-memory (a restart resets it -> full read).
-        rev: u64,
-        /// Rung 3 (api/39) uniform provenance (carrier 3): the causing op's `op_id` when the
-        /// emit site knows it; `None` otherwise (adapter-reported changes have no local token).
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        origin_op: Option<String>,
-    },
-    /// A conversation's membership changed (wire v30). A granular invalidation pointer; on an
-    /// `is_self` removal (`Left`/`Kicked`/`Banned`) the node has ALREADY reconciled its own routing
-    /// registry (dropped the now-dangling `ChatRoute` pin for that origin) before emitting this.
-    MembershipChanged {
-        /// The owning transport instance.
-        transport: TransportId,
-        /// The affected conversation id.
-        conv: String,
-        /// The adapter-opaque member handle whose membership changed (e.g. a Matrix MXID). Clients
-        /// re-fetch richer detail via `ConvGet`.
-        member: String,
-        /// What happened to `member`.
-        change: MembershipChange,
-        /// Who performed the action (the inviter/kicker/banner), when known.
-        #[serde(default)]
-        actor: Option<String>,
-        /// A reason string (kick/ban reason), when the transport supplies one.
-        #[serde(default)]
-        reason: Option<String>,
-        /// Whether `member` is THIS account. On a self `Left`/`Kicked`/`Banned` the node reconciled
-        /// its routing for the now-dangling origin before emitting.
-        is_self: bool,
-        /// Rung 3 (api/39) uniform provenance (carrier 3): the causing op's `op_id` when the
-        /// emit site knows it (a member-invite/remove/ban carrying one); `None` otherwise.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        origin_op: Option<String>,
-    },
-    /// A transport's server-side contact roster changed (wire v34): a contact was added, updated, or
-    /// removed. A payload-free-per-transport invalidation pointer (named `ContactsChanged` to avoid
-    /// colliding with the session-roster [`NodeEvent::RosterChanged`]); the client refetches the
-    /// roster (`RosterList`). Retires client roster re-polling.
-    ContactsChanged {
-        /// The owning transport instance whose roster changed.
-        transport: TransportId,
-        /// The owning transport's contact-roster revision at this change (rung 1, api/39); the
-        /// client compares it against `contact-page`'s echoed rev to skip an unchanged refetch.
-        /// Per-transport, in-memory (a restart resets it -> full read).
-        rev: u64,
-    },
     /// The feed could not serve from the client's cursor (aged out / lagged); the client must
     /// re-baseline the named scope ("roster" / "all" / ...).
     ResyncNeeded {
         /// The scope to refetch.
         scope: String,
     },
-    /// The node's notification set changed (wire v37): a notification was added, removed, read, or
-    /// deleted. A payload-free node-wide invalidation pointer (clients re-list via `NotificationList`),
-    /// mirroring [`NodeEvent::CatalogChanged`] — the whole list is cheap to refetch. Carries a
-    /// coalescing `rev` (rung 1, api/39) the client compares against `Notifications`' echoed rev
-    /// to skip an unchanged refetch.
-    NotificationsChanged {
-        /// The new notifications revision (rung 1). In-memory; a restart resets it -> full read.
-        rev: u64,
-    },
-    /// The node's person/metacontact registry changed (wire v37): a person was created or removed,
-    /// or a contact endpoint was associated/dissociated. A node-wide invalidation pointer (clients
-    /// re-list via `PersonList`), mirroring [`NodeEvent::NotificationsChanged`]. Carries a
-    /// coalescing `rev` (rung 1, api/39) the client compares against `Persons`' echoed rev.
-    PersonsChanged {
-        /// The new persons revision (rung 1). In-memory; a restart resets it -> full read.
-        rev: u64,
-    },
-    /// A conversation's durable chat history grew (wire v38): a messaging adapter recorded an
-    /// inbound or outbound [`ChatMessage`] as a [`JournalRecordPayload::Chat`] record on the
-    /// conversation's journal stream (`conv:<transport>:<conv>`). A granular invalidation pointer,
-    /// emitted once per appended message — the client refetches `ConvHistory` from its cursor
-    /// instead of re-polling the whole transcript.
-    MessagesChanged {
-        /// The owning transport instance.
-        transport: TransportId,
-        /// The affected conversation id.
-        conv: String,
-        /// Rung 3 (api/39) uniform provenance (carrier 3): the client-minted `op_id` of the
-        /// send that caused this message, stamped at the `LifecycleSink::chat_message` choke point
-        /// (the same token the node stamps as `origin_op` on the journal record). `None` for
-        /// inbound messages / token-incapable adapters.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        origin_op: Option<String>,
-    },
-    /// A vhc run changed (spec §10.4): its phase/round/contribution advanced, a run was
-    /// discovered/joined/left, or an event was appended to its windowed log. A payload-free
-    /// invalidation pointer (ADR-003) — the client refetches [`VhcRunDetail`] (whose
-    /// `recent_events` carries the windowed [`VhcEvent`]s, §10.3). This is how a live
-    /// `vhc_subscribe` rides the **existing** `events_subscribe` feed (no new transport). A `None`
-    /// `run_id` is a roster-level change (a run appeared/vanished); the client refetches the list.
-    VhcChanged {
-        /// The affected run, or `None` for a roster-level change.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        run_id: Option<String>,
-        /// The coalescing vhc-feed revision (compared to skip an unchanged refetch).
-        rev: u64,
-    },
-    /// The foreign-agent catalog changed (wire v46): a discovery scan landed (the immediate
-    /// PATH-presence pass, or the background `initialize` verification pass completing), or an
-    /// agent was registered/removed. A payload-free node-wide invalidation pointer (clients
-    /// refetch `AgentCatalog`), mirroring [`NodeEvent::ProfilesChanged`]. Carries a coalescing
-    /// `rev` so a burst of scan updates collapses to one refetch.
-    AgentsChanged {
-        /// The new agents-catalog revision. In-memory; a restart resets it -> full read.
-        rev: u64,
-    },
     /// Projection-sync (daemon-projection-sync-spec.md §3): THE generalized revisioned
     /// invalidation pointer — "domain `(projection, partition)` is now at `rev`; refetch `scope`
-    /// if you care". During the migration window the node dual-emits this alongside the matching
-    /// legacy arm above; at cutover the migrated legacy arms are removed and this is the only
-    /// invalidation event. Specialized events (`SessionAdvanced`, progress, `TransportChanged`
-    /// live presence, `ResyncNeeded`) are NOT invalidations and stay as they are.
+    /// if you care". The ONLY invalidation event since the stage-7 cutover (the per-domain legacy
+    /// arms are gone). Specialized events (`SessionAdvanced`, progress, `TransportChanged` live
+    /// presence, `ResyncNeeded`) are NOT invalidations and stay as they are.
     ProjectionChanged {
         /// The projection that changed.
         projection: ProjectionId,
@@ -5955,9 +5799,15 @@ mod tests {
             assert_eq!(resp, from_cbor::<ApiResponse>(&to_cbor(&resp)).unwrap());
         }
 
-        // The ContactsChanged event round-trips inside an EventsPage (its wire carrier).
+        // A Contacts invalidation pointer round-trips inside an EventsPage (its wire carrier).
         let wrapped = EventsPage {
-            events: vec![NodeEvent::ContactsChanged { transport, rev: 0 }],
+            events: vec![NodeEvent::ProjectionChanged {
+                projection: ProjectionId::Contacts,
+                partition: Some(transport.as_str().to_string()),
+                scope: ChangeScope::All,
+                rev: 0,
+                origin_op: None,
+            }],
             next_cursor: 1,
             head_cursor: 1,
             epoch: None,

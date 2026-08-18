@@ -3660,12 +3660,11 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
     use daemon_api::{
         AccountSettingsSchema, AdapterCapabilities, AdapterInfo, ApiRequest, ApiResponse,
         ApprovalInfo, ChatMessage, CommandInvocation, CommandOutput, ConnectionState, ContactInfo,
-        ContactsOps, ConvChange, ConversationOps, CredentialInfo, DisconnectReason, EventsPage,
-        HealthReport, JournalPageView, JournalRecord, JournalRecordPayload, LogPageView,
-        MembershipChange, MembershipOps, MessageAttachment, ModelDescriptor, NodeEvent,
-        Participant, PolicyEntry, PresenceState, ProfileInfo, ProfileSpec, ProviderDescriptor,
-        ProviderKindWire, ProviderSelector, ProviderSignIn, RosterOps, ServiceHealth, SessionPage,
-        TransportInstanceInfo,
+        ContactsOps, ConversationOps, CredentialInfo, DisconnectReason, EventsPage, HealthReport,
+        JournalPageView, JournalRecord, JournalRecordPayload, LogPageView, MembershipOps,
+        MessageAttachment, ModelDescriptor, NodeEvent, Participant, PolicyEntry, PresenceState,
+        ProfileInfo, ProfileSpec, ProviderDescriptor, ProviderKindWire, ProviderSelector,
+        ProviderSignIn, RosterOps, ServiceHealth, SessionPage, TransportInstanceInfo,
     };
     use daemon_common::{Author, ProfileRef, ReqId, SessionId};
     use daemon_protocol::{AgentCommand, ToolDetail, TransportId, UserMsg};
@@ -3732,10 +3731,7 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
     write_cbor(
         &out,
         "request-events-since.cbor",
-        &ApiRequest::EventsSince {
-            cursor: 0,
-            wait_ms: Some(1000),
-        },
+        &ApiRequest::EventsSince { cursor: 0 },
     )?;
     write_cbor(
         &out,
@@ -4948,16 +4944,8 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
         "response-events-page.cbor",
         &ApiResponse::EventsPage(EventsPage {
             events: vec![
-                NodeEvent::RosterChanged { rev: 7 },
-                // v31: the profile-list-changed pointer, so verify-codec proves the generated
-                // decoder accepts the new node-event arm.
-                NodeEvent::ProfilesChanged { rev: 3 },
-                NodeEvent::ApprovalPending {
-                    session: SessionId::new("fixture-session"),
-                    request_id: "req-1".into(),
-                },
-                // v26: byte counters on the throttled download-progress event + the payload-free
-                // catalog-changed pointer, so verify-codec proves the generated decoder takes both.
+                // v26: byte counters on the throttled download-progress event, so verify-codec
+                // proves the generated decoder takes them.
                 NodeEvent::DownloadProgress {
                     id: daemon_common::DownloadId(1),
                     pct: 50,
@@ -4981,7 +4969,6 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                     model_id: Some(daemon_common::ModelId::new("hf/org/repo/model-Q4_K_M.gguf")),
                     error: None,
                 },
-                NodeEvent::CatalogChanged { rev: 2 },
                 // v29: the presence-push event, so verify-codec proves the generated decoder
                 // accepts the new node-event arm + the connection/presence enums it carries.
                 NodeEvent::TransportChanged {
@@ -5004,48 +4991,10 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                     fatal: false,
                     origin_op: None,
                 },
-                // v30: the two membership-push tiers.
-                NodeEvent::ConversationsChanged {
-                    transport: TransportId::new("matrix/@bot:hs.org"),
-                    conv: "!room:hs.org".into(),
-                    change: ConvChange::Added,
-                    // rung 1 (api/39): the per-transport conversation-set rev.
-                    rev: 2,
-                    // rung 3 (api/39): carrier-3 provenance (null on adapter-reported changes).
-                    origin_op: None,
-                },
-                NodeEvent::MembershipChanged {
-                    transport: TransportId::new("matrix/@bot:hs.org"),
-                    conv: "!room:hs.org".into(),
-                    member: "@bot:hs.org".into(),
-                    change: MembershipChange::Kicked,
-                    actor: Some("@admin:hs.org".into()),
-                    reason: Some("cleanup".into()),
-                    is_self: true,
-                    origin_op: None,
-                },
-                // v34: the roster-changed pointer, so verify-codec proves the generated decoder
-                // accepts the new node-event arm.
-                NodeEvent::ContactsChanged {
-                    transport: TransportId::new("matrix/@bot:hs.org"),
-                    // rung 1 (api/39): the per-transport contact-roster rev.
-                    rev: 5,
-                },
-                // wire v37 + rung 1 (api/39): the notifications-changed pointer with its rev.
-                NodeEvent::NotificationsChanged { rev: 4 },
-                // wire v37 + rung 1 (api/39): the persons-changed pointer with its rev.
-                NodeEvent::PersonsChanged { rev: 6 },
-                // wire v38: the per-message conversation-history pointer (chat journal), so
-                // verify-codec proves the generated decoder accepts the new node-event arm.
-                NodeEvent::MessagesChanged {
-                    transport: TransportId::new("matrix/@bot:hs.org"),
-                    conv: "!room:hs.org".into(),
-                    // rung 3 (api/39): carrier-3 provenance — the client send op that caused it.
-                    origin_op: Some("018f3b9c-op".into()),
-                },
-                // Projection-sync stage 2: the generalized invalidation pointer, in both scope
-                // forms (All / Key) with and without a partition + provenance, so verify-codec
-                // proves the generated decoder accepts the new arm and its nested enums.
+                // Projection-sync stage 7: the generalized invalidation pointer — THE ONLY
+                // invalidation arm since cutover — in both scope forms (All / Key) with and
+                // without a partition + provenance, so verify-codec proves the generated decoder
+                // accepts the arm and its nested enums.
                 NodeEvent::ProjectionChanged {
                     projection: daemon_api::ProjectionId::Credentials,
                     partition: None,
@@ -5414,6 +5363,15 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
             &WireS2C::Reply {
                 id: 1,
                 res: ApiResponse::Ok,
+                // Stage 7: the complete (optional) response-metadata envelope, populated here so
+                // verify-codec proves the generated decoder accepts a receipt-carrying reply.
+                meta: Some(daemon_api::ResponseMetadata {
+                    changes: Some(vec![daemon_api::DomainRev {
+                        projection: daemon_api::ProjectionId::Sessions,
+                        partition: None,
+                        rev: 7,
+                    }]),
+                }),
             },
         )?;
         write_cbor(
@@ -5427,6 +5385,8 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                     head_seq: 0,
                     epoch: 0,
                 }),
+                // Absent metadata (the common shape today) — proves the field is optional.
+                meta: None,
             },
         )?;
         write_cbor(

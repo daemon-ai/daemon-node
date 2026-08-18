@@ -3,8 +3,8 @@
 
 //! Conversation chat journal (wire v38): the `LifecycleSink::chat_message` seam appends a
 //! `JournalRecordPayload::Chat` record onto the conversation's verifiable journal stream
-//! (`conv:<transport>:<conv>` — the stream `ConvHistory` pages) and emits the granular
-//! `NodeEvent::MessagesChanged` pointer, once per message. The seam is the single choke point every
+//! (`conv:<transport>:<conv>` — the stream `ConvHistory` pages) and emits the granular keyed
+//! Messages `ProjectionChanged` pointer, once per message. The seam is the single choke point every
 //! messaging adapter reports through, so journaling + announcement are inherited, never re-derived
 //! per adapter.
 
@@ -65,12 +65,16 @@ fn assemble_min() -> AssembledNode {
     })
 }
 
-/// The new node-event variant survives the shared CBOR codec (the additive wire v38 arm).
+/// The keyed Messages invalidation pointer survives the shared CBOR codec.
 #[test]
 fn messages_changed_round_trips() {
-    let ev = NodeEvent::MessagesChanged {
-        transport: TransportId::new("matrix/@bot:hs.org"),
-        conv: "!room:hs.org".into(),
+    let ev = NodeEvent::ProjectionChanged {
+        projection: daemon_api::ProjectionId::Messages,
+        partition: Some("matrix/@bot:hs.org".into()),
+        scope: daemon_api::ChangeScope::Key {
+            key: "!room:hs.org".into(),
+        },
+        rev: 1,
         origin_op: None,
     };
     assert_eq!(ev, from_cbor::<NodeEvent>(&to_cbor(&ev)).unwrap());
@@ -78,7 +82,7 @@ fn messages_changed_round_trips() {
 
 /// One `chat_message` report through the node's lifecycle sink lands as ONE verified
 /// `JournalRecordPayload::Chat` entry on `conv:<transport>:<conv>` (readable via `conv_history`,
-/// with the `ChatMessage` intact) and raises ONE `MessagesChanged { transport, conv }` on the
+/// with the `ChatMessage` intact) and raises ONE keyed Messages `ProjectionChanged` on the
 /// node-wide feed. A second report appends after the first (stable, strictly-increasing cursors;
 /// `after_cursor` pages past the first record).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -128,20 +132,22 @@ async fn sink_chat_message_journals_and_emits() {
             other => panic!("expected JournalRecordPayload::Chat, got {other:?}"),
         }
 
-        // The granular pointer is on the L3 feed, carrying the same (transport, conv).
+        // The granular pointer is on the L3 feed, carrying the same (transport, conv) as
+        // (partition, scope key) on the keyed Messages envelope.
+        let is_conv_pointer = |e: &NodeEvent| {
+            matches!(
+                e,
+                NodeEvent::ProjectionChanged {
+                    projection: daemon_api::ProjectionId::Messages,
+                    partition: Some(p),
+                    scope: daemon_api::ChangeScope::Key { key },
+                    ..
+                } if p == transport.as_str() && key == conv
+            )
+        };
         let events = node.events_page(0, 0).await;
-        let pointers = events
-            .events
-            .iter()
-            .filter(|e| {
-                matches!(
-                    e,
-                    NodeEvent::MessagesChanged { transport: t, conv: c, .. }
-                        if t == &transport && c == conv
-                )
-            })
-            .count();
-        assert_eq!(pointers, 1, "one append = one MessagesChanged pointer");
+        let pointers = events.events.iter().filter(|e| is_conv_pointer(e)).count();
+        assert_eq!(pointers, 1, "one append = one keyed Messages pointer");
 
         // A second (outbound, account-authored) message appends AFTER the first.
         let outbound = ChatMessage::new(None, "reply from the account");
@@ -164,14 +170,19 @@ async fn sink_chat_message_journals_and_emits() {
         assert_eq!(tail.entries.len(), 1, "after_cursor skips the first record");
         assert_eq!(tail.entries[0].cursor, page.entries[1].cursor);
 
+        // Two appends on ONE conversation share a (projection, partition, scope) — the §7
+        // coalescing matrix keeps the latest pointer only (a client refetch covers both).
         let pointers = node
             .events_page(0, 0)
             .await
             .events
             .iter()
-            .filter(|e| matches!(e, NodeEvent::MessagesChanged { .. }))
+            .filter(|e| is_conv_pointer(e))
             .count();
-        assert_eq!(pointers, 2, "MessagesChanged is emitted once per append");
+        assert_eq!(
+            pointers, 1,
+            "same-conv Messages pointers coalesce in the backlog"
+        );
     })
     .await;
 }

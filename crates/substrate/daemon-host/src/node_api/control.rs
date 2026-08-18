@@ -431,11 +431,7 @@ impl ControlApi for NodeApiImpl {
         if let Some(feed) = self.node_feed() {
             let origin_op = daemon_api::current_op_id();
             let rev = feed.note_roster_change_op(&session, origin_op.clone());
-            feed.emit(NodeEvent::SessionMetaChanged {
-                session,
-                rev,
-                origin_op,
-            });
+            feed.emit_session_meta(&session, rev, origin_op);
         }
         Ok(())
     }
@@ -921,7 +917,7 @@ impl ControlApi for NodeApiImpl {
         // other clients' rosters are stale (previously silent until the engine's first advance).
         if let Some(feed) = self.node_feed() {
             let rev = feed.note_roster_change(&session);
-            feed.emit(NodeEvent::RosterChanged { rev });
+            feed.emit_roster(rev);
         }
         // Wake it: the activation manager runs (or resumes) the engine; the resident services then
         // carry the durable delegate -> suspend -> resume -> complete cycle forward.
@@ -944,11 +940,7 @@ impl ControlApi for NodeApiImpl {
         // stale "running" badge (the engine's own terminal advance may lag or never come).
         if let Some(feed) = self.node_feed() {
             let rev = feed.note_roster_change(&session);
-            feed.emit(NodeEvent::SessionMetaChanged {
-                session,
-                rev,
-                origin_op: daemon_api::current_op_id(),
-            });
+            feed.emit_session_meta(&session, rev, daemon_api::current_op_id());
         }
         Ok(())
     }
@@ -2619,11 +2611,7 @@ impl ControlApi for NodeApiImpl {
         // workspace/state — invalidate its row so other clients refetch.
         if let Some(feed) = self.node_feed() {
             let rev = feed.note_roster_change(&session);
-            feed.emit(NodeEvent::SessionMetaChanged {
-                session,
-                rev,
-                origin_op: daemon_api::current_op_id(),
-            });
+            feed.emit_session_meta(&session, rev, daemon_api::current_op_id());
         }
         Ok(())
     }
@@ -2870,11 +2858,7 @@ impl ControlApi for NodeApiImpl {
             // own `SessionAdvanced` only reaches clients watching that stream).
             if let Some(feed) = self.node_feed() {
                 let rev = feed.note_roster_change(&session);
-                feed.emit(NodeEvent::SessionMetaChanged {
-                    session,
-                    rev,
-                    origin_op: daemon_api::current_op_id(),
-                });
+                feed.emit_session_meta(&session, rev, daemon_api::current_op_id());
             }
             return Ok(());
         }
@@ -3049,14 +3033,20 @@ impl NodeApiImpl {
         entry.auth = Some(AgentAuth { state, methods });
     }
 
-    /// Emit the node-wide `AgentsChanged` pointer (wire v46) — the foreign-agent catalog changed
+    /// Emit the node-wide Agents invalidation pointer — the foreign-agent catalog changed
     /// (a discovery pass landed, or an agent was registered/removed), so subscribed clients
-    /// refetch `AgentCatalog`. Bumps + stamps the coalescing agents revision, mirroring
-    /// `ProfilesChanged`. A no-op when no node-event feed is wired (tests / a minimal node).
+    /// refetch `AgentCatalog`. Bumps + stamps the coalescing agents revision. A no-op when no
+    /// node-event feed is wired (tests / a minimal node).
     pub(super) fn emit_agents_changed(&self) {
         if let Some(feed) = self.node_feed() {
             let rev = feed.note_agents_change();
-            feed.emit(daemon_api::NodeEvent::AgentsChanged { rev });
+            feed.emit_projection(
+                daemon_api::ProjectionId::Agents,
+                None,
+                daemon_api::ChangeScope::All,
+                rev,
+                None,
+            );
         }
     }
 

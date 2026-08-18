@@ -24,8 +24,8 @@ use crate::ApiError;
 
 /// A live, push-based stream of [`VhcEvent`]s — the delivery shape [`VhcApi::vhc_subscribe`]
 /// returns for the in-process transport and the node `VhcService`'s own broadcast. Over the socket
-/// mux, live vhc updates ride the **existing** node-event feed as payload-free
-/// [`NodeEvent::VhcChanged`](crate::NodeEvent::VhcChanged) pointers (the client refetches
+/// mux, live vhc updates ride the **existing** node-event feed as payload-free Vhc
+/// [`NodeEvent::ProjectionChanged`](crate::NodeEvent::ProjectionChanged) pointers (the client refetches
 /// [`VhcRunDetail`], whose `recent_events` carries the windowed events, §10.3) — no new transport.
 pub type VhcEventStream = BoxStream<'static, VhcEvent>;
 

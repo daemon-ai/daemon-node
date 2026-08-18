@@ -304,9 +304,9 @@ impl NodeApiImpl {
         owner_visible(&principal, &owner)
     }
 
-    /// Auth 4 (F4) + projection-sync §6: keep only the node-events `principal` may see. The three
-    /// session-bearing variants (`SessionAdvanced`/`SessionMetaChanged`/`ApprovalPending`) are
-    /// dropped unless the referenced session's owner is visible to `principal` (`owner_visible`
+    /// Auth 4 (F4) + projection-sync §6: keep only the node-events `principal` may see.
+    /// `SessionAdvanced` is dropped unless the referenced session's owner is visible to
+    /// `principal` (`owner_visible`
     /// grants `SessionSeeAll` holders everything); a `ProjectionChanged` is classed by its
     /// projection's [`visibility_class`](super::projection_policy::visibility_class) —
     /// OwnerScoped Key events resolve the key's session owner, All-scope rev pointers pass (the
@@ -325,9 +325,7 @@ impl NodeApiImpl {
         let mut kept = Vec::with_capacity(page.events.len());
         for ev in page.events {
             let session = match &ev {
-                NodeEvent::SessionAdvanced { session, .. }
-                | NodeEvent::SessionMetaChanged { session, .. }
-                | NodeEvent::ApprovalPending { session, .. } => Some(session.clone()),
+                NodeEvent::SessionAdvanced { session, .. } => Some(session.clone()),
                 // An OwnerScoped Key-scoped envelope names a session id as its key (Sessions and
                 // Approvals both partition by session); resolve its owner like the legacy arms.
                 NodeEvent::ProjectionChanged {
@@ -411,7 +409,7 @@ impl NodeApiImpl {
         }
     }
 
-    /// Emit the L3 `SessionMetaChanged` notification for a stale roster row (recency / title / pin /
+    /// Emit the L3 Sessions Key-scope pointer for a stale roster row (recency / title / pin /
     /// archive change). No-op when no event feed is wired.
     fn emit_session_meta_changed(&self, session: &SessionId) {
         if let Some(feed) = self.node_feed() {
@@ -420,11 +418,7 @@ impl NodeApiImpl {
             // stamps outside any op context. Uniform — the same call reads the dispatch context.
             let origin_op = daemon_api::current_op_id();
             let rev = feed.note_roster_change_op(session, origin_op.clone());
-            feed.emit(NodeEvent::SessionMetaChanged {
-                session: session.clone(),
-                rev,
-                origin_op,
-            });
+            feed.emit_session_meta(session, rev, origin_op);
         }
     }
 

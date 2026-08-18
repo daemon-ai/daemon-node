@@ -927,11 +927,11 @@ fn bind_node_api_surfaces(
 }
 
 /// L3 fleet liveness: bridge the fleet topology bus (`fleet_events`, consumed by `tree_subscribe`)
-/// onto the node-wide feed as a coalesced `FleetChanged`, so `events_since` clients learn the
+/// onto the node-wide feed as a coalesced Fleet invalidation, so `events_since` clients learn the
 /// subagent tree changed (spawn / state / finish) and re-fetch `Tree` live - without threading the
 /// feed through the orchestration crate (only `NodeApiImpl`/`LiveSessions` can reach it directly).
-/// `FleetChanged` coalesces in the feed ring, so a spawn burst is one client refetch; a `Lagged`
-/// (the bridge fell behind the bus) is itself just "the tree changed".
+/// The Fleet pointer coalesces in the feed ring, so a spawn burst is one client refetch; a
+/// `Lagged` (the bridge fell behind the bus) is itself just "the tree changed".
 fn spawn_fleet_change_bridge(shared: &Shared) {
     let feed = shared.node_events.clone();
     let mut rx = shared.fleet_events.subscribe();
@@ -940,7 +940,13 @@ fn spawn_fleet_change_bridge(shared: &Shared) {
         // Loop until the bus closes; both a value and a `Lagged` mean "the tree changed".
         while let Ok(_) | Err(RecvError::Lagged(_)) = rx.recv().await {
             let rev = feed.note_fleet_change();
-            feed.emit(daemon_api::NodeEvent::FleetChanged { rev });
+            feed.emit_projection(
+                daemon_api::ProjectionId::Fleet,
+                None,
+                daemon_api::ChangeScope::All,
+                rev,
+                None,
+            );
         }
     });
 }
@@ -1019,7 +1025,13 @@ fn bind_model_surface(mut node_api: NodeApiImpl, a: &NodeAssembly, shared: &Shar
         models.set_catalog_changed(Arc::new(move || {
             // rung 1: bump the catalog rev (once per emit) and stamp it onto the pointer.
             let rev = feed.note_catalog_change();
-            feed.emit(daemon_api::NodeEvent::CatalogChanged { rev });
+            feed.emit_projection(
+                daemon_api::ProjectionId::Catalog,
+                None,
+                daemon_api::ChangeScope::All,
+                rev,
+                None,
+            );
         }));
         node_api = node_api.with_models(models, a.profile.as_str().to_string());
     }

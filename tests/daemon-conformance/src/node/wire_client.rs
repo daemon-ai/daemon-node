@@ -97,7 +97,7 @@ where
         self.send(WireC2S::Call { id, req }).await?;
         loop {
             match self.next().await? {
-                WireS2C::Reply { id: rid, res } if rid == id => return Ok(res),
+                WireS2C::Reply { id: rid, res, .. } if rid == id => return Ok(res),
                 WireS2C::End { id: rid, error } if rid == id => {
                     return Err(error.unwrap_or_else(|| {
                         ApiError::Other("stream ended without a reply".into())

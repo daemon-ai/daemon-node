@@ -204,7 +204,7 @@ impl BackgroundSpawner {
         // a background review child appears on other clients only after its first advance.
         if let Some(feed) = &self.feed {
             let rev = feed.note_roster_change(&child);
-            feed.emit(daemon_api::NodeEvent::RosterChanged { rev });
+            feed.emit_roster(rev);
         }
         self.store.enqueue_wake(child.clone()).await;
         Some(child)

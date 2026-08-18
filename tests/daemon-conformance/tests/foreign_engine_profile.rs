@@ -497,16 +497,20 @@ async fn agent_discover_replies_presence_first_and_pings_agents_changed() {
 
         let page = node.events_page(0, 0).await;
         assert!(
-            page.events
-                .iter()
-                .any(|e| matches!(e, daemon_api::NodeEvent::AgentsChanged { .. })),
-            "the discover presence pass pings AgentsChanged"
+            page.events.iter().any(|e| matches!(
+                e,
+                daemon_api::NodeEvent::ProjectionChanged {
+                    projection: daemon_api::ProjectionId::Agents,
+                    ..
+                }
+            )),
+            "the discover presence pass pings the Agents pointer"
         );
     })
     .await;
 }
 
-/// Wire v46: registering and removing an agent each ping `AgentsChanged`, so every subscribed
+/// Wire v46: registering and removing an agent each ping the Agents pointer, so every subscribed
 /// client (not just the caller) refetches the catalog without polling.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn agent_register_and_remove_ping_agents_changed() {
@@ -516,13 +520,17 @@ async fn agent_register_and_remove_ping_agents_changed() {
         register_mock_agent(&node, "feed-ping").await;
         let page = node.events_page(0, 0).await;
         assert!(
-            page.events
-                .iter()
-                .any(|e| matches!(e, daemon_api::NodeEvent::AgentsChanged { .. })),
-            "register pings AgentsChanged"
+            page.events.iter().any(|e| matches!(
+                e,
+                daemon_api::NodeEvent::ProjectionChanged {
+                    projection: daemon_api::ProjectionId::Agents,
+                    ..
+                }
+            )),
+            "register pings the Agents pointer"
         );
 
-        // Read past the register ping first — AgentsChanged coalesces globally in the backlog, so
+        // Read past the register ping first — the Agents pointer coalesces globally in the backlog, so
         // the remove's ping is only distinguishable from a cursor past the register's.
         let cursor = page.next_cursor;
         node.agent_remove("feed-ping".into())
@@ -530,10 +538,14 @@ async fn agent_register_and_remove_ping_agents_changed() {
             .expect("remove the registered agent");
         let page = node.events_page(cursor, 0).await;
         assert!(
-            page.events
-                .iter()
-                .any(|e| matches!(e, daemon_api::NodeEvent::AgentsChanged { .. })),
-            "remove pings AgentsChanged"
+            page.events.iter().any(|e| matches!(
+                e,
+                daemon_api::NodeEvent::ProjectionChanged {
+                    projection: daemon_api::ProjectionId::Agents,
+                    ..
+                }
+            )),
+            "remove pings the Agents pointer"
         );
     })
     .await;
@@ -820,9 +832,13 @@ async fn acp_session_detail_surfaces_advertised_commands_impl() {
     assert!(
         page.events.iter().any(|e| matches!(
             e,
-            daemon_api::NodeEvent::SessionMetaChanged { session: s, .. } if s == &session
+            daemon_api::NodeEvent::ProjectionChanged {
+                projection: daemon_api::ProjectionId::Sessions,
+                scope: daemon_api::ChangeScope::Key { key },
+                ..
+            } if key == session.as_str()
         )),
-        "a command-list change pings SessionMetaChanged for the session"
+        "a command-list change pings the keyed Sessions pointer for the session"
     );
 }
 

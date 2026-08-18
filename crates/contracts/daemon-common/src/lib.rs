@@ -867,7 +867,19 @@ impl WireVersion {
     /// `? force` with guarded-by-default semantics (an in-use removal is rejected naming the
     /// dependent profiles; `force` removes regardless). The app renders the node's answers — it
     /// never re-derives provider/kind/usage locally.
-    pub const CURRENT: Self = Self(50);
+    ///
+    /// (v51) projection-sync stage 7 cutover (daemon-projection-sync-spec.md §10): the 14 legacy
+    /// per-collection `node-event` invalidation arms (`SessionMetaChanged` / `RosterChanged` /
+    /// `FleetChanged` / `ProfilesChanged` / `ApprovalPending` / `CatalogChanged` /
+    /// `ConversationsChanged` / `MembershipChanged` / `ContactsChanged` / `NotificationsChanged` /
+    /// `PersonsChanged` / `MessagesChanged` / `VhcChanged` / `AgentsChanged`) are REMOVED —
+    /// `ProjectionChanged` is the only invalidation pointer (the non-invalidation arms
+    /// `SessionAdvanced` / `DownloadProgress` / `QuantizeProgress` / `TransportChanged` /
+    /// `ResyncNeeded` survive). `EventsSince` drops `wait_ms` (the mux stream owns liveness; the
+    /// one-shot read never blocks). The mux `Reply`/`Item` S2C frames gain `? meta`
+    /// (`response-metadata`: `? changes` — per-response `domain-rev` receipts, stage-8 OCC seam,
+    /// absent until then).
+    pub const CURRENT: Self = Self(51);
 
     /// The version this build speaks (alias for [`WireVersion::CURRENT`]).
     pub fn current() -> Self {

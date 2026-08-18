@@ -36,25 +36,23 @@ async fn tree_report_rev_echoes_fleet_changed_rev_impl() {
         other => panic!("expected Ok from Assign, got {other:?}"),
     }
 
-    // The bridge emits asynchronously; poll the retained feed until a FleetChanged lands, then take
+    // The bridge emits asynchronously; poll the retained feed until a Fleet pointer lands, then take
     // its (latest) rev — the value the Tree report must echo.
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut fleet_rev = None;
     while Instant::now() < deadline && fleet_rev.is_none() {
-        if let ApiResponse::EventsPage(page) = dispatch(
-            node.as_ref(),
-            ApiRequest::EventsSince {
-                cursor: 0,
-                wait_ms: None,
-            },
-        )
-        .await
+        if let ApiResponse::EventsPage(page) =
+            dispatch(node.as_ref(), ApiRequest::EventsSince { cursor: 0 }).await
         {
             fleet_rev = page
                 .events
                 .iter()
                 .filter_map(|e| match e {
-                    NodeEvent::FleetChanged { rev } => Some(*rev),
+                    NodeEvent::ProjectionChanged {
+                        projection: daemon_api::ProjectionId::Fleet,
+                        rev,
+                        ..
+                    } => Some(*rev),
                     _ => None,
                 })
                 .max();
@@ -63,7 +61,7 @@ async fn tree_report_rev_echoes_fleet_changed_rev_impl() {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
-    let fleet_rev = fleet_rev.expect("a delegation must raise FleetChanged on the feed");
+    let fleet_rev = fleet_rev.expect("a delegation must raise the Fleet pointer on the feed");
     assert!(fleet_rev >= 1, "the fleet rev must have advanced past 0");
 
     let tree_rev = match dispatch(node.as_ref(), ApiRequest::Tree { after: None }).await {
@@ -72,14 +70,14 @@ async fn tree_report_rev_echoes_fleet_changed_rev_impl() {
     };
     assert_eq!(
         tree_rev, fleet_rev,
-        "tree-report.rev must echo the current FleetChanged.rev"
+        "tree-report.rev must echo the current Fleet pointer rev"
     );
 
     handle.shutdown().await;
 }
 
 /// A person-registry mutation bumps the persons rev exactly once per change and `PersonList` echoes
-/// the current value, so the pointer (`PersonsChanged.rev`) and the read agree on the generation.
+/// the current value, so the Persons pointer rev and the read agree on the generation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn person_add_bumps_persons_rev_once_and_list_echoes_it() {
     as_system(person_add_bumps_persons_rev_once_and_list_echoes_it_impl()).await;
@@ -107,30 +105,27 @@ async fn person_add_bumps_persons_rev_once_and_list_echoes_it_impl() {
         "the second add bumps it exactly once more (not twice per emit)"
     );
 
-    // The feed carries a PersonsChanged per add, and its latest rev matches the list's echo.
-    let latest_pointer_rev = match dispatch(
-        node.as_ref(),
-        ApiRequest::EventsSince {
-            cursor: 0,
-            wait_ms: None,
-        },
-    )
-    .await
-    {
-        ApiResponse::EventsPage(page) => page
-            .events
-            .iter()
-            .filter_map(|e| match e {
-                NodeEvent::PersonsChanged { rev } => Some(*rev),
-                _ => None,
-            })
-            .max(),
-        other => panic!("expected EventsPage, got {other:?}"),
-    };
+    // The feed carries a Persons pointer per add (same-domain entries coalesce), and its latest rev matches the list's echo.
+    let latest_pointer_rev =
+        match dispatch(node.as_ref(), ApiRequest::EventsSince { cursor: 0 }).await {
+            ApiResponse::EventsPage(page) => page
+                .events
+                .iter()
+                .filter_map(|e| match e {
+                    NodeEvent::ProjectionChanged {
+                        projection: daemon_api::ProjectionId::Persons,
+                        rev,
+                        ..
+                    } => Some(*rev),
+                    _ => None,
+                })
+                .max(),
+            other => panic!("expected EventsPage, got {other:?}"),
+        };
     assert_eq!(
         latest_pointer_rev,
         Some(rev2),
-        "the PersonsChanged pointer rev must agree with the PersonList echo"
+        "the Persons pointer rev must agree with the PersonList echo"
     );
 
     handle.shutdown().await;
@@ -181,9 +176,11 @@ async fn notification_list_rev(node: &Arc<NodeApiImpl>) -> u64 {
 }
 
 /// Projection-sync stage 1 (daemon-projection-sync-spec.md §10): every per-session override write
-/// (`SetSessionModel` / `SetSessionMode` / `SetSessionOverlay`) emits `SessionMetaChanged` from the
-/// single durable persistence path (`update_overlay`), so a second client's cached session detail
-/// is invalidated — previously these persisted silently and clients diverged until reconnect.
+/// (`SetSessionModel` / `SetSessionMode` / `SetSessionOverlay`) emits the keyed Sessions
+/// `ProjectionChanged` from the single durable persistence path (`update_overlay`), so a second
+/// client's cached session detail is invalidated — previously these persisted silently and
+/// clients diverged until reconnect. Same-key pointers coalesce in the backlog, so each write is
+/// verified on its own page read (one surviving pointer, rev bumped once per write).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn overlay_writes_emit_session_meta_changed() {
     as_system(overlay_writes_emit_session_meta_changed_impl()).await;
@@ -207,20 +204,39 @@ async fn overlay_writes_emit_session_meta_changed_impl() {
     .expect("submit opens the session");
 
     // Drain the feed so only the override writes below land past `after`.
-    let after = match dispatch(
-        node.as_ref(),
-        ApiRequest::EventsSince {
-            cursor: 0,
-            wait_ms: None,
-        },
-    )
-    .await
-    {
+    let after = match dispatch(node.as_ref(), ApiRequest::EventsSince { cursor: 0 }).await {
         ApiResponse::EventsPage(page) => page.next_cursor,
         other => panic!("expected EventsPage, got {other:?}"),
     };
 
+    // The surviving keyed Sessions pointer revs for this session, paged past `after`. The
+    // emission is synchronous with the write (no async bridge), so one page per write suffices.
+    let session_revs = |after: u64| {
+        let node = node.clone();
+        let session = session.clone();
+        async move {
+            match dispatch(node.as_ref(), ApiRequest::EventsSince { cursor: after }).await {
+                ApiResponse::EventsPage(page) => page
+                    .events
+                    .iter()
+                    .filter_map(|e| match e {
+                        NodeEvent::ProjectionChanged {
+                            projection: daemon_api::ProjectionId::Sessions,
+                            scope: daemon_api::ChangeScope::Key { key },
+                            rev,
+                            ..
+                        } if key == session.as_str() => Some(*rev),
+                        _ => None,
+                    })
+                    .collect::<Vec<u64>>(),
+                other => panic!("expected EventsPage, got {other:?}"),
+            }
+        }
+    };
+
     // All three override writes: model, mode (narrowing — no operator gate), unified overlay.
+    // Each write is verified on its own page read (same-key pointers coalesce in the backlog).
+    let mut revs: Vec<u64> = Vec::new();
     match dispatch(
         node.as_ref(),
         ApiRequest::SetSessionModel {
@@ -234,6 +250,9 @@ async fn overlay_writes_emit_session_meta_changed_impl() {
         ApiResponse::Ok => {}
         other => panic!("expected Ok from SetSessionModel, got {other:?}"),
     }
+    let page = session_revs(after).await;
+    assert_eq!(page.len(), 1, "one write = one pointer, got {page:?}");
+    revs.extend(page);
     match dispatch(
         node.as_ref(),
         ApiRequest::SetSessionMode {
@@ -246,6 +265,7 @@ async fn overlay_writes_emit_session_meta_changed_impl() {
         ApiResponse::Ok => {}
         other => panic!("expected Ok from SetSessionMode, got {other:?}"),
     }
+    revs.extend(session_revs(after).await.iter().max());
     match dispatch(
         node.as_ref(),
         ApiRequest::SetSessionOverlay {
@@ -261,38 +281,10 @@ async fn overlay_writes_emit_session_meta_changed_impl() {
         ApiResponse::Ok => {}
         other => panic!("expected Ok from SetSessionOverlay, got {other:?}"),
     }
-
-    // The emission is synchronous with the write (no async bridge), so one page suffices: three
-    // SessionMetaChanged pointers for this session, revs strictly increasing (one bump per write).
-    let revs: Vec<u64> = match dispatch(
-        node.as_ref(),
-        ApiRequest::EventsSince {
-            cursor: after,
-            wait_ms: None,
-        },
-    )
-    .await
-    {
-        ApiResponse::EventsPage(page) => page
-            .events
-            .iter()
-            .filter_map(|e| match e {
-                NodeEvent::SessionMetaChanged {
-                    session: s, rev, ..
-                } if *s == session => Some(*rev),
-                _ => None,
-            })
-            .collect(),
-        other => panic!("expected EventsPage, got {other:?}"),
-    };
-    assert_eq!(
-        revs.len(),
-        3,
-        "each override write must emit exactly one SessionMetaChanged, got revs {revs:?}"
-    );
+    revs.extend(session_revs(after).await.iter().max());
     assert!(
         revs.windows(2).all(|w| w[0] < w[1]),
-        "override writes bump the roster rev monotonically, got {revs:?}"
+        "override writes bump the roster rev monotonically, one per write, got {revs:?}"
     );
 
     handle.shutdown().await;
@@ -309,15 +301,7 @@ async fn events_page_is_stamped_with_the_feed_epoch_impl() {
     use daemon_api::dispatch;
 
     let (node, handle) = assemble();
-    match dispatch(
-        node.as_ref(),
-        ApiRequest::EventsSince {
-            cursor: 0,
-            wait_ms: None,
-        },
-    )
-    .await
-    {
+    match dispatch(node.as_ref(), ApiRequest::EventsSince { cursor: 0 }).await {
         ApiResponse::EventsPage(page) => assert!(
             page.epoch.is_some(),
             "every EventsPage must be stamped with the feed epoch (rung 1)"

@@ -58,11 +58,7 @@ impl NodeApiImpl {
             if let Some(feed) = self.node_feed() {
                 let origin_op = daemon_api::current_op_id();
                 let rev = feed.note_roster_change_op(session, origin_op.clone());
-                feed.emit(NodeEvent::SessionMetaChanged {
-                    session: session.clone(),
-                    rev,
-                    origin_op,
-                });
+                feed.emit_session_meta(session, rev, origin_op);
             }
         }
         overlay

@@ -328,7 +328,7 @@ impl CronWorker {
             // client browsing that scope must learn of it before its first advance).
             if let Some(feed) = &self.feed {
                 let rev = feed.note_roster_change(&session);
-                feed.emit(daemon_api::NodeEvent::RosterChanged { rev });
+                feed.emit_roster(rev);
             }
         }
         let _ = self

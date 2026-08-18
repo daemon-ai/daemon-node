@@ -368,12 +368,10 @@ async fn messaging_adapter_rooms_manage_over_socket() {
         )),
         "a loopback-delivered member reply is journaled with its author"
     );
-    // Every append raised the granular MessagesChanged pointer for (room, r2) on the L3 feed.
+    // Every append raised the granular keyed Messages pointer for (room, r2) on the L3 feed;
+    // same-conv pointers coalesce in the backlog, so at least one survivor remains.
     let messages_changed = match client
-        .call(ApiRequest::EventsSince {
-            cursor: 0,
-            wait_ms: None,
-        })
+        .call(ApiRequest::EventsSince { cursor: 0 })
         .await
         .unwrap()
     {
@@ -383,18 +381,20 @@ async fn messaging_adapter_rooms_manage_over_socket() {
             .filter(|e| {
                 matches!(
                     e,
-                    daemon_api::NodeEvent::MessagesChanged {
-                        transport: t, conv, ..
-                    } if t.as_str() == "room" && conv == "r2"
+                    daemon_api::NodeEvent::ProjectionChanged {
+                        projection: daemon_api::ProjectionId::Messages,
+                        partition: Some(p),
+                        scope: daemon_api::ChangeScope::Key { key },
+                        ..
+                    } if p == "room" && key == "r2"
                 )
             })
             .count(),
         other => panic!("expected EventsPage, got {other:?}"),
     };
     assert!(
-        messages_changed >= chats.len(),
-        "MessagesChanged must be emitted per Chat append (>= {} for r2, got {messages_changed})",
-        chats.len()
+        messages_changed >= 1,
+        "Chat appends must leave a keyed Messages pointer for r2 (got {messages_changed})"
     );
 
     // Delete the room: it disappears from `get`.
@@ -648,24 +648,25 @@ async fn messaging_adapter_roster_manage_over_socket() {
         .collect();
     assert_eq!(ids, vec!["@carol:hs".to_string()]);
 
-    // Every successful mutation raised a ContactsChanged pointer for this transport (the
+    // Every successful mutation raised a Contacts pointer for this transport (the
     // deterministic one-shot re-read of the retained node-event feed).
     let saw_contacts_changed = match client
-        .call(ApiRequest::EventsSince {
-            cursor: 0,
-            wait_ms: None,
-        })
+        .call(ApiRequest::EventsSince { cursor: 0 })
         .await
         .unwrap()
     {
         ApiResponse::EventsPage(page) => page.events.iter().any(|e| {
-            matches!(e, NodeEvent::ContactsChanged { transport: t, .. } if t.as_str() == "rostmock")
+            matches!(e, NodeEvent::ProjectionChanged {
+                projection: daemon_api::ProjectionId::Contacts,
+                partition: Some(p),
+                ..
+            } if p == "rostmock")
         }),
         other => panic!("expected EventsPage, got {other:?}"),
     };
     assert!(
         saw_contacts_changed,
-        "a successful roster mutation must raise ContactsChanged on the node-wide feed"
+        "a successful roster mutation must raise the Contacts pointer on the node-wide feed"
     );
 
     server.abort();
@@ -841,23 +842,24 @@ async fn messaging_adapter_rooms_roster_manage_over_socket() {
         .collect();
     assert_eq!(ids, vec!["agent-charlie".to_string()]);
 
-    // Every successful mutation raised a ContactsChanged pointer for the `room` transport.
+    // Every successful mutation raised a Contacts pointer for the `room` transport.
     let saw_contacts_changed = match client
-        .call(ApiRequest::EventsSince {
-            cursor: 0,
-            wait_ms: None,
-        })
+        .call(ApiRequest::EventsSince { cursor: 0 })
         .await
         .unwrap()
     {
-        ApiResponse::EventsPage(page) => page.events.iter().any(
-            |e| matches!(e, NodeEvent::ContactsChanged { transport: t, .. } if t.as_str() == "room"),
-        ),
+        ApiResponse::EventsPage(page) => page.events.iter().any(|e| {
+            matches!(e, NodeEvent::ProjectionChanged {
+                projection: daemon_api::ProjectionId::Contacts,
+                partition: Some(p),
+                ..
+            } if p == "room")
+        }),
         other => panic!("expected EventsPage, got {other:?}"),
     };
     assert!(
         saw_contacts_changed,
-        "a successful roster mutation must raise ContactsChanged on the node-wide feed"
+        "a successful roster mutation must raise the Contacts pointer on the node-wide feed"
     );
 
     server.abort();
@@ -991,14 +993,12 @@ impl RoomsSocket {
         }
     }
 
-    /// The `MessagesChanged` pointers currently on the node-wide feed for `(room, conv)`.
+    /// The keyed Messages pointers currently on the node-wide feed for `(room, conv)`.
+    /// Same-conv pointers coalesce in the backlog, so this is 0 or 1 on a one-shot read.
     async fn messages_changed(&self, conv: &str) -> usize {
         match self
             .client
-            .call(ApiRequest::EventsSince {
-                cursor: 0,
-                wait_ms: None,
-            })
+            .call(ApiRequest::EventsSince { cursor: 0 })
             .await
             .unwrap()
         {
@@ -1008,9 +1008,12 @@ impl RoomsSocket {
                 .filter(|e| {
                     matches!(
                         e,
-                        daemon_api::NodeEvent::MessagesChanged {
-                            transport, conv: c, ..
-                        } if transport.as_str() == "room" && c == conv
+                        daemon_api::NodeEvent::ProjectionChanged {
+                            projection: daemon_api::ProjectionId::Messages,
+                            partition: Some(p),
+                            scope: daemon_api::ChangeScope::Key { key },
+                            ..
+                        } if p == "room" && key == conv
                     )
                 })
                 .count(),
@@ -1032,8 +1035,8 @@ impl RoomsSocket {
 /// The journal obligation on the rooms send path (wire v38): every `ConvSend` — operator
 /// (`from: None`) and contact-attributed alike — appends one `JournalRecordPayload::Chat` with a
 /// properly populated `ChatMessage` (structured author, RAW text, timestamp) to
-/// `conv:room:<conv>`, readable via `ConvHistory` in append order, and each append raises exactly
-/// one granular `NodeEvent::MessagesChanged { transport: "room", conv }` on the L3 feed.
+/// `conv:room:<conv>`, readable via `ConvHistory` in append order, and each append raises the
+/// granular keyed Messages `ProjectionChanged` on the L3 feed (same-conv pointers coalesce).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn conv_send_journals_chat_and_emits_messages_changed() {
     let h = RoomsSocket::bring_up("chatjournal", [0x60; 32]).await;
@@ -1081,11 +1084,12 @@ async fn conv_send_journals_chat_and_emits_messages_changed() {
         other => panic!("expected Chat, got {other:?}"),
     }
 
-    // One MessagesChanged per append, carrying the right (transport, conv).
+    // The keyed pointer carries the right (transport, conv); same-conv appends coalesce to one
+    // backlog survivor, and no pointer leaks onto other conversations.
     assert_eq!(
         h.messages_changed("j1").await,
-        2,
-        "each Chat append emits exactly one MessagesChanged"
+        1,
+        "Chat appends on one conv coalesce to one surviving keyed Messages pointer"
     );
     assert_eq!(
         h.messages_changed("nonexistent").await,

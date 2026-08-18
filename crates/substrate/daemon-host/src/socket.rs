@@ -770,6 +770,7 @@ where
                                 res: ApiResponse::Error(ApiError::Unauthenticated(
                                     "credentials revoked; re-authenticate".into(),
                                 )),
+                                meta: None,
                             })
                             .await;
                         teardown_streams(&mut streams);
@@ -782,6 +783,7 @@ where
                             .send(WireS2C::Reply {
                                 id,
                                 res: ApiResponse::Error(ApiError::Other(e.to_string())),
+                                meta: None,
                             })
                             .await;
                         continue;
@@ -803,7 +805,13 @@ where
                             authorize_and_dispatch(api.as_ref(), req, ctx, audit),
                         )
                         .await;
-                        let _ = tx.send(WireS2C::Reply { id, res }).await;
+                        let _ = tx
+                            .send(WireS2C::Reply {
+                                id,
+                                res,
+                                meta: None,
+                            })
+                            .await;
                     });
                 } else {
                     let _ = tx
@@ -812,6 +820,7 @@ where
                             res: ApiResponse::Error(ApiError::Unauthenticated(
                                 "authenticate before issuing requests".into(),
                             )),
+                            meta: None,
                         })
                         .await;
                 }
@@ -997,7 +1006,7 @@ async fn pump_session_log(
                         head_seq: last_seq,
                         epoch,
                     };
-                    if tx.send(WireS2C::Item { id, res: ApiResponse::LogPage(page) }).await.is_err() {
+                    if tx.send(WireS2C::Item { id, res: ApiResponse::LogPage(page), meta: None }).await.is_err() {
                         break;
                     }
                 }
@@ -1015,7 +1024,7 @@ async fn pump_session_log(
             },
             _ = keepalive.tick() => {
                 let page = LogPageView { entries: Vec::new(), next_seq: last_seq, head_seq: last_seq, epoch };
-                if tx.send(WireS2C::Item { id, res: ApiResponse::LogPage(page) }).await.is_err() {
+                if tx.send(WireS2C::Item { id, res: ApiResponse::LogPage(page), meta: None }).await.is_err() {
                     break;
                 }
             }
@@ -1059,7 +1068,7 @@ async fn pump_node_events(
                     if page.next_cursor > last_cursor {
                         last_cursor = page.next_cursor;
                     }
-                    if tx.send(WireS2C::Item { id, res: ApiResponse::EventsPage(page) }).await.is_err() {
+                    if tx.send(WireS2C::Item { id, res: ApiResponse::EventsPage(page), meta: None }).await.is_err() {
                         break;
                     }
                 }
@@ -1072,7 +1081,7 @@ async fn pump_node_events(
                 // rung 1: an empty keepalive tick carries no epoch (the client already learned the
                 // feed generation from the real pages streamed above).
                 let page = EventsPage { events: Vec::new(), next_cursor: last_cursor, head_cursor: last_cursor, epoch: None };
-                if tx.send(WireS2C::Item { id, res: ApiResponse::EventsPage(page) }).await.is_err() {
+                if tx.send(WireS2C::Item { id, res: ApiResponse::EventsPage(page), meta: None }).await.is_err() {
                     break;
                 }
             }
@@ -1288,7 +1297,7 @@ impl MuxApiClient {
         self.send(WireC2S::Call { id, req }).await?;
         loop {
             match self.next().await? {
-                WireS2C::Reply { id: rid, res } if rid == id => return Ok(res),
+                WireS2C::Reply { id: rid, res, .. } if rid == id => return Ok(res),
                 WireS2C::End { id: rid, error } if rid == id => {
                     return Err(error.unwrap_or_else(|| {
                         ApiError::Other("stream ended without a reply".into())

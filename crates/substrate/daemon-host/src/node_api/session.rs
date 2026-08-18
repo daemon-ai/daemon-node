@@ -124,10 +124,10 @@ impl SessionApi for NodeApiImpl {
         }
         let _ = self.store.set_session_meta(&session, meta).await;
         // L3: the roster *set* changed — a client refetches the roster + the ByProfile query. This is
-        // the existing `RosterChanged` the live `ensure()` path also emits.
+        // the same Sessions All-scope pointer the live `ensure()` path also emits.
         if let Some(feed) = self.node_feed() {
             let rev = feed.note_roster_change(&session);
-            feed.emit(NodeEvent::RosterChanged { rev });
+            feed.emit_roster(rev);
         }
         Ok(session)
     }
@@ -419,11 +419,7 @@ impl SessionApi for NodeApiImpl {
         if res.is_ok() {
             if let Some(feed) = self.node_feed() {
                 let rev = feed.note_roster_change(&session);
-                feed.emit(daemon_api::NodeEvent::SessionMetaChanged {
-                    session,
-                    rev,
-                    origin_op: daemon_api::current_op_id(),
-                });
+                feed.emit_session_meta(&session, rev, daemon_api::current_op_id());
             }
         }
         res

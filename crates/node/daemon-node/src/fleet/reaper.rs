@@ -116,7 +116,13 @@ impl EphemeralReaper {
         if archived > 0 {
             if let Some(events) = &self.events {
                 let rev = events.note_fleet_change();
-                events.emit(daemon_api::NodeEvent::FleetChanged { rev });
+                events.emit_projection(
+                    daemon_api::ProjectionId::Fleet,
+                    None,
+                    daemon_api::ChangeScope::All,
+                    rev,
+                    None,
+                );
             }
         }
         archived

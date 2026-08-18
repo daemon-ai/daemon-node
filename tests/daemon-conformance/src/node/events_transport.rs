@@ -3,25 +3,30 @@
 
 use super::harness::*;
 
-/// Fold one page of node-events into the `saw_*` flags: any `RosterChanged`, and any
-/// `SessionMetaChanged`/`SessionAdvanced` for `want`. Shared by the live push read and the
-/// deterministic retained-ring re-read in [`events_since_feed_streams_node_events_and_resyncs`].
+/// Fold one page of node-events into the `saw_*` flags: any All-scope Sessions pointer (the
+/// roster set changed), and any keyed Sessions pointer / `SessionAdvanced` for `want`. Shared by
+/// the live push read and the deterministic retained-ring re-read in
+/// [`events_since_feed_streams_node_events_and_resyncs`].
 fn scan_node_events(
     events: Vec<daemon_api::NodeEvent>,
     want: &SessionId,
     saw_roster: &mut bool,
     saw_session: &mut bool,
 ) {
-    use daemon_api::NodeEvent;
+    use daemon_api::{ChangeScope, NodeEvent, ProjectionId};
     for ev in events {
         match ev {
-            NodeEvent::RosterChanged { .. } => *saw_roster = true,
-            NodeEvent::SessionMetaChanged { session: s, .. }
-            | NodeEvent::SessionAdvanced { session: s, .. }
-                if s == *want =>
-            {
-                *saw_session = true
-            }
+            NodeEvent::ProjectionChanged {
+                projection: ProjectionId::Sessions,
+                scope: ChangeScope::All,
+                ..
+            } => *saw_roster = true,
+            NodeEvent::ProjectionChanged {
+                projection: ProjectionId::Sessions,
+                scope: ChangeScope::Key { key },
+                ..
+            } if key == want.as_str() => *saw_session = true,
+            NodeEvent::SessionAdvanced { session: s, .. } if s == *want => *saw_session = true,
             _ => {}
         }
     }
@@ -140,7 +145,7 @@ async fn mux_envelope_one_shot_stream_and_legacy_fallback() {
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
         match mux.next().await.expect("stream frame") {
-            WireS2C::Item { id: rid, res } => {
+            WireS2C::Item { id: rid, res, .. } => {
                 assert_eq!(rid, id, "Item must carry the stream id");
                 match res {
                     // First activation streams epoch 0 (L2).
@@ -206,10 +211,7 @@ async fn events_since_feed_streams_node_events_and_resyncs() {
 
     // Open the node-wide feed from the start of the retained ring.
     let feed_id = mux
-        .open(ApiRequest::EventsSince {
-            cursor: 0,
-            wait_ms: None,
-        })
+        .open(ApiRequest::EventsSince { cursor: 0 })
         .await
         .expect("open events-since");
 
@@ -247,7 +249,7 @@ async fn events_since_feed_streams_node_events_and_resyncs() {
     let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline && !(saw_roster && saw_session) && !resynced {
         match mux.next().await.expect("feed frame") {
-            WireS2C::Item { id: rid, res } => {
+            WireS2C::Item { id: rid, res, .. } => {
                 assert_eq!(rid, feed_id, "Item must carry the feed stream id");
                 let ApiResponse::EventsPage(page) = res else {
                     panic!("EventsSince Item must wrap an EventsPage, got {res:?}");
@@ -269,10 +271,7 @@ async fn events_since_feed_streams_node_events_and_resyncs() {
     // is the deterministic backstop: the ring retains `RosterChanged` (never coalesced) and the
     // session's activity regardless of any live-broadcast lag, so the assertion is race-free.
     match mux
-        .call(ApiRequest::EventsSince {
-            cursor: 0,
-            wait_ms: None,
-        })
+        .call(ApiRequest::EventsSince { cursor: 0 })
         .await
         .expect("events-since call")
     {
@@ -323,26 +322,22 @@ async fn events_since_one_shot_is_bounded_at_the_wire_page_max() {
     as_system(events_since_one_shot_is_bounded_at_the_wire_page_max_impl()).await;
 }
 async fn events_since_one_shot_is_bounded_at_the_wire_page_max_impl() {
-    use daemon_api::{dispatch, SessionApi, WIRE_PAGE_MAX};
+    use daemon_api::{dispatch, WIRE_PAGE_MAX};
 
     let (node, handle) = assemble();
-    // 70 node-authoritative session creations: each emits an un-coalesced `RosterChanged` onto the
-    // retained feed, so the ring holds more than one wire page.
+    // 70 distinct-session advances: `SessionAdvanced` coalesces only per session, so distinct
+    // sessions leave 70 retained events — more than one wire page. (The old seeding — 70
+    // `session_create`s — no longer over-fills the ring: their All-scope Sessions pointers
+    // coalesce to one entry since the stage-7 cutover.)
     for n in 0..70 {
-        node.session_create(Some(SessionId::new(format!("evt-{n:03}"))), None)
-            .await
-            .expect("session_create");
+        node.emit_node_event(daemon_api::NodeEvent::SessionAdvanced {
+            session: SessionId::new(format!("evt-{n:03}")),
+            epoch: 0,
+            head_seq: 1,
+        });
     }
 
-    let page = match dispatch(
-        node.as_ref(),
-        ApiRequest::EventsSince {
-            cursor: 0,
-            wait_ms: None,
-        },
-    )
-    .await
-    {
+    let page = match dispatch(node.as_ref(), ApiRequest::EventsSince { cursor: 0 }).await {
         ApiResponse::EventsPage(page) => page,
         other => panic!("expected EventsPage, got {other:?}"),
     };
@@ -361,15 +356,7 @@ async fn events_since_one_shot_is_bounded_at_the_wire_page_max_impl() {
     let mut total = page.events.len();
     let mut pages = 1usize;
     loop {
-        let page = match dispatch(
-            node.as_ref(),
-            ApiRequest::EventsSince {
-                cursor,
-                wait_ms: None,
-            },
-        )
-        .await
-        {
+        let page = match dispatch(node.as_ref(), ApiRequest::EventsSince { cursor }).await {
             ApiResponse::EventsPage(page) => page,
             other => panic!("expected EventsPage, got {other:?}"),
         };
@@ -412,10 +399,7 @@ async fn events_since_feed_delivers_fleet_changed_on_delegation() {
         .await
         .expect("mux connect + hello");
     let feed_id = mux
-        .open(ApiRequest::EventsSince {
-            cursor: 0,
-            wait_ms: None,
-        })
+        .open(ApiRequest::EventsSince { cursor: 0 })
         .await
         .expect("open events-since");
 
@@ -434,19 +418,23 @@ async fn events_since_feed_delivers_fleet_changed_on_delegation() {
     while !saw_fleet {
         let frame = match tokio::time::timeout(Duration::from_secs(30), mux.next()).await {
             Ok(f) => f.expect("feed frame"),
-            Err(_) => break, // deadline: no FleetChanged arrived
+            Err(_) => break, // deadline: no Fleet pointer arrived
         };
         match frame {
-            WireS2C::Item { id: rid, res } => {
+            WireS2C::Item { id: rid, res, .. } => {
                 assert_eq!(rid, feed_id, "Item must carry the feed stream id");
                 let ApiResponse::EventsPage(page) = res else {
                     panic!("EventsSince Item must wrap an EventsPage, got {res:?}");
                 };
-                if page
-                    .events
-                    .iter()
-                    .any(|e| matches!(e, NodeEvent::FleetChanged { .. }))
-                {
+                if page.events.iter().any(|e| {
+                    matches!(
+                        e,
+                        NodeEvent::ProjectionChanged {
+                            projection: daemon_api::ProjectionId::Fleet,
+                            ..
+                        }
+                    )
+                }) {
                     saw_fleet = true;
                 }
             }
@@ -458,7 +446,7 @@ async fn events_since_feed_delivers_fleet_changed_on_delegation() {
     }
     assert!(
         saw_fleet,
-        "the feed delivered no FleetChanged after a delegation"
+        "the feed delivered no Fleet pointer after a delegation"
     );
 
     handle.shutdown().await;
