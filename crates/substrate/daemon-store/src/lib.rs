@@ -1202,6 +1202,16 @@ pub trait SessionStore: Send + Sync {
         Ok(false)
     }
 
+    /// Flip an `Idle` session to `Ready` — the F4 operator-assignment transition. An `Assign` on a
+    /// blank/quiescent durable session IS the work (the operator's instruction to drive it), and
+    /// under the §2 status rule (`Ready` iff runnable work exists — `wake` drops `Idle` sessions
+    /// precisely so a spurious wake can never open a blank turn) that work must be recorded as
+    /// `Ready` before the wake dispatches. Returns `true` when the flip happened, `false` when the
+    /// session was not `Idle` (no-op). Default: `false` (a non-authoritative proxy store).
+    async fn mark_ready_if_idle(&self, _id: &SessionId) -> Result<bool, StoreError> {
+        Ok(false)
+    }
+
     /// Every unconsumed splice (`Pending`/`Claimed`) with `splice_seq > after_seq`, ordered by
     /// sequence — the replay/projection read. Default: empty.
     async fn splices_after(&self, _id: &SessionId, _after_seq: u64) -> Vec<InboxSplice> {
@@ -2327,6 +2337,19 @@ impl SessionStore for InMemoryStore {
             .get_mut(id)
             .ok_or_else(|| StoreError::NotFound(id.clone()))?;
         if matches!(rec.status, SessionStatus::Completed) {
+            rec.status = SessionStatus::Ready;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    async fn mark_ready_if_idle(&self, id: &SessionId) -> Result<bool, StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        let rec = inner
+            .sessions
+            .get_mut(id)
+            .ok_or_else(|| StoreError::NotFound(id.clone()))?;
+        if matches!(rec.status, SessionStatus::Idle) {
             rec.status = SessionStatus::Ready;
             return Ok(true);
         }

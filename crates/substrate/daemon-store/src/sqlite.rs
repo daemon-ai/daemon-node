@@ -1093,6 +1093,29 @@ impl SessionStore for SqliteStore {
         Ok(n > 0)
     }
 
+    async fn mark_ready_if_idle(&self, id: &SessionId) -> Result<bool, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let exists: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM session_record WHERE session_id = ?1",
+                params![id.as_str()],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(sql_err)?;
+        if exists.is_none() {
+            return Err(StoreError::NotFound(id.clone()));
+        }
+        let n = conn
+            .execute(
+                "UPDATE session_record SET status_kind = 'ready' \
+                 WHERE session_id = ?1 AND status_kind = 'idle'",
+                params![id.as_str()],
+            )
+            .map_err(sql_err)?;
+        Ok(n > 0)
+    }
+
     async fn append_splice(&self, splice: NewSplice) -> Result<u64, StoreError> {
         // ONE transaction (session-unification §4.2): dedupe lookup + insert + the Idle → Ready
         // status flip land together; the wire ack follows the commit (splice-before-ack).

@@ -852,6 +852,13 @@ impl ControlApi for NodeApiImpl {
                 let _ = self.store.set_session_meta(&session, meta).await;
             }
         }
+        // An assignment on a quiescent (`Idle`) session IS the runnable work — the §2 status rule
+        // means `wake` drops `Idle` sessions (so a spurious wake never opens a blank turn), so the
+        // operator's drive-it instruction must be recorded as `Ready` before the wake dispatches.
+        self.store
+            .mark_ready_if_idle(&session)
+            .await
+            .map_err(|e| ApiError::Other(format!("mark assigned: {e}")))?;
         // Wake it: the activation manager runs (or resumes) the engine; the resident services then
         // carry the durable delegate -> suspend -> resume -> complete cycle forward.
         self.manager
