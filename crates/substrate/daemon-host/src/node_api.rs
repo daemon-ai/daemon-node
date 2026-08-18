@@ -269,18 +269,6 @@ pub type RoutingBuilder = Arc<dyn Fn() -> RoutingRegistry + Send + Sync>;
 /// assembly, which owns the profile store + resolution rules.
 pub type ForeignProbe = Arc<dyn Fn(&ProfileRef) -> bool + Send + Sync>;
 
-/// Which lifecycle owns a `SessionId`. The durable and live lifecycles are intentionally distinct
-/// (one runs an engine dormant-between-turns through the activation seam, the other keeps it
-/// resident in an actor), and a single id must not exist as two divergent engine instances. This is
-/// the guard-rail's ownership tag: a session is claimed by the first surface that touches it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Lifecycle {
-    /// Durable, control-surface managed (`assign` -> `ActivationManager`).
-    Durable,
-    /// Live, interactive session-surface managed (`submit` -> the §17 actor).
-    Live,
-}
-
 /// The live networked-model discovery seam for the `ModelApi`'s `models()` listing.
 ///
 /// `daemon-host` is provider-agnostic (it never links `genai`), so live cloud-model enumeration is
@@ -369,8 +357,6 @@ pub struct NodeApiImpl {
     fleet: Option<Arc<dyn FleetControl>>,
     partition: PartitionId,
     live: Arc<LiveSessions>,
-    /// One-lifecycle-owner guard-rail: which lifecycle (if any) has claimed each session id.
-    owners: Arc<DashMap<SessionId, Lifecycle>>,
     /// The node's journal signer, when journaling is enabled. Held here so a history read can verify
     /// each sealed segment (recompute root + check signature) before reporting it as `verified`.
     verifier: Option<Arc<TraceSigner>>,
@@ -617,25 +603,6 @@ pub struct NodeApiImpl {
 }
 
 impl NodeApiImpl {
-    /// Claim `session` for `want`, enforcing the one-lifecycle-owner invariant: the first surface to
-    /// touch a session id owns it; the other surface is rejected with [`ApiError::Conflict`] until
-    /// the session is released (via `cancel`). Re-claiming the same lifecycle is idempotent.
-    fn claim(&self, session: &SessionId, want: Lifecycle) -> Result<(), ApiError> {
-        use dashmap::mapref::entry::Entry;
-        match self.owners.entry(session.clone()) {
-            Entry::Occupied(e) if *e.get() != want => Err(ApiError::Conflict(format!(
-                "session {session} is owned by the {:?} lifecycle; cannot use it as {:?}",
-                e.get(),
-                want
-            ))),
-            Entry::Occupied(_) => Ok(()),
-            Entry::Vacant(v) => {
-                v.insert(want);
-                Ok(())
-            }
-        }
-    }
-
     /// Inject host-originated input (a background process-exit notification, a watch-pattern match,
     /// a message to a managed child) into `session`'s conversation, driving a reactive turn — the
     /// one seam that works across **both** session lifecycles:
@@ -643,15 +610,15 @@ impl NodeApiImpl {
     /// - a **live** (actor-resident) session takes a real [`AgentCommand::StartTurn`] through the
     ///   normal submit path (Observe-while-idle only folds context and drives no turn, so a
     ///   notification would otherwise sit unseen until the user next speaks);
-    /// - a **durable** (activation-lifecycle) session — which `submit` must reject under the
-    ///   one-lifecycle-owner guard-rail — gets a durable inbox splice
+    /// - a **durable** (non-resident) session gets a durable inbox splice
     ///   ([`SessionStore::append_splice`]) plus a wake; the incarnation folds it into the
     ///   conversation at hydrate and the woken turn runs with it.
     ///
-    /// An **unclaimed** id (the in-memory owner map is empty after a restart) routes by durable
-    /// evidence: a session with a durable activation row takes the store seam (never spawning a
-    /// divergent live engine over durable state); anything else opens the live path, exactly like
-    /// an inbound message would. A `Completed` durable session drops the input (its owner is gone).
+    /// Routing is by residency + durable evidence (the retired in-memory owner map is not
+    /// consulted): a live-resident session (Foreign) takes the submit path; a session with a
+    /// durable row takes the store seam (never spawning a divergent live engine over durable
+    /// state); anything else opens via `submit`, exactly like an inbound message would. A
+    /// `Completed` durable session drops the input (its owner is gone).
     pub async fn inject_session_input(
         &self,
         session: &SessionId,
@@ -669,12 +636,7 @@ impl NodeApiImpl {
         session: &SessionId,
         msg: UserMsg,
     ) -> Result<(), ApiError> {
-        let owner = self.owners.get(session).map(|o| *o.value());
-        let durable = match owner {
-            Some(Lifecycle::Live) => false,
-            Some(Lifecycle::Durable) => true,
-            None => self.store.status(session).await.is_some(),
-        };
+        let durable = !self.live.is_resident(session) && self.store.status(session).await.is_some();
         if durable {
             match self.store.status(session).await {
                 Some(SessionStatus::Completed) | None => {
@@ -810,6 +772,7 @@ impl NodeApiImpl {
         &self,
         session: &SessionId,
         command: AgentCommand,
+        origin: Option<&daemon_protocol::Origin>,
     ) -> Result<(), ApiError> {
         let hubs = self
             .attachments
@@ -835,13 +798,20 @@ impl NodeApiImpl {
             }
         }
         let hub = self.attach_hub(session).await;
+        // The splice provenance: the submitting origin's transport id when the surface passed one
+        // (armed one-shot at the fold so per-turn surface hints key on THIS submit — live
+        // `start_turn_from` parity), else the generic wire rail label (an unknown transport
+        // family, composing no hint).
+        let provenance = origin
+            .map(|o| o.transport.as_str().to_string())
+            .unwrap_or_else(|| "wire-submit".into());
         match command {
             AgentCommand::StartTurn { input, request_id } => {
                 hub.record_inbound(AgentCommand::StartTurn {
                     input: input.clone(),
                     request_id,
                 });
-                self.enqueue_wire_input(session, SpliceKind::StartTurn, &input)
+                self.enqueue_wire_input(session, SpliceKind::StartTurn, &input, provenance)
                     .await
             }
             AgentCommand::Steer { text, request_id } => {
@@ -853,8 +823,13 @@ impl NodeApiImpl {
                     text: text.clone(),
                     request_id,
                 });
-                self.enqueue_wire_input(session, SpliceKind::Steer, &UserMsg::new(text))
-                    .await?;
+                self.enqueue_wire_input(
+                    session,
+                    SpliceKind::Steer,
+                    &UserMsg::new(text),
+                    provenance,
+                )
+                .await?;
                 // Splice-before-ack (§4.2): the append IS acceptance — the fold at the next wake
                 // cannot correlate (the splice payload is the bare `UserMsg`), so the routing
                 // layer acks here, the durable analogue of the live actor's idle-steer ack.
@@ -872,7 +847,7 @@ impl NodeApiImpl {
                 });
                 // Fold-only: the woken incarnation commits the folded context without opening a
                 // model turn (`CoreIncarnation::fold_only`).
-                self.enqueue_wire_input(session, SpliceKind::Observe, &input)
+                self.enqueue_wire_input(session, SpliceKind::Observe, &input, provenance)
                     .await
             }
             AgentCommand::Interrupt { reason } => {
@@ -962,6 +937,7 @@ impl NodeApiImpl {
         session: &SessionId,
         kind: SpliceKind,
         msg: &UserMsg,
+        provenance: String,
     ) -> Result<(), ApiError> {
         let mut payload = Vec::new();
         ciborium::into_writer(msg, &mut payload)
@@ -972,7 +948,7 @@ impl NodeApiImpl {
                 kind,
                 payload,
                 origin_op: mint_op_id(),
-                origin: "wire-submit".into(),
+                origin: provenance,
             })
             .await
             .map_err(|e| ApiError::Other(format!("append wire input: {e}")))?;
@@ -1057,8 +1033,8 @@ impl NodeApiImpl {
     /// The F4 durable-resume gate: whether a wire `Submit { StartTurn | Steer }` addressed at
     /// `session` must ride the durable inbox rail instead of opening a fresh live incarnation.
     /// Returns `Some((kind, msg))` — the typed splice to fold into the durable transcript —
-    /// only for a **parked-durable** session: the durable lifecycle owns it (or, when unclaimed
-    /// after a restart, a durable activation row evidences it) AND it is live-but-dormant
+    /// only for a **parked-durable** session: NOT live-resident (a resident actor — Foreign —
+    /// keeps its rail) AND a durable activation row evidences it live-but-dormant
     /// (`Active | Suspended | Ready`, never `Completed`/absent). A `Completed` durable session
     /// keeps today's fresh-incarnation behavior (its durable owner is gone), and any non-
     /// `StartTurn`/`Steer` command falls through to the live path (`None`). The caller enforces
@@ -1073,12 +1049,7 @@ impl NodeApiImpl {
             AgentCommand::Steer { text, .. } => (SpliceKind::Steer, UserMsg::new(text.clone())),
             _ => return None,
         };
-        let durable = match self.owners.get(session).map(|o| *o.value()) {
-            Some(Lifecycle::Live) => false,
-            Some(Lifecycle::Durable) => true,
-            None => self.store.status(session).await.is_some(),
-        };
-        if !durable {
+        if self.live.is_resident(session) {
             return None;
         }
         match self.store.status(session).await {

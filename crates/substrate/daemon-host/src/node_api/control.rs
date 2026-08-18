@@ -819,9 +819,6 @@ impl ControlApi for NodeApiImpl {
         // through so the create-below path can stamp the caller as owner. `SessionControlAny`
         // (operator) crosses ownership.
         self.require_session_access(&session, true).await?;
-        // Guard-rail: a session driven through the durable control surface must not also be a live
-        // interactive session (two divergent engine instances for one id).
-        self.claim(&session, Lifecycle::Durable)?;
         // Create-if-absent: a fresh durable session row with the engine's initial snapshot.
         if self.store.status(&session).await.is_none() {
             let blob = Snapshot::fresh(session.clone())
@@ -855,8 +852,6 @@ impl ControlApi for NodeApiImpl {
             fleet.cancel(&UnitId::new(session.as_str())).await;
         }
         self.live.interrupt(&auth).await;
-        // Release the lifecycle claim so the id can be reused by either surface.
-        self.owners.remove(&session);
         Ok(())
     }
 

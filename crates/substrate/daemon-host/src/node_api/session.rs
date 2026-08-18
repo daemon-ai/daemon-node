@@ -19,7 +19,7 @@ impl SessionApi for NodeApiImpl {
                     .seed_primary_target(internals::api_origin().primary_target());
             }
             self.note_activity(&session, &command).await;
-            return self.submit_attached(&session, command).await;
+            return self.submit_attached(&session, command, None).await;
         }
         // F4 durable-resume: a `StartTurn`/`Steer` at a PARKED-DURABLE session rides the durable
         // inbox rail (typed splice into the durable transcript + wake) instead of opening a
@@ -31,8 +31,6 @@ impl SessionApi for NodeApiImpl {
                 .enqueue_durable_input(&session, kind, &msg, "wire-submit")
                 .await;
         }
-        // Guard-rail: claim the session for the live lifecycle (rejects an id already durable-managed).
-        self.claim(&session, Lifecycle::Live)?;
         // Auth 4: own-or-`SessionControlAny`. An `Absent` (brand-new) session passes here, then
         // `note_activity` stamps the caller as owner — checked BEFORE `note_activity` so a foreign
         // caller never mutates last-activity / the FTS index.
@@ -59,7 +57,7 @@ impl SessionApi for NodeApiImpl {
                     .seed_primary_target(origin.primary_target());
             }
             self.note_activity(&session, &command).await;
-            return self.submit_attached(&session, command).await;
+            return self.submit_attached(&session, command, Some(&origin)).await;
         }
         // F4 durable-resume: a parked-durable `StartTurn`/`Steer` folds into the durable transcript
         // (the origin is delivery attribution the durable session already owns) rather than opening
@@ -70,7 +68,6 @@ impl SessionApi for NodeApiImpl {
                 .enqueue_durable_input(&session, kind, &msg, "wire-submit")
                 .await;
         }
-        self.claim(&session, Lifecycle::Live)?;
         let auth = self.require_session_access(&session, true).await?;
         self.note_activity(&session, &command).await;
         self.live.submit_from(&auth, origin, command).await
@@ -85,13 +82,6 @@ impl SessionApi for NodeApiImpl {
         // body of `assign` (durable row + fresh snapshot + owner stamp) enriched with `bound_profile`,
         // MINUS `manager.wake()` — no turn runs and no engine is woken.
         let session = session.unwrap_or_else(mint_session_id);
-        // Pre-cutover: reserve the id for the live lifecycle — the GUI binds its composer to this
-        // id and opens it with a live `StartTurn`, so claiming `Live` keeps that subsequent submit
-        // idempotent. Under the armed cutover (§8) the first submit routes DURABLE, so no live
-        // claim is taken (the owners map itself retires with the live Core rail).
-        if self.attachments.is_none() {
-            self.claim(&session, Lifecycle::Live)?;
-        }
         // Auth 4: an `Absent` session passes; the durable-create + meta stamp below fixes ownership.
         self.require_session_access(&session, true).await?;
         // Resolve the profile to bind: an explicit ref, else the node's active default — so a blank
@@ -171,7 +161,9 @@ impl SessionApi for NodeApiImpl {
                 self.attach_hub(&session).await.seed_primary_target(target);
             }
             self.note_activity(&session, &command).await;
-            return self.submit_attached(&session, command).await;
+            return self
+                .submit_attached(&session, command, origin.as_ref())
+                .await;
         }
         // F4 durable-resume: a parked-durable `StartTurn`/`Steer` folds into the durable transcript
         // (its engine profile is already bound durably) rather than opening a fresh live incarnation.
@@ -181,7 +173,6 @@ impl SessionApi for NodeApiImpl {
                 .enqueue_durable_input(&session, kind, &msg, "wire-submit")
                 .await;
         }
-        self.claim(&session, Lifecycle::Live)?;
         let auth = self.require_session_access(&session, true).await?;
         // Bind the explicit profile sticky-on-first-open (the same `ensure` seam `submit_routed`
         // uses), so a GUI can "open this chat as agent X" before the first turn submits.
@@ -204,6 +195,34 @@ impl SessionApi for NodeApiImpl {
         // it (agent selection), and where its replies post.
         let routing = self.routing.load();
         let resolved = routing.resolve(&origin);
+        // Stage-5 cutover (§8): a Core-resolved origin routes durable, exactly like a direct
+        // `submit_as` — bind the RESOLVED profile sticky-on-first-open (routing owns agent
+        // selection) and seed the resolved `Primary` (routing owns delivery). A Foreign-resolved
+        // profile keeps the live actor rail (the probe inspects the resolution the registry
+        // already made, since a first open has no durable binding yet to probe).
+        let resolved_foreign = match (&resolved.profile, &self.foreign_probe) {
+            (Some(p), Some(probe)) => probe(p),
+            _ => false,
+        };
+        if !resolved_foreign && self.cutover_routes(&resolved.session).await {
+            self.require_session_access(&resolved.session, true).await?;
+            self.bind_profile_on_first_open(&resolved.session, resolved.profile.clone())
+                .await;
+            if matches!(
+                command,
+                AgentCommand::StartTurn { .. }
+                    | AgentCommand::Steer { .. }
+                    | AgentCommand::Observe { .. }
+            ) {
+                self.attach_hub(&resolved.session)
+                    .await
+                    .seed_primary_target(resolved.delivery.clone());
+            }
+            self.note_activity(&resolved.session, &command).await;
+            self.submit_attached(&resolved.session, command, Some(&origin))
+                .await?;
+            return Ok(resolved.session);
+        }
         // F4 durable-resume: if the origin resolves to a parked-durable session, a `StartTurn`/
         // `Steer` folds into the durable transcript + wakes it, rather than opening a fresh live
         // incarnation over the durable state.
@@ -213,7 +232,6 @@ impl SessionApi for NodeApiImpl {
                 .await?;
             return Ok(resolved.session);
         }
-        self.claim(&resolved.session, Lifecycle::Live)?;
         // Auth 4: own-or-`SessionControlAny` on the resolved session (new sessions pass and are
         // stamped by `note_activity`).
         let auth = self.require_session_access(&resolved.session, true).await?;

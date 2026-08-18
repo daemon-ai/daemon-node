@@ -22,10 +22,18 @@ pub trait DeliveryHost: Send + Sync {
 
 impl DeliveryHost for NodeApiImpl {
     fn register_delivery_sink(&self, transport: TransportId, sink: Arc<dyn DeliverySink>) {
+        // One registration covers both rails: live residencies (Foreign, legacy) and the durable
+        // attachment hubs (§8 — durable sessions push through their hub's pump).
+        if let Some(hubs) = &self.attachments {
+            hubs.register_delivery_sink(transport.clone(), sink.clone());
+        }
         self.live.register_delivery_sink(transport, sink);
     }
 
     fn unregister_delivery_sink(&self, transport: &TransportId) {
+        if let Some(hubs) = &self.attachments {
+            hubs.unregister_delivery_sink(transport);
+        }
         self.live.unregister_delivery_sink(transport);
     }
 }
@@ -84,7 +92,13 @@ impl crate::CronDelivery for NodeApiImpl {
                     text: text.to_string(),
                 }),
             );
-            self.live.push_to_target(target, entry).await;
+            // Both rails share the sink registration; deliver through whichever holds the sink
+            // (the sink maps are kept in lockstep by `register_delivery_sink`, so pushing via
+            // one is sufficient — prefer the durable registry when armed).
+            match &self.attachments {
+                Some(hubs) => hubs.push_to_target(target, entry).await,
+                None => self.live.push_to_target(target, entry).await,
+            }
         }
     }
 }

@@ -48,7 +48,6 @@ impl NodeApiImpl {
             fleet,
             partition,
             live,
-            owners: Arc::new(DashMap::new()),
             verifier: None,
             models: None,
             default_local_profile: "default".to_string(),

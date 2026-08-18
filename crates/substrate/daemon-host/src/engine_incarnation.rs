@@ -655,7 +655,18 @@ impl Incarnation for CoreIncarnation {
                     engine.push_observe(msg);
                     observed = true;
                 }
-                daemon_store::SpliceKind::StartTurn | daemon_store::SpliceKind::Steer => {
+                daemon_store::SpliceKind::StartTurn => {
+                    engine.push_user(msg);
+                    // Per-turn surface hint parity (live `start_turn_from`): a wire submit stamps
+                    // its origin TRANSPORT on the splice's provenance, armed one-shot for the turn
+                    // this fold opens so origin-aware nudge sources key on exactly that submit.
+                    // Rail labels ("host-inject", ...) are unknown families and compose nothing.
+                    engine.set_next_origin(Some(daemon_protocol::TransportId::new(
+                        splice.origin.clone(),
+                    )));
+                    opened = true;
+                }
+                daemon_store::SpliceKind::Steer => {
                     engine.push_user(msg);
                     opened = true;
                 }

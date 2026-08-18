@@ -19,7 +19,7 @@
 
 use super::internals::{api_origin, engine_origin, Drain, LogEntryParts, MergedLog, Pending};
 use super::NodeEventFeed;
-use daemon_api::{ApiError, LogPageView, LogStream, NodeEvent};
+use daemon_api::{ApiError, DeliverySink, LogPageView, LogStream, NodeEvent, SessionLogEntry};
 use daemon_common::{ReqId, SessionId};
 use daemon_core::{SteerReq, TurnControl};
 use daemon_protocol::{
@@ -57,10 +57,20 @@ pub struct AttachmentHub {
     /// used to keep on its actor entry, now homed here so a durable session's `handover` /
     /// `delivery_targets` / transport enumeration serve identically.
     delivery: Mutex<Vec<DeliveryTarget>>,
+    /// The in-process push feed (daemon-event-io-spec §5.9.3, the live pump's sink-push parity):
+    /// every outbound entry this hub publishes is queued here; the per-hub pump task resolves the
+    /// roster's CURRENT `Primary` targets and delivers to any registered [`DeliverySink`] owning
+    /// one — so handover demotion stops/starts push delivery exactly like the live rail.
+    push_tx: tokio::sync::mpsc::UnboundedSender<SessionLogEntry>,
 }
 
 impl AttachmentHub {
-    fn new(session: SessionId, epoch: u64, feed: Option<Arc<NodeEventFeed>>) -> Self {
+    fn new(
+        session: SessionId,
+        epoch: u64,
+        feed: Option<Arc<NodeEventFeed>>,
+        push_tx: tokio::sync::mpsc::UnboundedSender<SessionLogEntry>,
+    ) -> Self {
         let (occupied_tx, _) = watch::channel(false);
         Self {
             log: Arc::new(Mutex::new(MergedLog::new(
@@ -75,6 +85,7 @@ impl AttachmentHub {
             feed,
             session,
             delivery: Mutex::new(Vec::new()),
+            push_tx,
         }
     }
 
@@ -84,7 +95,7 @@ impl AttachmentHub {
     /// emits `SessionAdvanced`) and push it onto the poll drain — the same fan-out the live pump
     /// performs, minus the journal (the activation path journals at the turn boundary itself).
     pub fn publish_event(&self, ev: AgentEvent) {
-        self.log.lock().unwrap().append(
+        let entry = self.log.lock().unwrap().append(
             Direction::Outbound,
             LogEntryParts {
                 origin: engine_origin(),
@@ -92,6 +103,8 @@ impl AttachmentHub {
                 payload: SessionPayload::Event(ev.clone()),
             },
         );
+        // In-process sink push (§5.9.3): the pump task delivers to the roster's Primary sinks.
+        let _ = self.push_tx.send(entry);
         self.drain.lock().unwrap().push_back(Outbound::Event(ev));
     }
 
@@ -351,6 +364,10 @@ pub struct AttachmentHubs {
     /// The node-wide event feed every hub's merged log advances (`SessionAdvanced`) and parks
     /// badge (`ApprovalPending`) into; `None` => no feed wired (e.g. substrate-only tests).
     feed: Option<Arc<NodeEventFeed>>,
+    /// In-process outbound push sinks keyed by transport instance (daemon-event-io-spec §5.9.3),
+    /// the durable half of the registry `LiveSessions` holds for residencies: each hub's pump
+    /// resolves its roster's `Primary` targets per event and pushes to the sink owning each.
+    sinks: Arc<DashMap<TransportId, Arc<dyn DeliverySink>>>,
 }
 
 impl AttachmentHubs {
@@ -359,20 +376,37 @@ impl AttachmentHubs {
         Self {
             map: DashMap::new(),
             feed,
+            sinks: Arc::new(DashMap::new()),
         }
     }
 
+    /// Register (or replace) the in-process push [`DeliverySink`] for `transport` — the durable
+    /// half of [`DeliveryHost`](super::delivery::DeliveryHost) registration.
+    pub fn register_delivery_sink(&self, transport: TransportId, sink: Arc<dyn DeliverySink>) {
+        self.sinks.insert(transport, sink);
+    }
+
+    /// Drop the in-process push sink for `transport` (durable delivery reverts to pull).
+    pub fn unregister_delivery_sink(&self, transport: &TransportId) {
+        self.sinks.remove(transport);
+    }
+
     /// Get-or-create the hub for `session`. `epoch` stamps the merged log's activation generation
-    /// (L2 resync) and is only used at creation; an existing hub keeps its generation.
+    /// (L2 resync) and is only used at creation; an existing hub keeps its generation. Creation
+    /// spawns the hub's push pump (sink delivery); it ends when the hub is detached/dropped.
     pub fn attach(&self, session: &SessionId, epoch: u64) -> Arc<AttachmentHub> {
         self.map
             .entry(session.clone())
             .or_insert_with(|| {
-                Arc::new(AttachmentHub::new(
+                let (push_tx, push_rx) = tokio::sync::mpsc::unbounded_channel();
+                let hub = Arc::new(AttachmentHub::new(
                     session.clone(),
                     epoch,
                     self.feed.clone(),
-                ))
+                    push_tx,
+                ));
+                spawn_push_pump(&hub, push_rx, self.sinks.clone());
+                hub
             })
             .clone()
     }
@@ -398,6 +432,14 @@ impl AttachmentHubs {
             .collect()
     }
 
+    /// Push a synthesized outbound `entry` to the registered sink owning `target`'s transport
+    /// (post-settle cron delivery on the durable rail). A no-op when no sink is registered.
+    pub async fn push_to_target(&self, target: DeliveryTarget, entry: SessionLogEntry) {
+        if let Some(sink) = self.sinks.get(&target.transport).map(|s| s.clone()) {
+            sink.deliver(target, entry).await;
+        }
+    }
+
     /// Every distinct `Primary` target across attached sessions, deduplicated by
     /// `(transport, route)` — the durable half of a cron `deliver = "all"` broadcast.
     pub fn all_primary_targets(&self) -> Vec<DeliveryTarget> {
@@ -415,4 +457,37 @@ impl AttachmentHubs {
         }
         out
     }
+}
+
+/// The per-hub in-process push pump (the live per-session pump's sink half, §5.9.3): for each
+/// outbound entry the hub publishes, re-read the roster's CURRENT `Primary` targets and deliver
+/// the entry to any registered sink owning one — so a `handover` demotion silently stops one sink
+/// and starts the next. Holds the hub weakly (the pump must not keep a detached hub alive); it
+/// ends when the hub is dropped (the sender closes) or the registry entry is gone.
+fn spawn_push_pump(
+    hub: &Arc<AttachmentHub>,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<SessionLogEntry>,
+    sinks: Arc<DashMap<TransportId, Arc<dyn DeliverySink>>>,
+) {
+    let weak = Arc::downgrade(hub);
+    tokio::spawn(async move {
+        while let Some(entry) = rx.recv().await {
+            let Some(hub) = weak.upgrade() else { break };
+            let primaries: Vec<DeliveryTarget> = hub
+                .delivery
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|t| t.kind == SinkKind::Primary)
+                .cloned()
+                .collect();
+            drop(hub);
+            for target in primaries {
+                let sink = sinks.get(&target.transport).map(|s| s.clone());
+                if let Some(sink) = sink {
+                    sink.deliver(target, entry.clone()).await;
+                }
+            }
+        }
+    });
 }

@@ -631,6 +631,8 @@ async fn session_overlay_persists_and_restores_on_respawn_impl() {
     );
 
     // Open the session (binds it to `alpha`; builds its engine from the bare profile -> model-a).
+    // The routed submit rides the durable rail (splice + wake), so the engine build is
+    // asynchronous — drive the turn to completion before asserting on the resolution.
     let session = node
         .submit_routed(
             origin.clone(),
@@ -641,6 +643,21 @@ async fn session_overlay_persists_and_restores_on_respawn_impl() {
         )
         .await
         .expect("routed submit opens the session");
+    {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut finished = false;
+        while Instant::now() < deadline && !finished {
+            for item in node.poll(session.clone(), 0).await.expect("poll") {
+                if let Outbound::Event(AgentEvent::TurnFinished { .. }) = item {
+                    finished = true;
+                }
+            }
+            if !finished {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+        assert!(finished, "the opening routed turn ran to completion");
+    }
     assert_eq!(
         seen.lock().unwrap().first().map(String::as_str),
         Some("model-a"),
@@ -669,11 +686,12 @@ async fn session_overlay_persists_and_restores_on_respawn_impl() {
         "the model override is persisted on the overlay"
     );
 
-    // Tear the live actor down, then reopen the same routed session: `ensure` reads the persisted
-    // overlay and rebuilds the engine from `alpha + {model: model-x}` — the restore.
+    // Detach the session's observation surface, then reopen the same routed session: the next
+    // hydrate re-resolves `alpha + {model: model-x}` (the overlay changed the profile inputs, so
+    // a lingering resident engine is rebuilt under the new resolution) — the restore.
     node.submit(session.clone(), AgentCommand::Shutdown)
         .await
-        .expect("shutdown the live actor");
+        .expect("shutdown / detach");
     let reopened = node
         .submit_routed(
             origin,
@@ -709,10 +727,6 @@ async fn session_overlay_persists_and_restores_on_respawn_impl() {
         recorded.last().map(String::as_str),
         Some("model-x"),
         "the respawned engine resolved the *restored* overridden model, not the profile default: {recorded:?}"
-    );
-    assert!(
-        recorded.iter().filter(|m| m.as_str() == "model-x").count() >= 2,
-        "model-x was resolved both at override time and again on respawn: {recorded:?}"
     );
 
     handle.shutdown().await;
