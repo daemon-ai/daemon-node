@@ -229,9 +229,10 @@ async fn serve_control(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse
         }
         // -- saved presences (wire v37) -------------------------------------------------------
         ApiRequest::PresenceList => ApiResponse::SavedPresences(api.presence_list().await),
-        ApiRequest::PresenceSave { presence } => unit_or_err(api.presence_save(presence).await),
-        ApiRequest::PresenceDelete { id } => unit_or_err(api.presence_delete(id).await),
-        ApiRequest::PresenceSetActive { id } => unit_or_err(api.presence_set_active(id).await),
+        // OCC (`expected_rev`) is enforced centrally in `dispatch_censused`, before the fan-out.
+        ApiRequest::PresenceSave { presence, .. } => unit_or_err(api.presence_save(presence).await),
+        ApiRequest::PresenceDelete { id, .. } => unit_or_err(api.presence_delete(id).await),
+        ApiRequest::PresenceSetActive { id, .. } => unit_or_err(api.presence_set_active(id).await),
         // -- notifications (wire v37) ---------------------------------------------------------
         ApiRequest::NotificationList => ApiResponse::Notifications(api.notification_list().await),
         // -- persons / metacontacts (wire v37) ------------------------------------------------
@@ -335,10 +336,11 @@ async fn serve_models(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse>
         ApiRequest::CustomProviderList => {
             ApiResponse::CustomProviders(api.custom_provider_list().await)
         }
-        ApiRequest::CustomProviderSet { provider } => {
+        // OCC (`expected_rev`) is enforced centrally in `dispatch_censused`, before the fan-out.
+        ApiRequest::CustomProviderSet { provider, .. } => {
             unit_or_err(api.custom_provider_set(provider).await)
         }
-        ApiRequest::CustomProviderRemove { id } => {
+        ApiRequest::CustomProviderRemove { id, .. } => {
             unit_or_err(api.custom_provider_remove(id).await)
         }
         _ => return None,
@@ -399,7 +401,8 @@ async fn serve_profile(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse
         ApiRequest::ProfileList => ApiResponse::Profiles(api.profile_list().await),
         ApiRequest::ProfileGet { id } => ok_or_err(api.profile_get(id).await, ApiResponse::Profile),
         ApiRequest::ProfileCreate { spec } => unit_or_err(api.profile_create(spec).await),
-        ApiRequest::ProfileUpdate { spec } => unit_or_err(api.profile_update(spec).await),
+        // OCC (`expected_rev`) is enforced centrally in `dispatch_censused`, before the fan-out.
+        ApiRequest::ProfileUpdate { spec, .. } => unit_or_err(api.profile_update(spec).await),
         ApiRequest::ProfileDelete { id } => unit_or_err(api.profile_delete(id).await),
         ApiRequest::ProfileSelect { id } => unit_or_err(api.profile_select(id).await),
         ApiRequest::ProfileClone { source, new_id } => {
@@ -431,7 +434,8 @@ async fn serve_profile(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse
         ApiRequest::SkillGet { name } => {
             ok_or_err(api.skill_get(name).await, ApiResponse::SkillBundle)
         }
-        ApiRequest::SkillPut { bundle } => unit_or_err(api.skill_put(bundle).await),
+        // OCC (`expected_rev`) is enforced centrally in `dispatch_censused`, before the fan-out.
+        ApiRequest::SkillPut { bundle, .. } => unit_or_err(api.skill_put(bundle).await),
         _ => return None,
     })
 }
@@ -492,8 +496,9 @@ async fn serve_cron(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse> {
         ApiRequest::CronCreate { spec } => {
             ok_or_err(api.cron_create(spec).await, ApiResponse::CronId)
         }
-        ApiRequest::CronUpdate { id, spec } => unit_or_err(api.cron_update(id, spec).await),
-        ApiRequest::CronDelete { id } => unit_or_err(api.cron_delete(id).await),
+        // OCC (`expected_rev`) is enforced centrally in `dispatch_censused`, before the fan-out.
+        ApiRequest::CronUpdate { id, spec, .. } => unit_or_err(api.cron_update(id, spec).await),
+        ApiRequest::CronDelete { id, .. } => unit_or_err(api.cron_delete(id).await),
         ApiRequest::CronTrigger { id } => unit_or_err(api.cron_trigger(id).await),
         ApiRequest::CronRuns { id } => ApiResponse::CronRuns(api.cron_runs(id).await),
         ApiRequest::CronPause { id, paused } => unit_or_err(api.cron_pause(id, paused).await),
@@ -515,13 +520,15 @@ async fn serve_routing(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse
             ApiResponse::ChatRoutes(api.routing_list_chats(after).await)
         }
         ApiRequest::RoutingGet { origin } => ApiResponse::ChatRoute(api.routing_get(origin).await),
-        ApiRequest::RoutingSet { route } => unit_or_err(api.routing_set(route).await),
+        // OCC (`expected_rev`) is enforced centrally in `dispatch_censused`, before the fan-out.
+        ApiRequest::RoutingSet { route, .. } => unit_or_err(api.routing_set(route).await),
         ApiRequest::RoutingBindChat {
             origin,
             session,
             profile,
+            ..
         } => unit_or_err(api.routing_bind_chat(origin, session, profile).await),
-        ApiRequest::RoutingUnbindChat { origin } => {
+        ApiRequest::RoutingUnbindChat { origin, .. } => {
             unit_or_err(api.routing_unbind_chat(origin).await)
         }
         ApiRequest::TransportRooms { transport, after } => {
@@ -843,10 +850,53 @@ pub async fn dispatch_with_effects(
 /// silent-mutation defect; a `NonStateful` run that recorded any is a misclassification. Both log
 /// loud in every build (the conformance census suite hard-asserts per domain — a feed-less
 /// assembly legitimately records nothing, so dispatch must not panic here).
+/// [v52 OCC, spec §9] The optimistic-concurrency precondition a census update verb carries: the
+/// (partition-less) projection whose current rev must equal the request's `expected_rev` for the
+/// mutation to proceed. `None` = the verb carries no precondition (absent field = no check).
+fn occ_precondition(req: &ApiRequest) -> Option<(ProjectionId, u64)> {
+    let (projection, expected) = match req {
+        ApiRequest::ProfileUpdate { expected_rev, .. } => (ProjectionId::Profiles, expected_rev),
+        ApiRequest::SkillPut { expected_rev, .. } => (ProjectionId::Skills, expected_rev),
+        ApiRequest::CustomProviderSet { expected_rev, .. }
+        | ApiRequest::CustomProviderRemove { expected_rev, .. } => {
+            (ProjectionId::CustomProviders, expected_rev)
+        }
+        ApiRequest::CronUpdate { expected_rev, .. }
+        | ApiRequest::CronDelete { expected_rev, .. } => (ProjectionId::Cron, expected_rev),
+        ApiRequest::RoutingSet { expected_rev, .. }
+        | ApiRequest::RoutingBindChat { expected_rev, .. }
+        | ApiRequest::RoutingUnbindChat { expected_rev, .. } => {
+            (ProjectionId::Routing, expected_rev)
+        }
+        ApiRequest::PresenceSave { expected_rev, .. }
+        | ApiRequest::PresenceDelete { expected_rev, .. }
+        | ApiRequest::PresenceSetActive { expected_rev, .. } => {
+            (ProjectionId::Presence, expected_rev)
+        }
+        _ => return None,
+    };
+    expected.map(|rev| (projection, rev))
+}
+
 async fn dispatch_censused(
     api: &dyn NodeApi,
     req: ApiRequest,
 ) -> (ApiResponse, Vec<crate::DomainRev>) {
+    // [v52 OCC, spec §9] Enforce the census `expected_rev` precondition before the handler runs:
+    // a stale observation is rejected with `Conflict` and state is untouched (the `FsWrite
+    // base_revision` precedent). An unknown current rev (no feed) fails open, like the census.
+    if let Some((projection, expected)) = occ_precondition(&req) {
+        if let Some(current) = api.occ_domain_rev(projection).await {
+            if current != expected {
+                return (
+                    ApiResponse::Error(ApiError::Conflict(format!(
+                        "stale {projection:?} rev: expected {expected}, current {current}"
+                    ))),
+                    Vec::new(),
+                );
+            }
+        }
+    }
     let class = census(&req);
     // The request is consumed by the fan-out; capture a debug label up front for the (rare)
     // mutation classes only, so the hot read path pays nothing.

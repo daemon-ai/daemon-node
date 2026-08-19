@@ -431,7 +431,10 @@ mod tests {
                 Capability::CredentialWrite,
             ),
             (
-                ApiRequest::CronDelete { id: "c".into() },
+                ApiRequest::CronDelete {
+                    id: "c".into(),
+                    expected_rev: None,
+                },
                 Capability::CronWrite,
             ),
             (

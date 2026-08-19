@@ -252,6 +252,12 @@ impl ControlApi for NodeApiImpl {
         report
     }
 
+    async fn occ_domain_rev(&self, projection: daemon_api::ProjectionId) -> Option<u64> {
+        // [v52 OCC, spec §9] The census precondition's comparison value. `None` (no feed) fails
+        // open in dispatch — an assembly with no revision authority cannot arbitrate staleness.
+        self.node_feed().map(|f| f.domain_rev(projection))
+    }
+
     async fn command_dedup_lookup(&self, op_id: &str) -> Option<Vec<u8>> {
         // Dedup is keyed `(principal, op_id)`. The principal is the current request's ownership id
         // (fail-closed: a context-less request keys on the empty principal, matching how the

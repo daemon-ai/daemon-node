@@ -46,11 +46,16 @@ pub(super) async fn run(client: &ApiClient, cmd: CronCmd) -> anyhow::Result<()> 
                 enabled: true,
                 ..CronSpec::default()
             },
+            // The CLI is a one-shot operator tool with no observed rev — no OCC precondition.
+            expected_rev: None,
         },
         CronCmd::Pause { id } => ApiRequest::CronPause { id, paused: true },
         CronCmd::Resume { id } => ApiRequest::CronPause { id, paused: false },
         CronCmd::Run { id } => ApiRequest::CronTrigger { id },
-        CronCmd::Remove { id } => ApiRequest::CronDelete { id },
+        CronCmd::Remove { id } => ApiRequest::CronDelete {
+            id,
+            expected_rev: None,
+        },
         CronCmd::Runs { id } => ApiRequest::CronRuns { id },
         CronCmd::Suggest { cmd } => match cmd {
             CronSuggestCmd::List => ApiRequest::CronSuggestions,

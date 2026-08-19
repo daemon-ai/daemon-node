@@ -353,6 +353,10 @@ pub enum ApiRequest {
     ProfileUpdate {
         /// The replacement profile bundle (keyed by its id).
         spec: ProfileSpec,
+        /// [v52 OCC, spec §9] The Profiles domain rev the client observed; a mismatch returns
+        /// `Conflict` and leaves state unchanged. Absent = no check.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_rev: Option<u64>,
     },
     /// [`ProfileApi::profile_delete`].
     ProfileDelete {
@@ -571,12 +575,19 @@ pub enum ApiRequest {
     CustomProviderSet {
         /// The custom provider to persist (keyed by [`CustomProvider::id`]).
         provider: CustomProvider,
+        /// [v52 OCC, spec §9] The CustomProviders domain rev the client observed; a mismatch
+        /// returns `Conflict` and leaves state unchanged. Absent = no check.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_rev: Option<u64>,
     },
     /// [`ModelApi::custom_provider_remove`] — remove a user-defined custom provider by id. Gated on
     /// `Capability::ModelsWrite`.
     CustomProviderRemove {
         /// The [`CustomProvider::id`] to remove.
         id: String,
+        /// [v52 OCC, spec §9] The CustomProviders domain rev the client observed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_rev: Option<u64>,
     },
     /// [`SessionApi::set_session_model`].
     SetSessionModel {
@@ -722,6 +733,9 @@ pub enum ApiRequest {
     SkillPut {
         /// The bundle to write.
         bundle: SkillBundle,
+        /// [v52 OCC, spec §9] The Skills domain rev the client observed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_rev: Option<u64>,
     },
     /// [`ControlApi::provider_list`].
     ProviderList,
@@ -783,11 +797,17 @@ pub enum ApiRequest {
         id: String,
         /// The replacement spec.
         spec: CronSpec,
+        /// [v52 OCC, spec §9] The Cron domain rev the client observed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_rev: Option<u64>,
     },
     /// [`ControlApi::cron_delete`].
     CronDelete {
         /// The job id.
         id: String,
+        /// [v52 OCC, spec §9] The Cron domain rev the client observed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_rev: Option<u64>,
     },
     /// [`ControlApi::cron_trigger`].
     CronTrigger {
@@ -833,6 +853,9 @@ pub enum ApiRequest {
     RoutingSet {
         /// The pin to persist.
         route: ChatRoute,
+        /// [v52 OCC, spec §9] The Routing domain rev the client observed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_rev: Option<u64>,
     },
     /// [`ControlApi::routing_bind_chat`] — pin an origin to a session (+ optional profile).
     RoutingBindChat {
@@ -843,11 +866,17 @@ pub enum ApiRequest {
         /// An optional profile override.
         #[serde(default)]
         profile: Option<ProfileRef>,
+        /// [v52 OCC, spec §9] The Routing domain rev the client observed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_rev: Option<u64>,
     },
     /// [`ControlApi::routing_unbind_chat`] — remove an origin's pin.
     RoutingUnbindChat {
         /// The origin to unpin.
         origin: Origin,
+        /// [v52 OCC, spec §9] The Routing domain rev the client observed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_rev: Option<u64>,
     },
     /// [`ControlApi::transport_rooms`] — enumerate a transport instance's rooms.
     TransportRooms {
@@ -1276,16 +1305,25 @@ pub enum ApiRequest {
     PresenceSave {
         /// The saved presence to persist (an empty `id` mints a fresh one).
         presence: SavedPresence,
+        /// [v52 OCC, spec §9] The Presence domain rev the client observed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_rev: Option<u64>,
     },
     /// [`ControlApi::presence_delete`] — delete a saved presence by id (wire v37; idempotent).
     PresenceDelete {
         /// The saved-presence id to remove.
         id: String,
+        /// [v52 OCC, spec §9] The Presence domain rev the client observed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_rev: Option<u64>,
     },
     /// [`ControlApi::presence_set_active`] — set the active saved presence by id (wire v37).
     PresenceSetActive {
         /// The saved-presence id to activate.
         id: String,
+        /// [v52 OCC, spec §9] The Presence domain rev the client observed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_rev: Option<u64>,
     },
 
     // -- notifications (wire v37) --------------------------------------------------------------
@@ -2516,19 +2554,18 @@ mod auth_contract_tests {
     }
 
     /// The contract wire version (`daemon_common::WireVersion::CURRENT`, mirrored by
-    /// [`crate::API_WIRE_VERSION`]) is pinned to the sealed surface: v51 (the projection-sync
-    /// stage-7 cutover — the 14 legacy per-collection invalidation arms removed in favor of
-    /// `ProjectionChanged`, `EventsSince.wait_ms` deleted, and the mux `Reply`/`Item` frames gain
-    /// the optional `response-metadata` receipt envelope). Distinct from the transport-envelope
-    /// [`WIRE_VERSION`] above (= 2), which these rungs did not touch. Bumping the contract
-    /// version is a deliberate act — this assertion is the gate.
+    /// [`crate::API_WIRE_VERSION`]) is pinned to the sealed surface: v52 (projection-sync stage-8
+    /// OCC — the spec-§9 census update verbs gain `? expected_rev`; a mismatch returns `Conflict`
+    /// and leaves state unchanged). Distinct from the transport-envelope [`WIRE_VERSION`] above
+    /// (= 2), which these rungs did not touch. Bumping the contract version is a deliberate act —
+    /// this assertion is the gate.
     #[test]
-    fn contract_wire_version_is_v51() {
+    fn contract_wire_version_is_v52() {
         assert_eq!(
             daemon_common::WireVersion::CURRENT,
-            daemon_common::WireVersion(51)
+            daemon_common::WireVersion(52)
         );
-        assert_eq!(crate::API_WIRE_VERSION, daemon_common::WireVersion(51));
+        assert_eq!(crate::API_WIRE_VERSION, daemon_common::WireVersion(52));
     }
 
     /// The `api/<N>` feature string is formatted from the API mirror version (never hardcoded)

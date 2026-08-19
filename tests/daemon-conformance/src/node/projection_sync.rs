@@ -301,13 +301,21 @@ async fn formerly_silent_mutations_emit_their_domain_pointer_impl() {
                 origin: origin.clone(),
                 session: SessionId::new("psync-routed"),
                 profile: None,
+                expected_rev: None,
             },
         )
         .await,
         "routing bind",
     );
     ok(
-        dispatch(node.as_ref(), ApiRequest::RoutingUnbindChat { origin }).await,
+        dispatch(
+            node.as_ref(),
+            ApiRequest::RoutingUnbindChat {
+                origin,
+                expected_rev: None,
+            },
+        )
+        .await,
         "routing unbind",
     );
     // Tool enablement override.
@@ -348,6 +356,7 @@ async fn formerly_silent_mutations_emit_their_domain_pointer_impl() {
                     credential_ref: None,
                     source: daemon_api::CustomProviderSource::User,
                 },
+                expected_rev: None,
             },
         )
         .await,
@@ -540,6 +549,120 @@ async fn deduplicated_retry_carries_no_receipt_impl() {
         "a deduplicated retry mutates nothing and earns no receipt: {retry_effects:?}"
     );
 
+    handle.shutdown().await;
+}
+
+/// Stage 8 OCC (spec §9, v52): the census `expected_rev` precondition on a mutation. A fresh
+/// observation is accepted and its receipt carries the newly minted rev; a stale observation is
+/// rejected with `Conflict` and leaves state untouched; an absent field means no check (the
+/// pre-v52 behavior, byte-identical on the wire).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn occ_expected_rev_gates_census_mutations() {
+    let (node, handle) = assemble();
+    let path = temp_socket();
+    let listener = UnixListener::bind(&path).expect("bind socket");
+    let server = tokio::spawn(serve_api_unix(listener, node.clone()));
+    let mut mux = MuxApiClient::connect(path.clone())
+        .await
+        .expect("mux connect + hello");
+
+    let provider = |name: &str| daemon_api::CustomProvider {
+        id: "occ-provider".into(),
+        display_name: name.into(),
+        base_url: "https://example.invalid/v1".into(),
+        wire_selector: daemon_api::ProviderSelector::DaemonApi,
+        requires_key: false,
+        credential_ref: None,
+        source: daemon_api::CustomProviderSource::User,
+    };
+
+    // Fresh observation: the domain has never been touched, so its current rev is 0.
+    let (res, meta) = mux
+        .call_with_meta(ApiRequest::CustomProviderSet {
+            provider: provider("first"),
+            expected_rev: Some(0),
+        })
+        .await
+        .expect("fresh-rev set");
+    assert!(
+        matches!(res, ApiResponse::Ok),
+        "fresh rev accepted: {res:?}"
+    );
+    let changes = meta
+        .expect("the accepted write carries a receipt")
+        .changes
+        .expect("with its changes list");
+    let minted = changes
+        .iter()
+        .find(|d| d.projection == ProjectionId::CustomProviders)
+        .expect("the receipt names the CustomProviders domain")
+        .rev;
+    assert!(minted >= 1, "the accepted write minted a new rev");
+
+    // Stale observation: expected_rev 0 no longer matches — Conflict, and state is untouched.
+    let (res, meta) = mux
+        .call_with_meta(ApiRequest::CustomProviderSet {
+            provider: provider("stale-loser"),
+            expected_rev: Some(0),
+        })
+        .await
+        .expect("stale-rev set");
+    assert!(
+        matches!(res, ApiResponse::Error(daemon_api::ApiError::Conflict(_))),
+        "stale rev must return Conflict: {res:?}"
+    );
+    assert_eq!(meta, None, "a rejected write earns no receipt");
+    let listed = match mux
+        .call_with_meta(ApiRequest::CustomProviderList)
+        .await
+        .expect("list")
+        .0
+    {
+        ApiResponse::CustomProviders(list) => list,
+        other => panic!("expected CustomProviders, got {other:?}"),
+    };
+    assert_eq!(
+        listed
+            .iter()
+            .find(|p| p.id == "occ-provider")
+            .map(|p| p.display_name.as_str()),
+        Some("first"),
+        "the conflicted write left state unchanged"
+    );
+
+    // Absent field: no check (the pre-v52 behavior).
+    let (res, _) = mux
+        .call_with_meta(ApiRequest::CustomProviderSet {
+            provider: provider("unchecked"),
+            expected_rev: None,
+        })
+        .await
+        .expect("unchecked set");
+    assert!(matches!(res, ApiResponse::Ok), "absent = no check: {res:?}");
+
+    // Current observation: reading the receipt's rev makes the next guarded write land.
+    let current = node.occ_domain_rev(ProjectionId::CustomProviders).await;
+    let (res, meta) = mux
+        .call_with_meta(ApiRequest::CustomProviderSet {
+            provider: provider("guarded-winner"),
+            expected_rev: current,
+        })
+        .await
+        .expect("current-rev set");
+    assert!(
+        matches!(res, ApiResponse::Ok),
+        "the current rev is accepted: {res:?}"
+    );
+    let receipt = meta.expect("receipt").changes.expect("changes");
+    assert!(
+        receipt
+            .iter()
+            .any(|d| d.projection == ProjectionId::CustomProviders && Some(d.rev) > current),
+        "the OCC-guarded write's receipt carries the NEW rev: {receipt:?}"
+    );
+
+    server.abort();
+    let _ = std::fs::remove_file(&path);
     handle.shutdown().await;
 }
 

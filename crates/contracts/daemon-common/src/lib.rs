@@ -879,7 +879,14 @@ impl WireVersion {
     /// one-shot read never blocks). The mux `Reply`/`Item` S2C frames gain `? meta`
     /// (`response-metadata`: `? changes` — per-response `domain-rev` receipts, stage-8 OCC seam,
     /// absent until then).
-    pub const CURRENT: Self = Self(51);
+    ///
+    /// (v52) projection-sync stage 8 OCC (daemon-projection-sync-spec.md §9): the census-selected
+    /// editable records gain optimistic concurrency — `? expected_rev` (the domain rev the client
+    /// observed) on `ProfileUpdate` / `SkillPut` / `CustomProviderSet` / `CustomProviderRemove` /
+    /// `CronUpdate` / `CronDelete` / `RoutingSet` / `RoutingBindChat` / `RoutingUnbindChat` /
+    /// `PresenceSave` / `PresenceDelete` / `PresenceSetActive`. A mismatch returns `Conflict` and
+    /// leaves state unchanged (the `FsWrite base_revision` precedent); absent = no check.
+    pub const CURRENT: Self = Self(52);
 
     /// The version this build speaks (alias for [`WireVersion::CURRENT`]).
     pub fn current() -> Self {

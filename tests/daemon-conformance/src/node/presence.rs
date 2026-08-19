@@ -49,7 +49,10 @@ async fn presence_crud_over_socket_and_in_process() {
     };
     assert!(matches!(
         client
-            .call(ApiRequest::PresenceSave { presence: saved })
+            .call(ApiRequest::PresenceSave {
+                presence: saved,
+                expected_rev: None
+            })
             .await
             .unwrap(),
         ApiResponse::Ok
@@ -68,7 +71,8 @@ async fn presence_crud_over_socket_and_in_process() {
     assert!(matches!(
         client
             .call(ApiRequest::PresenceSetActive {
-                id: lunch_id.clone()
+                id: lunch_id.clone(),
+                expected_rev: None
             })
             .await
             .unwrap(),
@@ -94,7 +98,8 @@ async fn presence_crud_over_socket_and_in_process() {
     assert!(matches!(
         client
             .call(ApiRequest::PresenceDelete {
-                id: lunch_id.clone()
+                id: lunch_id.clone(),
+                expected_rev: None
             })
             .await
             .unwrap(),

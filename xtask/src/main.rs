@@ -4511,6 +4511,7 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
         "request-profile-update.cbor",
         &ApiRequest::ProfileUpdate {
             spec: fixture_spec.clone(),
+            expected_rev: None,
         },
     )?;
     write_cbor(
@@ -4816,6 +4817,7 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
                 credential_ref: Some("custom/my-gateway".into()),
                 source: daemon_api::CustomProviderSource::User,
             },
+            expected_rev: None,
         },
     )?;
     write_cbor(
@@ -4823,6 +4825,7 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
         "request-custom-provider-remove.cbor",
         &ApiRequest::CustomProviderRemove {
             id: "custom/my-gateway".into(),
+            expected_rev: None,
         },
     )?;
     write_cbor(
@@ -5551,6 +5554,7 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
             "request-presence-save.cbor",
             &ApiRequest::PresenceSave {
                 presence: fixture_presence.clone(),
+                expected_rev: None,
             },
         )?;
         write_cbor(
@@ -5558,6 +5562,7 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
             "request-presence-delete.cbor",
             &ApiRequest::PresenceDelete {
                 id: "ffffffff-ffff-ffff-ffff-ffffffffffff".into(),
+                expected_rev: None,
             },
         )?;
         write_cbor(
@@ -5565,6 +5570,7 @@ fn gen_api_fixtures() -> anyhow::Result<()> {
             "request-presence-set-active.cbor",
             &ApiRequest::PresenceSetActive {
                 id: "ffffffff-ffff-ffff-ffff-ffffffffffff".into(),
+                expected_rev: None,
             },
         )?;
         write_cbor(

@@ -777,6 +777,14 @@ pub trait ControlApi: Send + Sync {
         BootstrapReport::default()
     }
 
+    /// [v52 OCC, spec §9] The current revision of a whole (partition-less) revision domain — the
+    /// value the dispatch core compares a census verb's `expected_rev` precondition against
+    /// before running the handler. `None` = unknown (a node with no feed), and the check fails
+    /// open, mirroring the census discipline. Default: `None`.
+    async fn occ_domain_rev(&self, _projection: ProjectionId) -> Option<u64> {
+        None
+    }
+
     // -- rung 3 (api/39) op-id idempotent dedup ---------------------------------------------
     //
     // The verb-agnostic dedup seam the shared `dispatch` core consults for every request carrying
@@ -5392,6 +5400,7 @@ mod tests {
             ApiRequest::CronUpdate {
                 id: "j1".into(),
                 spec: spec.clone(),
+                expected_rev: None,
             },
             ApiRequest::CronPause {
                 id: "j1".into(),

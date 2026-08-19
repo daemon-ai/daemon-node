@@ -19,7 +19,7 @@ kv-pair = [k: tstr, v: tstr]
 ; cap) - the fix that lets arbitrary file sizes round-trip. Fixed 32-byte hashes stay arrays
 ; (`content-hash`, below) since they are small and `ContentHash([u8; 32])` serializes as a sequence.
 byte-array = bstr
-wire_version = uint                 ; daemon-common WireVersion (current = 51)
+wire_version = uint                 ; daemon-common WireVersion (current = 52)
 
 ; ----- uniform wire pagination (wire v25) -----
 ; Every list op that can exceed the client codec's fixed 64-element array buffers is paginated
@@ -1526,7 +1526,10 @@ request-fingerprint-revoke = { "FingerprintRevoke": { "session": session-id, "fi
 request-profile-list = "ProfileList"
 request-profile-get = { "ProfileGet": { "id": tstr } }
 request-profile-create = { "ProfileCreate": { "spec": profile-spec } }
-request-profile-update = { "ProfileUpdate": { "spec": profile-spec } }
+; v52 (projection-sync stage 8, spec §9): the census-selected editable records gain OCC —
+; `? expected_rev` names the domain rev the client observed; a mismatch returns Conflict and
+; leaves state unchanged (the FsWrite base_revision precedent). Absent = no check.
+request-profile-update = { "ProfileUpdate": { "spec": profile-spec, ? "expected_rev": (uint64 / null) } }
 request-profile-delete = { "ProfileDelete": { "id": tstr } }
 request-profile-select = { "ProfileSelect": { "id": tstr } }
 request-profile-clone = { "ProfileClone": { "source": tstr, "new_id": tstr } }
@@ -1594,8 +1597,8 @@ request-model-current = { "ModelCurrent": { "profile": (tstr / null) } }
 request-provider-catalog = "ProviderCatalog"
 request-provider-models = { "ProviderModels": { "provider": tstr, ? "credential_ref": (tstr / null), ? "transient_key": (tstr / null), ? "after": (tstr / null) } }
 request-custom-provider-list = "CustomProviderList"
-request-custom-provider-set = { "CustomProviderSet": { "provider": custom-provider } }
-request-custom-provider-remove = { "CustomProviderRemove": { "id": tstr } }
+request-custom-provider-set = { "CustomProviderSet": { "provider": custom-provider, ? "expected_rev": (uint64 / null) } }
+request-custom-provider-remove = { "CustomProviderRemove": { "id": tstr, ? "expected_rev": (uint64 / null) } }
 request-auth-begin = { "AuthBegin": auth-begin-request }
 request-auth-step = { "AuthStep": auth-step-request }
 request-auth-complete = { "AuthComplete": auth-complete-request }
@@ -1615,7 +1618,7 @@ request-agent-catalog = "AgentCatalog"
 request-agent-register = { "AgentRegister": { "entry": agent-entry } }
 request-agent-remove = { "AgentRemove": { "name": tstr } }
 request-skill-get = { "SkillGet": { "name": tstr } }
-request-skill-put = { "SkillPut": { "bundle": skill-bundle } }
+request-skill-put = { "SkillPut": { "bundle": skill-bundle, ? "expected_rev": (uint64 / null) } }
 request-provider-list = "ProviderList"
 request-provider-register = { "ProviderRegister": { "provider": provider-info } }
 request-tool-list = "ToolList"
@@ -1630,8 +1633,8 @@ request-gateway-get = "GatewayGet"
 request-gateway-set = { "GatewaySet": { "enabled": bool, ? "addr": (tstr / null) } }
 request-cron-list = "CronList"
 request-cron-create = { "CronCreate": { "spec": cron-spec } }
-request-cron-update = { "CronUpdate": { "id": tstr, "spec": cron-spec } }
-request-cron-delete = { "CronDelete": { "id": tstr } }
+request-cron-update = { "CronUpdate": { "id": tstr, "spec": cron-spec, ? "expected_rev": (uint64 / null) } }
+request-cron-delete = { "CronDelete": { "id": tstr, ? "expected_rev": (uint64 / null) } }
 request-cron-trigger = { "CronTrigger": { "id": tstr } }
 request-cron-runs = { "CronRuns": { "id": tstr } }
 request-cron-pause = { "CronPause": { "id": tstr, "paused": bool } }
@@ -1640,9 +1643,9 @@ request-cron-accept-suggestion = { "CronAcceptSuggestion": { "id": tstr } }
 request-cron-dismiss-suggestion = { "CronDismissSuggestion": { "id": tstr } }
 request-routing-list-chats = { "RoutingListChats": { ? "after": (tstr / null) } }
 request-routing-get = { "RoutingGet": { "origin": origin } }
-request-routing-set = { "RoutingSet": { "route": chat-route } }
-request-routing-bind-chat = { "RoutingBindChat": { "origin": origin, "session": session-id, ? "profile": (profile-ref / null) } }
-request-routing-unbind-chat = { "RoutingUnbindChat": { "origin": origin } }
+request-routing-set = { "RoutingSet": { "route": chat-route, ? "expected_rev": (uint64 / null) } }
+request-routing-bind-chat = { "RoutingBindChat": { "origin": origin, "session": session-id, ? "profile": (profile-ref / null), ? "expected_rev": (uint64 / null) } }
+request-routing-unbind-chat = { "RoutingUnbindChat": { "origin": origin, ? "expected_rev": (uint64 / null) } }
 request-transport-rooms = { "TransportRooms": { "transport": transport-id, ? "after": (tstr / null) } }
 request-transport-adapters = "TransportAdapters"
 request-transport-instances = "TransportInstances"
@@ -1759,9 +1762,9 @@ request-person-list = { "PersonList": { ? "since_rev": (uint64 / null) } }
 
 ; ----- saved presences (wire v37) -----
 request-presence-list = "PresenceList"
-request-presence-save = { "PresenceSave": { "presence": saved-presence } }
-request-presence-delete = { "PresenceDelete": { "id": tstr } }
-request-presence-set-active = { "PresenceSetActive": { "id": tstr } }
+request-presence-save = { "PresenceSave": { "presence": saved-presence, ? "expected_rev": (uint64 / null) } }
+request-presence-delete = { "PresenceDelete": { "id": tstr, ? "expected_rev": (uint64 / null) } }
+request-presence-set-active = { "PresenceSetActive": { "id": tstr, ? "expected_rev": (uint64 / null) } }
 
 ; ----- file transfer (wire v37) -----
 ; FileTransfer (<- PurpleFileTransfer). "name"+"blob" are the original required shape; the rest are additive

@@ -786,6 +786,25 @@ impl NodeEventFeed {
         }
     }
 
+    /// [v52 OCC, spec §9] The current revision of one whole (partition-less) revision domain —
+    /// the value a census verb's `expected_rev` precondition is compared against. Legacy-counter
+    /// domains read their dedicated counters (the same values [`Self::bootstrap`] serves, so the
+    /// two can never disagree); everything else reads the uniform map (`0` = never touched).
+    pub(crate) fn domain_rev(&self, projection: daemon_api::ProjectionId) -> u64 {
+        use daemon_api::ProjectionId;
+        let g = self.inner.lock().unwrap();
+        match projection {
+            ProjectionId::Sessions => g.rev,
+            ProjectionId::Fleet => g.fleet_rev,
+            ProjectionId::Profiles => g.profiles_rev,
+            ProjectionId::Agents => g.agents_rev,
+            ProjectionId::Persons => g.persons.rev,
+            ProjectionId::Notifications => g.notifications_rev,
+            ProjectionId::Catalog => g.catalog_rev,
+            other => g.domains.get(&(other, None)).copied().unwrap_or(0),
+        }
+    }
+
     /// The `epoch` value to stamp onto an outgoing [`EventsPage`] (rung 1): this feed's generation.
     fn stamp_epoch(&self) -> Option<u64> {
         Some(self.epoch())
