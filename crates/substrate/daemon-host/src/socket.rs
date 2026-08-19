@@ -19,10 +19,10 @@ use crate::authz::authorize;
 use crate::request_context::{with_request_context, AuthMethod, RequestContext};
 use crate::revocation::RevocationGuard;
 use daemon_api::{
-    dispatch, from_cbor, is_streaming, to_cbor, wire_feature_api, ApiError, ApiRequest,
-    ApiResponse, EventsPage, LogPageView, LogStreamItem, NodeApi, WireC2S, WireS2C,
-    WIRE_FEATURE_AUTH, WIRE_FEATURE_MUX, WIRE_FEATURE_STREAM, WIRE_FEATURE_VERSIONING,
-    WIRE_VERSION,
+    dispatch_with_effects, from_cbor, is_streaming, to_cbor, wire_feature_api, ApiError,
+    ApiRequest, ApiResponse, DomainRev, EventsPage, LogPageView, LogStreamItem, NodeApi,
+    ResponseMetadata, WireC2S, WireS2C, WIRE_FEATURE_AUTH, WIRE_FEATURE_MUX, WIRE_FEATURE_STREAM,
+    WIRE_FEATURE_VERSIONING, WIRE_VERSION,
 };
 use daemon_auth::Principal;
 use daemon_common::{IngressGovernor, IngressLimits};
@@ -317,8 +317,11 @@ where
                         if mode.is_local_system() {
                             let ctx = RequestContext::system().with_conn_id(conn_id);
                             // Local-trust system principal holds every capability, so no denial can
-                            // occur here; the bare one-shot path carries no audit sink.
-                            authorize_and_dispatch(api.as_ref(), request, ctx, None).await
+                            // occur here; the bare one-shot path carries no audit sink. The bare
+                            // framing has no envelope, so receipt effects have nowhere to ride.
+                            authorize_and_dispatch(api.as_ref(), request, ctx, None)
+                                .await
+                                .0
                         } else {
                             // No SASL handshake on the bare protocol: fail closed.
                             ApiResponse::Error(ApiError::Unauthenticated(
@@ -419,12 +422,16 @@ fn method_label(method: AuthMethod) -> &'static str {
 /// `tokio::spawn`ed tasks do NOT inherit the caller's task-local, so EVERY spawned per-`Call` task
 /// re-establishes the scope here (the Auth 2 caveat); `current_principal` is otherwise `None`
 /// (fail-closed) and the gate denies.
+///
+/// Also returns the request's recorded mutation effects (spec §9 receipts): the mux `Call` path
+/// stamps them into the `Reply` envelope's `meta.changes`; a denial (or the legacy bare path)
+/// carries none.
 async fn authorize_and_dispatch(
     api: &dyn NodeApi,
     req: ApiRequest,
     ctx: RequestContext,
     audit: Option<Arc<AuthAudit>>,
-) -> ApiResponse {
+) -> (ApiResponse, Vec<DomainRev>) {
     let conn_id = ctx.conn_id;
     // Request-level dispatch log (both the mux per-`Call` tasks and the legacy path funnel
     // through here): the payload-free op tag only, never the body (it may carry a credential).
@@ -438,18 +445,31 @@ async fn authorize_and_dispatch(
     }
     with_request_context(ctx, async {
         match authorize(&req) {
-            Ok(()) => dispatch(api, req).await,
+            Ok(()) => dispatch_with_effects(api, req).await,
             Err(e) => {
                 if let Some(a) = &audit {
                     // Payload-free op tag (NEVER the request body — it may carry a password).
                     a.permission_denied(&op_tag(&req), conn_id, &e.to_string())
                         .await;
                 }
-                ApiResponse::Error(e)
+                (ApiResponse::Error(e), Vec::new())
             }
         }
     })
     .await
+}
+
+/// The receipt slot for a completed `Call`: recorded effects become `meta.changes`; a run with no
+/// effects stays `meta: None` (a client must treat absence as "no receipt", not "no changes" —
+/// but on a Reply the two coincide, and `None` keeps NonStateful replies byte-identical to v51).
+fn receipt_meta(effects: Vec<DomainRev>) -> Option<ResponseMetadata> {
+    if effects.is_empty() {
+        None
+    } else {
+        Some(ResponseMetadata {
+            changes: Some(effects),
+        })
+    }
 }
 
 /// The externally-tagged variant name of a request (the CBOR/JSON tag), with **no** payload — safe
@@ -798,7 +818,7 @@ where
                     // re-enters the scope before the gate + dispatch (Auth 2 caveat).
                     tokio::spawn(async move {
                         let trace = ingress_trace(None);
-                        let res = with_trace_span(
+                        let (res, effects) = with_trace_span(
                             trace,
                             fields::span::API_UNIX_REQUEST,
                             SpanKind::Boundary,
@@ -809,7 +829,7 @@ where
                             .send(WireS2C::Reply {
                                 id,
                                 res,
-                                meta: None,
+                                meta: receipt_meta(effects),
                             })
                             .await;
                     });
@@ -1293,11 +1313,21 @@ impl MuxApiClient {
 
     /// Send a one-shot `Call` and await its `Reply` (skipping unrelated frames).
     pub async fn call(&mut self, req: ApiRequest) -> Result<ApiResponse, ApiError> {
+        self.call_with_meta(req).await.map(|(res, _)| res)
+    }
+
+    /// As [`MuxApiClient::call`], but also returning the `Reply` envelope's
+    /// [`ResponseMetadata`] (the spec §9 mutation receipt; `None` when the request recorded no
+    /// effects). Used by drivers/conformance that assert on receipts.
+    pub async fn call_with_meta(
+        &mut self,
+        req: ApiRequest,
+    ) -> Result<(ApiResponse, Option<ResponseMetadata>), ApiError> {
         let id = self.take_id();
         self.send(WireC2S::Call { id, req }).await?;
         loop {
             match self.next().await? {
-                WireS2C::Reply { id: rid, res, .. } if rid == id => return Ok(res),
+                WireS2C::Reply { id: rid, res, meta } if rid == id => return Ok((res, meta)),
                 WireS2C::End { id: rid, error } if rid == id => {
                     return Err(error.unwrap_or_else(|| {
                         ApiError::Other("stream ended without a reply".into())

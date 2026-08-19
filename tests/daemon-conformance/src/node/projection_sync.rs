@@ -12,9 +12,12 @@
 
 use super::harness::*;
 use super::wire_client::MuxConn;
-use daemon_api::{dispatch, ChangeScope, ControlApi, NodeEvent, ProjectionId, SessionApi};
+use daemon_api::{
+    dispatch, dispatch_with_effects, ChangeScope, ControlApi, NodeEvent, ProjectionId, SessionApi,
+    SessionMetaPatch,
+};
 use daemon_auth::{Principal, Role};
-use daemon_host::{serve_api_unix, with_request_context, RequestContext};
+use daemon_host::{serve_api_unix, with_request_context, MuxApiClient, RequestContext};
 use daemon_protocol::{AgentCommand, UserMsg};
 use tokio::net::{UnixListener, UnixStream};
 
@@ -405,6 +408,137 @@ async fn formerly_silent_mutations_emit_their_domain_pointer_impl() {
             "expected an All-scope ProjectionChanged for {p:?}, got {events:?}"
         );
     }
+
+    handle.shutdown().await;
+}
+
+/// Stage 8 receipts (spec §9): a MustChange mutation's mux `Reply` carries `meta.changes` with
+/// the exact `(domain, rev)` its handler recorded — and the feed's `ProjectionChanged` twin
+/// carries the SAME rev, so the initiating client's receipt and every other client's pointer
+/// agree (the echo-suppression contract).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mutation_reply_receipt_matches_the_feed() {
+    let (node, handle) = assemble();
+    let path = temp_socket();
+    let listener = UnixListener::bind(&path).expect("bind socket");
+    let server = tokio::spawn(serve_api_unix(listener, node.clone()));
+
+    let mut mux = MuxApiClient::connect(path.clone())
+        .await
+        .expect("mux connect + hello");
+    let (res, meta) = mux
+        .call_with_meta(ApiRequest::TelemetryConsentSet { enabled: true })
+        .await
+        .expect("consent call");
+    assert!(
+        matches!(res, ApiResponse::TelemetryConsent { enabled: true }),
+        "consent set: {res:?}"
+    );
+    let changes = meta
+        .expect("a MustChange mutation's Reply carries meta")
+        .changes
+        .expect("the receipt carries the changes list");
+    assert_eq!(
+        changes.len(),
+        1,
+        "one domain changed, one receipt entry: {changes:?}"
+    );
+    assert_eq!(changes[0].projection, ProjectionId::TelemetryConsent);
+    assert!(changes[0].rev >= 1, "a minted rev is never zero");
+
+    // The feed twin the OTHER clients see carries the identical rev.
+    let events = as_system(async {
+        match dispatch(node.as_ref(), ApiRequest::EventsSince { cursor: 0 }).await {
+            ApiResponse::EventsPage(page) => page.events,
+            other => panic!("expected EventsPage, got {other:?}"),
+        }
+    })
+    .await;
+    assert!(
+        events.iter().any(|e| matches!(e,
+            NodeEvent::ProjectionChanged {
+                projection: ProjectionId::TelemetryConsent,
+                rev,
+                ..
+            } if *rev == changes[0].rev)),
+        "the feed twin must mint the same rev as the receipt ({}), got {events:?}",
+        changes[0].rev
+    );
+
+    server.abort();
+    let _ = std::fs::remove_file(&path);
+    handle.shutdown().await;
+}
+
+/// Stage 8 receipts (spec §9): a NonStateful request's `Reply` carries NO meta — the envelope
+/// stays byte-identical to the pre-receipts wire for reads, so receipts cost nothing on the hot
+/// read path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_stateful_reply_carries_no_meta() {
+    let (node, handle) = assemble();
+    let path = temp_socket();
+    let listener = UnixListener::bind(&path).expect("bind socket");
+    let server = tokio::spawn(serve_api_unix(listener, node.clone()));
+
+    let mut mux = MuxApiClient::connect(path.clone())
+        .await
+        .expect("mux connect + hello");
+    let (res, meta) = mux
+        .call_with_meta(ApiRequest::Bootstrap)
+        .await
+        .expect("bootstrap call");
+    assert!(matches!(res, ApiResponse::Bootstrap(_)), "got {res:?}");
+    assert_eq!(meta, None, "a read's Reply must carry no meta");
+
+    server.abort();
+    let _ = std::fs::remove_file(&path);
+    handle.shutdown().await;
+}
+
+/// Stage 8 receipts (spec §9) x rung-3 dedup: a deduplicated retry (same `op_id`) returns the
+/// ORIGINAL response with NO effects — the retry mutated nothing, so it earns no receipt (the
+/// first execution's receipt or the feed already carried the revisions).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deduplicated_retry_carries_no_receipt() {
+    as_system(deduplicated_retry_carries_no_receipt_impl()).await;
+}
+async fn deduplicated_retry_carries_no_receipt_impl() {
+    let (node, handle) = assemble();
+    let session = SessionId::new("receipt-dedup");
+
+    node.submit(
+        session.clone(),
+        AgentCommand::StartTurn {
+            input: UserMsg::new("hi"),
+            request_id: daemon_common::ReqId(1),
+        },
+    )
+    .await
+    .expect("submit opens the session");
+
+    let req = ApiRequest::SessionUpdateMeta {
+        session: session.clone(),
+        patch: SessionMetaPatch {
+            title: Some(Some("receipted".into())),
+            ..Default::default()
+        },
+        op_id: Some("receipt-dedup-op".into()),
+    };
+    let (first, first_effects) = dispatch_with_effects(node.as_ref(), req.clone()).await;
+    assert!(matches!(first, ApiResponse::Ok), "got {first:?}");
+    assert!(
+        first_effects
+            .iter()
+            .any(|d| d.projection == ProjectionId::Sessions),
+        "the fresh execution records its Sessions effect: {first_effects:?}"
+    );
+
+    let (retry, retry_effects) = dispatch_with_effects(node.as_ref(), req).await;
+    assert_eq!(retry, first, "the dedup hit returns the original response");
+    assert!(
+        retry_effects.is_empty(),
+        "a deduplicated retry mutates nothing and earns no receipt: {retry_effects:?}"
+    );
 
     handle.shutdown().await;
 }

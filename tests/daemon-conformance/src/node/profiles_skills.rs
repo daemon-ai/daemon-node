@@ -141,6 +141,58 @@ async fn profile_select_emits_profiles_changed_impl() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Stage 8 receipts (spec §9), multi-domain: a mutation that advances TWO revision domains
+/// (`CuratorArchive` moves the skill out of discovery — Skills — and flips its curator record —
+/// Curator) records BOTH effects, so its receipt carries every affected domain, each with its
+/// own minted rev.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn multi_domain_mutation_receipt_carries_every_domain() {
+    as_system(multi_domain_mutation_receipt_carries_every_domain_impl()).await;
+}
+async fn multi_domain_mutation_receipt_carries_every_domain_impl() {
+    use daemon_api::{dispatch_with_effects, ProfileApi, ProfileSpec, ProviderSelector};
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "daemon-receipt-multi-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (node, handle, skills) = assemble_versioning(&dir);
+
+    node.profile_create(ProfileSpec::new("rcpt", ProviderSelector::GenAi, "m"))
+        .await
+        .expect("create rcpt");
+    skills
+        .for_profile("rcpt")
+        .create("mine", &sample_skill_md("receipted"), None)
+        .expect("create skill");
+
+    let (res, effects) = dispatch_with_effects(
+        node.as_ref(),
+        ApiRequest::CuratorArchive {
+            profile: Some("rcpt".into()),
+            name: "mine".into(),
+        },
+    )
+    .await;
+    assert!(matches!(res, ApiResponse::Ok), "archive: {res:?}");
+    let domains: Vec<daemon_api::ProjectionId> = effects.iter().map(|d| d.projection).collect();
+    assert!(
+        domains.contains(&daemon_api::ProjectionId::Skills)
+            && domains.contains(&daemon_api::ProjectionId::Curator),
+        "the receipt must carry BOTH affected domains, got {effects:?}"
+    );
+    assert!(
+        effects.iter().all(|d| d.rev >= 1),
+        "every receipt entry carries its minted rev: {effects:?}"
+    );
+
+    handle.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Wire page bound (v25): a revision history past `WIRE_PAGE_MAX` entries is served in cursor
 /// pages (the stringified-`seq` cursor, resumed numerically) — 71 revisions page as 64 + 7,
 /// oldest-first, chaining to completion with no dup or gap.

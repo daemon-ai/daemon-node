@@ -804,6 +804,19 @@ async fn serve_access(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse>
 /// Errors are never cached (a transient/rejection must re-execute on retry — ADR-006 alt 6). Only
 /// a request that carries an `op_id` touches either seam; everything else dispatches directly.
 pub async fn dispatch(api: &dyn NodeApi, req: ApiRequest) -> ApiResponse {
+    dispatch_with_effects(api, req).await.0
+}
+
+/// [`dispatch`] that also returns the request's recorded [`MutationEffects`] — the exact
+/// `(domain, rev)` list the handler's `note_change` calls assigned (spec §9 receipts). The mux
+/// transport stamps these into the `Reply` envelope's `meta.changes` so the initiating client
+/// gets read-your-writes without waiting for the feed. A deduplicated retry returns the original
+/// response with **no** effects (nothing mutated on the retry; the first execution's receipt —
+/// or the feed — already carried the revisions).
+pub async fn dispatch_with_effects(
+    api: &dyn NodeApi,
+    req: ApiRequest,
+) -> (ApiResponse, Vec<crate::DomainRev>) {
     let Some(op_id) = req.op_id().map(|s| s.to_string()) else {
         return dispatch_censused(api, req).await;
     };
@@ -811,17 +824,17 @@ pub async fn dispatch(api: &dyn NodeApi, req: ApiRequest) -> ApiResponse {
     // first ack — the point of returning the result, not an error).
     if let Some(bytes) = api.command_dedup_lookup(&op_id).await {
         if let Ok(resp) = ciborium::from_reader::<ApiResponse, _>(&bytes[..]) {
-            return resp;
+            return (resp, Vec::new());
         }
     }
-    let resp = with_op_id(Some(op_id.clone()), dispatch_censused(api, req)).await;
+    let (resp, effects) = with_op_id(Some(op_id.clone()), dispatch_censused(api, req)).await;
     if !matches!(resp, ApiResponse::Error(_)) {
         let mut buf = Vec::new();
         if ciborium::into_writer(&resp, &mut buf).is_ok() {
             api.command_dedup_store(&op_id, buf).await;
         }
     }
-    resp
+    (resp, effects)
 }
 
 /// [`dispatch_inner`] wrapped in the projection-sync census check (spec §5): the handler runs
@@ -830,7 +843,10 @@ pub async fn dispatch(api: &dyn NodeApi, req: ApiRequest) -> ApiResponse {
 /// silent-mutation defect; a `NonStateful` run that recorded any is a misclassification. Both log
 /// loud in every build (the conformance census suite hard-asserts per domain — a feed-less
 /// assembly legitimately records nothing, so dispatch must not panic here).
-async fn dispatch_censused(api: &dyn NodeApi, req: ApiRequest) -> ApiResponse {
+async fn dispatch_censused(
+    api: &dyn NodeApi,
+    req: ApiRequest,
+) -> (ApiResponse, Vec<crate::DomainRev>) {
     let class = census(&req);
     // The request is consumed by the fan-out; capture a debug label up front for the (rare)
     // mutation classes only, so the hot read path pays nothing.
@@ -866,7 +882,7 @@ async fn dispatch_censused(api: &dyn NodeApi, req: ApiRequest) -> ApiResponse {
         }
         _ => {}
     }
-    resp
+    (resp, effects)
 }
 
 /// The surface fan-out: every `ApiRequest` variant is routed by exactly one per-surface `serve_*`
