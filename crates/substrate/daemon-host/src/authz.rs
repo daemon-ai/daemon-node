@@ -36,6 +36,10 @@ pub enum RequiredAccess {
     Authenticated,
     /// Requires the named [`Capability`].
     Cap(Capability),
+    /// Requires EVERY listed capability (a composite op spanning several write domains — e.g.
+    /// `ProfileCommission` writes profiles AND credentials). Mapping such an op to a single
+    /// capability would be a privilege escalation for holders of that one capability.
+    AllCaps(&'static [Capability]),
 }
 
 /// The [`RequiredAccess`] gating `req`. ONE exhaustive match, NO `_` arm: a new [`ApiRequest`]
@@ -186,6 +190,13 @@ pub fn required_capability(req: &ApiRequest) -> RequiredAccess {
         | SoulSet { .. }
         | SkillRevert { .. }
         | SkillPut { .. } => C::ProfileWrite,
+        // The composite commit (v53) writes the profile AND (optionally) its credential: the gate
+        // demands both write capabilities unconditionally — gating on request content would let a
+        // crafted intent pick its weaker gate. The `return` diverges from the `Capability`-typed
+        // match, like WhoAmI's.
+        ProfileCommission(..) => {
+            return RequiredAccess::AllCaps(&[C::ProfileWrite, C::CredentialWrite])
+        }
 
         // -- serve_curator: per-profile skill library -------------------------------------------
         CuratorList { .. } => C::ProfileRead,
@@ -326,6 +337,12 @@ pub fn authorize(req: &ApiRequest) -> Result<(), ApiError> {
         RequiredAccess::Cap(cap) => Err(ApiError::Forbidden(format!(
             "operation requires capability {cap:?}"
         ))),
+        RequiredAccess::AllCaps(caps) => match caps.iter().find(|cap| !principal.has(**cap)) {
+            None => Ok(()),
+            Some(missing) => Err(ApiError::Forbidden(format!(
+                "operation requires capability {missing:?}"
+            ))),
+        },
     }
 }
 
@@ -499,6 +516,52 @@ mod tests {
                 "expected Unauthenticated for {req:?}"
             );
         }
+    }
+
+    /// The composite `ProfileCommission` (v53) writes profiles AND credentials: the gate demands
+    /// BOTH capabilities. Holding either one alone is Forbidden (mapping it to a single cap would
+    /// be a privilege escalation for that cap's holders); a `User` (who holds both) passes.
+    #[tokio::test]
+    async fn profile_commission_requires_both_write_capabilities() {
+        let commission = || {
+            ApiRequest::ProfileCommission(daemon_api::ProfileCommissionArgs {
+                spec: daemon_api::ProfileSpec::new("p", daemon_api::ProviderSelector::GenAi, "m"),
+                credential: Some("sk".into()),
+                soul: None,
+                activate_model: None,
+                set_default: true,
+                probe: None,
+                expected_rev: None,
+            })
+        };
+        assert_eq!(
+            required_capability(&commission()),
+            RequiredAccess::AllCaps(&[Capability::ProfileWrite, Capability::CredentialWrite])
+        );
+        // A bespoke principal holding exactly one of the two caps: denied either way round.
+        for caps in [
+            vec![Capability::ProfileWrite],
+            vec![Capability::CredentialWrite],
+        ] {
+            let partial = Principal {
+                user_id: "u".into(),
+                username: "u".into(),
+                roles: vec![],
+                capabilities: caps.into_iter().collect(),
+            };
+            let res = with_request_context(RequestContext::authenticated(partial, None), async {
+                authorize(&commission())
+            })
+            .await;
+            assert!(
+                matches!(res, Err(ApiError::Forbidden(_))),
+                "one capability alone must not commission: {res:?}"
+            );
+        }
+        assert!(
+            gate(Role::User, commission()).await.is_ok(),
+            "a User holds both write capabilities and may commission"
+        );
     }
 
     #[tokio::test]

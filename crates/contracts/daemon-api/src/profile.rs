@@ -16,7 +16,7 @@
 //! These are *contract* types: serializable primitives only (no `daemon-core` types), so the
 //! surface never drags the engine's concrete construction types into the wire protocol.
 
-use daemon_common::{Author, SkillBundle, WireVersion};
+use daemon_common::{Author, ModelId, SkillBundle, WireVersion};
 // Relocated to `daemon-protocol` so the wire types that cannot depend on `daemon-api` can carry
 // them without a contract-crate cycle: `EngineSelector` (wire v29, the fleet tree's `UnitNode`);
 // `ProviderSelector` + `ForeignBackend` (Phase 1, the inline sub-agent spec on the delegation
@@ -676,6 +676,58 @@ pub struct ProviderModelsResult {
     /// The structured failure when the listing could not be served; `models` is empty then.
     #[serde(default)]
     pub error: Option<ProviderListError>,
+}
+
+/// The `ProfileCommission` composite intent (wire v53): a first-run/editor "commit" as ONE call —
+/// profile upsert + credential + persona + model activation + default selection + provider probe,
+/// strictly ordered node-side. Exists so no client ever orchestrates these as separate
+/// fire-and-forget calls again: the node dispatches each `Call` concurrently, so a client-issued
+/// probe could read the credential store before the client's own `CredentialSet` landed.
+///
+/// Field order is the wire member order (serde emits declaration order; the generated zcbor
+/// decoder is order-sensitive).
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileCommissionArgs {
+    /// The profile bundle to commit. An existing `spec.id` updates (replace semantics, OCC via
+    /// `expected_rev`); a new id creates (and retires the seeded first-boot placeholder).
+    pub spec: ProfileSpec,
+    /// An API key to store for the committed profile (the v49 provider-global redirect applies),
+    /// BEFORE any probe runs. `None` = leave stored credentials untouched.
+    #[serde(default)]
+    pub credential: Option<String>,
+    /// A persona (SOUL.md) text to set. `None` = leave untouched (never clears).
+    #[serde(default)]
+    pub soul: Option<String>,
+    /// An installed local model to activate for the committed profile.
+    #[serde(default)]
+    pub activate_model: Option<ModelId>,
+    /// Make the committed profile the active default.
+    pub set_default: bool,
+    /// The catalog provider to probe (`ProviderModels`) through the committed profile's stored
+    /// credential, returning the verdict — the client names the provider it committed (a custom
+    /// endpoint stays permissive by passing `None`); the node owns the ordering and the answer.
+    /// A probe failure PERSISTS the committed state (retry is cheap; a transient vendor outage
+    /// must not destroy a valid key).
+    #[serde(default)]
+    pub probe: Option<String>,
+    /// [v52 OCC, spec §9] The Profiles domain rev the client observed — checked only for the
+    /// update path; a mismatch returns `Conflict` and leaves state unchanged. Absent = no check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_rev: Option<u64>,
+}
+
+/// The `ProfileCommission` outcome (wire v53). Mutations are all-or-error (the reply is an
+/// `ApiError` when any mutation step fails); the probe soft-fails through
+/// [`ProviderModelsResult::error`] with everything already committed.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileCommissionOutcome {
+    /// The committed profile's id.
+    pub profile_id: String,
+    /// The probe verdict when `probe` was requested (`None` = no probe ran).
+    #[serde(default)]
+    pub probe: Option<ProviderModelsResult>,
 }
 
 /// The interactive sign-in a provider advertises (wire v30, CON-15). The node states the auth

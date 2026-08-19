@@ -405,6 +405,12 @@ async fn serve_profile(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse
         ApiRequest::ProfileUpdate { spec, .. } => unit_or_err(api.profile_update(spec).await),
         ApiRequest::ProfileDelete { id } => unit_or_err(api.profile_delete(id).await),
         ApiRequest::ProfileSelect { id } => unit_or_err(api.profile_select(id).await),
+        // The composite commit (v53). OCC on its update path is enforced centrally, like
+        // ProfileUpdate's.
+        ApiRequest::ProfileCommission(args) => ok_or_err(
+            api.profile_commission(args).await,
+            ApiResponse::ProfileCommissioned,
+        ),
         ApiRequest::ProfileClone { source, new_id } => {
             unit_or_err(api.profile_clone(source, new_id).await)
         }
@@ -856,6 +862,9 @@ pub async fn dispatch_with_effects(
 fn occ_precondition(req: &ApiRequest) -> Option<(ProjectionId, u64)> {
     let (projection, expected) = match req {
         ApiRequest::ProfileUpdate { expected_rev, .. } => (ProjectionId::Profiles, expected_rev),
+        // The composite commit's update path carries the same Profiles-domain precondition
+        // (create-mode clients pass absent = no check).
+        ApiRequest::ProfileCommission(args) => (ProjectionId::Profiles, &args.expected_rev),
         ApiRequest::SkillPut { expected_rev, .. } => (ProjectionId::Skills, expected_rev),
         ApiRequest::CustomProviderSet { expected_rev, .. }
         | ApiRequest::CustomProviderRemove { expected_rev, .. } => {

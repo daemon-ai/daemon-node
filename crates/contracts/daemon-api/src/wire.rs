@@ -368,6 +368,10 @@ pub enum ApiRequest {
         /// The profile id to make the active default.
         id: String,
     },
+    /// [`ProfileApi::profile_commission`] (wire v53): the composite first-run/editor commit —
+    /// profile upsert + credential + persona + model activation + default selection + provider
+    /// probe, strictly ordered inside ONE call so no client-side sequence can race itself.
+    ProfileCommission(ProfileCommissionArgs),
     /// [`ProfileApi::profile_clone`].
     ProfileClone {
         /// The source profile to copy.
@@ -1524,6 +1528,9 @@ pub enum ApiResponse {
     Profile(Option<ProfileSpec>),
     /// A profile's persona (SOUL.md) text (soul_get; wire v36).
     SoulText(String),
+    /// A composite commit's outcome (profile_commission; wire v53). Mutations were all-or-error;
+    /// a present `probe` verdict may still carry the structured listing failure.
+    ProfileCommissioned(ProfileCommissionOutcome),
     /// A redacted credential listing.
     Credentials(Vec<CredentialInfo>),
     /// A begun interactive-auth flow handle (`auth_begin`).
@@ -2554,18 +2561,18 @@ mod auth_contract_tests {
     }
 
     /// The contract wire version (`daemon_common::WireVersion::CURRENT`, mirrored by
-    /// [`crate::API_WIRE_VERSION`]) is pinned to the sealed surface: v52 (projection-sync stage-8
-    /// OCC — the spec-§9 census update verbs gain `? expected_rev`; a mismatch returns `Conflict`
-    /// and leaves state unchanged). Distinct from the transport-envelope [`WIRE_VERSION`] above
-    /// (= 2), which these rungs did not touch. Bumping the contract version is a deliberate act —
-    /// this assertion is the gate.
+    /// [`crate::API_WIRE_VERSION`]) is pinned to the sealed surface: v53 (`ProfileCommission` —
+    /// the composite first-run/editor commit: profile upsert + credential + persona + model
+    /// activation + default selection + provider probe as ONE strictly-ordered call). Distinct
+    /// from the transport-envelope [`WIRE_VERSION`] above (= 2), which this rung did not touch.
+    /// Bumping the contract version is a deliberate act — this assertion is the gate.
     #[test]
-    fn contract_wire_version_is_v52() {
+    fn contract_wire_version_is_v53() {
         assert_eq!(
             daemon_common::WireVersion::CURRENT,
-            daemon_common::WireVersion(52)
+            daemon_common::WireVersion(53)
         );
-        assert_eq!(crate::API_WIRE_VERSION, daemon_common::WireVersion(52));
+        assert_eq!(crate::API_WIRE_VERSION, daemon_common::WireVersion(53));
     }
 
     /// The `api/<N>` feature string is formatted from the API mirror version (never hardcoded)

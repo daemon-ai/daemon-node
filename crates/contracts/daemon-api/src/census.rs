@@ -168,6 +168,10 @@ pub fn census(req: &ApiRequest) -> MutationClass {
         | R::ProfileImport { .. }
         | R::ProfileRevert { .. }
         | R::SoulSet { .. } => MustChange(&[P::Profiles]),
+        // The composite commit (v53) always revs Profiles (the upsert is unconditional); the
+        // Credentials write only happens when a credential rides the intent — the AuthStep
+        // pattern.
+        R::ProfileCommission(..) => Conditional(&[P::Profiles, P::Credentials]),
 
         // -- contact roster: `emit_contacts_changed` fires synchronously after the awaited
         // adapter mutation ------------------------------------------------------------------

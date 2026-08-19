@@ -886,7 +886,12 @@ impl WireVersion {
     /// `CronUpdate` / `CronDelete` / `RoutingSet` / `RoutingBindChat` / `RoutingUnbindChat` /
     /// `PresenceSave` / `PresenceDelete` / `PresenceSetActive`. A mismatch returns `Conflict` and
     /// leaves state unchanged (the `FsWrite base_revision` precedent); absent = no check.
-    pub const CURRENT: Self = Self(52);
+    ///
+    /// (v53) `ProfileCommission` / `ProfileCommissioned`: the composite first-run/editor commit —
+    /// profile upsert + credential + persona + model activation + default selection + provider
+    /// probe as ONE strictly-ordered call, retiring the client-orchestrated fire-and-forget
+    /// sequence that raced its own dependent probe (each `Call` dispatches concurrently).
+    pub const CURRENT: Self = Self(53);
 
     /// The version this build speaks (alias for [`WireVersion::CURRENT`]).
     pub fn current() -> Self {

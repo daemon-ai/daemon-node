@@ -137,6 +137,77 @@ impl ProfileApi for NodeApiImpl {
         Ok(())
     }
 
+    async fn profile_commission(
+        &self,
+        args: ProfileCommissionArgs,
+    ) -> Result<ProfileCommissionOutcome, ApiError> {
+        let ProfileCommissionArgs {
+            spec,
+            credential,
+            soul,
+            activate_model,
+            set_default,
+            probe,
+            // Enforced centrally in dispatch (`occ_precondition`), exactly like ProfileUpdate's.
+            expected_rev: _,
+        } = args;
+        let profile_id = spec.id.clone();
+        // The strict order IS this op: every dependent step runs after the step it depends on has
+        // committed, inside one call. The client-orchestrated sequence this replaces raced its own
+        // probe past its own CredentialSet (each wire `Call` dispatches concurrently), which is a
+        // bug class no client should be able to re-create. Sub-steps call the sibling handlers
+        // directly (never a nested dispatch — that would open a fresh effects scope and drop the
+        // receipt), so one `Reply.meta` accumulates every domain this commit touched.
+        let exists = self
+            .profile_store()?
+            .get(&profile_id)
+            .map_err(profile_err)?
+            .is_some();
+        if exists {
+            self.profile_update(spec).await?;
+        } else {
+            self.profile_create(spec).await?;
+        }
+        if let Some(secret) = credential {
+            // Stored BEFORE anything reads it; the paste-for-profile provider-global redirect
+            // applies through the just-committed spec.
+            self.credential_set(profile_id.clone(), secret).await?;
+        }
+        if let Some(text) = soul {
+            self.soul_set(profile_id.clone(), text).await?;
+        }
+        if let Some(model) = activate_model {
+            self.model_activate(model, Some(profile_id.clone())).await?;
+        }
+        if set_default {
+            self.profile_select(profile_id.clone()).await?;
+        }
+        // Turn-faithful probe: authenticate the listing exactly where a session turn will look —
+        // the COMMITTED spec's `credential_profile()` (its explicit/minted ref, else the profile
+        // id). Every mutation above is already durable; a probe failure reports through the
+        // verdict and PERSISTS the committed state (a transient vendor outage must not destroy a
+        // valid key — retry re-probes cheaply).
+        let probe_verdict = match probe.filter(|p| !p.is_empty()) {
+            None => None,
+            Some(provider) => {
+                let lookup_ref = self
+                    .profile_store()
+                    .ok()
+                    .and_then(|profiles| profiles.get(&profile_id).ok().flatten())
+                    .map(|spec| spec.credential_profile().to_string())
+                    .unwrap_or_else(|| profile_id.clone());
+                Some(
+                    self.provider_models(provider, Some(lookup_ref), None, None)
+                        .await,
+                )
+            }
+        };
+        Ok(ProfileCommissionOutcome {
+            profile_id,
+            probe: probe_verdict,
+        })
+    }
+
     async fn profile_clone(&self, source: String, new_id: String) -> Result<(), ApiError> {
         let store = self.profile_store()?;
         let mut spec = store

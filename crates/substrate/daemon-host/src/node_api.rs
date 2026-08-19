@@ -118,6 +118,8 @@ use daemon_api::{
     Outbound,
     Participant,
     ProfileApi,
+    ProfileCommissionArgs,
+    ProfileCommissionOutcome,
     ProfileInfo,
     ProfileSpec,
     ProviderDescriptor,

@@ -39,6 +39,7 @@ mod ownership_transport;
 mod positive_e2e;
 mod presence;
 mod process_notify;
+mod profile_commission;
 mod profiles_skills;
 mod projection_sync;
 mod provider_discovery;

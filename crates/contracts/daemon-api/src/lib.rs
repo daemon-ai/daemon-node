@@ -69,10 +69,10 @@ pub use daemon_common::{SkillCreator, SkillState, SkillUsage};
 pub use profile::{
     BoundAccount, BudgetSpec, ContextEngineSel, CredentialInfo, CuratorChange, CuratorEntry,
     CustomProvider, CustomProviderSource, Distribution, EngineSelector, EngineTunables,
-    ForeignBackend, InstallStrategy, MemoryProviderSel, ModelDescriptor, ProfileInfo, ProfileSpec,
-    ProviderAction, ProviderAuth, ProviderDescriptor, ProviderKindWire, ProviderListError,
-    ProviderListErrorKind, ProviderModelsResult, ProviderSelector, ProviderSignIn, SessionOverlay,
-    ToolsOverride,
+    ForeignBackend, InstallStrategy, MemoryProviderSel, ModelDescriptor, ProfileCommissionArgs,
+    ProfileCommissionOutcome, ProfileInfo, ProfileSpec, ProviderAction, ProviderAuth,
+    ProviderDescriptor, ProviderKindWire, ProviderListError, ProviderListErrorKind,
+    ProviderModelsResult, ProviderSelector, ProviderSignIn, SessionOverlay, ToolsOverride,
 };
 
 /// One item of a [`LogStream`]: either a merged-log entry, or a `Lagged` signal that the live
@@ -1789,6 +1789,20 @@ pub trait ProfileApi: Send + Sync {
     /// Select the active default profile (new sessions bind to it unless overridden).
     async fn profile_select(&self, _id: String) -> Result<(), ApiError> {
         Err(ApiError::Unsupported("profile_select".into()))
+    }
+
+    /// The composite first-run/editor commit (wire v53): upsert `args.spec` (a new id creates and
+    /// retires the seeded placeholder; an existing id replaces, OCC-checked via the dispatch
+    /// precondition), then — strictly ordered — store `credential`, set `soul`, activate
+    /// `activate_model`, select the default, and finally probe the provider listing through the
+    /// just-stored credential. One call, one commit order: a client can no longer race a
+    /// dependent read past its own mutation. Mutation failures error the whole call; a probe
+    /// failure PERSISTS the committed state and reports through the outcome's structured verdict.
+    async fn profile_commission(
+        &self,
+        _args: ProfileCommissionArgs,
+    ) -> Result<ProfileCommissionOutcome, ApiError> {
+        Err(ApiError::Unsupported("profile_commission".into()))
     }
 
     /// Clone `source` into a new profile `new_id` (a local copy; starts a fresh revision history).

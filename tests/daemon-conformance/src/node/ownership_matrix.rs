@@ -341,6 +341,8 @@ fn classify(req: &ApiRequest) -> Coverage {
         | ProfileUpdate { .. }
         | ProfileDelete { .. }
         | ProfileSelect { .. }
+        // The composite commit (v53) is profile/credential domain state, like its parts.
+        | ProfileCommission(_)
         | ProfileClone { .. }
         | ProfileExport { .. }
         | ProfileImport { .. }

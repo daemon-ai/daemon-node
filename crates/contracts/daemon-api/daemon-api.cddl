@@ -19,7 +19,7 @@ kv-pair = [k: tstr, v: tstr]
 ; cap) - the fix that lets arbitrary file sizes round-trip. Fixed 32-byte hashes stay arrays
 ; (`content-hash`, below) since they are small and `ContentHash([u8; 32])` serializes as a sequence.
 byte-array = bstr
-wire_version = uint                 ; daemon-common WireVersion (current = 52)
+wire_version = uint                 ; daemon-common WireVersion (current = 53)
 
 ; ----- uniform wire pagination (wire v25) -----
 ; Every list op that can exceed the client codec's fixed 64-element array buffers is paginated
@@ -1532,6 +1532,14 @@ request-profile-create = { "ProfileCreate": { "spec": profile-spec } }
 request-profile-update = { "ProfileUpdate": { "spec": profile-spec, ? "expected_rev": (uint64 / null) } }
 request-profile-delete = { "ProfileDelete": { "id": tstr } }
 request-profile-select = { "ProfileSelect": { "id": tstr } }
+; v53: the composite first-run/editor commit — profile upsert + credential + persona + model
+; activation + default selection + provider probe, strictly ordered inside ONE call. Exists so no
+; client ever orchestrates this as separate fire-and-forget calls again (the calls race: the node
+; dispatches each Call concurrently, so a client-side probe could read the credential store before
+; its own CredentialSet landed). Member order mirrors the Rust struct declaration (serde emits
+; fields in that order and the generated zcbor decoder is order-sensitive).
+profile-commission-args = { "spec": profile-spec, ? "credential": (tstr / null), ? "soul": (tstr / null), ? "activate_model": (model-id / null), "set_default": bool, ? "probe": (tstr / null), ? "expected_rev": (uint64 / null) }
+request-profile-commission = { "ProfileCommission": profile-commission-args }
 request-profile-clone = { "ProfileClone": { "source": tstr, "new_id": tstr } }
 request-profile-export = { "ProfileExport": { "id": tstr } }
 request-profile-import = { "ProfileImport": { "dist": distribution, ? "new_id": (tstr / null) } }
@@ -1844,6 +1852,7 @@ api-request = request-submit
             / request-profile-update
             / request-profile-delete
             / request-profile-select
+            / request-profile-commission
             / request-profile-clone
             / request-profile-export
             / request-profile-import
@@ -2091,6 +2100,9 @@ response-vhc-switch-outcome = { "VhcSwitchOutcome": vhc-switch-outcome }
 response-profiles = { "Profiles": [* profile-info] }
 response-profile = { "Profile": (profile-spec / null) }   ; ProfileGet returns null on a missing id
 response-soul-text = { "SoulText": tstr }                 ; SoulGet returns the persona (SOUL.md) text
+; v53: the ProfileCommission outcome. Mutations are all-or-error; the probe verdict rides the v48
+; structured channel — a probe failure PERSISTS the committed profile/credential and reports here.
+response-profile-commissioned = { "ProfileCommissioned": { "profile_id": tstr, ? "probe": (provider-models-result / null) } }
 response-credentials = { "Credentials": [* credential-info] }
 response-models = { "Models": model-page }
 response-model-current = { "ModelCurrent": (model-descriptor / null) }
@@ -2237,6 +2249,7 @@ api-response = response-ok
              / response-profiles
              / response-profile
              / response-soul-text
+             / response-profile-commissioned
              / response-credentials
              / response-models
              / response-model-current
