@@ -29,8 +29,17 @@ guest typed run-ends; substantially LANDED as of 2026-08-11 — per-section stat
 spec). Its guest-contract rung assigns ABI minor 6 (`EnvStarved`, ABI §4.5): the trap
 taxonomy itself is unchanged — environmental starvation leaves the trap lane entirely and
 becomes a typed outcome, so `guest trap ⇒ examine as module defect` sharpens into a
-conformance property rather than acquiring new trap codes. Where this spec defers a detail
-to a companion, the deferral is explicit.
+conformance property rather than acquiring new trap codes.
+[`vhc-sdk-primitives-spec.md`](vhc-sdk-primitives-spec.md) (2026-08-18) — the SDK training
+primitives contract and refactor plan: it **embodies** this spec's reserved seams ([VP-12],
+[PIR-11/12], [CO-6/8], [PL-1], [LC-2], [GR-6], §4.2 output vocabulary, §12 monitor, A.4)
+into implementation clauses and waves; every clause of this spec it touches is dispositioned
+in its Appendix B (embodied / narrowed / deferred / adopted-informative — notably: the
+`plan@1` derivation slot of §4.1 is deferred in favor of authored genesis/run configuration;
+[PL-1]'s binding reading is pinned there as a consensus-clock constraint, not a local-compute
+constraint). Nothing in that document contradicts this one; where wording differs, this spec
+remains the design authority and that document the implementation contract. Where this spec
+defers a detail to a companion, the deferral is explicit.
 
 **The archived program architecture doc is a TARGET where it diverges.** The frozen
 `daemon-vhc-architecture.md` (archived under the program docs) reads as current in places where
