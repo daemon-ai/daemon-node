@@ -3516,35 +3516,97 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     }
 
     // The networked TLS/TCP api transport (opt-in via `[api].tls_addr`). TCP always requires
-    // authentication (never local-trusted).
-    let tls_server = match (&cfg.api.tls_addr, &cfg.api.tls_cert, &cfg.api.tls_key) {
-        (Some(addr), Some(cert), Some(key)) => {
-            let tls_cfg = daemon_host::ApiTlsConfig {
-                cert_path: cert.clone(),
-                key_path: key.clone(),
-                require_client_cert: cfg.api.require_client_cert,
-                client_ca_path: cfg.api.tls_client_ca.clone(),
-            };
-            let server_config = daemon_host::build_server_config(&tls_cfg)
-                .map_err(|e| anyhow::anyhow!("building TLS server config: {e}"))?;
-            let tls_listener = tokio::net::TcpListener::bind(addr).await?;
-            tracing::info!(
-                %addr,
-                require_client_cert = cfg.api.require_client_cert,
-                "serving daemon-api over TLS/TCP (authentication required)"
-            );
-            Some(tokio::spawn(daemon_host::serve_api_tls_tcp(
-                tls_listener,
-                server_config,
-                node.clone(),
-                authenticator.clone(),
-                ingress_governor.clone(),
-            )))
+    // authentication (never local-trusted). The *actually bound* address is captured for the
+    // DNS-SD advertiser below — never the configured string (a `:0` bind would advertise a lie).
+    let (tls_server, tls_bound_addr) =
+        match (&cfg.api.tls_addr, &cfg.api.tls_cert, &cfg.api.tls_key) {
+            (Some(addr), Some(cert), Some(key)) => {
+                let tls_cfg = daemon_host::ApiTlsConfig {
+                    cert_path: cert.clone(),
+                    key_path: key.clone(),
+                    require_client_cert: cfg.api.require_client_cert,
+                    client_ca_path: cfg.api.tls_client_ca.clone(),
+                };
+                let server_config = daemon_host::build_server_config(&tls_cfg)
+                    .map_err(|e| anyhow::anyhow!("building TLS server config: {e}"))?;
+                let tls_listener = tokio::net::TcpListener::bind(addr).await?;
+                let bound_addr = tls_listener.local_addr()?;
+                tracing::info!(
+                    %addr,
+                    require_client_cert = cfg.api.require_client_cert,
+                    "serving daemon-api over TLS/TCP (authentication required)"
+                );
+                (
+                    Some(tokio::spawn(daemon_host::serve_api_tls_tcp(
+                        tls_listener,
+                        server_config,
+                        node.clone(),
+                        authenticator.clone(),
+                        ingress_governor.clone(),
+                    ))),
+                    Some(bound_addr),
+                )
+            }
+            (Some(_), _, _) => {
+                anyhow::bail!(
+                    "[api].tls_addr is set but [api].tls_cert / [api].tls_key are missing"
+                )
+            }
+            _ => (None, None),
+        };
+
+    // LAN DNS-SD advertisement of the TLS listener (daemon-lan-discovery-spec.md §3): default-on
+    // but safe by construction — inert unless the TLS listener bound successfully to a
+    // non-loopback address. Advertiser failure is non-fatal (warn + continue): a node that cannot
+    // advertise is degraded, not down.
+    let mdns_advertiser = if !cfg.api.mdns.enabled {
+        None
+    } else {
+        match tls_bound_addr {
+            None => {
+                tracing::info!(
+                    "mdns: not advertising — no TLS listener is configured ([api].tls_addr)"
+                );
+                None
+            }
+            Some(bound) if bound.ip().is_loopback() => {
+                tracing::info!(
+                    %bound,
+                    "mdns: not advertising — the TLS listener is loopback-only"
+                );
+                None
+            }
+            Some(bound) => match compose_mdns_spec(&cfg, bound.port()) {
+                Ok(spec) => {
+                    let instance = spec.instance.clone();
+                    match daemon_mdns::Advertiser::start(spec) {
+                        Ok(adv) => {
+                            tracing::info!(
+                                %instance,
+                                port = bound.port(),
+                                service = daemon_mdns::SERVICE_TYPE,
+                                "mdns: advertising the TLS api listener on the LAN"
+                            );
+                            Some(adv)
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "mdns: advertiser failed to start ({e:#}); continuing without \
+                                 LAN discovery"
+                            );
+                            None
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "mdns: could not compose the advertisement ({e:#}); continuing without \
+                         LAN discovery"
+                    );
+                    None
+                }
+            },
         }
-        (Some(_), _, _) => {
-            anyhow::bail!("[api].tls_addr is set but [api].tls_cert / [api].tls_key are missing")
-        }
-        _ => None,
     };
 
     // The plain-WebSocket mux carrier (opt-in via `[api].ws_addr`) for browser (Qt WASM) clients:
@@ -3808,6 +3870,11 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     server.abort();
     #[cfg(windows)]
     pipe_server.abort();
+    // Unregister the DNS-SD record BEFORE the TLS listener disappears, so goodbye records
+    // (TTL 0) reach browsers while the advertised endpoint is still coherent.
+    if let Some(advertiser) = mdns_advertiser {
+        advertiser.shutdown();
+    }
     if let Some(tls_server) = tls_server {
         tls_server.abort();
     }
@@ -3834,6 +3901,59 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
     #[cfg(unix)]
     let _ = std::fs::remove_file(&cfg.socket_path);
     Ok(())
+}
+
+/// Compose the DNS-SD registration for the bound TLS listener (daemon-lan-discovery-spec.md §2):
+/// the `txtvers=1` TXT schema — persistent `node` identity, display `name`, the two distinct
+/// version numbers (`api` = the contract `WireVersion::CURRENT`, `wire` = the mux envelope
+/// `WIRE_VERSION`), the bare SemVer, the `auth` pre-warning, and the untrusted leaf-cert `fp`
+/// hint. Policy lives here in the binary; `daemon-mdns` publishes the spec verbatim.
+///
+/// The caller guarantees a bound TLS listener, so `api.tls_cert` is present. The SRV hostname
+/// (`<hostname>.local.`) will usually NOT match a self-signed cert's SANs — expected and
+/// disclosed (spec §3.5): LAN trust is established by pairing or pin/TOFU, never hostname
+/// verification, and the node never refuses to advertise on SAN mismatch.
+fn compose_mdns_spec(cfg: &NodeConfig, port: u16) -> anyhow::Result<daemon_mdns::ServiceSpec> {
+    let node_id = cfg.resolve_node_id()?;
+    let cert_path = cfg
+        .api
+        .tls_cert
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("mdns requires the TLS listener's certificate"))?;
+    let fp = daemon_host::leaf_cert_fingerprint(cert_path)
+        .map_err(|e| anyhow::anyhow!("fingerprinting {}: {e}", cert_path.display()))?;
+    let host = gethostname::gethostname().to_string_lossy().into_owned();
+    let name = cfg
+        .api
+        .mdns
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&host)
+        .to_string();
+    // Bare X.Y.Z (the workspace VERSION); deliberately not `daemon_common::VERSION`, which
+    // carries the git build-metadata suffix the TXT contract excludes.
+    let ver = env!("CARGO_PKG_VERSION");
+    let txt = std::collections::BTreeMap::from([
+        ("txtvers".to_string(), "1".to_string()),
+        ("node".to_string(), node_id),
+        ("name".to_string(), name.clone()),
+        (
+            "api".to_string(),
+            daemon_api::API_WIRE_VERSION.0.to_string(),
+        ),
+        ("wire".to_string(), daemon_api::WIRE_VERSION.to_string()),
+        ("ver".to_string(), ver.to_string()),
+        ("auth".to_string(), "scram".to_string()),
+        ("fp".to_string(), fp),
+    ]);
+    Ok(daemon_mdns::ServiceSpec {
+        instance: name,
+        hostname: format!("{host}.local."),
+        port,
+        txt,
+    })
 }
 
 /// Build the host routing registry (daemon-event-io-spec §5.9) from the resolved `[routing]` config,

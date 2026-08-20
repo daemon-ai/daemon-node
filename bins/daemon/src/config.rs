@@ -133,6 +133,12 @@ fn default_profile() -> String {
     "default".to_string()
 }
 
+/// Whether `s` is a well-formed persistent node id: exactly 32 lowercase hex chars
+/// (daemon-lan-discovery-spec.md §3.2).
+fn is_node_id(s: &str) -> bool {
+    s.len() == 32 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 fn default_true() -> bool {
     true
 }
@@ -885,6 +891,8 @@ pub struct ApiConfig {
     /// Override the max decoded payload size (bytes). `None` = the shared `MAX_FRAME_BYTES` default
     /// (≥ the 256 MiB blob ceiling, so no in-spec blob is newly rejected).
     pub ingress_max_decoded_bytes: Option<usize>,
+    /// LAN DNS-SD advertising of the TLS listener (`[api.mdns]`; daemon-lan-discovery-spec.md §3.3).
+    pub mdns: MdnsConfig,
 }
 
 impl ApiConfig {
@@ -930,6 +938,34 @@ impl Default for ApiConfig {
             ingress_max_tracked_peers: 4096,
             ingress_max_frame_bytes: None,
             ingress_max_decoded_bytes: None,
+            mdns: MdnsConfig::default(),
+        }
+    }
+}
+
+/// `[api.mdns]` / `DAEMON_API__MDNS__*` — LAN DNS-SD advertising of the TLS api listener
+/// (daemon-lan-discovery-spec.md §3.3). Nested under `[api]` because the advertiser announces the
+/// API listener and nothing else ("discovery" already means model-vendor/MCP/VHC discovery here).
+///
+/// Default-on is safe by construction: advertisement happens only when the TLS listener is
+/// configured, binds successfully, AND the bound address is non-loopback — a default install
+/// (Unix socket only) advertises nothing.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MdnsConfig {
+    /// Advertise `_daemon-node._tcp` when the TLS listener is up on a non-loopback address.
+    #[serde(with = "daemon_common::flex_bool")]
+    pub enabled: bool,
+    /// The DNS-SD instance (display) name; default: the machine hostname. Display only —
+    /// node identity is the TXT `node` key (see [`NodeConfig::resolve_node_id`]).
+    pub name: Option<String>,
+}
+
+impl Default for MdnsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            name: None,
         }
     }
 }
@@ -1481,6 +1517,11 @@ impl CustomProviderConfig {
 pub struct NodeConfig {
     /// The partition this node owns.
     pub partition: PartitionId,
+    /// Persistent node identity override (32 lowercase hex chars; env `DAEMON_NODE_ID`). `None`
+    /// (the default) loads — or mints once — `<data_dir>/node-id` via
+    /// [`NodeConfig::resolve_node_id`]. Node identity generally (discovery TXT `node`, pairing
+    /// URIs), not a discovery detail (daemon-lan-discovery-spec.md §3.2).
+    pub node_id: Option<String>,
     /// The Unix socket the node serves its `daemon_api` surface on (env `DAEMON_SOCKET_PATH`).
     pub socket_path: PathBuf,
     /// The optional in-process HTTP/WS surface bind address (`None` leaves it off).
@@ -1637,6 +1678,7 @@ impl Default for NodeConfig {
     fn default() -> Self {
         Self {
             partition: PartitionId::DEFAULT,
+            node_id: None,
             socket_path: default_socket(),
             http_addr: None,
             store: StoreKind::Memory,
@@ -1798,6 +1840,41 @@ impl NodeConfig {
             .auth_db
             .clone()
             .unwrap_or_else(|| self.data_dir.join("auth.sqlite"))
+    }
+
+    /// The persistent node identity (daemon-lan-discovery-spec.md §3.2): the configured
+    /// `node_id` / `DAEMON_NODE_ID` override when set (validated, boot-fails on a malformed
+    /// value), else `<data_dir>/node-id` — 32 lowercase hex chars minted once (16 random bytes,
+    /// the `mint_incarnation` recipe) and reused forever. Mint-and-persist is atomic (tmp +
+    /// rename); a corrupt/short file is re-minted.
+    pub fn resolve_node_id(&self) -> anyhow::Result<String> {
+        if let Some(configured) = &self.node_id {
+            let id = configured.trim().to_ascii_lowercase();
+            if !is_node_id(&id) {
+                anyhow::bail!(
+                    "node_id {configured:?} is malformed: expected 32 lowercase hex chars"
+                );
+            }
+            return Ok(id);
+        }
+        let path = self.data_dir.join("node-id");
+        if let Ok(raw) = std::fs::read_to_string(&path) {
+            let id = raw.trim().to_ascii_lowercase();
+            if is_node_id(&id) {
+                return Ok(id);
+            }
+            tracing::warn!(path = %path.display(), "corrupt node-id file; re-minting");
+        }
+        let mut bytes = [0u8; 16];
+        getrandom::fill(&mut bytes)
+            .map_err(|e| anyhow::anyhow!("minting node-id: no OS randomness: {e}"))?;
+        let id: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        std::fs::create_dir_all(&self.data_dir)
+            .with_context(|| format!("creating data dir {}", self.data_dir.display()))?;
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, &id).with_context(|| format!("writing {}", tmp.display()))?;
+        std::fs::rename(&tmp, &path).with_context(|| format!("persisting {}", path.display()))?;
+        Ok(id)
     }
 
     /// The profile-scoped data home (`<data_dir>/<profile>/`) rooting this node's subsystem databases.
@@ -1999,6 +2076,86 @@ fn walk_reference(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `<data_dir>/node-id` is minted once (32 lowercase hex) and then reused forever
+    /// (discovery spec §3.2).
+    #[test]
+    #[allow(clippy::result_large_err)] // figment's `Jail` closure Result type; not ours to shrink.
+    fn node_id_minted_once_and_stable() {
+        figment::Jail::expect_with(|jail| {
+            let cfg = NodeConfig {
+                data_dir: jail.directory().to_path_buf(),
+                ..NodeConfig::default()
+            };
+            let first = cfg.resolve_node_id().expect("mints");
+            assert!(is_node_id(&first), "minted id is 32 lowercase hex: {first}");
+            let on_disk = std::fs::read_to_string(jail.directory().join("node-id")).unwrap();
+            assert_eq!(on_disk, first, "persisted verbatim");
+            assert_eq!(cfg.resolve_node_id().expect("reloads"), first);
+            Ok(())
+        });
+    }
+
+    /// A corrupt/short node-id file is re-minted, not served.
+    #[test]
+    #[allow(clippy::result_large_err)] // figment's `Jail` closure Result type; not ours to shrink.
+    fn node_id_corrupt_file_is_reminted() {
+        figment::Jail::expect_with(|jail| {
+            let cfg = NodeConfig {
+                data_dir: jail.directory().to_path_buf(),
+                ..NodeConfig::default()
+            };
+            std::fs::write(jail.directory().join("node-id"), "not-hex").unwrap();
+            let id = cfg.resolve_node_id().expect("re-mints");
+            assert!(is_node_id(&id));
+            Ok(())
+        });
+    }
+
+    /// A configured `node_id` overrides the file (case-normalized); a malformed one fails boot
+    /// loudly instead of advertising garbage.
+    #[test]
+    #[allow(clippy::result_large_err)] // figment's `Jail` closure Result type; not ours to shrink.
+    fn node_id_config_override() {
+        figment::Jail::expect_with(|jail| {
+            let cfg = NodeConfig {
+                data_dir: jail.directory().to_path_buf(),
+                node_id: Some("00112233445566778899AABBCCDDEEFF".into()),
+                ..NodeConfig::default()
+            };
+            assert_eq!(
+                cfg.resolve_node_id().expect("override wins"),
+                "00112233445566778899aabbccddeeff"
+            );
+            assert!(
+                !jail.directory().join("node-id").exists(),
+                "override never touches the file"
+            );
+
+            let bad = NodeConfig {
+                node_id: Some("too-short".into()),
+                ..NodeConfig::default()
+            };
+            assert!(bad.resolve_node_id().is_err(), "malformed override fails");
+            Ok(())
+        });
+    }
+
+    /// `[api.mdns]` defaults on (safe by construction: inert without a non-loopback TLS bind)
+    /// and parses its TOML/env keys.
+    #[test]
+    fn mdns_config_defaults_and_parses() {
+        let dflt = NodeConfig::default();
+        assert!(dflt.api.mdns.enabled, "default-on per spec §3.3");
+        assert_eq!(dflt.api.mdns.name, None, "default name is the hostname");
+
+        let fig = Figment::from(Serialized::defaults(NodeConfig::default())).merge(Toml::string(
+            "[api.mdns]\nenabled = false\nname = \"Office Daemon\"\n",
+        ));
+        let cfg: NodeConfig = fig.extract().expect("parses");
+        assert!(!cfg.api.mdns.enabled);
+        assert_eq!(cfg.api.mdns.name.as_deref(), Some("Office Daemon"));
+    }
 
     /// A `[[custom_providers]]` config row projects to a `source = Config` wire provider bound to the
     /// OpenAI-compatible `DaemonApi` selector, with an empty `display_name` falling back to the id.

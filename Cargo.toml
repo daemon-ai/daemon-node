@@ -338,6 +338,12 @@ axum = { version = "0.8", features = ["ws"] }
 # Already resolved in the tree via axum's ws feature (same 0.29), so this adds no new crates. No
 # TLS features on purpose: `wss://` terminates at a reverse proxy for now.
 tokio-tungstenite = "0.29"
+# mDNS/DNS-SD advertising for LAN node discovery (daemon-lan-discovery-spec.md §3): a pure-Rust
+# responder with no Avahi/Bonjour runtime dependency, keeping the sealed bundle self-contained.
+# Isolated to the `daemon-mdns` adapter crate; `bins/daemon` composes the record and owns policy.
+mdns-sd = "0.21"
+# The machine hostname for the DNS-SD SRV host (`<hostname>.local.`) + the default instance name.
+gethostname = "1"
 # rustls 0.23 — already resolved transitively (the tree's aws-lc-rs TLS backbone). Declared here so
 # `daemon-vhc-net`'s WS client (the `ws` feature) can install the aws-lc-rs `CryptoProvider` as the
 # process default before its first `wss://` dial: the tree compiles BOTH aws-lc-rs (reqwest/egress —
@@ -453,6 +459,7 @@ daemon-acp = { version = "0", path = "crates/adapters/daemon-acp" }
 daemon-gateway = { version = "0", path = "crates/adapters/daemon-gateway" }
 daemon-http = { version = "0", path = "crates/adapters/daemon-http" }
 daemon-mcp-client = { version = "0", path = "crates/adapters/daemon-mcp-client" }
+daemon-mdns = { version = "0", path = "crates/adapters/daemon-mdns" }
 daemon-delivery = { version = "0", path = "crates/adapters/daemon-delivery" }
 daemon-ingest = { version = "0", path = "crates/adapters/daemon-ingest" }
 daemon-matrix = { version = "0", path = "crates/adapters/daemon-matrix" }

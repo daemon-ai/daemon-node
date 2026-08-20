@@ -51,6 +51,13 @@ daemon-pytool-client = { workspace = true }
 # The MCP client: connects to external MCP servers and proxies their tools through the same
 # `ToolProvider` seam as the Python worker. Opt-in per server via `[[mcp.servers]]`.
 daemon-mcp-client = { workspace = true }
+# The LAN DNS-SD advertiser (daemon-lan-discovery-spec.md §3): the binary composes the ServiceSpec
+# (node identity, versions, TXT) and owns the enable gating; the crate owns the mdns-sd responder.
+daemon-mdns = { workspace = true }
+# The machine hostname for the DNS-SD SRV host + the default instance name.
+gethostname = { workspace = true }
+# Minting the persistent `<data_dir>/node-id` (16 OS-random bytes, hex — the incarnation recipe).
+getrandom = { workspace = true }
 # The web tools (`web_search`/`web_extract`); opt-in at runtime via `[web].enable`.
 daemon-tool-web = { workspace = true }
 # The `[fs]` config table (`FsConfig`) embedded in NodeConfig; the tool itself is registered by

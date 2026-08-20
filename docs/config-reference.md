@@ -23,6 +23,8 @@ Single-origin browser deployment: `web.addr` binds ONE plain-HTTP listener that 
 | `api.ingress_peer_burst` | `DAEMON_API__INGRESS_PEER_BURST` | number | `256.0` |
 | `api.ingress_peer_rate_per_sec` | `DAEMON_API__INGRESS_PEER_RATE_PER_SEC` | number | `128.0` |
 | `api.local_trust` | `DAEMON_API__LOCAL_TRUST` | string | `system` |
+| `api.mdns.enabled` | `DAEMON_API__MDNS__ENABLED` | bool | `true` |
+| `api.mdns.name` | `DAEMON_API__MDNS__NAME` | optional | _(unset)_ |
 | `api.require_client_cert` | `DAEMON_API__REQUIRE_CLIENT_CERT` | bool | `false` |
 | `api.tls_addr` | `DAEMON_API__TLS_ADDR` | optional | _(unset)_ |
 | `api.tls_cert` | `DAEMON_API__TLS_CERT` | optional | _(unset)_ |
@@ -186,6 +188,7 @@ Single-origin browser deployment: `web.addr` binds ONE plain-HTTP listener that 
 | `models.endpoint` | `DAEMON_MODELS__ENDPOINT` | optional | _(unset)_ |
 | `models.registry_path` | `DAEMON_MODELS__REGISTRY_PATH` | optional | _(unset)_ |
 | `nesting_depth` | `DAEMON_NESTING_DEPTH` | number | `0` |
+| `node_id` | `DAEMON_NODE_ID` | optional | _(unset)_ |
 | `oauth.huggingface_client_id` | `DAEMON_OAUTH__HUGGINGFACE_CLIENT_ID` | optional | _(unset)_ |
 | `orchestrate.max_composed_profiles` | `DAEMON_ORCHESTRATE__MAX_COMPOSED_PROFILES` | number | `32` |
 | `orchestrate.max_depth` | `DAEMON_ORCHESTRATE__MAX_DEPTH` | number | `8` |

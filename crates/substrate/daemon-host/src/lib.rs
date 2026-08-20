@@ -167,7 +167,9 @@ pub use supervisor::{
     Backoff, ChildSpec, HealthStatus, MeltdownPolicy, RestartPolicy, ServiceError, Supervisor,
     SupervisorHandle, SupervisorObserver,
 };
-pub use tls::{build_server_config, serve_api_tls_tcp, ApiTlsConfig, TlsConfigError};
+pub use tls::{
+    build_server_config, leaf_cert_fingerprint, serve_api_tls_tcp, ApiTlsConfig, TlsConfigError,
+};
 pub use transcript::{BlockCoalescer, JournalAction};
 pub use unit::{EngineUnit, RewindHooks};
 pub use web::{serve_web, WebHealth, WebRoot};

@@ -70,6 +70,9 @@ pub enum TlsConfigError {
     /// The client-certificate verifier could not be built (e.g. an unparsable CA bundle).
     #[error("client cert verifier: {0}")]
     Verifier(String),
+    /// A PEM chain parsed but contained no certificates (leaf fingerprint needs one).
+    #[error("{0}: no certificates in PEM chain")]
+    EmptyChain(String),
 }
 
 /// Load a PEM certificate chain via the `rustls-pki-types` `PemObject` reader (the maintained
@@ -134,6 +137,19 @@ fn hex(bytes: &[u8]) -> String {
         s.push_str(&format!("{b:02x}"));
     }
     s
+}
+
+/// The SHA-256 fingerprint (lowercase hex) of the FIRST certificate in a PEM chain file —
+/// byte-for-byte the format of [`TlsState::peer_cert_fingerprint`] and of the app's
+/// `conn/tls/pinnedSha256` key, so an accepted fingerprint drops in with no transformation.
+/// Published as the discovery TXT `fp` hint (daemon-lan-discovery-spec.md §2.2) — an untrusted
+/// hint app-side; never a trust decision input node-side.
+pub fn leaf_cert_fingerprint(path: &Path) -> Result<String, TlsConfigError> {
+    let certs = load_certs(path)?;
+    let leaf = certs
+        .first()
+        .ok_or_else(|| TlsConfigError::EmptyChain(path.display().to_string()))?;
+    Ok(hex(&Sha256::digest(leaf.as_ref())))
 }
 
 /// The SHA-256 fingerprint (hex) of the peer's leaf certificate, if one was presented + verified.
