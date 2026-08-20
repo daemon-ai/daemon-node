@@ -892,10 +892,16 @@ impl WireVersion {
     /// probe as ONE strictly-ordered call, retiring the client-orchestrated fire-and-forget
     /// sequence that raced its own dependent probe (each `Call` dispatches concurrently).
     ///
-    /// (v54) additive `? display_name` on `profile-spec` + `profile-info`: the human-facing label
-    /// (the free-text name an operator typed), distinct from the immutable slug/store-key `id`.
-    /// Absent/null on legacy encodings — clients fall back to rendering the `id`. Renames update
-    /// only this field; `id` never changes.
+    /// (v54) two additions that landed together (both minted pre-release, unified at merge):
+    /// additive `? display_name` on `profile-spec` + `profile-info` — the human-facing label
+    /// (the free-text name an operator typed), distinct from the immutable slug/store-key `id`;
+    /// absent/null on legacy encodings (clients fall back to rendering the `id`), renames update
+    /// only this field. And the LAN pairing admin surface (daemon-pairing-spec.md §5.5):
+    /// `PairingBegin` / `PairingCancel` / `PairingStatus` / `PairedDeviceList` /
+    /// `PairedDeviceRevoke` and their `PairingCode` / `PairingState` / `PairedDevices` responses
+    /// — arming a single-use SPAKE2 pairing code and administering the enrolled-device roster.
+    /// The `X-DAEMON-PAIR-1` SASL mechanism itself rides the (unversioned-here) auth envelope's
+    /// opaque byte fields.
     pub const CURRENT: Self = Self(54);
 
     /// The version this build speaks (alias for [`WireVersion::CURRENT`]).

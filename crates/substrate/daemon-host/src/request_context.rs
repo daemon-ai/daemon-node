@@ -44,6 +44,9 @@ pub enum AuthMethod {
     External,
     /// A resumed server-side session token (`AuthResume`).
     Token,
+    /// SASL `X-DAEMON-PAIR-1` (SPAKE2 pairing enrollment; the connection ends up authenticated
+    /// as the freshly enrolled device user).
+    Pairing,
 }
 
 /// The identity + provenance bound to one in-flight request.

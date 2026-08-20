@@ -1749,6 +1749,15 @@ request-resource-grant-create = { "ResourceGrantCreate": { "user_id": tstr, "res
 request-resource-grant-list   = { "ResourceGrantList": { ? "user_id": (tstr / null) } }
 request-resource-grant-revoke = { "ResourceGrantRevoke": { "id": tstr } }
 
+; ----- LAN pairing (daemon-pairing-spec.md §5.5; wire v54) -----
+; All AccessAdmin-gated. The armed code appears exactly once (in pairing-code) and is never
+; retrievable again; pairing-state never carries it.
+request-pairing-begin        = "PairingBegin"
+request-pairing-cancel       = "PairingCancel"
+request-pairing-status       = "PairingStatus"
+request-paired-device-list   = "PairedDeviceList"
+request-paired-device-revoke = { "PairedDeviceRevoke": { "fingerprint": tstr } }
+
 ; ----- user feedback over OpenTelemetry (N1; wire v32) -----
 ; Explicit feedback is per-event consent (queued even when the global telemetry toggle is off);
 ; the ack means accepted+queued to the durable outbox, never delivered. Optional fields mirror
@@ -2013,6 +2022,11 @@ api-request = request-submit
             / request-resource-grant-create
             / request-resource-grant-list
             / request-resource-grant-revoke
+            / request-pairing-begin
+            / request-pairing-cancel
+            / request-pairing-status
+            / request-paired-device-list
+            / request-paired-device-revoke
             / request-feedback-submit
             / request-telemetry-consent-get
             / request-telemetry-consent-set
@@ -2177,6 +2191,17 @@ response-access-users = { "AccessUsers": [* access-user] }
 response-access-roles = { "AccessRoles": [* role-info] }
 response-who-am-i     = { "WhoAmI": principal-view }
 
+; ----- LAN pairing (daemon-pairing-spec.md §5.5; wire v54) DTOs + responses -----
+; pairing-code is the ONE exposure of the armed code (canonical ungrouped Crockford-base32);
+; `uri` is the canonical daemon+pair: join URI (spec §7), also the QR payload. Timestamps are
+; ms since epoch (expires_at) / unix seconds (created_at, last_seen_at — the store's granularity).
+pairing-code = { "code": tstr, "expires_at": uint64, "uri": tstr, "addresses": [* tstr], "server_fp": tstr, "node_id": tstr, "node_name": tstr }
+pairing-state = { "armed": bool, ? "expires_at": (uint64 / null), ? "attempts_remaining": (uint / null), "locked": bool }
+paired-device = { "user_id": tstr, "username": tstr, ? "display_name": (tstr / null), "fingerprint": tstr, "created_at": int, ? "last_seen_at": (int / null), "enabled": bool }
+response-pairing-code   = { "PairingCode": pairing-code }
+response-pairing-state  = { "PairingState": pairing-state }
+response-paired-devices = { "PairedDevices": [* paired-device] }
+
 ; ----- user feedback over OpenTelemetry (N1; wire v32) -----
 feedback-ack = { "accepted": bool, "queued": bool }
 response-feedback-ack = { "FeedbackAck": feedback-ack }
@@ -2316,6 +2341,9 @@ api-response = response-ok
              / response-access-users
              / response-access-roles
              / response-who-am-i
+             / response-pairing-code
+             / response-pairing-state
+             / response-paired-devices
              / response-feedback-ack
              / response-telemetry-consent
              / response-crash-consent

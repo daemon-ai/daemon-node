@@ -2350,6 +2350,36 @@ pub trait AccessControlApi: Send + Sync {
     async fn resource_grant_revoke(&self, _id: String) -> Result<(), ApiError> {
         Err(ApiError::Unsupported("resource grants are reserved".into()))
     }
+
+    // -- LAN pairing (pairing spec §5.5; wire v54). All `access_admin`-gated. ---------------------
+
+    /// Arm a fresh single-use pairing code (replacing any previous one, clearing a lockout).
+    /// The returned [`PairingCode`] is the only exposure of the code. Fails with a clear error
+    /// on a node without a TLS listener (pairing binds to TLS certificates).
+    async fn pairing_begin(&self) -> Result<PairingCode, ApiError> {
+        Err(ApiError::Unsupported("pairing not available".into()))
+    }
+
+    /// Disarm the pairing code; also clears the locked state.
+    async fn pairing_cancel(&self) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("pairing not available".into()))
+    }
+
+    /// The armed/locked view (never returns the code).
+    async fn pairing_status(&self) -> Result<PairingState, ApiError> {
+        Err(ApiError::Unsupported("pairing not available".into()))
+    }
+
+    /// The enrolled device roster.
+    async fn paired_device_list(&self) -> Result<Vec<PairedDevice>, ApiError> {
+        Err(ApiError::Unsupported("pairing not available".into()))
+    }
+
+    /// Sever a device: delete its fingerprint mapping, disable (not delete) the device user,
+    /// and revoke its sessions + live connections.
+    async fn paired_device_revoke(&self, _fingerprint: String) -> Result<(), ApiError> {
+        Err(ApiError::Unsupported("pairing not available".into()))
+    }
 }
 
 /// The whole node surface: the session, control, model-management, profile/config, credential,

@@ -52,6 +52,9 @@ pub const MECH_SCRAM_SHA_256: &str = SCRAM_SHA_256;
 pub const MECH_PLAIN: &str = "PLAIN";
 /// EXTERNAL mechanism name (mTLS client-cert).
 pub const MECH_EXTERNAL: &str = "EXTERNAL";
+/// The SPAKE2 pairing mechanism (pairing spec §4). Advertised only when pairing is armed AND the
+/// connection is TLS with a presented client certificate; handled entirely outside rsasl.
+pub use crate::pairing::MECH_PAIRING;
 
 /// Per-connection transport security facts the mechanism policy depends on.
 #[derive(Clone, Debug, Default)]
@@ -160,8 +163,23 @@ enum Drive {
 }
 
 /// A live, in-progress multi-step mechanism exchange (e.g. SCRAM between server-first and the final
-/// proof). Owned by the transport between an `AuthChallenge` and the next `AuthStep`.
+/// proof, or a pairing exchange between the node's challenge and the app's confirmation). Owned by
+/// the transport between an `AuthChallenge` and the next `AuthStep`.
 pub struct AuthExchange {
+    inner: ExchangeInner,
+}
+
+enum ExchangeInner {
+    /// An rsasl-driven mechanism (SCRAM; PLAIN/EXTERNAL complete in one step but share the type).
+    Sasl(SaslExchange),
+    /// An `X-DAEMON-PAIR-1` exchange awaiting the app's confirmation MAC (pairing spec §4).
+    Pairing {
+        pending: Option<crate::pairing::PendingPairing>,
+        store: Arc<AuthStore>,
+    },
+}
+
+struct SaslExchange {
     session: Session<NoValidation>,
     captured: Arc<Mutex<Option<ValidatedIdentity>>>,
     store: Arc<AuthStore>,
@@ -183,6 +201,18 @@ pub struct Authenticator {
     /// revocation is not enforced on this transport (e.g. tests, or a node assembled without it);
     /// the connection then holds no guard and behaves as before.
     revocations: Option<Arc<crate::revocation::SessionRevocations>>,
+    /// The pairing hook (pairing spec §4–§5): the shared armed-state manager plus the TLS
+    /// listener's own leaf-cert fingerprint (one half of the channel-binding AAD). `None` =>
+    /// the mechanism is never advertised and an `AuthStart` naming it is unsupported (the
+    /// `[api.pairing] enabled = false` posture, or a node without a TLS listener).
+    pairing: Option<PairingHook>,
+}
+
+/// The pairing wiring attached via [`Authenticator::with_pairing`].
+struct PairingHook {
+    manager: Arc<crate::pairing::PairingManager>,
+    /// The TLS listener's leaf-cert SHA-256 (lowercase hex) — the server half of the AAD.
+    server_fp: String,
 }
 
 impl Authenticator {
@@ -197,7 +227,22 @@ impl Authenticator {
             decoy_secret,
             audit: None,
             revocations: None,
+            pairing: None,
         }
+    }
+
+    /// Attach the pairing surface (pairing spec §4): the shared [`PairingManager`] the admin API
+    /// arms, plus the TLS listener's leaf-certificate SHA-256 fingerprint (lowercase hex) for the
+    /// channel-binding AAD. Without this hook `X-DAEMON-PAIR-1` is never advertised or served.
+    ///
+    /// [`PairingManager`]: crate::pairing::PairingManager
+    pub fn with_pairing(
+        mut self,
+        manager: Arc<crate::pairing::PairingManager>,
+        server_fp: String,
+    ) -> Self {
+        self.pairing = Some(PairingHook { manager, server_fp });
+        self
     }
 
     /// Attach the shared auth-audit sink so login success/failure (and, via [`Self::audit`], the
@@ -252,19 +297,66 @@ impl Authenticator {
 
     /// The mechanisms to advertise on a `Hello`, in preference order, given the transport security.
     /// SCRAM is always offered; PLAIN and EXTERNAL only over TLS (PLAIN sends the password; EXTERNAL
-    /// needs a client certificate).
+    /// needs a client certificate). `X-DAEMON-PAIR-1` appears only when ALL hold (pairing spec §4):
+    /// pairing is wired + armed, the connection is TLS, and a client certificate was presented.
     pub fn advertised_mechanisms(&self, tls: &TlsState) -> Vec<String> {
         let mut mechs = vec![MECH_SCRAM_SHA_256.to_string()];
         if tls.is_tls {
             mechs.push(MECH_EXTERNAL.to_string());
             mechs.push(MECH_PLAIN.to_string());
+            if let Some(hook) = &self.pairing {
+                if tls.peer_cert_fingerprint.is_some() && hook.manager.is_armed() {
+                    mechs.push(MECH_PAIRING.to_string());
+                }
+            }
         }
         mechs
+    }
+
+    /// Begin an `X-DAEMON-PAIR-1` exchange (pairing spec §4 messages 1–2), entirely outside rsasl.
+    /// The refusal reasons are the spec's four coarse states; wrong code / malformed payload /
+    /// MAC mismatch are indistinguishable (`pairing-failed`) by design.
+    fn begin_pairing(&self, initial: &[u8], tls: &TlsState) -> BeginOutcome {
+        let Some(hook) = &self.pairing else {
+            return BeginOutcome::Failed(AuthReject::unsupported_mechanism());
+        };
+        if !tls.is_tls {
+            // Pairing binds to TLS certificates; a plaintext transport can never carry it.
+            return BeginOutcome::Failed(AuthReject {
+                reason: crate::pairing::PairingRefusal::NotArmed.reason().into(),
+            });
+        }
+        let Some(client_fp) = tls.peer_cert_fingerprint.as_deref() else {
+            return BeginOutcome::Failed(AuthReject {
+                reason: crate::pairing::PairingRefusal::NoClientCert.reason().into(),
+            });
+        };
+        match hook
+            .manager
+            .begin_exchange(&hook.server_fp, client_fp, initial)
+        {
+            Ok((challenge, pending)) => BeginOutcome::Challenge {
+                data: challenge,
+                exchange: AuthExchange {
+                    inner: ExchangeInner::Pairing {
+                        pending: Some(pending),
+                        store: self.store.clone(),
+                    },
+                },
+            },
+            Err(refusal) => BeginOutcome::Failed(AuthReject {
+                reason: refusal.reason().into(),
+            }),
+        }
     }
 
     /// Begin a mechanism exchange. Rejects mechanisms not permitted on this transport (e.g. PLAIN on
     /// a plaintext socket), then feeds the client's `initial` response into the first server step.
     pub fn begin(&self, mechanism: &str, initial: &[u8], tls: TlsState) -> BeginOutcome {
+        // Pairing is not an rsasl mechanism: branch before rsasl ever sees the name (spec §4).
+        if mechanism == MECH_PAIRING {
+            return self.begin_pairing(initial, &tls);
+        }
         if !self
             .advertised_mechanisms(&tls)
             .iter()
@@ -295,14 +387,19 @@ impl Authenticator {
             Ok(s) => s,
             Err(_) => return BeginOutcome::Failed(AuthReject::unsupported_mechanism()),
         };
-        let mut exchange = AuthExchange {
+        let mut sasl = SaslExchange {
             session,
             captured,
             store: self.store.clone(),
             method: mechanism.to_string(),
         };
-        match exchange.drive(initial) {
-            Drive::Challenge(data) => BeginOutcome::Challenge { data, exchange },
+        match sasl.drive(initial) {
+            Drive::Challenge(data) => BeginOutcome::Challenge {
+                data,
+                exchange: AuthExchange {
+                    inner: ExchangeInner::Sasl(sasl),
+                },
+            },
             Drive::Success {
                 final_data,
                 success,
@@ -340,19 +437,88 @@ impl Authenticator {
 impl AuthExchange {
     /// Feed the next client `AuthStep` bytes into the mechanism.
     pub fn step(&mut self, data: &[u8]) -> StepOutcome {
-        match self.drive(data) {
-            Drive::Challenge(d) => StepOutcome::Challenge(d),
-            Drive::Success {
-                final_data,
-                success,
-            } => StepOutcome::Success {
-                final_data,
-                success,
+        match &mut self.inner {
+            ExchangeInner::Sasl(sasl) => match sasl.drive(data) {
+                Drive::Challenge(d) => StepOutcome::Challenge(d),
+                Drive::Success {
+                    final_data,
+                    success,
+                } => StepOutcome::Success {
+                    final_data,
+                    success,
+                },
+                Drive::Failed(reject) => StepOutcome::Failed(reject),
             },
-            Drive::Failed(reject) => StepOutcome::Failed(reject),
+            ExchangeInner::Pairing { pending, store } => step_pairing(pending, store, data),
         }
     }
+}
 
+/// The pairing confirmation step (pairing spec §4 messages 3–4): verify the app's MAC, then run
+/// the §5.4 enrollment transaction and mint the session — the connection ends up authenticated as
+/// the freshly enrolled device user. Any failure is the coarse `pairing-failed`.
+fn step_pairing(
+    pending: &mut Option<crate::pairing::PendingPairing>,
+    store: &Arc<AuthStore>,
+    data: &[u8],
+) -> StepOutcome {
+    let Some(pending) = pending.take() else {
+        // A second AuthStep after completion/failure: nothing in flight.
+        return StepOutcome::Failed(AuthReject {
+            reason: crate::pairing::PairingRefusal::Failed.reason().into(),
+        });
+    };
+    let manager = pending.manager_handle();
+    let (client_fp, display_name) = match pending.complete(data) {
+        Ok(facts) => facts,
+        Err(refusal) => {
+            return StepOutcome::Failed(AuthReject {
+                reason: refusal.reason().into(),
+            })
+        }
+    };
+    // Enrollment (§5.4), one store transaction: device-scoped passwordless user + fingerprint
+    // mapping + metadata. Username derives from the handshake-observed fingerprint — stable and
+    // collision-free.
+    let username = format!("device-{}", &client_fp[..client_fp.len().min(12)]);
+    let enrolled = store.enroll_paired_device(&username, &client_fp, Some(&display_name));
+    let user = match enrolled {
+        Ok(u) => u,
+        Err(e) => {
+            tracing::error!("pairing: enrollment transaction failed: {e}");
+            return StepOutcome::Failed(AuthReject {
+                reason: crate::pairing::PairingRefusal::Failed.reason().into(),
+            });
+        }
+    };
+    let principal = match store.principal_for_user(&user.id, &user.username) {
+        Ok(p) => p,
+        Err(_) => return StepOutcome::Failed(AuthReject::failed()),
+    };
+    let token = match store.mint_session(&user.id, DEFAULT_SESSION_TTL_SECS, "pairing") {
+        Ok(t) => t,
+        Err(_) => return StepOutcome::Failed(AuthReject::failed()),
+    };
+    tracing::info!(
+        username = %user.username,
+        display_name = %display_name,
+        "pairing: device enrolled"
+    );
+    // The §5.5 invalidation for the paired-device-set change (the success path's disarm already
+    // signaled the arming-state change).
+    manager.notify_changed();
+    let principal_view = principal_view(&principal);
+    StepOutcome::Success {
+        final_data: None,
+        success: Box::new(AuthSuccess {
+            principal,
+            token,
+            principal_view,
+        }),
+    }
+}
+
+impl SaslExchange {
     /// Perform one server step over `input`. A token is minted (and the principal resolved) *only*
     /// when the mechanism reaches `State::Finished` **and** the callback captured a validated
     /// identity.
@@ -505,6 +671,9 @@ impl AuthCallback {
             return; // EXTERNAL with no presented client cert: deny.
         };
         if let Some(id) = self.external_identity(fingerprint) {
+            // M3 device metadata: stamp the last successful EXTERNAL login on the mapping.
+            // Best-effort — bookkeeping never gates an already-validated authentication.
+            let _ = self.store.touch_external_identity(fingerprint);
             *self.captured.lock().unwrap_or_else(|e| e.into_inner()) = Some(id);
         }
     }
@@ -816,7 +985,7 @@ mod tests {
         // Enroll the verified client-cert fingerprint -> user (the store-level writer).
         let user = store.find_user("svc").unwrap().unwrap();
         store
-            .set_external_identity(&user.id, "ab12cd34")
+            .set_external_identity(&user.id, "ab12cd34", None)
             .expect("enroll fingerprint");
         let auth = Authenticator::new(store);
         let tls = TlsState {
@@ -843,6 +1012,173 @@ mod tests {
             auth2.begin(MECH_EXTERNAL, b"", tls_unknown),
             BeginOutcome::Failed(_)
         ));
+    }
+
+    /// The pairing-groundwork checkpoint (pairing spec §5.4 stage 2): a device user created via
+    /// `create_external_user` (NO password/SCRAM material) with a hand-enrolled fingerprint logs
+    /// in via EXTERNAL — and the login stamps `last_seen_at` (M3). A SCRAM attempt against the
+    /// passwordless username fails exactly like a wrong password (the decoy path), and PLAIN
+    /// denies too: the account is cert-only, fail-closed.
+    #[test]
+    fn external_user_enrollment_checkpoint() {
+        let store = Arc::new(AuthStore::open_in_memory().expect("store"));
+        let device = store
+            .create_external_user("device-ab12cd34dead", &[Role::User])
+            .expect("external user");
+        store
+            .set_external_identity(&device.id, "ffee00112233", Some("Pixel 9"))
+            .expect("enroll fingerprint");
+        let auth = Authenticator::new(store.clone());
+        let tls = TlsState {
+            is_tls: true,
+            peer_cert_fingerprint: Some("ffee00112233".into()),
+        };
+
+        // EXTERNAL with the enrolled cert: authenticates as the device user.
+        match auth.begin(MECH_EXTERNAL, b"", tls.clone()) {
+            BeginOutcome::Success { success, .. } => {
+                assert_eq!(success.principal.username, "device-ab12cd34dead");
+            }
+            _ => panic!("an enrolled device certificate must authenticate via EXTERNAL"),
+        }
+        // The successful login stamped the device's last_seen_at (M3).
+        let rows = store.list_external_identities().unwrap();
+        assert_eq!(rows[0].display_name.as_deref(), Some("Pixel 9"));
+        assert!(rows[0].last_seen_at.is_some(), "login stamps last_seen_at");
+
+        // SCRAM against the passwordless device user: denied via the decoy (no probe oracle).
+        assert!(matches!(
+            mediate(
+                &auth,
+                MECH_SCRAM_SHA_256,
+                "device-ab12cd34dead",
+                "guess",
+                tls.clone()
+            ),
+            Mediated::Denied
+        ));
+        // PLAIN too: there is no password credential to verify against.
+        assert!(matches!(
+            mediate(&auth, MECH_PLAIN, "device-ab12cd34dead", "guess", tls),
+            Mediated::Denied
+        ));
+    }
+
+    /// The §4 wire ceremony end-to-end through the authenticator: advertisement gating, the
+    /// full SPAKE2 exchange (AuthStart -> AuthChallenge -> AuthStep -> success), the §5.4
+    /// enrollment, and the steady-state EXTERNAL reconnect as the freshly enrolled device.
+    #[test]
+    fn pairing_mechanism_end_to_end_then_external_reconnect() {
+        use crate::pairing::{PairingManager, MECH_PAIRING};
+        use daemon_pake::{Exchange, PasswordScalar, IDENT_APP, IDENT_NODE};
+
+        const SERVER_FP: &str = "aa11bb22cc33dd44ee55ff660011223344556677889900aabbccddeeff001122";
+        const CLIENT_FP: &str = "1122334455667788990011223344556677889900112233445566778899001122";
+
+        let store = Arc::new(AuthStore::open_in_memory().expect("store"));
+        let manager = Arc::new(PairingManager::new());
+        let auth =
+            Authenticator::new(store.clone()).with_pairing(manager.clone(), SERVER_FP.to_string());
+        let tls = TlsState {
+            is_tls: true,
+            peer_cert_fingerprint: Some(CLIENT_FP.to_string()),
+        };
+
+        // Not armed: the mechanism is absent from Hello and AuthStart names the exact reason.
+        assert!(!auth
+            .advertised_mechanisms(&tls)
+            .contains(&MECH_PAIRING.to_string()));
+        match auth.begin(MECH_PAIRING, b"anything", tls.clone()) {
+            BeginOutcome::Failed(r) => assert_eq!(r.reason, "pairing-not-armed"),
+            _ => panic!("unarmed pairing must fail"),
+        }
+
+        let armed = manager.arm().expect("arm");
+        // Armed + TLS + client cert: advertised. No client cert: not advertised, refused.
+        assert!(auth
+            .advertised_mechanisms(&tls)
+            .contains(&MECH_PAIRING.to_string()));
+        let tls_no_cert = TlsState {
+            is_tls: true,
+            peer_cert_fingerprint: None,
+        };
+        assert!(!auth
+            .advertised_mechanisms(&tls_no_cert)
+            .contains(&MECH_PAIRING.to_string()));
+        match auth.begin(MECH_PAIRING, b"x", tls_no_cert) {
+            BeginOutcome::Failed(r) => assert_eq!(r.reason, "pairing-no-client-cert"),
+            _ => panic!("pairing without a client cert must fail"),
+        }
+
+        // The app side of the ceremony.
+        #[derive(serde::Serialize)]
+        struct Start<'a> {
+            v: u8,
+            #[serde(with = "serde_bytes")]
+            pa: &'a [u8],
+            name: &'a str,
+        }
+        #[derive(serde::Deserialize)]
+        struct Challenge {
+            #[serde(with = "serde_bytes")]
+            pb: Vec<u8>,
+            #[serde(with = "serde_bytes")]
+            cb: Vec<u8>,
+        }
+        #[derive(serde::Serialize)]
+        struct Confirm<'a> {
+            #[serde(with = "serde_bytes")]
+            ca: &'a [u8],
+        }
+        let w = PasswordScalar::derive(armed.code.as_bytes());
+        let app = Exchange::new_a(&w, IDENT_APP, IDENT_NODE).expect("app exchange");
+        let initial = daemon_api::to_cbor(&Start {
+            v: 1,
+            pa: app.share(),
+            name: "Pixel 9",
+        });
+        let (challenge, mut exchange) = match auth.begin(MECH_PAIRING, &initial, tls.clone()) {
+            BeginOutcome::Challenge { data, exchange } => (data, exchange),
+            _ => panic!("armed pairing AuthStart must yield a challenge"),
+        };
+        let ch: Challenge = daemon_api::from_cbor(&challenge).expect("challenge decodes");
+        let mut aad = Vec::new();
+        for fp in [SERVER_FP, CLIENT_FP] {
+            for i in (0..64).step_by(2) {
+                aad.push(u8::from_str_radix(&fp[i..i + 2], 16).unwrap());
+            }
+        }
+        aad.extend_from_slice(b"Pixel 9");
+        let fin = app.finish(&ch.pb, &aad).expect("app finish");
+        assert!(fin.verify_peer_confirmation(&ch.cb), "app verifies cb");
+        let step = daemon_api::to_cbor(&Confirm {
+            ca: fin.local_confirmation(),
+        });
+        let success = match exchange.step(&step) {
+            StepOutcome::Success { success, .. } => success,
+            _ => panic!("verified ca must enroll"),
+        };
+        assert_eq!(
+            success.principal.username,
+            format!("device-{}", &CLIENT_FP[..12])
+        );
+        assert!(!success.token.is_empty(), "session minted");
+        // Single use: disarmed after success, and the metadata landed.
+        assert!(!manager.is_armed());
+        let rows = store.list_external_identities().unwrap();
+        assert_eq!(rows[0].display_name.as_deref(), Some("Pixel 9"));
+        assert_eq!(rows[0].fingerprint, CLIENT_FP);
+
+        // The steady state: the enrolled device reconnects via plain EXTERNAL.
+        match auth.begin(MECH_EXTERNAL, b"", tls) {
+            BeginOutcome::Success { success, .. } => {
+                assert_eq!(
+                    success.principal.username,
+                    format!("device-{}", &CLIENT_FP[..12])
+                );
+            }
+            _ => panic!("the enrolled device must reconnect via EXTERNAL"),
+        }
     }
 
     #[test]

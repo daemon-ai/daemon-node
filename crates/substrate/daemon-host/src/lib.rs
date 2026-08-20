@@ -57,6 +57,7 @@ pub mod journal;
 pub mod managed;
 pub mod node_api;
 pub mod notifications;
+pub mod pairing;
 pub mod person;
 pub mod persona_ops;
 pub mod presence;
@@ -137,6 +138,7 @@ pub use node_api::{
     SessionEngineBuilder, TitleAuxResolver,
 };
 pub use notifications::{AddOutcome, NotificationManager, ReadChange};
+pub use pairing::{PairingManager, PairingSurface, MECH_PAIRING};
 pub use persona_ops::PersonaOps;
 pub use presence::PresenceManager;
 pub use process_agent::ProcessAgentUnit;
@@ -167,7 +169,9 @@ pub use supervisor::{
     Backoff, ChildSpec, HealthStatus, MeltdownPolicy, RestartPolicy, ServiceError, Supervisor,
     SupervisorHandle, SupervisorObserver,
 };
-pub use tls::{build_server_config, serve_api_tls_tcp, ApiTlsConfig, TlsConfigError};
+pub use tls::{
+    build_server_config, leaf_cert_fingerprint, serve_api_tls_tcp, ApiTlsConfig, TlsConfigError,
+};
 pub use transcript::{BlockCoalescer, JournalAction};
 pub use unit::{EngineUnit, RewindHooks};
 pub use web::{serve_web, WebHealth, WebRoot};

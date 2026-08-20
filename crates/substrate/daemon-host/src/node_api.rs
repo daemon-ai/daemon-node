@@ -526,6 +526,12 @@ pub struct NodeApiImpl {
     /// identity store — the FFI / conformance harness). `who_am_i` needs no store (it reads the
     /// request principal); `role_list` is store-free (the built-in role→capability matrix).
     auth_store: Option<Arc<daemon_auth::AuthStore>>,
+    /// The LAN pairing surface (pairing spec §5.5): the shared armed-state manager + join-URI
+    /// facts. Bound **post-`Arc`** via [`NodeApiImpl::set_pairing`] (the TLS listener's bound
+    /// port is only known after assembly — the `set_vhc` pattern). Unset => the pairing arming
+    /// ops resolve to a clear error ("pairing requires the TLS listener" / `[api.pairing]
+    /// enabled = false`); the paired-device roster ops only need `auth_store` and stay available.
+    pairing: std::sync::OnceLock<Arc<crate::pairing::PairingSurface>>,
     /// The shared auth-audit sink (the `node-auth` verifiable journal chain). `None` => admin-op
     /// audit is a no-op (no journaling). The same handle is given to the transport's
     /// [`Authenticator`](crate::authn::Authenticator) so login/denial events ride the same chain.

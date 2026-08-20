@@ -398,11 +398,12 @@ async fn revoked_or_never(guard: &Option<RevocationGuard>) {
 
 /// Map a SASL mechanism name to its [`AuthMethod`] (audit/telemetry tag).
 fn auth_method_for(mechanism: &str) -> AuthMethod {
-    use crate::authn::{MECH_EXTERNAL, MECH_PLAIN, MECH_SCRAM_SHA_256};
+    use crate::authn::{MECH_EXTERNAL, MECH_PAIRING, MECH_PLAIN, MECH_SCRAM_SHA_256};
     match mechanism {
         m if m == MECH_SCRAM_SHA_256 => AuthMethod::Scram,
         m if m == MECH_PLAIN => AuthMethod::Plain,
         m if m == MECH_EXTERNAL => AuthMethod::External,
+        m if m == MECH_PAIRING => AuthMethod::Pairing,
         _ => AuthMethod::Scram,
     }
 }
@@ -415,6 +416,7 @@ fn method_label(method: AuthMethod) -> &'static str {
         AuthMethod::Plain => "plain",
         AuthMethod::External => "external",
         AuthMethod::Token => "token",
+        AuthMethod::Pairing => "pairing",
     }
 }
 

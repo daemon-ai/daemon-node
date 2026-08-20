@@ -120,6 +120,14 @@ ed25519-dalek = "2"
 # Both already resolved in Cargo.lock as transitives; single-sourced here for the identity seat.
 getrandom = "0.3"
 zeroize = "1"
+# SPAKE2 primitives (pairing spec §3.1): the audited RustCrypto set backing the in-workspace
+# `daemon-pake` implementation (SPAKE2-P256-SHA256-HKDF-HMAC, RFC 9382). `p256` is the only new
+# crate (arithmetic-only — no ecdsa/serde); hkdf/hmac/subtle are already-locked transitives,
+# single-sourced here for the pake seat. sha2/zeroize/getrandom above complete the suite.
+p256 = { version = "0.13", default-features = false, features = ["arithmetic"] }
+hkdf = "0.12"
+hmac = "0.12"
+subtle = "2"
 # --- vhc transport plane (iroh gossip control plane + self-hosted relay, spec §7) --------------
 # The iroh 1.0 stack: the QUIC/relay endpoint + the mandatory gossip control plane (§7.1 — every peer
 # speaks gossip in every mode) + the self-hosted `iroh-relay` binary/lib (§7.4 — relay URLs pinned in
@@ -338,6 +346,15 @@ axum = { version = "0.8", features = ["ws"] }
 # Already resolved in the tree via axum's ws feature (same 0.29), so this adds no new crates. No
 # TLS features on purpose: `wss://` terminates at a reverse proxy for now.
 tokio-tungstenite = "0.29"
+# mDNS/DNS-SD advertising for LAN node discovery (daemon-lan-discovery-spec.md §3): a pure-Rust
+# responder with no Avahi/Bonjour runtime dependency, keeping the sealed bundle self-contained.
+# Isolated to the `daemon-mdns` adapter crate; `bins/daemon` composes the record and owns policy.
+mdns-sd = "0.21"
+# Interface enumeration for the pairing join-URI addresses (daemon-pairing-spec.md §5.5) — already
+# in the tree as mdns-sd's own address-resolution dependency; pinned to the same version.
+if-addrs = "0.15"
+# The machine hostname for the DNS-SD SRV host (`<hostname>.local.`) + the default instance name.
+gethostname = "1"
 # rustls 0.23 — already resolved transitively (the tree's aws-lc-rs TLS backbone). Declared here so
 # `daemon-vhc-net`'s WS client (the `ws` feature) can install the aws-lc-rs `CryptoProvider` as the
 # process default before its first `wss://` dial: the tree compiles BOTH aws-lc-rs (reqwest/egress —
@@ -449,10 +466,12 @@ daemon-provision = { version = "0", path = "crates/substrate/daemon-provision" }
 daemon-credentials = { version = "0", path = "crates/substrate/daemon-credentials" }
 daemon-telemetry = { version = "0", path = "crates/substrate/daemon-telemetry" }
 daemon-host = { version = "0", path = "crates/substrate/daemon-host" }
+daemon-pake = { version = "0", path = "crates/substrate/daemon-pake" }
 daemon-acp = { version = "0", path = "crates/adapters/daemon-acp" }
 daemon-gateway = { version = "0", path = "crates/adapters/daemon-gateway" }
 daemon-http = { version = "0", path = "crates/adapters/daemon-http" }
 daemon-mcp-client = { version = "0", path = "crates/adapters/daemon-mcp-client" }
+daemon-mdns = { version = "0", path = "crates/adapters/daemon-mdns" }
 daemon-delivery = { version = "0", path = "crates/adapters/daemon-delivery" }
 daemon-ingest = { version = "0", path = "crates/adapters/daemon-ingest" }
 daemon-matrix = { version = "0", path = "crates/adapters/daemon-matrix" }

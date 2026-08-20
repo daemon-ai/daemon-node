@@ -197,6 +197,35 @@ pub(crate) enum Command {
         #[command(subcommand)]
         cmd: VhcCmd,
     },
+    /// LAN device pairing (daemon-pairing-spec.md §5): arm/cancel/inspect the single-use pairing
+    /// code and manage the enrolled device roster. Admin-only; typically run over the local-trust
+    /// Unix socket.
+    Pair {
+        #[command(subcommand)]
+        cmd: PairCmd,
+    },
+}
+
+/// Pairing verbs (pairing spec §5.5). Each maps 1:1 onto an `ApiRequest` variant. There is no
+/// auto-arming anywhere — `new` is the only way a code comes to exist, and its reply is the only
+/// exposure of the code.
+#[derive(Subcommand)]
+pub(crate) enum PairCmd {
+    /// Arm a fresh single-use pairing code (replaces any previous one, clears a lockout) and
+    /// print the grouped code, the join URI, and the expiry.
+    New,
+    /// Show the armed/locked state (never reveals the code).
+    Status,
+    /// Disarm the code (also clears a lockout).
+    Cancel,
+    /// List enrolled devices.
+    Devices,
+    /// Revoke an enrolled device by its certificate fingerprint (disables its user and tears
+    /// down its live sessions).
+    Revoke {
+        /// The enrolled client-certificate SHA-256 fingerprint (lowercase hex).
+        fingerprint: String,
+    },
 }
 
 /// Foreign-agent catalog verbs. `register` is the full wire surface — including the auth

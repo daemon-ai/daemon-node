@@ -454,6 +454,14 @@ fn classify(req: &ApiRequest) -> Coverage {
         | ResourceGrantCreate { .. }
         | ResourceGrantList { .. }
         | ResourceGrantRevoke { .. } => NotSessionTouching,
+        // LAN pairing (wire v54): node-wide access-control admin state (the armed code + the
+        // enrolled device roster), not per-owner session state — the AccessAdmin capability gate
+        // governs all five (authz.rs), same posture as the user/role surface above.
+        PairingBegin
+        | PairingCancel
+        | PairingStatus
+        | PairedDeviceList
+        | PairedDeviceRevoke { .. } => NotSessionTouching,
         // -- user feedback + node-owned telemetry consent (N1): the coarse capability gate governs
         // (FeedbackSubmit -> SessionWrite, consent -> ControlRead/ControlWrite). FeedbackSubmit reads
         // a session's existence for response feedback but does not touch per-owner session state, so

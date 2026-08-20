@@ -20,7 +20,9 @@ use super::*;
 
 use crate::authn::principal_view;
 use crate::request_context::current_principal;
-use daemon_api::{AccessControlApi, AccessUser, PrincipalView, RoleInfo};
+use daemon_api::{
+    AccessControlApi, AccessUser, PairedDevice, PairingCode, PairingState, PrincipalView, RoleInfo,
+};
 use daemon_auth::{AuthStore, Capability, Principal, Role, UserRecord};
 
 /// Map a `daemon-auth` store error onto the wire [`ApiError`]. The last-admin guard becomes a
@@ -74,6 +76,16 @@ impl NodeApiImpl {
         self.auth_store
             .as_ref()
             .ok_or_else(|| ApiError::Unsupported("access control not available".into()))
+    }
+
+    fn pairing_surface(&self) -> Result<&Arc<crate::pairing::PairingSurface>, ApiError> {
+        self.pairing.get().ok_or_else(|| {
+            ApiError::Unsupported(
+                "pairing not available: it requires the TLS api listener and \
+                 [api.pairing] enabled = true"
+                    .into(),
+            )
+        })
     }
 
     /// Tear down `user_id`'s live mux connections (Cluster F, Part A): bump the principal's
@@ -229,4 +241,93 @@ impl AccessControlApi for NodeApiImpl {
     }
 
     // resource_grant_* keep the trait's default `ApiError::Unsupported` (reserved, option B).
+
+    // -- LAN pairing (pairing spec §5.5) ----------------------------------------------------------
+
+    async fn pairing_begin(&self) -> Result<PairingCode, ApiError> {
+        require_admin()?;
+        let surface = self.pairing_surface()?;
+        let armed = surface
+            .manager
+            .arm()
+            .map_err(|e| ApiError::Other(format!("pairing: {e}")))?;
+        let addresses = surface.endpoints();
+        let uri = surface.compose_uri(&armed.code, &addresses);
+        // The manager's change hook fires too; this explicit emission keeps the census
+        // `MustChange` receipt on the dispatch even on a node without the hook bound.
+        self.note_access_control_changed();
+        Ok(PairingCode {
+            code: armed.code,
+            expires_at: armed.expires_at_ms,
+            uri,
+            addresses,
+            server_fp: surface.server_fp.clone(),
+            node_id: surface.node_id.clone(),
+            node_name: surface.node_name.clone(),
+        })
+    }
+
+    async fn pairing_cancel(&self) -> Result<(), ApiError> {
+        require_admin()?;
+        let surface = self.pairing_surface()?;
+        surface.manager.cancel();
+        self.note_access_control_changed();
+        Ok(())
+    }
+
+    async fn pairing_status(&self) -> Result<PairingState, ApiError> {
+        require_admin()?;
+        let surface = self.pairing_surface()?;
+        let status = surface.manager.status();
+        Ok(PairingState {
+            armed: status.armed,
+            expires_at: status.expires_at_ms,
+            attempts_remaining: status.attempts_remaining.map(u32::from),
+            locked: status.locked,
+        })
+    }
+
+    async fn paired_device_list(&self) -> Result<Vec<PairedDevice>, ApiError> {
+        require_admin()?;
+        let store = self.auth_store()?;
+        Ok(store
+            .list_external_identities()
+            .map_err(auth_err)?
+            .into_iter()
+            .map(|r| PairedDevice {
+                user_id: r.user_id,
+                username: r.username,
+                display_name: r.display_name,
+                fingerprint: r.fingerprint,
+                created_at: r.created_at,
+                last_seen_at: r.last_seen_at,
+                enabled: !r.disabled,
+            })
+            .collect())
+    }
+
+    async fn paired_device_revoke(&self, fingerprint: String) -> Result<(), ApiError> {
+        require_admin()?;
+        let store = self.auth_store()?;
+        // Resolve the mapping (including one whose user is already disabled).
+        let row = store
+            .list_external_identities()
+            .map_err(auth_err)?
+            .into_iter()
+            .find(|r| r.fingerprint == fingerprint)
+            .ok_or_else(|| ApiError::Other("unknown device fingerprint".into()))?;
+        // Sever the mapping, disable (never delete — audit) the device user (which also revokes
+        // its store sessions), then tear down its live connections.
+        store
+            .remove_external_identity(&fingerprint)
+            .map_err(auth_err)?;
+        store.set_disabled(&row.user_id, true).map_err(auth_err)?;
+        self.revoke_principal(&row.user_id);
+        tracing::info!(username = %row.username, "pairing: device revoked");
+        if let Some(a) = &self.auth_audit {
+            a.user_disabled(&row.user_id, true).await;
+        }
+        self.note_access_control_changed();
+        Ok(())
+    }
 }

@@ -1,0 +1,22 @@
+[package]
+name = "daemon-mdns"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The LAN DNS-SD advertiser (daemon-lan-discovery-spec.md §3): a thin shell over the pure-Rust
+# `mdns-sd` responder daemon. It publishes exactly the `ServiceSpec` it is handed — `bins/daemon`
+# composes the TXT record and owns policy (version constants, node identity, enable gating), so
+# this crate knows nothing about NodeConfig, TLS, or wire versions. Isolated here so `mdns-sd`
+# never leaks into daemon-host or daemon-core.
+[dependencies]
+anyhow = { workspace = true }
+# Interface enumeration for the pairing join-URI addresses — the same crate mdns-sd resolves
+# its own advertised addresses through, so this adds no new dependency tree.
+if-addrs = { workspace = true }
+mdns-sd = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true

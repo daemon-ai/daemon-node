@@ -86,6 +86,7 @@ impl NodeApiImpl {
             tools_inventory: Arc::new(ArcSwapOption::empty()),
             caps: daemon_api::CapsReport::default(),
             auth_store: None,
+            pairing: std::sync::OnceLock::new(),
             auth_audit: None,
             revocations: None,
             credential_revoker: None,
@@ -177,6 +178,28 @@ impl NodeApiImpl {
     pub fn with_auth_store(mut self, auth_store: Arc<daemon_auth::AuthStore>) -> Self {
         self.auth_store = Some(auth_store);
         self
+    }
+
+    /// Bind the LAN pairing surface (pairing spec §5.5) backing `pairing_begin`/`pairing_cancel`/
+    /// `pairing_status` — **post-`Arc`** (the `set_vhc` pattern), because the surface carries the
+    /// TLS listener's *actually bound* port, known only after assembly. Pass the **same**
+    /// [`PairingManager`](crate::pairing::PairingManager) wired into the transport's
+    /// [`Authenticator`](crate::authn::Authenticator) (via `with_pairing`) so the API arms the
+    /// state the mechanism serves. Call ONLY when the TLS listener is bound and `[api.pairing]
+    /// enabled = true`; unset, arming resolves to a clear error. Also wires the manager's change
+    /// hook onto the `AccessControl` invalidation pointer: arming, cancel, failed attempts,
+    /// lockout, and enrollment all mark the admin pairing surface stale so UIs refetch instead of
+    /// polling (spec §5.5). Idempotent (write-once); a second bind is ignored.
+    pub fn set_pairing(self: &Arc<Self>, surface: Arc<crate::pairing::PairingSurface>) {
+        if self.pairing.set(surface.clone()).is_err() {
+            return;
+        }
+        let weak = Arc::downgrade(self);
+        surface.manager.set_change_hook(Box::new(move || {
+            if let Some(api) = weak.upgrade() {
+                api.note_access_control_changed();
+            }
+        }));
     }
 
     /// Bind the shared auth-audit sink so admin access-control mutations are recorded onto the
