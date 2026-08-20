@@ -1,4 +1,4 @@
-# daemon-vhc — wild-fleet training: the blockwise-denoising design and the 160M experiment
+# daemon-vhc — wild-fleet training: the blockwise-denoising design and its experiment ladder
 
 **Status: design, pre-evidence.** This document replaces the previous revision of this file (the
 two-spine program spec) in full; nothing from it is inherited (§8 says why). It specifies one
@@ -338,8 +338,9 @@ the design's structural upside if the bets land.
 
 ## 5. Budgets — design arithmetic, no measurements
 
-At the X2/X3 configuration (§7): L = 24, d = 768, v = 32K tied, B = 8 → ~21 M params per block;
-sequence n = 1024. Formulas inline; every figure re-derivable.
+At the canonical per-block geometry (§7) — 3 layers of d = 768, v = 32K tied → ~21 M params
+per block (the paper config at B = 4 and X2's L = 24 sweep at B = 8 share it); sequence
+n = 1024. Formulas inline; every figure re-derivable; other arms scale by block size.
 
 | Bus                       | Bytes per event                                        | Cadence            |
 | ------------------------- | ------------------------------------------------------- | ------------------- |
@@ -416,17 +417,29 @@ class whose published feasibility floor is 80 Mbps (§2.3).
 
 ---
 
-## 7. The 160M experiment
+## 7. The experiment — machinery first
 
-This ladder **is** the deliverable — the successor to the TinyLlama ceremony (§0.1), which
-proved consensus and memory behavior; this one trains something real on the same substrate.
-"160M" names the scale class; the canonical config is **L = 24, d = 768, 32K vocab, tied
-embeddings** (~170 M non-embedding params; 24 divides cleanly across the B sweep). Ordered by
-cost of being wrong; each rung names its kill criterion or gate. X0–X2 are single-process
-research-harness work (any one GPU box; deliberately not on the substrate). X3–X4 run on the
-substrate — but not on the tree as it stands: the topology they need is XS's contract work,
-and the ceremony machinery underneath supplies consensus, checkpointing, and transport, not
-the topology itself.
+**What this experiment is for:** landing and proving the substrate machinery — XS's
+generalizations and the SDK primitives they exercise — over a real internet ceremony, with
+model quality benchmarked against published claims. It is explicitly **not** a run at the §5
+target scale: the 8B arithmetic there prices the design's ambition, and nothing in this ladder
+depends on reaching it.
+
+**The canonical model is [DBLOCK]'s own AR configuration** — 12-layer Llama-2-style, d = 768,
+32K vocab, tied embeddings, ~110 M params ([DBLOCK]:477) — chosen precisely so the
+decentralized runs have an external comparator: the paper's published MAUVE /
+teacher-perplexity results ([DBLOCK]:479), bridged through our own X0 reproduction
+(cross-codebase comparisons anchor on X0; the paper's numbers are the reference X0 must
+approach). The L = 24 extension appears only inside X2, where floor-finding needs depth the
+paper config lacks.
+
+Two tracks, run in parallel, each rung naming its kill criterion or gate. The **research
+track** (X0 → X1 → X2) is single-process research-harness work — any one GPU box, deliberately
+not on the substrate. The **machinery track** (XS → X3 → X4) is the deliverable and the
+successor to the TinyLlama ceremony (§0.1): X3's topology does not exist on the tree as it
+stands — XS is the contract work that creates it, with the existing ceremony machinery
+supplying consensus, checkpointing, and transport underneath. X3 consumes X0's model config
+and XS's contracts; it does not wait on X2's verdict.
 
 - **X0 — reproduce the paper.** [DBLOCK]'s AR configuration verbatim: 12-layer Llama-2-style,
   d = 768, 32K vocab, B = 4, γ = 0.1, seq 256 (LM1B), batch 256, AdamW 3e-4, 10 epochs
@@ -443,7 +456,9 @@ the topology itself.
   (control) · V-d split · V-k latents · fresh-vs-stale factor mirrors (§4.1). **Kill for V-d:
   degradation beyond tolerance → dense-table fallback** (costs bytes, not the design). V-k
   failing is an acceptable outcome of a cheap arm; it retires B5.
-- **X2 — the (B, L/B) factorial, ~160M, then the horizon extension.** B ∈ {2, 4, 8, 12} at
+- **X2 — the (B, L/B) factorial at L = 24, then the horizon extension.** The research track's
+  one departure from the paper config: floor-finding needs depth the 12-layer model lacks
+  (~170 M non-embedding params; 24 divides cleanly across the sweep). B ∈ {2, 4, 8, 12} at
   L = 24 crossed with B ∈ {2, 4} at L = 12: the equal-depth pairs (L/B = 3: 24/8 vs 12/4;
   L/B = 6: 24/4 vs 12/2) disentangle band count from per-block depth — the published ablations
   cannot (§6, B2) — and the B = 12 arm (L/B = 2) brackets the target-scale operating point
@@ -469,19 +484,37 @@ the topology itself.
   ([GV-1]/[GV-4]/[GV-5]) plus its cohort-scoped rounds ([DR-2]), pulled onto this experiment's
   critical path; the rest of that plan stays off it. X3's digest gates are XS's acceptance
   criteria run on real boxes.
-- **X3 — the three-box band ceremony.** X0's model at B = 3 (L/B = 4): one band per box, the
-  factor cohort as a fourth role co-hosted on the strongest box (quality is not this rung's
-  question; systems behavior is). Genesis declares the four clocks (§4.1). Gates, all
-  systems-level: **every wire byte accounted against §5's table with
-  zero activation-class traffic**; per-band det digests bit-identical across restart; kill one
-  band's box mid-round → the other bands keep training, the band restores and catches up (lag
-  semantics live); kill the factor cohort → park → resume; factor-refresh delay injected
-  deliberately (the §4.1 staleness bound exercised, not assumed).
+- **X3 — the band ceremony (the 3–4 hosted boxes).** The fleet is real WAN — hosted nodes over
+  the internet with decent bandwidth — so latency is real but the consumer-uplink claim is not:
+  at least one pass runs with links shaped to §0.2's consumer median (~15 Mbps up, ~25 ms), so
+  §2.3's headline is exercised, not assumed. Quality is not this rung's question; systems
+  behavior is. Two arms on the same boxes:
+  - **X3-mesh — the minimal non-degenerate mesh.** X0's model at B = 2 (L/B = 6), two replicas
+    per band, the factor cohort co-hosted on the strongest box (four seats on four boxes; on
+    three, one box doubles seats — a functional arrangement, not a performance one). The
+    smallest geometry where every axis is simultaneously real: two independent band clocks,
+    within-band folds with ≥ 2 contributors and cross-peer digest equality, the cohort folding
+    contributions from both bands — and every liveness case live: kill one replica → the band
+    continues; kill both replicas of one band → lag, restore, catch-up; kill the cohort →
+    park → resume.
+  - **X3-paper — the external benchmark arm.** The paper's exact configuration, B = 4
+    ([DBLOCK]:477), one replica per band: the published single-process result rerun under this
+    protocol, evaluated with the paper's own harness against our X0 reproduction, the paper's
+    numbers as the external anchor. One replica per band leaves the within-band axis idle by
+    construction — the arm isolates what decentralization *adds*: block ownership over the
+    substrate, factor/embed sync on the cohort clock, independent band clocks.
+  Genesis declares the four clocks (§4.1). Gates, all systems-level: **every wire byte
+  accounted against §5's formulas at each arm's block size, with zero activation-class
+  traffic**; per-band det digests bit-identical across restart; the liveness cases above
+  observed live; factor-refresh delay injected deliberately (the §4.1 staleness bound
+  exercised, not assumed).
 - **X4 — churn and placement campaign.** Seeded joins and departures against X3's fleet: the
   full join ladder (restore → warm-up → weight-0 → active), placement moving capacity to lagging
   bands on the loss-EMA signal, correlated whole-band loss, publisher-slot churn. Instruments:
   catch-up time, warm-up fraction of session life, band-balance spread — the statistics no
-  paper publishes and this fleet lives or dies by.
+  paper publishes and this fleet lives or dies by. At this fleet size they are correctness
+  smokes, not fleet claims: the gates are that the machinery behaves, never a throughput or
+  scaling number.
 
 **Standing gates at every rung:** the comparator discipline above; det digests never diverge;
 traffic accounting matches §5 or the table is corrected in the same commit; and §0's language
