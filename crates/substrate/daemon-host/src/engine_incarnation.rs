@@ -110,7 +110,7 @@ struct ContentTransfer {
 #[derive(Clone)]
 pub struct TurnIndexing {
     store: Arc<dyn SessionStore>,
-    title_aux: Option<Arc<dyn Provider>>,
+    title_aux: Option<crate::TitleAuxResolver>,
     titled: Arc<dashmap::DashMap<SessionId, ()>>,
     feed: Option<Arc<crate::NodeEventFeed>>,
 }
@@ -275,7 +275,7 @@ impl CoreEngineFactory {
     pub fn with_indexing(
         mut self,
         store: Arc<dyn SessionStore>,
-        title_aux: Option<Arc<dyn Provider>>,
+        title_aux: Option<crate::TitleAuxResolver>,
         feed: Option<Arc<crate::NodeEventFeed>>,
     ) -> Self {
         self.indexing = Some(TurnIndexing {

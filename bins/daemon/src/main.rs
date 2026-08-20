@@ -2659,15 +2659,6 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
         }
     }
 
-    // The auxiliary provider for background session-title generation, resolved like `lcm_aux`
-    // (the profile's builder). `None` — provider unset or `[sessions].title_generation = false` —
-    // keeps the truncation-seeded titles.
-    let title_aux: Option<Arc<dyn Provider>> = cfg
-        .sessions
-        .title_generation
-        .then(|| providers.builder_for(&cred_profile).map(|b| b()))
-        .flatten();
-
     // The skills subsystem (opt-out via `[skills].enable = false`): the `skill_*` tools join every
     // role registry, and the progressive-disclosure index is folded into the stable system-prompt
     // tier (`prompt_sources`). The background `skill_review` curator activates only when the engine's
@@ -2819,6 +2810,26 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
             provider_builder_for(spec, &cfg, provider_kind, &manager, &active)
         })
     };
+
+    // The lazy resolver for background session-title generation (`[sessions].title_generation`
+    // gates it). Resolved PER TITLE CALL over the LIVE profile store + the same provider seam
+    // sessions use: the session's bound profile, else the active default. A boot-time resolution
+    // (the old shape) froze against the launch registry — a node booted unconfigured (the wizard
+    // first-run) could never title, even after the operator commissioned a working profile.
+    let title_aux: Option<daemon_host::TitleAuxResolver> =
+        cfg.sessions.title_generation.then(|| {
+            let profiles = profile_store.clone();
+            let resolver = provider_resolver.clone();
+            Arc::new(move |bound: Option<&daemon_common::ProfileRef>| {
+                let spec = bound
+                    .and_then(|p| profiles.get(p.as_str()).ok().flatten())
+                    .or_else(|| {
+                        let id = profiles.active().ok().flatten()?;
+                        profiles.get(&id).ok().flatten()
+                    })?;
+                Some(resolver(&spec)())
+            }) as daemon_host::TitleAuxResolver
+        });
 
     let routing = build_routing_registry(&cfg.routing);
     // The §12 tool-checkpoint store: a workspace checkpoint is recorded before each mutating tool

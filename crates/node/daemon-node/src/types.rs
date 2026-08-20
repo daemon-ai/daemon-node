@@ -233,11 +233,13 @@ pub struct NodeAssembly {
     /// 180 s/600 s foreground timeouts, watch rate limits), so tests just pass
     /// `Default::default()`.
     pub processes: daemon_processes::ProcessesConfig,
-    /// The auxiliary provider for background session-title generation (resolved by the binary the
-    /// same way as the LCM/Mnemosyne aux providers): after a live session's first exchange, one
+    /// The lazy resolver for the background session-title generation provider: after a live
+    /// session's first exchange, the resolver is called with that session's bound profile and one
     /// best-effort `task = "title_generation"` call replaces the truncation-seeded roster title.
-    /// `None` keeps seeded titles only (tests / nodes without an aux provider).
-    pub title_aux: Option<Arc<dyn daemon_core::Provider>>,
+    /// Resolved PER CALL against the binary's live profile store + provider registry (a
+    /// boot-frozen provider left wizard-first-run nodes titleless forever). `None` keeps seeded
+    /// titles only (tests / nodes without an aux provider).
+    pub title_aux: Option<daemon_host::TitleAuxResolver>,
     /// The ephemeral-subagent reaper policy ([`EphemeralReaper`](crate::fleet::EphemeralReaper)):
     /// archive `EphemeralSubagent` sessions `grace` after their terminal state, swept every
     /// `interval`. The default is enabled (300s grace / 60s interval); the first sweep runs one

@@ -99,7 +99,7 @@ async fn title_generation_replaces_the_seed_after_first_exchange() {
     // The aux replies with a quoted title — the cleanup must strip the quotes.
     let title_aux: Arc<dyn Provider> =
         Arc::new(MockProvider::completing("\"Docker Networking Help\""));
-    let (node, handle, store) = assemble_with_store_for_recall(Some(title_aux));
+    let (node, handle, store) = assemble_with_store_for_recall(Some(fixed_title_aux(title_aux)));
     let session = SessionId::new("s-titled");
 
     with_request_context(ctx("alice", Role::User), async {
@@ -151,6 +151,76 @@ async fn title_generation_replaces_the_seed_after_first_exchange() {
     })
     .await;
     assert_eq!(hit_title, "Docker Networking Help");
+
+    handle.shutdown().await;
+}
+
+/// The title aux is resolved at TITLE TIME, not boot (the wizard-first-run fix): an exchange
+/// whose resolver finds no provider keeps the truncation seed WITHOUT consuming the
+/// once-per-residency guard, and once a provider becomes resolvable (the operator commissioned a
+/// profile), the next exchange inside the first-exchange gate (≤ 2 user turns) titles.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn title_generation_resolves_lazily_after_a_late_created_profile() {
+    // The "profile store": empty at boot, filled mid-session — the resolver reads it live.
+    let slot: Arc<std::sync::Mutex<Option<Arc<dyn Provider>>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let resolver: daemon_host::TitleAuxResolver = {
+        let slot = slot.clone();
+        Arc::new(move |_| slot.lock().unwrap().clone())
+    };
+    let (node, handle, store) = assemble_with_store_for_recall(Some(resolver));
+    let session = SessionId::new("s-late-titled");
+
+    with_request_context(ctx("alice", Role::User), async {
+        node.submit(
+            session.clone(),
+            start_turn("first question about docker networking"),
+        )
+        .await
+    })
+    .await
+    .expect("alice opens");
+
+    // The first exchange completes (its FTS index lands) with nothing resolvable: the seed stays.
+    wait_for("the first exchange to be indexed", || {
+        let store = store.clone();
+        let session = session.clone();
+        async move {
+            let hits = store.search_sessions("docker", 10).await;
+            hits.iter().any(|h| h.session_id == session).then_some(())
+        }
+    })
+    .await;
+    assert_eq!(
+        store.session_meta(&session).await.and_then(|m| m.title),
+        Some("first question about docker networking".into()),
+        "an unresolvable aux leaves the truncation seed untouched"
+    );
+
+    // The operator "commissions a profile": the resolver now yields a provider…
+    *slot.lock().unwrap() = Some(Arc::new(MockProvider::completing("\"Late Docker Title\"")));
+
+    // …and the SECOND exchange (still within the ≤ 2-user-turn gate) titles — proving the
+    // unresolvable first pass did not consume the once-per-residency guard.
+    with_request_context(ctx("alice", Role::User), async {
+        node.submit(session.clone(), start_turn("a follow-up question"))
+            .await
+    })
+    .await
+    .expect("alice follows up");
+    let title = wait_for("the late-resolved generated title", || {
+        let store = store.clone();
+        let session = session.clone();
+        async move {
+            store
+                .session_meta(&session)
+                .await
+                .and_then(|m| m.title)
+                .filter(|t| t == "Late Docker Title")
+        }
+    })
+    .await;
+    assert_eq!(title, "Late Docker Title");
 
     handle.shutdown().await;
 }
@@ -248,9 +318,15 @@ async fn session_recap_serves_durable_and_live_sessions_owner_scoped() {
     handle.shutdown().await;
 }
 
-/// Assemble exactly like [`assemble_over`] but with an optional title-generation aux provider.
+/// Wrap a fixed provider as the trivial lazy title-aux resolver (tests that don't exercise the
+/// late-resolution seam).
+fn fixed_title_aux(provider: Arc<dyn Provider>) -> daemon_host::TitleAuxResolver {
+    Arc::new(move |_| Some(provider.clone()))
+}
+
+/// Assemble exactly like [`assemble_over`] but with an optional title-generation aux resolver.
 fn assemble_with_store_for_recall(
-    title_aux: Option<Arc<dyn Provider>>,
+    title_aux: Option<daemon_host::TitleAuxResolver>,
 ) -> (
     Arc<NodeApiImpl>,
     daemon_host::SupervisorHandle,

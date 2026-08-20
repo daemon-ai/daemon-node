@@ -1156,10 +1156,11 @@ pub(crate) struct LiveSessions {
     /// `note_activity`/`ensure`, `ApprovalPending` in the live `ParkingHandler`) push onto it. `None`
     /// until `set_node_events` wires it (a node assembled without a feed leaves it unset).
     node_events: Mutex<Option<Arc<NodeEventFeed>>>,
-    /// The auxiliary provider for background session-title generation, when configured: the live
-    /// event pump fires one best-effort `generate_title` call after a session's first exchange and
-    /// persists the result over the truncation-seeded roster title. `None` keeps seeds only.
-    title_aux: Mutex<Option<Arc<dyn Provider>>>,
+    /// The lazy resolver for the auxiliary title-generation provider, when configured: the live
+    /// event pump fires one best-effort `generate_title` call after a session's first exchange
+    /// (resolving the provider against the session's bound profile AT THAT MOMENT, not at boot)
+    /// and persists the result over the truncation-seeded roster title. `None` keeps seeds only.
+    title_aux: Mutex<Option<crate::TitleAuxResolver>>,
     /// Sessions this residency already attempted title generation for (once-per-residency guard, so
     /// a failed aux call is not retried on every subsequent turn).
     titled: Arc<DashMap<SessionId, ()>>,
@@ -1319,8 +1320,8 @@ impl LiveSessions {
         *self.credentials.lock().unwrap() = Some(credentials);
     }
 
-    /// Wire the auxiliary provider for background session-title generation.
-    pub(crate) fn set_title_aux(&self, aux: Arc<dyn Provider>) {
+    /// Wire the lazy resolver for the background session-title generation provider.
+    pub(crate) fn set_title_aux(&self, aux: crate::TitleAuxResolver) {
         *self.title_aux.lock().unwrap() = Some(aux);
     }
 
@@ -2358,7 +2359,7 @@ pub(crate) async fn index_and_title_session(
     store: Arc<dyn SessionStore>,
     session: SessionId,
     view: ConvView,
-    aux: Option<Arc<dyn Provider>>,
+    aux: Option<crate::TitleAuxResolver>,
     titled: Arc<DashMap<SessionId, ()>>,
     feed: Option<Arc<NodeEventFeed>>,
 ) {
@@ -2395,6 +2396,13 @@ pub(crate) async fn index_and_title_session(
     if !title_replaceable(&meta, &first_user) {
         return;
     }
+    // Resolve the provider NOW, against this session's bound profile — the resolver reads the
+    // LIVE profile store, so a profile commissioned after boot (the wizard first-run) titles.
+    // An unresolvable provider is "not configured yet", NOT a failed call: leave the
+    // once-per-residency guard unconsumed so a later exchange inside the gate may still title.
+    let Some(aux) = aux(meta.bound_profile.as_ref()) else {
+        return;
+    };
     if titled.insert(session.clone(), ()).is_some() {
         return;
     }

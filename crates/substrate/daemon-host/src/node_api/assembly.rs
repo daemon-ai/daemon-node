@@ -569,11 +569,14 @@ impl NodeApiImpl {
         self
     }
 
-    /// Attach the auxiliary provider for background session-title generation: after a live
-    /// session's first exchange completes, one best-effort `task = "title_generation"` call
-    /// replaces the truncation-seeded roster title (hermes `title_generator` parity). Absent,
-    /// sessions keep their seeded titles. Call during assembly.
-    pub fn with_title_aux(self, aux: Arc<dyn daemon_core::Provider>) -> Self {
+    /// Attach the lazy resolver for the background session-title generation provider: after a
+    /// live session's first exchange completes, the resolver is called with that session's bound
+    /// profile and one best-effort `task = "title_generation"` call replaces the
+    /// truncation-seeded roster title (hermes `title_generator` parity). Resolving per call —
+    /// not once at assembly — is what lets a node booted unconfigured start titling as soon as
+    /// the operator commissions a working profile. Absent, sessions keep their seeded titles.
+    /// Call during assembly.
+    pub fn with_title_aux(self, aux: crate::TitleAuxResolver) -> Self {
         self.live.set_title_aux(aux);
         self
     }

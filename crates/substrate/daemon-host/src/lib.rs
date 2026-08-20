@@ -134,7 +134,7 @@ pub use node_api::{
     decode_overlay, encode_overlay, AccountProvisioning, AgentDiscovery, AttachmentHub,
     AttachmentHubs, CloudCatalog, DeliveryHost, DurableProfileResolver, ForeignSessionFactory,
     NodeApiImpl, NodeApiParts, NodeEventFeed, ProvisionedAccount, RoutingBuilder, SessionBackend,
-    SessionEngineBuilder,
+    SessionEngineBuilder, TitleAuxResolver,
 };
 pub use notifications::{AddOutcome, NotificationManager, ReadChange};
 pub use persona_ops::PersonaOps;

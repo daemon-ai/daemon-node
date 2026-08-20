@@ -156,9 +156,7 @@ use daemon_common::{
     ModelEngine, ModelFile, ModelId, ModelRef, PartitionId, ProfileRef, QuantRecommendation,
     QuantizeId, QuantizeStatus, ReqId, SearchPage, SearchQuery, SessionId, UnitId, UsageDelta,
 };
-use daemon_core::{
-    is_sensitive_path, ApprovalPolicy, Engine, LocalEnvironment, Provider, Snapshot,
-};
+use daemon_core::{is_sensitive_path, ApprovalPolicy, Engine, LocalEnvironment, Snapshot};
 use daemon_models::{ModelError, ModelManager};
 use daemon_protocol::{
     AgentCommand, AgentEvent, ConvView, DeliveryTarget, Direction, Disposition, HostRequest,
@@ -253,6 +251,17 @@ pub type DurableProfileResolver = Arc<
         + Send
         + Sync,
 >;
+
+/// Lazily resolves the auxiliary provider for background session-title generation, called at
+/// TITLE TIME (a session's first exchange) with that session's `meta.bound_profile`. This replaces
+/// a boot-frozen `Arc<dyn Provider>`: resolving once at assembly bound titling to whatever the
+/// LAUNCH config named, so a node booted unconfigured (the wizard-first-run path) never titled
+/// anything even after the operator commissioned a working profile. The assembling binary owns the
+/// closure (it owns the profile store + provider registry); the expected policy is: resolve the
+/// bound profile's spec, fall back to the active default profile, `None` when neither yields a
+/// usable provider (titles then keep their truncation seed — best-effort, like every aux failure).
+pub type TitleAuxResolver =
+    Arc<dyn Fn(Option<&ProfileRef>) -> Option<Arc<dyn daemon_core::Provider>> + Send + Sync>;
 
 /// The routing rebuild hook (the §5.9 hot-reload seam): produces a fresh [`RoutingRegistry`] from
 /// current node state (profiles + bound accounts). Re-run on `profile_update` / `auth_complete` so
