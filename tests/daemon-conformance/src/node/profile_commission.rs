@@ -177,8 +177,10 @@ async fn commission_probes_through_the_just_stored_credential_impl(store: Arc<dy
     let node = assemble_commission(store, catalog, creds, Arc::new(MemProfileStore::new()));
 
     // An UN-namespaced model id: the credential stays profile-keyed (no provider-global mint) —
-    // the exact shape the first-run wizard commits.
-    let spec = ProfileSpec::new("daemon-anthropic", ProviderSelector::GenAi, "claude-x");
+    // the exact shape the first-run wizard commits: a slug id plus the operator's free-text label
+    // (wire v54 display_name), which the commission must carry through whole.
+    let mut spec = ProfileSpec::new("daemon-anthropic", ProviderSelector::GenAi, "claude-x");
+    spec.display_name = Some("Daemon (Anthropic)".into());
     let (res, effects) = dispatch_with_effects(
         node.as_ref(),
         commission_req(spec, "sk-pasted-123", "anthropic"),
@@ -212,6 +214,17 @@ async fn commission_probes_through_the_just_stored_credential_impl(store: Arc<dy
         .find(|p| p.id == "daemon-anthropic")
         .expect("committed profile listed");
     assert!(row.is_active, "set_default selected the committed profile");
+    assert_eq!(
+        row.display_name.as_deref(),
+        Some("Daemon (Anthropic)"),
+        "the list row carries the commissioned display_name (wire v54)"
+    );
+    let spec = node
+        .profile_get("daemon-anthropic".into())
+        .await
+        .unwrap()
+        .expect("committed spec readable");
+    assert_eq!(spec.display_name.as_deref(), Some("Daemon (Anthropic)"));
 }
 
 /// The provider-global redirect leg: a NAMESPACED model mints `credential_ref =

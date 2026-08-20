@@ -19,7 +19,7 @@ kv-pair = [k: tstr, v: tstr]
 ; cap) - the fix that lets arbitrary file sizes round-trip. Fixed 32-byte hashes stay arrays
 ; (`content-hash`, below) since they are small and `ContentHash([u8; 32])` serializes as a sequence.
 byte-array = bstr
-wire_version = uint                 ; daemon-common WireVersion (current = 53)
+wire_version = uint                 ; daemon-common WireVersion (current = 54)
 
 ; ----- uniform wire pagination (wire v25) -----
 ; Every list op that can exceed the client codec's fixed 64-element array buffers is paginated
@@ -1106,12 +1106,17 @@ profile-spec = {
   ; the first operator update (adoption). An operator ProfileCreate retires a still-seeded,
   ; session-free placeholder node-side. Optional: a pre-v47 encoding omits it => false.
   ? "seeded": bool,
+  ; human-facing label (wire v54): the free-text name an operator typed, distinct from the
+  ; slug/store-key id (renames update only this field; id is immutable). Optional: a pre-v54
+  ; encoding omits it => null, and clients fall back to rendering the id.
+  ? "display_name": (tstr / null),
 }
 bound-account = { "transport_instance": tstr, "credential_ref": tstr }
 ; profile-info provenance (wire v31): mirrors profile-spec's created_by/owner so a client can badge +
 ; subtree-filter the profile list. Optional (pre-provenance encodings omit both).
 ; seeded (wire v47): mirrors profile-spec's node-seeded placeholder marker (read-only for clients).
-profile-info = { "id": tstr, "provider": provider-selector, "model": tstr, "is_active": bool, "bound_accounts": [* bound-account], ? "created_by": (author / null), ? "owner": (tstr / null), ? "seeded": bool }
+; display_name (wire v54): mirrors profile-spec's human-facing label so list rows carry it.
+profile-info = { "id": tstr, "provider": provider-selector, "model": tstr, "is_active": bool, "bound_accounts": [* bound-account], ? "created_by": (author / null), ? "owner": (tstr / null), ? "seeded": bool, ? "display_name": (tstr / null) }
 ; credential-info typed manager fields (wire v50, credential plan Phase 5) — all node-derived,
 ; all optional (a pre-v50 row omits them; None = the node could not derive the fact):
 ;   provider:       canonical vendor id ("open_router") from the ref shape or the stored

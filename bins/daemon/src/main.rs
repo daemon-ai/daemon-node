@@ -952,6 +952,8 @@ fn default_profile_spec(
         // `ProfileStore::seed` stamps the marker itself (and only on a first-boot empty store);
         // the spec never claims it.
         seeded: false,
+        // The launch-config seed has no operator-typed label; clients render the id.
+        display_name: None,
     }
 }
 

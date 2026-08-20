@@ -2561,18 +2561,18 @@ mod auth_contract_tests {
     }
 
     /// The contract wire version (`daemon_common::WireVersion::CURRENT`, mirrored by
-    /// [`crate::API_WIRE_VERSION`]) is pinned to the sealed surface: v53 (`ProfileCommission` —
-    /// the composite first-run/editor commit: profile upsert + credential + persona + model
-    /// activation + default selection + provider probe as ONE strictly-ordered call). Distinct
-    /// from the transport-envelope [`WIRE_VERSION`] above (= 2), which this rung did not touch.
-    /// Bumping the contract version is a deliberate act — this assertion is the gate.
+    /// [`crate::API_WIRE_VERSION`]) is pinned to the sealed surface: v54 (additive
+    /// `? display_name` on `profile-spec`/`profile-info` — the human-facing label distinct from
+    /// the immutable slug/store-key `id`). Distinct from the transport-envelope [`WIRE_VERSION`]
+    /// above (= 2), which this rung did not touch. Bumping the contract version is a deliberate
+    /// act — this assertion is the gate.
     #[test]
-    fn contract_wire_version_is_v53() {
+    fn contract_wire_version_is_v54() {
         assert_eq!(
             daemon_common::WireVersion::CURRENT,
-            daemon_common::WireVersion(53)
+            daemon_common::WireVersion(54)
         );
-        assert_eq!(crate::API_WIRE_VERSION, daemon_common::WireVersion(53));
+        assert_eq!(crate::API_WIRE_VERSION, daemon_common::WireVersion(54));
     }
 
     /// The `api/<N>` feature string is formatted from the API mirror version (never hardcoded)

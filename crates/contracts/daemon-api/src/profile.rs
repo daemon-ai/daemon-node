@@ -193,6 +193,12 @@ pub struct ProfileSpec {
     /// pre-v47 / legacy encoding => `false`, so a legacy row is never treated as retireable.
     #[serde(default)]
     pub seeded: bool,
+    /// The human-facing label (wire v54): the free-text name an operator typed (e.g.
+    /// "Daemon (Anthropic)"), distinct from the slug/store-key `id`. Renames update ONLY this
+    /// field — `id` is immutable (the on-disk key, the credential default, the session binding).
+    /// `None` on a pre-v54 / legacy encoding: clients fall back to rendering the `id`.
+    #[serde(default)]
+    pub display_name: Option<String>,
 }
 
 impl ProfileSpec {
@@ -220,6 +226,7 @@ impl ProfileSpec {
             created_by: None,
             owner: None,
             seeded: false,
+            display_name: None,
         }
     }
 
@@ -365,6 +372,10 @@ pub struct ProfileInfo {
     /// node-side (an operator create replaces a still-seeded, session-free placeholder).
     #[serde(default)]
     pub seeded: bool,
+    /// The human-facing label (wire v54): mirrors [`ProfileSpec::display_name`] so list rows carry
+    /// it without a per-profile `ProfileGet`. `None` => clients render the `id`.
+    #[serde(default)]
+    pub display_name: Option<String>,
 }
 
 impl ProfileInfo {
@@ -379,6 +390,7 @@ impl ProfileInfo {
             created_by: spec.created_by.clone(),
             owner: spec.owner.clone(),
             seeded: spec.seeded,
+            display_name: spec.display_name.clone(),
         }
     }
 }

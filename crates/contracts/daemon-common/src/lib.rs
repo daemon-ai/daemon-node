@@ -891,7 +891,12 @@ impl WireVersion {
     /// profile upsert + credential + persona + model activation + default selection + provider
     /// probe as ONE strictly-ordered call, retiring the client-orchestrated fire-and-forget
     /// sequence that raced its own dependent probe (each `Call` dispatches concurrently).
-    pub const CURRENT: Self = Self(53);
+    ///
+    /// (v54) additive `? display_name` on `profile-spec` + `profile-info`: the human-facing label
+    /// (the free-text name an operator typed), distinct from the immutable slug/store-key `id`.
+    /// Absent/null on legacy encodings — clients fall back to rendering the `id`. Renames update
+    /// only this field; `id` never changes.
+    pub const CURRENT: Self = Self(54);
 
     /// The version this build speaks (alias for [`WireVersion::CURRENT`]).
     pub fn current() -> Self {

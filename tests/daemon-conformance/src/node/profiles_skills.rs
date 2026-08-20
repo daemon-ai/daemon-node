@@ -307,6 +307,79 @@ async fn local_provider_profile_requires_a_model() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `display_name` (wire v54) round-trips the whole profile surface: create persists it, both
+/// authoritative reads (`profile_get` + the `profile_list` row) return it, a rename updates ONLY
+/// the label (the id stays the store key), and a label-less profile reads back `None` (the
+/// legacy/pre-v54 shape — clients fall back to the id).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn display_name_round_trips_create_update_and_list() {
+    use daemon_api::{ProfileApi, ProfileSpec, ProviderSelector};
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "daemon-display-name-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (node, handle, _skills) = assemble_versioning(&dir);
+
+    // Create with the operator's free-text label alongside the slug id.
+    let mut spec = ProfileSpec::new("daemon-anthropic", ProviderSelector::GenAi, "claude-x");
+    spec.display_name = Some("Daemon (Anthropic)".into());
+    node.profile_create(spec).await.expect("create labeled");
+
+    let got = node
+        .profile_get("daemon-anthropic".into())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(got.display_name.as_deref(), Some("Daemon (Anthropic)"));
+    let row = |list: Vec<daemon_api::ProfileInfo>, id: &str| {
+        list.into_iter().find(|p| p.id == id).expect("row listed")
+    };
+    assert_eq!(
+        row(node.profile_list().await, "daemon-anthropic")
+            .display_name
+            .as_deref(),
+        Some("Daemon (Anthropic)"),
+        "the list row mirrors the spec's display_name"
+    );
+
+    // Rename = a display_name-only update; the id stays the key.
+    let mut renamed = got;
+    renamed.display_name = Some("My Anthropic Agent".into());
+    node.profile_update(renamed).await.expect("rename label");
+    let got = node
+        .profile_get("daemon-anthropic".into())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(got.id, "daemon-anthropic", "rename never moves the id");
+    assert_eq!(got.display_name.as_deref(), Some("My Anthropic Agent"));
+
+    // A label-less profile reads back None end to end (the pre-v54 fallback shape).
+    node.profile_create(ProfileSpec::new(
+        "plain",
+        ProviderSelector::GenAi,
+        "claude-x",
+    ))
+    .await
+    .expect("create unlabeled");
+    assert_eq!(
+        node.profile_get("plain".into())
+            .await
+            .unwrap()
+            .unwrap()
+            .display_name,
+        None
+    );
+    assert_eq!(row(node.profile_list().await, "plain").display_name, None);
+
+    handle.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// THE VERSIONING + DISTRIBUTION GATE: a profile's edits are versioned in a native append-only
 /// history with non-destructive revert (and roll-forward), skills (incl. agent-authored ones)
 /// share the same mechanism, binary-bundled skills are read-only, and a profile exports/imports
