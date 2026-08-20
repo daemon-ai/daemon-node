@@ -267,3 +267,109 @@ async fn rewind_to_seals_history_and_reruns_over_node_impl() {
 
     handle.shutdown().await;
 }
+
+/// The wire-level rewind verb (`ApiRequest::Rewind` → `ControlApi::rewind`) end-to-end, on BOTH
+/// store backends: the edit/retry contract a thin client composes is `Rewind` (truncate-only,
+/// reply `Ok`) followed by a separate `StartTurn` carrying the replacement text. Asserts the
+/// durable journal records the truncation seal (`sealed_after`) and the follow-up turn runs to
+/// completion on the truncated history. (`RewindTo`-over-submit is covered above; this is the
+/// `Call`-dispatched verb the GUI/TUI actually send.)
+#[tokio::test]
+async fn rewind_verb_seals_history_and_accepts_a_follow_up_turn() {
+    for store in [
+        Arc::new(InMemoryStore::new()) as Arc<dyn SessionStore>,
+        Arc::new(SqliteStore::open_in_memory().expect("open sqlite store"))
+            as Arc<dyn SessionStore>,
+    ] {
+        as_system(rewind_verb_seals_history_and_accepts_a_follow_up_turn_impl(
+            store,
+        ))
+        .await;
+    }
+}
+async fn rewind_verb_seals_history_and_accepts_a_follow_up_turn_impl(store: Arc<dyn SessionStore>) {
+    use daemon_api::{dispatch, ApiRequest, ApiResponse, RewindPoint, SessionApi};
+    use daemon_common::ReqId;
+    use daemon_protocol::{AgentCommand, AgentEvent, Outbound, RewindAnchor, UserMsg};
+
+    async fn drive_to_finished(node: &Arc<NodeApiImpl>, session: &SessionId) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            let drained = node.poll(session.clone(), 0).await.expect("poll");
+            if drained
+                .iter()
+                .any(|o| matches!(o, Outbound::Event(AgentEvent::TurnFinished { .. })))
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("the turn never reached TurnFinished");
+    }
+
+    let AssembledNode { node, handle, .. } =
+        assemble_over(store, 0, [0x6a; 32], fast_host_config());
+    let session = SessionId::new("rewind-verb-1");
+
+    // Two exchanges, so the rewind genuinely discards history (the second one).
+    for (n, text) in [(1u64, "first question"), (2, "second question")] {
+        node.submit(
+            session.clone(),
+            AgentCommand::StartTurn {
+                input: UserMsg::new(text),
+                request_id: ReqId(n),
+            },
+        )
+        .await
+        .expect("submit StartTurn");
+        drive_to_finished(&node, &session).await;
+    }
+
+    // The wire verb: truncate back to the FIRST user turn. Truncate-only — the reply is a bare
+    // `Ok`; any replacement text is the client's follow-up `StartTurn`.
+    let res = dispatch(
+        node.as_ref(),
+        ApiRequest::Rewind {
+            session: session.clone(),
+            point: RewindPoint {
+                anchor: RewindAnchor::UserTurn { ordinal: 0 },
+                restore_workspace: false,
+            },
+        },
+    )
+    .await;
+    assert!(
+        matches!(res, ApiResponse::Ok),
+        "Rewind replies a bare Ok, got {res:?}"
+    );
+
+    // The durable journal records the truncation seal for reconnecting clients.
+    let mut sealed = None;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        let page = node.session_history(session.clone(), 0, None, 0).await;
+        if page.sealed_after.is_some() {
+            sealed = page.sealed_after;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        sealed.is_some(),
+        "session_history must flag the rewind seal"
+    );
+
+    // The follow-up StartTurn (the edited/replayed text) runs on the truncated history.
+    node.submit(
+        session.clone(),
+        AgentCommand::StartTurn {
+            input: UserMsg::new("first question, edited"),
+            request_id: ReqId(3),
+        },
+    )
+    .await
+    .expect("submit StartTurn after the wire rewind");
+    drive_to_finished(&node, &session).await;
+
+    handle.shutdown().await;
+}
