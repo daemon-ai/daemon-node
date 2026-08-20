@@ -505,6 +505,9 @@ impl AuthCallback {
             return; // EXTERNAL with no presented client cert: deny.
         };
         if let Some(id) = self.external_identity(fingerprint) {
+            // M3 device metadata: stamp the last successful EXTERNAL login on the mapping.
+            // Best-effort — bookkeeping never gates an already-validated authentication.
+            let _ = self.store.touch_external_identity(fingerprint);
             *self.captured.lock().unwrap_or_else(|e| e.into_inner()) = Some(id);
         }
     }
@@ -816,7 +819,7 @@ mod tests {
         // Enroll the verified client-cert fingerprint -> user (the store-level writer).
         let user = store.find_user("svc").unwrap().unwrap();
         store
-            .set_external_identity(&user.id, "ab12cd34")
+            .set_external_identity(&user.id, "ab12cd34", None)
             .expect("enroll fingerprint");
         let auth = Authenticator::new(store);
         let tls = TlsState {
@@ -842,6 +845,56 @@ mod tests {
         assert!(matches!(
             auth2.begin(MECH_EXTERNAL, b"", tls_unknown),
             BeginOutcome::Failed(_)
+        ));
+    }
+
+    /// The pairing-groundwork checkpoint (pairing spec §5.4 stage 2): a device user created via
+    /// `create_external_user` (NO password/SCRAM material) with a hand-enrolled fingerprint logs
+    /// in via EXTERNAL — and the login stamps `last_seen_at` (M3). A SCRAM attempt against the
+    /// passwordless username fails exactly like a wrong password (the decoy path), and PLAIN
+    /// denies too: the account is cert-only, fail-closed.
+    #[test]
+    fn external_user_enrollment_checkpoint() {
+        let store = Arc::new(AuthStore::open_in_memory().expect("store"));
+        let device = store
+            .create_external_user("device-ab12cd34dead", &[Role::User])
+            .expect("external user");
+        store
+            .set_external_identity(&device.id, "ffee00112233", Some("Pixel 9"))
+            .expect("enroll fingerprint");
+        let auth = Authenticator::new(store.clone());
+        let tls = TlsState {
+            is_tls: true,
+            peer_cert_fingerprint: Some("ffee00112233".into()),
+        };
+
+        // EXTERNAL with the enrolled cert: authenticates as the device user.
+        match auth.begin(MECH_EXTERNAL, b"", tls.clone()) {
+            BeginOutcome::Success { success, .. } => {
+                assert_eq!(success.principal.username, "device-ab12cd34dead");
+            }
+            _ => panic!("an enrolled device certificate must authenticate via EXTERNAL"),
+        }
+        // The successful login stamped the device's last_seen_at (M3).
+        let rows = store.list_external_identities().unwrap();
+        assert_eq!(rows[0].display_name.as_deref(), Some("Pixel 9"));
+        assert!(rows[0].last_seen_at.is_some(), "login stamps last_seen_at");
+
+        // SCRAM against the passwordless device user: denied via the decoy (no probe oracle).
+        assert!(matches!(
+            mediate(
+                &auth,
+                MECH_SCRAM_SHA_256,
+                "device-ab12cd34dead",
+                "guess",
+                tls.clone()
+            ),
+            Mediated::Denied
+        ));
+        // PLAIN too: there is no password credential to verify against.
+        assert!(matches!(
+            mediate(&auth, MECH_PLAIN, "device-ab12cd34dead", "guess", tls),
+            Mediated::Denied
         ));
     }
 

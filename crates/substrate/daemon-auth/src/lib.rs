@@ -38,4 +38,6 @@ pub use capability::{
 };
 pub use error::{Error, Result};
 pub use scram::{ScramMaterial, SCRAM_DEFAULT_ITERATIONS, SCRAM_SHA_256};
-pub use store::{generate_secret_hex, AuthStore, UserRecord, DEFAULT_SESSION_TTL_SECS};
+pub use store::{
+    generate_secret_hex, AuthStore, ExternalIdentityRecord, UserRecord, DEFAULT_SESSION_TTL_SECS,
+};

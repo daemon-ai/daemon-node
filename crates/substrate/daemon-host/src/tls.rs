@@ -25,10 +25,15 @@ use daemon_api::NodeApi;
 use daemon_common::{IngressGovernor, PeerKey};
 use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
+use tokio_rustls::rustls::client::danger::HandshakeSignatureValid;
+use tokio_rustls::rustls::crypto::CryptoProvider;
 use tokio_rustls::rustls::pki_types::pem::PemObject;
-use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, UnixTime};
+use tokio_rustls::rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use tokio_rustls::rustls::server::WebPkiClientVerifier;
-use tokio_rustls::rustls::{RootCertStore, ServerConfig};
+use tokio_rustls::rustls::{
+    DigitallySignedStruct, DistinguishedName, RootCertStore, ServerConfig, SignatureScheme,
+};
 use tokio_rustls::TlsAcceptor;
 
 use crate::authn::{Authenticator, TlsState};
@@ -96,11 +101,96 @@ fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>, TlsConfigError> {
     })
 }
 
+/// The **request-optional-any** client-certificate verifier (pairing spec §5.1), the default
+/// client-auth mode of the TLS api listener: the server *requests* a client certificate but does
+/// not require one, and *any* presented certificate passes the TLS layer — after its handshake
+/// signature is verified, so possession of the matching private key is still proven. All trust
+/// judgment is deferred to SASL, which is fail-closed: an unmapped fingerprint means EXTERNAL
+/// denies, and SCRAM/PLAIN are unaffected. The only new capability over `with_no_client_auth` is
+/// that a presented self-signed certificate reaches [`TlsState::peer_cert_fingerprint`] — which
+/// pairing enrollment and EXTERNAL need.
+#[derive(Debug)]
+struct AcceptAnyClientCert {
+    provider: Arc<CryptoProvider>,
+    /// Empty: we hint no CA subjects, so clients offer whatever identity they have.
+    subjects: Vec<DistinguishedName>,
+}
+
+impl AcceptAnyClientCert {
+    fn new(provider: Arc<CryptoProvider>) -> Self {
+        Self {
+            provider,
+            subjects: Vec::new(),
+        }
+    }
+}
+
+impl ClientCertVerifier for AcceptAnyClientCert {
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        &self.subjects
+    }
+
+    fn verify_client_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _now: UnixTime,
+    ) -> Result<ClientCertVerified, tokio_rustls::rustls::Error> {
+        // Any certificate is admitted at the TLS layer; SASL owns the trust decision.
+        Ok(ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, tokio_rustls::rustls::Error> {
+        tokio_rustls::rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, tokio_rustls::rustls::Error> {
+        tokio_rustls::rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+
+    fn offer_client_auth(&self) -> bool {
+        true
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        false
+    }
+}
+
 /// Build a rustls [`ServerConfig`] from the resolved [`ApiTlsConfig`], pinning the aws-lc-rs crypto
 /// provider (matching the rest of the tree). With `require_client_cert`, an mTLS verifier is built
 /// over the configured client-CA bundle so untrusted client certificates are rejected during the
-/// handshake; otherwise client certs are optional (clients authenticate via SCRAM/PLAIN over the
-/// server-authenticated channel, and a presented cert is still captured for EXTERNAL).
+/// handshake. Otherwise (the default) client certificates are **requested but optional**, and any
+/// presented certificate is admitted at the TLS layer ([`AcceptAnyClientCert`], pairing spec §5.1):
+/// clients presenting nothing still connect and SCRAM as before, while a presented (e.g.
+/// self-signed) certificate reaches [`TlsState::peer_cert_fingerprint`] for EXTERNAL/pairing —
+/// where trust is decided, fail-closed.
 pub fn build_server_config(cfg: &ApiTlsConfig) -> Result<Arc<ServerConfig>, TlsConfigError> {
     let provider = Arc::new(tokio_rustls::rustls::crypto::aws_lc_rs::default_provider());
     let certs = load_certs(&cfg.cert_path)?;
@@ -125,7 +215,9 @@ pub fn build_server_config(cfg: &ApiTlsConfig) -> Result<Arc<ServerConfig>, TlsC
             .with_client_cert_verifier(verifier)
             .with_single_cert(certs, key)?
     } else {
-        builder.with_no_client_auth().with_single_cert(certs, key)?
+        builder
+            .with_client_cert_verifier(Arc::new(AcceptAnyClientCert::new(provider)))
+            .with_single_cert(certs, key)?
     };
     Ok(Arc::new(config))
 }
@@ -348,6 +440,78 @@ mod tests {
             .await
             .expect("server handshake did not settle")
             .unwrap()
+    }
+
+    /// Like [`handshake`], but also returns the server-observed peer-certificate fingerprint of
+    /// an accepted connection (`None` = handshake rejected; `Some(None)` = accepted, no client
+    /// cert presented; `Some(Some(fp))` = accepted with a captured fingerprint).
+    async fn handshake_fp(
+        server: Arc<ServerConfig>,
+        client: Arc<ClientConfig>,
+    ) -> Option<Option<String>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let acceptor = TlsAcceptor::from(server);
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            acceptor
+                .accept(stream)
+                .await
+                .ok()
+                .map(|s| peer_fingerprint(&s))
+        });
+        let connector = TlsConnector::from(client);
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let name = ServerName::try_from("localhost").unwrap();
+        let _ = connector.connect(name, tcp).await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), server_task)
+            .await
+            .expect("server handshake did not settle")
+            .unwrap()
+    }
+
+    /// The §5.1 verifier-mode matrix, default (request-optional-any) side: presenting nothing
+    /// still connects exactly as before (no fingerprint), and a presented **self-signed**
+    /// certificate is admitted at the TLS layer with its fingerprint captured for SASL — where
+    /// trust is decided fail-closed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn optional_client_auth_matrix_captures_any_presented_cert() {
+        let pki = gen_pki();
+
+        // No client certificate: connects, nothing captured (the pre-§5.1 behavior, preserved).
+        let server = server_config(&pki, false);
+        let client = client_config(&pki, None);
+        assert_eq!(
+            handshake_fp(server, client).await,
+            Some(None),
+            "a certificate-less client must still connect under request-optional-any"
+        );
+
+        // A self-signed client certificate: admitted, and the captured fingerprint is the
+        // SHA-256 of its DER — the pin/TXT-fp/EXTERNAL format.
+        let server = server_config(&pki, false);
+        let client = client_config(
+            &pki,
+            Some((vec![pki.bad_cert_der.clone()], pki.bad_key_der.clone_key())),
+        );
+        let expected = hex(&Sha256::digest(pki.bad_cert_der.as_ref()));
+        assert_eq!(
+            handshake_fp(server, client).await,
+            Some(Some(expected)),
+            "a self-signed client certificate must be admitted and fingerprinted"
+        );
+
+        // A CA-signed client certificate is equally admitted (any presented cert passes TLS).
+        let server = server_config(&pki, false);
+        let client = client_config(
+            &pki,
+            Some((
+                vec![pki.client_cert_der.clone()],
+                pki.client_key_der.clone_key(),
+            )),
+        );
+        let expected = hex(&Sha256::digest(pki.client_cert_der.as_ref()));
+        assert_eq!(handshake_fp(server, client).await, Some(Some(expected)));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

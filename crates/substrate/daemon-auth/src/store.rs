@@ -109,6 +109,13 @@ static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
              );\n\
              CREATE INDEX IF NOT EXISTS external_identities_user ON external_identities (user_id);",
         ),
+        // M3 (pairing spec §5.4): device metadata on the fingerprint mapping — the display name
+        // the device sent during pairing, and the last successful EXTERNAL login. `created_at`
+        // already exists (M2). Never edit a released migration; this only adds columns.
+        M::up(
+            "ALTER TABLE external_identities ADD COLUMN display_name TEXT;\n\
+             ALTER TABLE external_identities ADD COLUMN last_seen_at INTEGER;",
+        ),
     ])
 });
 
@@ -123,6 +130,25 @@ pub struct UserRecord {
     pub disabled: bool,
     /// Unix seconds at creation.
     pub created_at: i64,
+}
+
+/// One `external_identities` row joined with its owning user (the paired-devices admin view).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExternalIdentityRecord {
+    /// SHA-256 of the client leaf certificate DER, lowercase hex.
+    pub fingerprint: String,
+    /// The mapped user's stable id.
+    pub user_id: String,
+    /// The mapped user's username.
+    pub username: String,
+    /// The device display name captured at pairing (M3).
+    pub display_name: Option<String>,
+    /// Unix seconds at enrollment.
+    pub created_at: i64,
+    /// Unix seconds of the last successful EXTERNAL login (M3).
+    pub last_seen_at: Option<i64>,
+    /// Whether the mapped user is disabled (a disabled user's cert never authenticates).
+    pub disabled: bool,
 }
 
 /// The SQLite-backed identity / credential / session store.
@@ -263,6 +289,39 @@ impl AuthStore {
         )?;
         // Derive the parallel SCRAM-SHA-256 material from the same password (same write).
         upsert_scram(&conn, &id, password)?;
+        for role in roles {
+            conn.execute(
+                "INSERT OR IGNORE INTO user_roles (user_id, role) VALUES (?1, ?2)",
+                params![id, role.as_str()],
+            )?;
+        }
+        Ok(UserRecord {
+            id,
+            username: username.to_string(),
+            disabled: false,
+            created_at,
+        })
+    }
+
+    /// Create a user with NO password credentials (pairing spec §5.4): the account authenticates
+    /// exclusively via a mapped external identity (mTLS client cert + SASL EXTERNAL). No
+    /// `password_credentials` / `scram_credentials` rows are written, so a SCRAM/PLAIN attempt
+    /// against the username fails closed through the authenticator's decoy path — exactly like a
+    /// wrong password, with no probe oracle for "this user is passwordless".
+    pub fn create_external_user(&self, username: &str, roles: &[Role]) -> Result<UserRecord> {
+        if crate::is_reserved_username(username) {
+            return Err(Error::ReservedUsername);
+        }
+        let id = random_hex()?;
+        if crate::is_reserved_username(&id) {
+            return Err(Error::ReservedUsername);
+        }
+        let created_at = now_secs();
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO users (id, username, disabled, created_at) VALUES (?1, ?2, 0, ?3)",
+            params![id, username, created_at],
+        )?;
         for role in roles {
             conn.execute(
                 "INSERT OR IGNORE INTO user_roles (user_id, role) VALUES (?1, ?2)",
@@ -557,7 +616,12 @@ impl AuthStore {
     /// re-binding a fingerprint moves it to the new user. Errors with [`Error::NotFound`] if the
     /// target user row does not exist. The admin op that exposes this is deferred (Auth 5); this is
     /// the store-level writer so the read path is testable end-to-end.
-    pub fn set_external_identity(&self, user_id: &str, fingerprint: &str) -> Result<()> {
+    pub fn set_external_identity(
+        &self,
+        user_id: &str,
+        fingerprint: &str,
+        display_name: Option<&str>,
+    ) -> Result<()> {
         let conn = self.lock();
         let exists: bool = conn
             .query_row(
@@ -571,13 +635,61 @@ impl AuthStore {
             return Err(Error::NotFound);
         }
         conn.execute(
-            "INSERT INTO external_identities (fingerprint, user_id, created_at) \
-             VALUES (?1, ?2, ?3) \
+            "INSERT INTO external_identities (fingerprint, user_id, created_at, display_name) \
+             VALUES (?1, ?2, ?3, ?4) \
              ON CONFLICT(fingerprint) DO UPDATE SET user_id = excluded.user_id, \
-             created_at = excluded.created_at",
-            params![fingerprint, user_id, now_secs()],
+             created_at = excluded.created_at, display_name = excluded.display_name",
+            params![fingerprint, user_id, now_secs(), display_name],
         )?;
         Ok(())
+    }
+
+    /// Record a successful EXTERNAL login on the fingerprint mapping (`last_seen_at`, M3).
+    /// Best-effort from the auth path: an unknown fingerprint is a no-op, never an error.
+    pub fn touch_external_identity(&self, fingerprint: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE external_identities SET last_seen_at = ?2 WHERE fingerprint = ?1",
+            params![fingerprint, now_secs()],
+        )?;
+        Ok(())
+    }
+
+    /// Remove a fingerprint mapping. Returns whether a row was deleted (an unknown fingerprint is
+    /// `false`, not an error). Revocation of the *user* (disable, session teardown) is the admin
+    /// surface's responsibility — this only severs the certificate mapping.
+    pub fn remove_external_identity(&self, fingerprint: &str) -> Result<bool> {
+        let conn = self.lock();
+        let n = conn.execute(
+            "DELETE FROM external_identities WHERE fingerprint = ?1",
+            params![fingerprint],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// All fingerprint mappings joined with their owning user (the paired-devices admin view,
+    /// pairing spec §5.5), newest first.
+    pub fn list_external_identities(&self) -> Result<Vec<ExternalIdentityRecord>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT e.fingerprint, e.user_id, u.username, e.display_name, e.created_at, \
+                    e.last_seen_at, u.disabled \
+             FROM external_identities e JOIN users u ON u.id = e.user_id \
+             ORDER BY e.created_at DESC, e.fingerprint",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(ExternalIdentityRecord {
+                fingerprint: r.get(0)?,
+                user_id: r.get(1)?,
+                username: r.get(2)?,
+                display_name: r.get(3)?,
+                created_at: r.get(4)?,
+                last_seen_at: r.get(5)?,
+                disabled: r.get::<_, i64>(6)? != 0,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Error::from)
     }
 
     /// Resolve a verified client-certificate `fingerprint` to its `(user_id, username)`, or `None`
@@ -723,7 +835,7 @@ mod tests {
             .lock()
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 2);
+        assert_eq!(v, 3);
     }
 
     #[test]
@@ -733,7 +845,7 @@ mod tests {
         // Unmapped fingerprint: deny (fail-closed).
         assert!(s.external_identity("ab12cd34").unwrap().is_none());
         // Writing then reading resolves to the right user.
-        s.set_external_identity(&u.id, "ab12cd34").unwrap();
+        s.set_external_identity(&u.id, "ab12cd34", None).unwrap();
         let (uid, name) = s.external_identity("ab12cd34").unwrap().expect("mapped");
         assert_eq!(uid, u.id);
         assert_eq!(name, "svc");
@@ -746,12 +858,12 @@ mod tests {
         let s = store();
         // Binding to a nonexistent user is rejected.
         assert!(matches!(
-            s.set_external_identity("ghost", "aa"),
+            s.set_external_identity("ghost", "aa", None),
             Err(Error::NotFound)
         ));
         // A disabled user's mapping is not resolvable (disable hides the EXTERNAL identity too).
         let u = s.create_user("dora", "pw", &[Role::User]).unwrap();
-        s.set_external_identity(&u.id, "bb22").unwrap();
+        s.set_external_identity(&u.id, "bb22", None).unwrap();
         assert!(s.external_identity("bb22").unwrap().is_some());
         s.set_disabled(&u.id, true).unwrap();
         assert!(s.external_identity("bb22").unwrap().is_none());
@@ -763,8 +875,8 @@ mod tests {
         let a = s.create_user("a", "pw", &[Role::User]).unwrap();
         let b = s.create_user("b", "pw", &[Role::User]).unwrap();
         // Re-binding a fingerprint moves it to the new user (upsert).
-        s.set_external_identity(&a.id, "deadbeef").unwrap();
-        s.set_external_identity(&b.id, "deadbeef").unwrap();
+        s.set_external_identity(&a.id, "deadbeef", None).unwrap();
+        s.set_external_identity(&b.id, "deadbeef", None).unwrap();
         assert_eq!(
             s.external_identity("deadbeef").unwrap().map(|(id, _)| id),
             Some(b.id.clone())
@@ -774,6 +886,67 @@ mod tests {
             .execute("DELETE FROM users WHERE id = ?1", params![b.id])
             .unwrap();
         assert!(s.external_identity("deadbeef").unwrap().is_none());
+    }
+
+    #[test]
+    fn external_user_has_no_password_credentials() {
+        let s = store();
+        let u = s
+            .create_external_user("device-ab12cd34dead", &[Role::User])
+            .unwrap();
+        assert_eq!(u.username, "device-ab12cd34dead");
+        // No password/SCRAM rows: PLAIN authentication fails closed.
+        assert!(matches!(
+            s.authenticate_password("device-ab12cd34dead", "anything"),
+            Err(Error::InvalidCredentials)
+        ));
+        let scram_rows: i64 = s
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM scram_credentials WHERE user_id = ?1",
+                params![u.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(scram_rows, 0, "an external user never gets SCRAM material");
+        // Reserved usernames stay rejected on this path too.
+        assert!(matches!(
+            s.create_external_user("system", &[Role::User]),
+            Err(Error::ReservedUsername)
+        ));
+    }
+
+    /// The M3 device metadata: display name at enrollment, `last_seen_at` on touch, the joined
+    /// admin list view, and mapping removal.
+    #[test]
+    fn external_identity_device_metadata_roundtrip() {
+        let s = store();
+        let u = s.create_external_user("device-aa", &[Role::User]).unwrap();
+        s.set_external_identity(&u.id, "aabbccdd", Some("Pixel 9"))
+            .unwrap();
+
+        let rows = s.list_external_identities().unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.fingerprint, "aabbccdd");
+        assert_eq!(row.user_id, u.id);
+        assert_eq!(row.username, "device-aa");
+        assert_eq!(row.display_name.as_deref(), Some("Pixel 9"));
+        assert!(row.created_at > 0);
+        assert_eq!(row.last_seen_at, None, "never logged in yet");
+        assert!(!row.disabled);
+
+        // A successful EXTERNAL login stamps last_seen_at; unknown fingerprints are a no-op.
+        s.touch_external_identity("aabbccdd").unwrap();
+        s.touch_external_identity("ffffffff").unwrap();
+        let row = &s.list_external_identities().unwrap()[0];
+        assert!(row.last_seen_at.is_some());
+
+        // Removal severs the mapping (and reports whether anything was removed).
+        assert!(s.remove_external_identity("aabbccdd").unwrap());
+        assert!(!s.remove_external_identity("aabbccdd").unwrap());
+        assert!(s.external_identity("aabbccdd").unwrap().is_none());
+        assert!(s.list_external_identities().unwrap().is_empty());
     }
 
     #[test]
