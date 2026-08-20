@@ -339,6 +339,7 @@ impl EngineFactory for CoreEngineFactory {
             ctx: None,
             turn_seal: None,
             hydrated_key: None,
+            turn_inputs: Vec::new(),
         })
     }
 }
@@ -391,6 +392,13 @@ pub struct CoreIncarnation {
     /// resolution at the very next turn — the same boundary the live actor applies pending
     /// switches at. `None` until first hydrated.
     hydrated_key: Option<ProfileKey>,
+    /// The turn-opening user inputs THIS activation folded (`StartTurn`/`Steer` splices), captured
+    /// at hydrate so `run` can journal each as a first-class `TranscriptBlock::Message { User }`
+    /// ahead of the turn's coalesced events. Without them the durable journal — the node's
+    /// authoritative transcript — holds only assistant/tool blocks (`TurnTrigger` carries no text),
+    /// so a client cold-rendering from `SessionHistory` alone could never show user turns.
+    /// Consumed (taken) by `run`; a resumed suspension folds no new splices, so no duplicates.
+    turn_inputs: Vec<String>,
 }
 
 /// See [`CoreIncarnation::hydrated_key`]: (bound profile, inline spec, overlay, cron stamp).
@@ -645,6 +653,9 @@ impl Incarnation for CoreIncarnation {
         let cursor = engine.consumed_splice_seq();
         let mut observed = false;
         let mut opened = has_completions;
+        // Fresh capture per hydrate: only the splices THIS activation folds become journaled user
+        // blocks (already-consumed splices were journaled by the activation that folded them).
+        self.turn_inputs.clear();
         for splice in splices {
             if splice.splice_seq <= cursor {
                 continue;
@@ -656,6 +667,7 @@ impl Incarnation for CoreIncarnation {
                     observed = true;
                 }
                 daemon_store::SpliceKind::StartTurn => {
+                    self.turn_inputs.push(msg.text.clone());
                     engine.push_user(msg);
                     // Per-turn surface hint parity (live `start_turn_from`): a wire submit stamps
                     // its origin TRANSPORT on the splice's provenance, armed one-shot for the turn
@@ -667,6 +679,7 @@ impl Incarnation for CoreIncarnation {
                     opened = true;
                 }
                 daemon_store::SpliceKind::Steer => {
+                    self.turn_inputs.push(msg.text.clone());
                     engine.push_user(msg);
                     opened = true;
                 }
@@ -831,6 +844,17 @@ impl Incarnation for CoreIncarnation {
                 )
                 .await,
             );
+            // The turn-opening user inputs lead the segment: the journal is the CONVERSATION, not
+            // just the agent's half — a client replaying `SessionHistory` renders user turns from
+            // these blocks (they exist nowhere else durably; `TurnTrigger` carries no text).
+            for text in std::mem::take(&mut self.turn_inputs) {
+                let _ = jsink
+                    .record_block(&daemon_protocol::TranscriptBlock::Message {
+                        role: daemon_protocol::TranscriptRole::User,
+                        text,
+                    })
+                    .await;
+            }
             let feeder = JournalFeeder::new(jsink.clone());
             let events = std::mem::take(&mut *captured.lock().unwrap());
             for ev in events {
@@ -1090,6 +1114,7 @@ mod tests {
             ctx: None,
             turn_seal: None,
             hydrated_key: None,
+            turn_inputs: Vec::new(),
         }
     }
 

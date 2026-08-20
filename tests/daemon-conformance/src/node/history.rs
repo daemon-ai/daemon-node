@@ -16,7 +16,7 @@ async fn reconnect_reads_back_verified_session_history() {
 async fn reconnect_reads_back_verified_session_history_impl() {
     use daemon_api::{ControlApi, JournalRecordPayload, Outbound, SessionApi};
     use daemon_common::ReqId;
-    use daemon_protocol::{AgentCommand, AgentEvent, TranscriptBlock, UserMsg};
+    use daemon_protocol::{AgentCommand, AgentEvent, TranscriptBlock, TranscriptRole, UserMsg};
 
     let (node, handle) = assemble();
     let session = SessionId::new("history-1");
@@ -65,11 +65,26 @@ async fn reconnect_reads_back_verified_session_history_impl() {
         page.entries.iter().all(|e| e.verified),
         "every sealed entry must verify under the node key: {page:?}"
     );
+    // BOTH halves of the conversation are durable blocks: the journal is the conversation, so a
+    // cold-rendering client (no live drain, no local echo) reconstructs user AND assistant turns
+    // from `SessionHistory` alone. The user block carries the submitted text verbatim.
     assert!(
         page.entries.iter().any(|e| matches!(
             &e.payload,
             JournalRecordPayload::Block {
-                block: TranscriptBlock::Message { .. }
+                block: TranscriptBlock::Message { role: TranscriptRole::User, text }
+            } if text == "hello"
+        )),
+        "expected the user's turn-opening message as a durable block, got {page:?}"
+    );
+    assert!(
+        page.entries.iter().any(|e| matches!(
+            &e.payload,
+            JournalRecordPayload::Block {
+                block: TranscriptBlock::Message {
+                    role: TranscriptRole::Assistant,
+                    ..
+                }
             }
         )),
         "expected a coalesced assistant message block, got {page:?}"
