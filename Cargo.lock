@@ -4444,6 +4444,7 @@ dependencies = [
  "daemon-core",
  "daemon-credentials",
  "daemon-models",
+ "daemon-pake",
  "daemon-protocol",
  "daemon-provision",
  "daemon-schedule",
@@ -4459,6 +4460,7 @@ dependencies = [
  "regex",
  "rsasl",
  "serde",
+ "serde_bytes",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
@@ -4599,6 +4601,7 @@ name = "daemon-mdns"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "if-addrs",
  "mdns-sd",
  "tracing",
 ]

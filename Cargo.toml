@@ -350,6 +350,9 @@ tokio-tungstenite = "0.29"
 # responder with no Avahi/Bonjour runtime dependency, keeping the sealed bundle self-contained.
 # Isolated to the `daemon-mdns` adapter crate; `bins/daemon` composes the record and owns policy.
 mdns-sd = "0.21"
+# Interface enumeration for the pairing join-URI addresses (daemon-pairing-spec.md §5.5) — already
+# in the tree as mdns-sd's own address-resolution dependency; pinned to the same version.
+if-addrs = "0.15"
 # The machine hostname for the DNS-SD SRV host (`<hostname>.local.`) + the default instance name.
 gethostname = "1"
 # rustls 0.23 — already resolved transitively (the tree's aws-lc-rs TLS backbone). Declared here so

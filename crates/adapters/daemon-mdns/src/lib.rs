@@ -79,6 +79,31 @@ impl Advertiser {
     }
 }
 
+/// The host's current non-loopback, non-link-local-v6 IP addresses (IPv4 first, then IPv6) —
+/// the same interface set the responder advertises on. Consumed by the pairing admin surface
+/// (`PairingBegin.addresses`, daemon-pairing-spec.md §5.5) so the join URI names endpoints a
+/// LAN peer can actually dial. Reuses the `if-addrs` enumeration `mdns-sd` already vendors.
+pub fn non_loopback_addrs() -> Vec<std::net::IpAddr> {
+    let mut v4 = Vec::new();
+    let mut v6 = Vec::new();
+    for iface in if_addrs::get_if_addrs().unwrap_or_default() {
+        if iface.is_loopback() {
+            continue;
+        }
+        match iface.ip() {
+            std::net::IpAddr::V4(a) => v4.push(std::net::IpAddr::V4(a)),
+            std::net::IpAddr::V6(a) => {
+                // Link-local v6 needs a zone id to dial; useless in a URI.
+                if (a.segments()[0] & 0xffc0) != 0xfe80 {
+                    v6.push(std::net::IpAddr::V6(a));
+                }
+            }
+        }
+    }
+    v4.extend(v6);
+    v4
+}
+
 /// Map a [`ServiceSpec`] onto an `mdns-sd` [`ServiceInfo`] with address auto-detection enabled.
 fn service_info(spec: &ServiceSpec) -> anyhow::Result<ServiceInfo> {
     let txt: Vec<(&str, &str)> = spec

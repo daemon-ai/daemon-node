@@ -57,6 +57,7 @@ pub mod journal;
 pub mod managed;
 pub mod node_api;
 pub mod notifications;
+pub mod pairing;
 pub mod person;
 pub mod persona_ops;
 pub mod presence;
@@ -137,6 +138,7 @@ pub use node_api::{
     SessionEngineBuilder,
 };
 pub use notifications::{AddOutcome, NotificationManager, ReadChange};
+pub use pairing::{PairingManager, PairingSurface, MECH_PAIRING};
 pub use persona_ops::PersonaOps;
 pub use presence::PresenceManager;
 pub use process_agent::ProcessAgentUnit;

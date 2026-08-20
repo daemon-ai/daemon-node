@@ -797,6 +797,17 @@ async fn serve_access(api: &dyn NodeApi, req: ApiRequest) -> Option<ApiResponse>
             unit_or_err(api.resource_grant_list(user_id).await)
         }
         ApiRequest::ResourceGrantRevoke { id } => unit_or_err(api.resource_grant_revoke(id).await),
+        ApiRequest::PairingBegin => ok_or_err(api.pairing_begin().await, ApiResponse::PairingCode),
+        ApiRequest::PairingCancel => unit_or_err(api.pairing_cancel().await),
+        ApiRequest::PairingStatus => {
+            ok_or_err(api.pairing_status().await, ApiResponse::PairingState)
+        }
+        ApiRequest::PairedDeviceList => {
+            ok_or_err(api.paired_device_list().await, ApiResponse::PairedDevices)
+        }
+        ApiRequest::PairedDeviceRevoke { fingerprint } => {
+            unit_or_err(api.paired_device_revoke(fingerprint).await)
+        }
         _ => return None,
     })
 }

@@ -25,6 +25,7 @@ Single-origin browser deployment: `web.addr` binds ONE plain-HTTP listener that 
 | `api.local_trust` | `DAEMON_API__LOCAL_TRUST` | string | `system` |
 | `api.mdns.enabled` | `DAEMON_API__MDNS__ENABLED` | bool | `true` |
 | `api.mdns.name` | `DAEMON_API__MDNS__NAME` | optional | _(unset)_ |
+| `api.pairing.enabled` | `DAEMON_API__PAIRING__ENABLED` | bool | `true` |
 | `api.require_client_cert` | `DAEMON_API__REQUIRE_CLIENT_CERT` | bool | `false` |
 | `api.tls_addr` | `DAEMON_API__TLS_ADDR` | optional | _(unset)_ |
 | `api.tls_cert` | `DAEMON_API__TLS_CERT` | optional | _(unset)_ |

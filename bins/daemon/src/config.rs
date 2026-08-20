@@ -893,6 +893,8 @@ pub struct ApiConfig {
     pub ingress_max_decoded_bytes: Option<usize>,
     /// LAN DNS-SD advertising of the TLS listener (`[api.mdns]`; daemon-lan-discovery-spec.md §3.3).
     pub mdns: MdnsConfig,
+    /// LAN pairing over the TLS listener (`[api.pairing]`; daemon-pairing-spec.md §5.2).
+    pub pairing: PairingConfig,
 }
 
 impl ApiConfig {
@@ -939,6 +941,7 @@ impl Default for ApiConfig {
             ingress_max_frame_bytes: None,
             ingress_max_decoded_bytes: None,
             mdns: MdnsConfig::default(),
+            pairing: PairingConfig::default(),
         }
     }
 }
@@ -967,6 +970,28 @@ impl Default for MdnsConfig {
             enabled: true,
             name: None,
         }
+    }
+}
+
+/// `[api.pairing]` / `DAEMON_API__PAIRING__*` — SPAKE2 pairing enrollment over the TLS api
+/// listener (daemon-pairing-spec.md §5.2).
+///
+/// Default-on exposes nothing by itself: pairing is inert until an admin arms a code
+/// (`PairingBegin` / `daemon-cli pair new`), and the whole surface requires the TLS listener —
+/// a default install (Unix socket only) has nothing to pair against. `enabled = false`
+/// hard-disables arming and the `X-DAEMON-PAIR-1` mechanism for operators who want the surface
+/// gone.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PairingConfig {
+    /// Master switch for the pairing mechanism + arming API.
+    #[serde(with = "daemon_common::flex_bool")]
+    pub enabled: bool,
+}
+
+impl Default for PairingConfig {
+    fn default() -> Self {
+        Self { enabled: true }
     }
 }
 

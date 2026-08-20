@@ -336,6 +336,68 @@ impl AuthStore {
         })
     }
 
+    /// Pairing enrollment (pairing spec §5.4), one transaction: ensure the device-scoped user
+    /// exists (created passwordless via the [`Self::create_external_user`] shape; a previously
+    /// revoked device user is re-enabled on re-pair), then upsert the fingerprint mapping with the
+    /// device display name. Role is always [`Role::User`] — elevation is an explicit post-pairing
+    /// admin act, never part of the ceremony.
+    pub fn enroll_paired_device(
+        &self,
+        username: &str,
+        fingerprint: &str,
+        display_name: Option<&str>,
+    ) -> Result<UserRecord> {
+        if crate::is_reserved_username(username) {
+            return Err(Error::ReservedUsername);
+        }
+        let minted_id = random_hex()?;
+        if crate::is_reserved_username(&minted_id) {
+            return Err(Error::ReservedUsername);
+        }
+        let now = now_secs();
+        let conn = self.lock();
+        let tx = conn.unchecked_transaction()?;
+        let existing: Option<(String, i64)> = tx
+            .query_row(
+                "SELECT id, created_at FROM users WHERE username = ?1",
+                params![username],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let (user_id, created_at) = match existing {
+            Some((id, created_at)) => {
+                // Re-pairing a previously revoked (disabled, never deleted) device user.
+                tx.execute("UPDATE users SET disabled = 0 WHERE id = ?1", params![id])?;
+                (id, created_at)
+            }
+            None => {
+                tx.execute(
+                    "INSERT INTO users (id, username, disabled, created_at) VALUES (?1, ?2, 0, ?3)",
+                    params![minted_id, username, now],
+                )?;
+                tx.execute(
+                    "INSERT OR IGNORE INTO user_roles (user_id, role) VALUES (?1, ?2)",
+                    params![minted_id, Role::User.as_str()],
+                )?;
+                (minted_id, now)
+            }
+        };
+        tx.execute(
+            "INSERT INTO external_identities (fingerprint, user_id, created_at, display_name) \
+             VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT(fingerprint) DO UPDATE SET user_id = excluded.user_id, \
+             created_at = excluded.created_at, display_name = excluded.display_name",
+            params![fingerprint, user_id, now, display_name],
+        )?;
+        tx.commit()?;
+        Ok(UserRecord {
+            id: user_id,
+            username: username.to_string(),
+            disabled: false,
+            created_at,
+        })
+    }
+
     /// Look a user up by username.
     pub fn find_user(&self, username: &str) -> Result<Option<UserRecord>> {
         let conn = self.lock();

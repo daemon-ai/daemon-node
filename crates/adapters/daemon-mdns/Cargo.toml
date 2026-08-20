@@ -12,6 +12,9 @@ license.workspace = true
 # never leaks into daemon-host or daemon-core.
 [dependencies]
 anyhow = { workspace = true }
+# Interface enumeration for the pairing join-URI addresses — the same crate mdns-sd resolves
+# its own advertised addresses through, so this adds no new dependency tree.
+if-addrs = { workspace = true }
 mdns-sd = { workspace = true }
 tracing = { workspace = true }
 

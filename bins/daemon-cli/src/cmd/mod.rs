@@ -21,6 +21,7 @@ mod directory;
 mod member;
 mod model;
 mod orchestration;
+mod pair;
 mod session;
 mod vhc;
 
@@ -36,6 +37,7 @@ pub(crate) async fn dispatch(client: &ApiClient, command: Command) -> anyhow::Re
         Command::Contact { cmd } => contact::run(client, cmd).await,
         Command::Directory { cmd } => directory::run(client, cmd).await,
         Command::Vhc { cmd } => vhc::run(client, cmd).await,
+        Command::Pair { cmd } => pair::run(client, cmd).await,
         flat => {
             let Some(flat) = session::try_run(client, flat).await? else {
                 return Ok(());

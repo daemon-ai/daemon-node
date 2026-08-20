@@ -3443,13 +3443,40 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
             }
         }
     }
+    // LAN pairing (daemon-pairing-spec.md §5): one shared `PairingManager` serves BOTH sides of
+    // the flow — the admin surface arms it (`PairingBegin`), the transport authenticator runs the
+    // `X-DAEMON-PAIR-1` SPAKE2 exchange against it. Built only when `[api.pairing] enabled` AND
+    // the TLS listener is configured (the mechanism binds the channel to the server cert, and the
+    // enrolled identity is the TLS client-cert fingerprint — no TLS, no pairing). The cert
+    // fingerprint is known from config before bind; the bound port arrives later (`set_pairing`).
+    let pairing_manager = if cfg.api.pairing.enabled && cfg.api.tls_addr.is_some() {
+        match &cfg.api.tls_cert {
+            Some(cert_path) => match daemon_host::leaf_cert_fingerprint(cert_path) {
+                Ok(fp) => Some((Arc::new(daemon_host::PairingManager::new()), fp)),
+                Err(e) => {
+                    tracing::warn!(
+                        "pairing: cannot fingerprint {} ({e}); pairing disabled this run",
+                        cert_path.display()
+                    );
+                    None
+                }
+            },
+            None => None, // tls_addr without tls_cert fails the bind below anyway.
+        }
+    } else {
+        None
+    };
     // The store handle is cloned in (not moved): the web front's `/healthz` readiness probe below
     // keeps its own reference for the auth check.
-    let authenticator = Arc::new(
-        daemon_host::Authenticator::new(auth_store.clone())
+    let authenticator = {
+        let mut a = daemon_host::Authenticator::new(auth_store.clone())
             .with_audit(auth_audit)
-            .with_revocations(revocations),
-    );
+            .with_revocations(revocations);
+        if let Some((manager, server_fp)) = &pairing_manager {
+            a = a.with_pairing(manager.clone(), server_fp.clone());
+        }
+        Arc::new(a)
+    };
     // B5: `[api].local_trust` defaults to `system` — the Unix socket / FFI / in-process HTTP run as
     // the deliberate full-trust principal. Disable it to require SCRAM on the Unix socket and fully
     // gate HTTP. TCP/TLS always requires authentication regardless of this flag.
@@ -3608,6 +3635,39 @@ async fn run_as_host(cfg: NodeConfig) -> anyhow::Result<()> {
             },
         }
     };
+
+    // Bind the pairing admin surface (pairing spec §5.5) now that the TLS listener's real port is
+    // known: `PairingBegin`/`Cancel`/`Status` arm the SAME manager the authenticator's
+    // `X-DAEMON-PAIR-1` branch serves, and the join URI carries the bound port + the node's
+    // current non-loopback addresses (enumerated per-arm, not frozen at boot — DHCP moves).
+    if let (Some((manager, server_fp)), Some(bound)) = (&pairing_manager, tls_bound_addr) {
+        match cfg.resolve_node_id() {
+            Ok(node_id) => {
+                let host = gethostname::gethostname().to_string_lossy().into_owned();
+                let node_name = cfg
+                    .api
+                    .mdns
+                    .name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(&host)
+                    .to_string();
+                node.set_pairing(Arc::new(daemon_host::PairingSurface {
+                    manager: manager.clone(),
+                    node_id,
+                    node_name,
+                    server_fp: server_fp.clone(),
+                    port: bound.port(),
+                    addresses: Box::new(daemon_mdns::non_loopback_addrs),
+                }));
+                tracing::info!("pairing: arming surface bound ([api.pairing] enabled)");
+            }
+            Err(e) => {
+                tracing::warn!("pairing: node id unavailable ({e:#}); arming surface not bound");
+            }
+        }
+    }
 
     // The plain-WebSocket mux carrier (opt-in via `[api].ws_addr`) for browser (Qt WASM) clients:
     // the same CBOR mux, one binary message per frame, subprotocol `daemon-mux`, authentication

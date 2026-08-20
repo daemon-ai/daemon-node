@@ -1255,6 +1255,26 @@ pub enum ApiRequest {
         id: String,
     },
 
+    // -- LAN pairing (pairing spec §5.5; wire v54) ------------------------------------------------
+    /// [`AccessControlApi::pairing_begin`] — arm a fresh single-use pairing code (replacing any
+    /// previous one and clearing a lockout). Answered by [`ApiResponse::PairingCode`] — the one
+    /// and only exposure of the code; it is never retrievable again.
+    PairingBegin,
+    /// [`AccessControlApi::pairing_cancel`] — disarm; also clears the locked state.
+    PairingCancel,
+    /// [`AccessControlApi::pairing_status`] — the armed/locked view (never returns the code).
+    /// Answered by [`ApiResponse::PairingState`].
+    PairingStatus,
+    /// [`AccessControlApi::paired_device_list`] — the enrolled device roster. Answered by
+    /// [`ApiResponse::PairedDevices`].
+    PairedDeviceList,
+    /// [`AccessControlApi::paired_device_revoke`] — sever a device: delete the fingerprint
+    /// mapping, disable (not delete — audit) the device user, revoke its sessions.
+    PairedDeviceRevoke {
+        /// The enrolled client-certificate SHA-256 fingerprint (lowercase hex).
+        fingerprint: String,
+    },
+
     // -- user feedback over OpenTelemetry (N1; wire v32) -----------------------------------------
     /// [`ControlApi::feedback_submit`] — submit thumbs up/down + optional comment on an agent
     /// response, or general app feedback. Explicit feedback is per-event consent: it is
@@ -1659,6 +1679,14 @@ pub enum ApiResponse {
     /// The caller's own principal view (who_am_i).
     WhoAmI(PrincipalView),
 
+    // -- LAN pairing (pairing spec §5.5; wire v54) ------------------------------------------------
+    /// The freshly armed pairing code + join facts (pairing_begin). The ONLY exposure of the code.
+    PairingCode(PairingCode),
+    /// The armed/locked view (pairing_status). Never contains the code.
+    PairingState(PairingState),
+    /// The enrolled device roster (paired_device_list).
+    PairedDevices(Vec<PairedDevice>),
+
     // -- user feedback over OpenTelemetry (N1; wire v32) -----------------------------------------
     /// The acknowledgement for a `FeedbackSubmit` — accepted+queued to the durable feedback outbox
     /// (NOT delivered; export is a separate best-effort drain).
@@ -1988,6 +2016,69 @@ pub struct RoleInfo {
     pub role: String,
     /// The capability names the role grants (snake_case).
     pub capabilities: Vec<String>,
+}
+
+/// The reply to `pairing_begin` (pairing spec §5.5): the freshly armed single-use code plus
+/// everything a joining client needs, composed node-side (the node decides; clients render).
+/// The code appears here once and is never retrievable again.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairingCode {
+    /// The canonical (ungrouped, uppercase Crockford-base32) pairing code. Renderers display it
+    /// grouped `XXXXX-XXXXX`.
+    pub code: String,
+    /// Wall-clock expiry of the armed code, milliseconds since the Unix epoch (TTL 120 s).
+    pub expires_at: u64,
+    /// The canonical `daemon+pair:` join URI (pairing spec §7), also the QR payload.
+    pub uri: String,
+    /// The node's non-loopback `host:port` endpoints (primary first; IPv6 bracketed), so an
+    /// admin client can render alternates.
+    pub addresses: Vec<String>,
+    /// The TLS listener's leaf-certificate SHA-256 fingerprint (lowercase hex) — the URI `fp`.
+    pub server_fp: String,
+    /// The node's persistent id (lan-discovery spec §3.2), display/bookkeeping only.
+    pub node_id: String,
+    /// The node's display name (lan-discovery spec §3.3), display only.
+    pub node_name: String,
+}
+
+/// The reply to `pairing_status` (pairing spec §5.5). Never contains the code.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairingState {
+    /// Whether a live (unexpired) code is armed.
+    pub armed: bool,
+    /// Expiry of the armed code (ms since epoch), when armed.
+    #[serde(default)]
+    pub expires_at: Option<u64>,
+    /// Remaining exchange attempts before lockout, when armed.
+    #[serde(default)]
+    pub attempts_remaining: Option<u32>,
+    /// Whether the attempt budget was exhausted (an admin must re-arm or cancel).
+    pub locked: bool,
+}
+
+/// One enrolled device row (`paired_device_list`, pairing spec §5.5): the `external_identities`
+/// mapping joined with its device user. Carries no credential material.
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairedDevice {
+    /// The device user's stable id.
+    pub user_id: String,
+    /// The device user's username (`device-<fp[:12]>`).
+    pub username: String,
+    /// The device display name sent at enrollment, if any.
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// The enrolled client-certificate SHA-256 fingerprint (lowercase hex).
+    pub fingerprint: String,
+    /// Unix seconds at enrollment.
+    pub created_at: i64,
+    /// Unix seconds of the last successful EXTERNAL login, if any.
+    #[serde(default)]
+    pub last_seen_at: Option<i64>,
+    /// Whether the device user is enabled (a revoked device is disabled, not deleted).
+    pub enabled: bool,
 }
 
 /// A client -> server multiplexed frame. Wraps an [`ApiRequest`] so one connection can carry many
@@ -2561,18 +2652,18 @@ mod auth_contract_tests {
     }
 
     /// The contract wire version (`daemon_common::WireVersion::CURRENT`, mirrored by
-    /// [`crate::API_WIRE_VERSION`]) is pinned to the sealed surface: v53 (`ProfileCommission` —
-    /// the composite first-run/editor commit: profile upsert + credential + persona + model
-    /// activation + default selection + provider probe as ONE strictly-ordered call). Distinct
-    /// from the transport-envelope [`WIRE_VERSION`] above (= 2), which this rung did not touch.
-    /// Bumping the contract version is a deliberate act — this assertion is the gate.
+    /// [`crate::API_WIRE_VERSION`]) is pinned to the sealed surface: v54 (the LAN pairing admin
+    /// surface, daemon-pairing-spec.md §5.5: `PairingBegin`/`Cancel`/`Status` +
+    /// `PairedDeviceList`/`Revoke` and their responses). Distinct from the transport-envelope
+    /// [`WIRE_VERSION`] above (= 2), which this rung did not touch. Bumping the contract version
+    /// is a deliberate act — this assertion is the gate.
     #[test]
-    fn contract_wire_version_is_v53() {
+    fn contract_wire_version_is_v54() {
         assert_eq!(
             daemon_common::WireVersion::CURRENT,
-            daemon_common::WireVersion(53)
+            daemon_common::WireVersion(54)
         );
-        assert_eq!(crate::API_WIRE_VERSION, daemon_common::WireVersion(53));
+        assert_eq!(crate::API_WIRE_VERSION, daemon_common::WireVersion(54));
     }
 
     /// The `api/<N>` feature string is formatted from the API mirror version (never hardcoded)

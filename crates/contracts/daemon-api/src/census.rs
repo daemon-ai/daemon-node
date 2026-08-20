@@ -129,6 +129,8 @@ pub fn census(req: &ApiRequest) -> MutationClass {
         | R::RoleList
         | R::WhoAmI
         | R::ResourceGrantList { .. }
+        | R::PairingStatus
+        | R::PairedDeviceList
         | R::TelemetryConsentGet
         | R::CrashConsentGet
         | R::PresenceList
@@ -316,6 +318,11 @@ pub fn census(req: &ApiRequest) -> MutationClass {
         // Reserved (`Unsupported` trait defaults, option B) — MustChange so an implementation
         // landing without an emission is caught on its first successful call.
         R::ResourceGrantCreate { .. } | R::ResourceGrantRevoke { .. } => {
+            MustChange(&[P::AccessControl])
+        }
+        // -- LAN pairing (spec §5.5): arming-state + device-set changes ride the AccessControl
+        // invalidation (the surface is AccessAdmin-scoped, matching the projection's policy) ---
+        R::PairingBegin | R::PairingCancel | R::PairedDeviceRevoke { .. } => {
             MustChange(&[P::AccessControl])
         }
 

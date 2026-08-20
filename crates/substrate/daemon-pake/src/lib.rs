@@ -30,7 +30,10 @@ use p256::elliptic_curve::bigint::{Encoding, NonZero, U384};
 use p256::elliptic_curve::group::Group;
 use p256::elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint};
 use p256::elliptic_curve::PrimeField;
-use p256::{AffinePoint, EncodedPoint, ProjectivePoint, Scalar};
+use p256::{AffinePoint, EncodedPoint, ProjectivePoint};
+// Re-exported because it appears in the public `with_scalar`/`scalar_from_bytes` signatures
+// (fixture-generation callers name it without a direct p256 dependency).
+pub use p256::Scalar;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use zeroize::Zeroize;
@@ -141,6 +144,19 @@ impl PasswordScalar {
     pub fn from_bytes(bytes: &[u8; 32]) -> Option<Self> {
         Option::<Scalar>::from(Scalar::from_repr((*bytes).into())).map(Self)
     }
+
+    /// The scalar as 32 big-endian bytes — emitted into the cross-implementation transcript
+    /// fixture so the C++ side can gate its §3.2 derivation step independently of the exchange.
+    pub fn to_bytes(&self) -> [u8; 32] {
+        self.0.to_repr().into()
+    }
+}
+
+/// Decode a caller-provided 32-byte big-endian ephemeral scalar `< n` (`None` if out of range).
+/// For [`Exchange::with_scalar`] callers ONLY — the RFC vector tests and the deterministic
+/// cross-implementation fixture; production exchanges draw their scalars internally.
+pub fn scalar_from_bytes(bytes: &[u8; 32]) -> Option<Scalar> {
+    Option::from(Scalar::from_repr((*bytes).into()))
 }
 
 /// Which side of the exchange this is (RFC 9382: A uses M and goes first; B uses N).

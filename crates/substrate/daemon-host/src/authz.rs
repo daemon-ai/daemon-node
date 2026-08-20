@@ -315,6 +315,13 @@ pub fn required_capability(req: &ApiRequest) -> RequiredAccess {
         | ResourceGrantCreate { .. }
         | ResourceGrantList { .. }
         | ResourceGrantRevoke { .. } => C::AccessAdmin,
+        // LAN pairing (pairing spec §5.5): all five ops are admin acts — arming exposes a join
+        // secret, and the device roster is identity administration.
+        PairingBegin
+        | PairingCancel
+        | PairingStatus
+        | PairedDeviceList
+        | PairedDeviceRevoke { .. } => C::AccessAdmin,
     };
     RequiredAccess::Cap(cap)
 }

@@ -891,7 +891,13 @@ impl WireVersion {
     /// profile upsert + credential + persona + model activation + default selection + provider
     /// probe as ONE strictly-ordered call, retiring the client-orchestrated fire-and-forget
     /// sequence that raced its own dependent probe (each `Call` dispatches concurrently).
-    pub const CURRENT: Self = Self(53);
+    ///
+    /// (v54) LAN pairing admin surface (daemon-pairing-spec.md §5.5): `PairingBegin` /
+    /// `PairingCancel` / `PairingStatus` / `PairedDeviceList` / `PairedDeviceRevoke` and their
+    /// `PairingCode` / `PairingState` / `PairedDevices` responses — arming a single-use SPAKE2
+    /// pairing code and administering the enrolled-device roster. The `X-DAEMON-PAIR-1` SASL
+    /// mechanism itself rides the (unversioned-here) auth envelope's opaque byte fields.
+    pub const CURRENT: Self = Self(54);
 
     /// The version this build speaks (alias for [`WireVersion::CURRENT`]).
     pub fn current() -> Self {

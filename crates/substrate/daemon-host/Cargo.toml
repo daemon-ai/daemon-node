@@ -47,7 +47,10 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_bytes = { workspace = true }
 ciborium = { workspace = true }
+# SPAKE2 (RFC 9382) for the X-DAEMON-PAIR-1 pairing mechanism (pairing.rs / authn.rs).
+daemon-pake = { workspace = true }
 # SASL authentication state machine for the api handshake (authn.rs).
 rsasl = { workspace = true }
 # TLS for the TCP api transport (tls.rs). PEM cert/key loading uses the maintained `PemObject`
